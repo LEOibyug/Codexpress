@@ -3,49 +3,69 @@ import AppKit
 
 struct MenuView: View {
     @EnvironmentObject var model: AppModel
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 15) {
-            HStack {
-                Image(systemName: "arrow.triangle.branch").font(.title2).foregroundStyle(.tint)
-                VStack(alignment: .leading, spacing: 2) { Text("Codexpress").font(.headline); Text(model.running ? "本地网关运行中" : "网关未连接").font(.caption).foregroundStyle(.secondary) }
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.triangle.branch").font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(.white).frame(width: 34, height: 34)
+                    .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 10))
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Codexpress").font(.system(size: 13, weight: .semibold))
+                    Text("本地模型网关").font(.system(size: 10)).foregroundStyle(.secondary)
+                }
                 Spacer()
-                Circle().fill(model.running ? .green : .orange).frame(width: 8, height: 8)
+                StatusPill(text: model.running ? "运行中" : "未连接", color: model.running ? .green : .orange)
             }
             Divider()
             if model.sources.isEmpty {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("添加第一个来源").font(.headline)
-                    Text("连接官方账号或 Responses API，开始使用本地优先级网关。").font(.callout).foregroundStyle(.secondary)
-                    Button("添加来源…") { showSettings() }.buttonStyle(.borderedProminent)
-                }.padding(.vertical, 6)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("连接你的第一个来源").font(.system(size: 13, weight: .medium))
+                    Text("官方账号与 API，在同一个优先级池中使用。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(3)
+                    Button { showSettings() } label: { Label("添加来源", systemImage: "plus") }
+                        .buttonStyle(.borderedProminent).controlSize(.small).padding(.top, 3)
+                }.padding(.vertical, 4)
             } else {
-                HStack { Text("路由").foregroundStyle(.secondary); Spacer(); Text(model.routingMode == "auto" ? "自动优先级池" : "固定 · \(model.fixedName)") }
-                ForEach(Array(model.sources.prefix(4))) { source in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Circle().fill(source.enabled && model.state(source.id)["health"].string == "ready" ? .green : .secondary).frame(width: 6, height: 6)
-                            Text(source.name).lineLimit(1)
-                            Spacer()
-                            Text(source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用").font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Text("当前路由").foregroundStyle(.secondary)
+                    Spacer()
+                    Text(model.routingMode == "auto" ? "自动优先级池" : "固定 · \(model.fixedName)").fontWeight(.medium)
+                }.font(.system(size: 11))
+                VStack(spacing: 13) {
+                    ForEach(Array(model.sources.prefix(4))) { source in
+                        HStack(alignment: .top, spacing: 9) {
+                            Circle().fill(source.enabled && model.state(source.id)["health"].string == "ready" ? .green : .secondary)
+                                .frame(width: 5, height: 5).padding(.top, 5)
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(source.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                                Text(source.policyLabel + (source.official ? " · \(quotaSummary(model.state(source.id)["quota"]))" : ""))
+                                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 0)
+                            Text(source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用")
+                                .font(.system(size: 10)).foregroundStyle(.secondary)
                         }
-                        HStack { Text(source.policyLabel); if source.official { Text("·"); Text(quotaSummary(model.state(source.id)["quota"])) } }.font(.caption).foregroundStyle(.secondary)
                     }
                 }
             }
-            if model.pendingSync { Label("已保存的配置尚未应用，当前路由以网关状态为准。", systemImage: "clock").font(.caption).foregroundStyle(.orange) }
-            if let error = model.error { Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange).lineLimit(3) }
+            if model.pendingSync { InfoNote(text: "配置尚未应用，当前路由使用上次设置。", symbol: "clock", color: .orange) }
+            if let error = model.error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange).lineLimit(3) }
             Divider()
             HStack {
-                Button("设置…") { showSettings() }
+                Button { showSettings() } label: { Label("设置", systemImage: "slider.horizontal.3") }
                 if !model.running { Button("重试启动") { model.retry() } }
                 Spacer()
-                Button("退出") { NSApp.terminate(nil) }.keyboardShortcut("q")
-            }.buttonStyle(.borderless)
-            Text("退出应用后本地网关停止；恢复原连接请在设置中操作。").font(.caption2).foregroundStyle(.tertiary)
+                Button("退出") { NSApp.terminate(nil) }.keyboardShortcut("q").foregroundStyle(.secondary)
+            }.buttonStyle(.borderless).font(.system(size: 11))
+            Text("退出后网关停止，原连接可在设置中恢复。")
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
         }.padding(18).frame(width: 340)
     }
+
     private func showSettings() { AppDelegate.current?.showSettings() }
 }
+
 func quotaSummary(_ quota: JSONValue) -> String {
     guard let window = quota["windows"].array.first, let used = window["used_percent"].number else { return "额度未知" }
     return "剩余 \(Int(max(0, 100 - used)))%" + (quota["stale"].bool == true ? " · 陈旧" : "")

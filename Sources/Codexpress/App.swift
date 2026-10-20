@@ -25,8 +25,10 @@ import AppKit
             let window = NSWindow(contentViewController: NSHostingController(rootView: content))
             window.title = "Codexpress 设置"
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-            window.setContentSize(NSSize(width: 860, height: 620))
-            window.minSize = NSSize(width: 800, height: 570)
+            window.titlebarAppearsTransparent = true
+            window.titleVisibility = .hidden
+            window.setContentSize(NSSize(width: 960, height: 780))
+            window.minSize = NSSize(width: 860, height: 650)
             window.isReleasedWhenClosed = false
             window.center()
             settingsWindow = window

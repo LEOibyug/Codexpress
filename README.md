@@ -4,6 +4,8 @@ Apple Silicon Mac 上的原生菜单栏工具。Codex 连接本机 Responses 网
 
 首版使用 SwiftUI／AppKit + Rust，要求 macOS 14 或更新版本。仅构建 arm64。两个上游参考仓库保留在 `references/`，本产品独立实现，研究记录见 [源码调研](docs/research/2026-10-20-upstream-study.md)。
 
+界面预览：[设置页](docs/images/settings-polished.png)。原生深浅色、按模型上下文规则、逐源网络设置与用量页面采用统一样式，见 [视觉检查记录](docs/visual-review-2026-10-20.md)。
+
 ## 使用
 
 本机构建产物：`dist/Codexpress.app`。双击打开，或执行：

@@ -3,173 +3,353 @@ import SwiftUI
 private enum SettingsPage: String, CaseIterable, Identifiable {
     case sources = "来源", routing = "路由", usage = "用量", general = "设置"
     var id: String { rawValue }
-    var symbol: String { switch self { case .sources: return "server.rack"; case .routing: return "arrow.triangle.branch"; case .usage: return "chart.bar.xaxis"; case .general: return "gearshape" } }
+    var symbol: String {
+        switch self {
+        case .sources: return "server.rack"
+        case .routing: return "arrow.triangle.branch"
+        case .usage: return "chart.bar.xaxis"
+        case .general: return "slider.horizontal.3"
+        }
+    }
 }
+
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
     @State private var page: SettingsPage? = .sources
+
     var body: some View {
         NavigationSplitView {
-            List(SettingsPage.allCases, selection: $page) { item in Label(item.rawValue, systemImage: item.symbol).tag(item) }
-                .navigationSplitViewColumnWidth(155)
-                .safeAreaInset(edge: .bottom) {
-                    HStack { Circle().fill(model.running ? .green : .orange).frame(width: 7, height: 7); Text(model.running ? "网关运行中" : "网关未连接").font(.caption); Spacer() }.padding(14)
-                }
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 17, weight: .semibold)).foregroundStyle(.white)
+                        .frame(width: 34, height: 34)
+                        .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 10))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Codexpress").font(.system(size: 14, weight: .semibold))
+                        Text("本地模型网关").font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }.padding(.horizontal, 18).padding(.top, 18).padding(.bottom, 23)
+
+                List(SettingsPage.allCases, selection: $page) { item in
+                    Label {
+                        Text(item.rawValue).font(.system(size: 13, weight: page == item ? .medium : .regular))
+                    } icon: {
+                        Image(systemName: item.symbol).font(.system(size: 14, weight: .medium)).frame(width: 20)
+                    }.listItemTint(.monochrome).padding(.vertical, 5).tag(item)
+                }.listStyle(.sidebar).scrollContentBackground(.hidden)
+
+                VStack(alignment: .leading, spacing: 9) {
+                    Divider().padding(.bottom, 5)
+                    HStack(spacing: 7) {
+                        Circle().fill(model.running ? .green : .orange).frame(width: 6, height: 6)
+                        Text(model.running ? "网关运行中" : "网关未连接").font(.system(size: 11, weight: .medium))
+                    }
+                    Text("仅在此 Mac 上运行").font(.system(size: 10)).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
+            }.navigationSplitViewColumnWidth(min: 178, ideal: 190, max: 210)
         } detail: {
             VStack(spacing: 0) {
+                notices
+                Group {
+                    switch page ?? .sources {
+                    case .sources: SourcesView()
+                    case .routing: RoutingView()
+                    case .usage: UsageView()
+                    case .general: GeneralSettingsView()
+                    }
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }.background(AppPalette.canvas)
+        }.font(.system(size: 13)).frame(minWidth: 860, minHeight: 620)
+    }
+
+    @ViewBuilder private var notices: some View {
+        if model.metadataLoadFailed || model.pendingSync || model.error != nil || model.notice != nil {
+            VStack(spacing: 8) {
                 if model.metadataLoadFailed {
-                    Label("来源文件无法读取，已进入只读保护。请从备份修复 sources.json 后重启；原文件未改动。", systemImage: "lock.shield").font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading).background(.orange.opacity(0.12))
+                    banner("来源文件无法读取，已进入只读保护。请从备份修复 sources.json 后重启。", symbol: "lock.shield", color: .orange)
                 }
                 if model.pendingSync {
-                    Label("配置已保存，但尚未成功应用到网关。当前路由以网关最后状态为准，请重试启动。", systemImage: "exclamationmark.arrow.triangle.2.circlepath").font(.callout).padding(12).frame(maxWidth: .infinity, alignment: .leading).background(.orange.opacity(0.12))
+                    banner("配置尚未应用到网关，当前路由仍使用上次设置。请重试启动。", symbol: "arrow.triangle.2.circlepath", color: .orange)
                 }
                 if let error = model.error {
-                    HStack(alignment: .top) { Image(systemName: "exclamationmark.triangle.fill"); Text(error).textSelection(.enabled); Spacer(); Button { model.error = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain) }
-                        .font(.callout).padding(12).background(.orange.opacity(0.12))
+                    banner(error, symbol: "exclamationmark.triangle", color: .orange) { model.error = nil }
                 }
                 if let notice = model.notice {
-                    HStack { Text(notice); Spacer(); Button { model.notice = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain) }.font(.callout).padding(10).background(.blue.opacity(0.08))
+                    banner(notice, symbol: "checkmark.circle", color: .accentColor) { model.notice = nil }
                 }
-                Group {
-                    switch page ?? .sources { case .sources: SourcesView(); case .routing: RoutingView(); case .usage: UsageView(); case .general: GeneralSettingsView() }
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }.padding(.horizontal, 28).padding(.top, 18).frame(maxWidth: 820)
+        }
+    }
+
+    private func banner(_ text: String, symbol: String, color: Color, dismiss: (() -> Void)? = nil) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: symbol).foregroundStyle(color)
+            Text(text).font(.system(size: 12)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            if let dismiss {
+                Button(action: dismiss) { Image(systemName: "xmark").font(.system(size: 10, weight: .medium)) }
+                    .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("关闭提示")
             }
-        }.frame(minWidth: 800, minHeight: 570)
+        }.padding(12).background(color.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
     }
 }
-private struct EditingSource: Identifiable { let source: Source; let isNew: Bool; var id: String { source.id } }
+
+private struct EditingSource: Identifiable {
+    let source: Source
+    let isNew: Bool
+    var id: String { source.id }
+}
+
 struct SourcesView: View {
     @EnvironmentObject var model: AppModel
     @State private var editing: EditingSource?
     @State private var deleting: Source?
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) { Text("来源").font(.largeTitle.bold()); Text("官方账号与 API 共享同一个优先级池。").foregroundStyle(.secondary) }
-                Spacer()
+        VStack(alignment: .leading, spacing: 22) {
+            PageHeading("来源", subtitle: "连接官方账号与 API，统一管理每个来源。") {
                 Menu {
-                    Button("官方账号") { editing = EditingSource(source: .newOfficial(), isNew: true) }
-                    Button("Responses API") { editing = EditingSource(source: Source(), isNew: true) }
-                } label: { Label("添加来源", systemImage: "plus") }.fixedSize(horizontal: true, vertical: true).disabled(!model.running || model.busy || model.metadataLoadFailed)
+                    Button("官方账号") { addOfficial() }
+                    Button("Responses API") { addAPI() }
+                } label: { Label("添加来源", systemImage: "plus") }
+                    .menuStyle(.borderlessButton).fixedSize().padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 7)).foregroundStyle(.white)
+                    .disabled(!canEdit)
             }
             if model.sources.isEmpty {
-                ContentUnavailableView { Label("还没有来源", systemImage: "server.rack") } description: { Text("添加一个官方账号或 API 来源。真实凭据只保存在钥匙串中。") } actions: {
-                    Button("添加 API 来源") { editing = EditingSource(source: Source(), isNew: true) }.disabled(!model.running)
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                EmptyState("连接第一个来源", subtitle: "使用官方 ChatGPT 账号或 Responses API。凭据安全存放在 macOS 钥匙串中。", symbol: "server.rack") {
+                    HStack(spacing: 10) {
+                        Button("添加官方账号") { addOfficial() }.buttonStyle(.borderedProminent)
+                        Button("添加 API") { addAPI() }.buttonStyle(.bordered)
+                    }.controlSize(.large).disabled(!canEdit)
+                }
+                HStack(spacing: 22) {
+                    Label("独立网络策略", systemImage: "network.badge.shield.half.filled")
+                    Label("共享优先级池", systemImage: "arrow.triangle.branch")
+                }.font(.system(size: 11)).foregroundStyle(.tertiary).frame(maxWidth: .infinity)
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 12) {
-                        ForEach(model.sources) { source in
-                            VStack(alignment: .leading, spacing: 12) {
-                                HStack {
-                                    Image(systemName: source.official ? "person.crop.circle" : "key.horizontal").font(.title2).foregroundStyle(.secondary)
-                                    VStack(alignment: .leading, spacing: 3) { Text(source.name).font(.headline); Text(source.official ? "官方 OAuth" : "Responses API").font(.caption).foregroundStyle(.secondary) }
-                                    Spacer()
-                                    Text(source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用").font(.caption).foregroundStyle(.secondary)
-                                    Toggle("启用", isOn: Binding(get: { source.enabled }, set: { _ in model.toggle(source) })).labelsHidden().disabled(model.busy)
-                                    Menu {
-                                        Button("编辑…") { editing = EditingSource(source: source, isNew: false) }
-                                        Button("删除…", role: .destructive) { deleting = source }
-                                    } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).frame(width: 24)
-                                }
-                                Text(source.base_url).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                                Label(source.policyLabel + (source.proxy.url.map { " · \($0)" } ?? ""), systemImage: source.proxy.mode == "direct" ? "network" : "shield.lefthalf.filled").font(.caption)
-                                if let reason = model.state(source.id)["last_error"].string { Text(reason).font(.caption).foregroundStyle(.orange) }
-                                if source.official {
-                                    Divider()
-                                    OfficialAccountView(source: source)
-                                }
-                            }.padding(16).background(.background, in: RoundedRectangle(cornerRadius: 10)).overlay(RoundedRectangle(cornerRadius: 10).stroke(.quaternary))
-                        }
-                    }
+                    LazyVStack(spacing: 14) {
+                        ForEach(model.sources) { source in sourceCard(source) }
+                    }.padding(.bottom, 2)
                 }
             }
-        }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }.settingsPage()
             .sheet(item: $editing) { item in SourceEditor(source: item.source, isNew: item.isNew).environmentObject(model) }
             .alert("删除来源？", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
                 Button("取消", role: .cancel) { deleting = nil }
                 Button("删除", role: .destructive) { if let source = deleting { model.removeSource(source.id) }; deleting = nil }
             } message: { Text("将删除此来源的元数据和钥匙串凭据。已有用量记录会保留。") }
     }
-}
-struct RoutingView: View {
-    @EnvironmentObject var model: AppModel
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("路由").font(.largeTitle.bold())
-            Picker("模式", selection: Binding(get: { model.routingMode }, set: { model.changeRouting(mode: $0, fixed: model.settings.fixed_source_id ?? model.sources.first?.id) })) {
-                Text("自动优先级池").tag("auto"); Text("固定来源").tag("fixed")
-            }.pickerStyle(.segmented).disabled(model.busy || model.sources.isEmpty)
-            if model.routingMode == "fixed" {
-                Picker("固定来源", selection: Binding(get: { model.fixedSourceID ?? "" }, set: { model.changeRouting(mode: "fixed", fixed: $0) })) { ForEach(model.sources.filter(\.enabled)) { Text($0.name).tag($0.id) } }.disabled(model.busy)
+
+    private var canEdit: Bool { model.running && !model.busy && !model.metadataLoadFailed }
+    private func addOfficial() { editing = EditingSource(source: .newOfficial(), isNew: true) }
+    private func addAPI() { editing = EditingSource(source: Source(), isNew: true) }
+
+    private func sourceCard(_ source: Source) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 11) {
+                Image(systemName: source.official ? "person.crop.circle" : "terminal")
+                    .font(.system(size: 19, weight: .regular)).foregroundStyle(Color.accentColor)
+                    .frame(width: 40, height: 40).background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 11))
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(source.name).font(.system(size: 14, weight: .semibold))
+                    Text(source.official ? "官方账号" : "Responses API").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                StatusPill(text: source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用", color: sourceColor(source))
+                Toggle("启用 \(source.name)", isOn: Binding(get: { source.enabled }, set: { _ in model.toggle(source) }))
+                    .toggleStyle(.switch).labelsHidden().controlSize(.small).disabled(model.busy)
+                Menu {
+                    Button("编辑…") { editing = EditingSource(source: source, isNew: false) }
+                    Button("删除…", role: .destructive) { deleting = source }
+                } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).frame(width: 20)
             }
-            Text(model.routingMode == "auto" ? "从上到下选择可用且支持请求模型的来源。拖动调整优先级。" : "请求仅交给所选来源；发生错误时不会改用其他账号或供应商。").font(.callout).foregroundStyle(.secondary)
-            if model.sources.isEmpty { ContentUnavailableView("暂无可排序的来源", systemImage: "arrow.triangle.branch", description: Text("请先在“来源”中添加账号或 API。")).frame(maxWidth: .infinity, maxHeight: .infinity) }
-            else {
-                List {
-                    ForEach(Array(model.sources.enumerated()), id: \.element.id) { index, source in
-                        HStack {
-                            Text("\(index + 1)").monospacedDigit().foregroundStyle(.secondary).frame(width: 22)
-                            VStack(alignment: .leading) { Text(source.name); Text(source.policyLabel).font(.caption).foregroundStyle(.secondary) }
-                            Spacer(); Text(source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用").font(.caption).foregroundStyle(.secondary)
-                            Button { model.move(IndexSet(integer: index), to: index - 1) } label: { Image(systemName: "chevron.up") }.disabled(index == 0 || model.busy).help("提高优先级")
-                            Button { model.move(IndexSet(integer: index), to: index + 2) } label: { Image(systemName: "chevron.down") }.disabled(index == model.sources.count - 1 || model.busy).help("降低优先级")
-                        }.padding(.vertical, 7)
-                    }.onMove { model.move($0, to: $1) }
-                }.listStyle(.inset).disabled(model.busy)
-            }
-            Label("依赖 previous_response_id 的请求优先保留原来源；已开始的生成不会拼接其他源的响应。", systemImage: "info.circle").font(.caption).foregroundStyle(.secondary)
-        }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            VStack(alignment: .leading, spacing: 10) {
+                Text(source.base_url).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                    .textSelection(.enabled).lineLimit(2)
+                Label(source.policyLabel + (source.proxy.url.map { " · \($0)" } ?? ""), systemImage: source.proxy.mode == "direct" ? "network" : "shield.lefthalf.filled")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                .background(AppPalette.well, in: RoundedRectangle(cornerRadius: 8))
+            if let reason = model.state(source.id)["last_error"].string { InfoNote(text: reason, symbol: "exclamationmark.triangle", color: .orange) }
+            if source.official { Divider(); OfficialAccountView(source: source) }
+        }.padding(18).cardSurface()
+    }
+
+    private func sourceColor(_ source: Source) -> Color {
+        guard source.enabled else { return .secondary }
+        switch model.state(source.id)["health"].string { case "ready": return .green; case nil: return .secondary; default: return .orange }
     }
 }
+
+struct RoutingView: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            PageHeading("路由", subtitle: "按优先级分配请求，或固定使用一个来源。")
+            SettingsCard("分配方式", subtitle: "自动模式优先使用排序靠前的可用来源。", symbol: "arrow.triangle.branch") {
+                Picker("分配方式", selection: Binding(get: { model.routingMode }, set: { model.changeRouting(mode: $0, fixed: model.settings.fixed_source_id ?? model.sources.first?.id) })) {
+                    Text("自动优先级池").tag("auto")
+                    Text("固定来源").tag("fixed")
+                }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 330).disabled(model.busy || model.sources.isEmpty)
+                if model.routingMode == "fixed" {
+                    Picker("固定来源", selection: Binding(get: { model.fixedSourceID ?? "" }, set: { model.changeRouting(mode: "fixed", fixed: $0) })) {
+                        ForEach(model.sources.filter(\.enabled)) { Text($0.name).tag($0.id) }
+                    }.disabled(model.busy)
+                    InfoNote(text: "请求仅交给所选来源，失败时不会自动切换。")
+                }
+            }
+            if model.sources.isEmpty {
+                EmptyState("暂无可排序的来源", subtitle: "先在「来源」中添加账号或 API，再设置请求的分配顺序。", symbol: "arrow.triangle.branch")
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("来源优先级").font(.system(size: 12, weight: .semibold))
+                        Spacer()
+                        Text("拖动或使用箭头排序").font(.system(size: 11)).foregroundStyle(.tertiary)
+                    }.padding(.horizontal, 4)
+                    List {
+                        ForEach(Array(model.sources.enumerated()), id: \.element.id) { index, source in
+                            HStack(spacing: 12) {
+                                Text("\(index + 1)").font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(.secondary).frame(width: 26, height: 26).background(AppPalette.well, in: RoundedRectangle(cornerRadius: 7))
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(source.name).font(.system(size: 13, weight: .medium))
+                                    Text(source.policyLabel).font(.system(size: 11)).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                StatusPill(text: source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用")
+                                HStack(spacing: 8) {
+                                    Button { model.move(IndexSet(integer: index), to: index - 1) } label: { Image(systemName: "chevron.up") }.disabled(index == 0 || model.busy).help("提高优先级")
+                                    Button { model.move(IndexSet(integer: index), to: index + 2) } label: { Image(systemName: "chevron.down") }.disabled(index == model.sources.count - 1 || model.busy).help("降低优先级")
+                                }.buttonStyle(.borderless).foregroundStyle(.secondary)
+                            }.padding(.vertical, 9).listRowBackground(Color.clear)
+                        }.onMove { model.move($0, to: $1) }
+                    }.listStyle(.plain).scrollContentBackground(.hidden).padding(7).cardSurface().disabled(model.busy)
+                }
+            }
+            InfoNote(text: "带有上游状态的请求保留原来源。生成开始后，不会拼接其他来源的响应。")
+        }.settingsPage()
+    }
+}
+
 struct GeneralSettingsView: View {
     @EnvironmentObject var model: AppModel
     @State private var port = 17863
     @State private var home = ""
     @State private var confirming: String?
+    @State private var connectionDetails = false
+
+    private var preferencesChanged: Bool { port != model.settings.port || home != model.settings.codexHome }
+    private var canPreview: Bool { !model.busy && model.running && !preferencesChanged && !model.portNeedsRestart && !model.metadataLoadFailed }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                Text("设置").font(.largeTitle.bold())
-                GroupBox("本地网关") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack { Text("监听端口"); TextField("端口", value: $port, format: .number.grouping(.never)).frame(width: 100); Spacer(); Text(model.running ? "运行中" : "未连接").foregroundStyle(.secondary); if !model.running { Button("重试") { model.retry() } } }
-                        Text(model.baseURL).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
-                        Toggle("登录时启动 Codexpress", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
-                        Text("更改端口需重启应用，再重新预览并更新 Codex 连接配置。").font(.caption).foregroundStyle(.secondary)
-                    }.padding(8)
-                }
-                ModelCompactionView()
-                GroupBox("Codex 连接") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        TextField("Codex 配置目录（绝对路径）", text: $home)
-                        Button("保存设置") { model.savePreferences(port: port, codexHome: home) }.disabled(model.busy || model.metadataLoadFailed)
-                        Text("应用不会自动接管连接。预览将读取所选目录的配置；确认后只更新受管字段，不修改原生登录、历史或工具设置。").font(.callout).foregroundStyle(.secondary)
-                        Label("已有会话可能仍使用原连接，需要重新载入。根配置变化不代表所有历史会话已切换。", systemImage: "clock.arrow.circlepath").font(.callout).foregroundStyle(.orange)
-                        if model.portNeedsRestart { Label("端口变更待重启；重新启动后才能预览和接管连接。", systemImage: "arrow.clockwise").font(.callout).foregroundStyle(.orange) }
-                        Button("预览连接配置…") { model.configPreview() }.disabled(model.busy || !model.running || home != model.settings.codexHome || model.portNeedsRestart || model.metadataLoadFailed)
-                    }.padding(8)
-                }
-                if model.preview != .null {
-                    Text(model.preview["warning"].string ?? "请在接管后验证新会话和恢复会话的真实连接目标。").font(.callout).foregroundStyle(.orange)
-                    GroupBox("当前配置（敏感字段已隐藏）") { Text(model.preview["before"].string ?? "").font(.system(.caption, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(8) }
-                    GroupBox("接管后的配置") { Text(model.preview["after"].string ?? "").font(.system(.caption, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(8) }
-                    if !model.preview["model_limits"].array.isEmpty {
-                        GroupBox("将应用的模型压缩规则") {
-                            VStack(alignment: .leading, spacing: 8) {
-                                ForEach(Array(model.preview["model_limits"].array.enumerated()), id: \.offset) { _, rule in
-                                    Text("\(rule["model"].string ?? "")：达到 \(countLabel(rule["auto_compact_token_limit"])) Token 时压缩；窗口 \(countLabel(rule["context_window"])) Token").font(.callout)
-                                }
-                            }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
-                        }
+                PageHeading("设置", subtitle: "管理网关、模型上下文与 Codex 连接。") {
+                    HStack(spacing: 10) {
+                        if preferencesChanged { Text("未保存").font(.system(size: 11)).foregroundStyle(.secondary) }
+                        Button("保存设置") { model.savePreferences(port: port, codexHome: home) }
+                            .disabled(model.busy || model.metadataLoadFailed || !preferencesChanged)
                     }
-                    HStack { Button(model.preview["attached"].bool == true ? "应用连接与模型规则…" : "接管所选 Codex 连接…") { confirming = "config.attach" }.buttonStyle(.borderedProminent).disabled(model.portNeedsRestart || model.metadataLoadFailed); Button("恢复接管前连接…") { confirming = "config.restore" }.disabled(model.preview["attached"].bool != true) }.disabled(model.busy)
                 }
-            }.padding(24)
+                gatewayCard
+                ModelCompactionView()
+                connectionCard
+                if model.preview != .null { previewCard }
+            }.settingsPage()
         }.onAppear { port = model.settings.port; home = model.settings.codexHome }
             .alert(confirming == "config.restore" ? "恢复原连接和模型设置？" : "应用 Codex 连接和模型规则？", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
                 Button("取消", role: .cancel) { confirming = nil }
                 Button("确认") { if let op = confirming { model.configAction(op) }; confirming = nil }
             } message: { Text("操作目录：\(model.settings.codexHome)\n只更改本应用管理的字段。已有会话的连接需要另行验证。") }
+    }
+
+    private var gatewayCard: some View {
+        SettingsCard("本地网关", subtitle: "仅接受来自此 Mac 的连接。", symbol: "network", accessory: {
+            StatusPill(text: model.running ? "运行中" : "未连接", color: model.running ? .green : .orange)
+        }) {
+            VStack(spacing: 13) {
+                SettingRow(title: "监听端口", subtitle: "更改后需重新启动 Codexpress") {
+                    HStack(spacing: 8) {
+                        TextField("端口", value: $port, format: .number.grouping(.never))
+                            .font(.system(size: 12, design: .monospaced)).multilineTextAlignment(.trailing).settingsField().frame(width: 90)
+                        if !model.running { Button("重试") { model.retry() } }
+                    }
+                }
+                Divider().overlay(AppPalette.border)
+                SettingRow(title: "登录时启动", subtitle: "在菜单栏中保持可用") {
+                    Toggle("登录时启动 Codexpress", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
+                        .toggleStyle(.switch).labelsHidden().controlSize(.small)
+                }
+                HStack(spacing: 6) {
+                    Image(systemName: "link").font(.system(size: 10))
+                    Text(model.baseURL).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                    Spacer()
+                }.foregroundStyle(.secondary).padding(.top, 2)
+            }
+        }
+    }
+
+    private var connectionCard: some View {
+        SettingsCard("Codex 连接", subtitle: "预览变更，再将 Codex 连接到本地网关。", symbol: "link") {
+            VStack(alignment: .leading, spacing: 13) {
+                Text("配置目录").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                TextField("Codex 配置目录（绝对路径）", text: $home)
+                    .font(.system(size: 12, design: .monospaced)).settingsField()
+                HStack(alignment: .center, spacing: 18) {
+                    InfoNote(text: preferencesChanged ? "先保存设置，再预览连接配置。" : "历史记录与工具设置会保留。")
+                    Spacer(minLength: 0)
+                    Button { model.configPreview() } label: { Label("预览连接配置", systemImage: "doc.text.magnifyingglass") }
+                        .buttonStyle(.borderedProminent).disabled(!canPreview)
+                }
+                if model.portNeedsRestart { InfoNote(text: "端口变更待重启。重启后可预览并接管连接。", symbol: "arrow.clockwise", color: .orange) }
+                DisclosureGroup("连接与恢复说明", isExpanded: $connectionDetails) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("预览将读取所选目录的配置；确认后只更新受管字段，不修改原生登录、历史或工具设置。")
+                        Text("已有会话可能保留原连接，需要重新载入并验证。根配置更新不代表所有历史会话已切换。")
+                    }.font(.system(size: 11)).foregroundStyle(.secondary).padding(.top, 7).lineSpacing(3)
+                }.font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var previewCard: some View {
+        SettingsCard("连接预览", subtitle: "敏感字段已隐藏。确认后应用以下变更。", symbol: "doc.text") {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .top, spacing: 12) {
+                    configurationBlock("当前配置", value: model.preview["before"].string ?? "")
+                    configurationBlock("应用后", value: model.preview["after"].string ?? "")
+                }
+                ForEach(Array(model.preview["model_limits"].array.enumerated()), id: \.offset) { _, rule in
+                    HStack {
+                        Text(rule["model"].string ?? "").font(.system(size: 11, weight: .medium, design: .monospaced))
+                        Spacer()
+                        Text("压缩 \(countLabel(rule["auto_compact_token_limit"])) / 窗口 \(countLabel(rule["context_window"])) Token")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
+                InfoNote(text: model.preview["warning"].string ?? "已有会话需重新载入并验证。")
+                HStack(spacing: 10) {
+                    Button("恢复接管前连接…") { confirming = "config.restore" }.disabled(model.preview["attached"].bool != true)
+                    Spacer()
+                    Button(model.preview["attached"].bool == true ? "应用连接与模型规则…" : "接管 Codex 连接…") { confirming = "config.attach" }
+                        .buttonStyle(.borderedProminent).disabled(model.portNeedsRestart || model.metadataLoadFailed || preferencesChanged)
+                }.disabled(model.busy)
+            }
+        }
+    }
+
+    private func configurationBlock(_ title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+            ScrollView([.vertical, .horizontal]) {
+                Text(value.isEmpty ? "（空配置）" : value).font(.system(size: 10, design: .monospaced))
+                    .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .topLeading).padding(12)
+            }.frame(height: 175).background(AppPalette.well, in: RoundedRectangle(cornerRadius: 8))
+        }.frame(maxWidth: .infinity)
     }
 }
