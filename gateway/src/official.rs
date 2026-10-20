@@ -21,6 +21,7 @@ use tokio::{
     sync::Mutex,
 };
 
+const PERSISTENCE_FAILURE: &str = "新凭据保存失败，账号已暂停；请检查钥匙串后重新登录";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REDIRECT: &str = "http://localhost:1455/auth/callback";
 const TOKEN: &str = "https://auth.openai.com/oauth/token";
@@ -110,23 +111,76 @@ fn same_binding(a: &Source, b: &Source) -> bool {
 }
 async fn install(state: &Arc<AppState>, before: &Source, secret: Value) -> Result<Source> {
     let mut sources = state.sources.write().await;
-    let runtime = sources
-        .iter_mut()
+    let current = sources
+        .iter()
         .find(|r| r.source.id == before.id)
         .ok_or_else(|| anyhow!("登录来源已删除"))?;
-    if !same_binding(&runtime.source, before) {
+    if !same_binding(&current.source, before) {
         bail!("来源或凭据已经变化，请重新操作");
     }
-    runtime.source.account_id = secret
-        .get("account_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    runtime.source.secret = secret;
-    if runtime.health == "auth_required" {
-        runtime.health = "ready".into();
-        runtime.last_error = None;
+    // Persist the whole refresh-token family before any source can use the rotation.
+    let refresh = token(&before.secret, "refresh_token");
+    let targets: Vec<usize> = sources
+        .iter()
+        .enumerate()
+        .filter(|(_, runtime)| {
+            runtime.source.id == before.id
+                || (!refresh.is_empty()
+                    && account(before).is_some()
+                    && account(before) == secret.get("account_id").and_then(Value::as_str)
+                    && runtime.source.kind == "official"
+                    && account(&runtime.source) == account(before)
+                    && token(&runtime.source.secret, "refresh_token") == refresh)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    for &index in &targets {
+        if state
+            .persist_credential(&sources[index].source.id, &secret)
+            .is_err()
+        {
+            // The upstream may already have invalidated the previous refresh token.
+            // Preserve old memory but block further use or retry of those credentials.
+            for &index in &targets {
+                sources[index].health = "auth_required".into();
+                sources[index].last_error = Some(PERSISTENCE_FAILURE.into());
+            }
+            bail!("{PERSISTENCE_FAILURE}");
+        }
     }
-    Ok(runtime.source.clone())
+    let changed_accounts: Vec<_> = targets
+        .iter()
+        .filter(|index| {
+            account(&sources[**index].source) != secret.get("account_id").and_then(Value::as_str)
+        })
+        .map(|index| sources[*index].source.id.clone())
+        .collect();
+    // Lock affinity state before publication so no old-account continuation survives login.
+    if !changed_accounts.is_empty() {
+        state
+            .bindings
+            .lock()
+            .await
+            .retain(|_, id| !changed_accounts.contains(id));
+    }
+    for &index in &targets {
+        let runtime = &mut sources[index];
+        runtime.source.account_id = secret
+            .get("account_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        runtime.source.secret = secret.clone();
+        if runtime.health == "auth_required" {
+            runtime.health = "ready".into();
+            runtime.last_error = None;
+        }
+    }
+    Ok(sources
+        .iter()
+        .find(|r| r.source.id == before.id)
+        .unwrap()
+        .source
+        .clone())
 }
 fn random() -> String {
     let mut bytes = [0; 32];
@@ -217,6 +271,15 @@ async fn refresh_inner(
     let mutex = lock(state, key).await;
     let _guard = mutex.lock().await;
     let current = source(state, id).await?;
+    if state
+        .sources
+        .read()
+        .await
+        .iter()
+        .any(|r| r.source.id == id && r.last_error.as_deref() == Some(PERSISTENCE_FAILURE))
+    {
+        bail!("{PERSISTENCE_FAILURE}");
+    }
     // A concurrent refresh already rotated this token while this request waited.
     let rotated = current.secret != initial.secret;
     let fresh = current
@@ -286,22 +349,7 @@ async fn refresh_inner(
             bail!("刷新返回了不同账号，请重新登录确认");
         }
     }
-    let installed = install(state, &current, secret.clone()).await?;
-    // The same account can appear in more than one source. Keep its token rotation
-    // coherent so a waiter never redeems a refresh token that was just consumed.
-    if let Some(identity) = account(&current) {
-        let mut sources = state.sources.write().await;
-        for runtime in sources.iter_mut() {
-            if runtime.source.kind == "official"
-                && runtime.source.id != current.id
-                && account(&runtime.source) == Some(identity)
-                && token(&runtime.source.secret, "refresh_token") == refresh
-            {
-                runtime.source.secret = secret.clone();
-            }
-        }
-    }
-    Ok(installed)
+    install(state, &current, secret).await
 }
 pub async fn ensure_access(state: &Arc<AppState>, source_id: &str) -> Result<Source> {
     refresh_inner(state, source_id, false, ENDPOINTS).await
@@ -606,17 +654,25 @@ fn quota_snapshot(raw: &Value) -> Result<Value> {
             ("primary", "primary_window"),
             ("secondary", "secondary_window"),
         ] {
-            if let Some(window) = limits.get(key) {
+            if let Some(window) = limits.get(key).filter(|window| !window.is_null()) {
                 let used = number(&window["used_percent"]);
                 windows.push(json!({"name":format!("{prefix}{name}"),"used_percent":used,"reset_at":timestamp(&window["reset_at"]),"window_seconds":number(&window["limit_window_seconds"])}));
             }
         }
     };
     append("", &raw["rate_limit"]);
-    let mut complete = raw.get("rate_limit").is_some_and(Value::is_object);
+    let mut complete = raw.get("rate_limit").is_some_and(Value::is_object)
+        && raw
+            .get("additional_rate_limits")
+            .is_none_or(|v| v.is_null() || v.is_array());
     if let Some(additional) = raw["additional_rate_limits"].as_array() {
         for (index, item) in additional.iter().enumerate() {
-            complete &= item.get("rate_limit").is_some_and(Value::is_object);
+            complete &= item.get("rate_limit").is_some_and(|v| {
+                v.is_object()
+                    && ["primary_window", "secondary_window"]
+                        .iter()
+                        .any(|key| v.get(*key).is_some_and(|w| !w.is_null()))
+            });
             append(
                 &format!(
                     "{}:",
@@ -676,6 +732,47 @@ fn stale(mut previous: Value, kind: &str, error: &str) -> Value {
     previous["error"] = json!(error);
     previous
 }
+fn recover_exhaustion(runtime: &mut crate::model::SourceRuntime) {
+    if runtime.health != "exhausted"
+        || runtime.quota["stale"] != false
+        || runtime.quota["complete"] != true
+    {
+        return;
+    }
+    let Some(windows) = runtime.quota["windows"]
+        .as_array()
+        .filter(|v| !v.is_empty())
+    else {
+        return;
+    };
+    if windows
+        .iter()
+        .any(|window| window["used_percent"].as_f64().is_none())
+    {
+        return;
+    }
+    let exhausted: Vec<_> = windows
+        .iter()
+        .filter(|window| {
+            window["used_percent"]
+                .as_f64()
+                .is_some_and(|used| used >= 100.0)
+        })
+        .collect();
+    if exhausted.is_empty() {
+        runtime.health = "ready".into();
+        runtime.cooldown_until = None;
+        runtime.last_error = None;
+    } else {
+        let resets: Option<Vec<_>> = exhausted
+            .iter()
+            .map(|window| window["reset_at"].as_u64().filter(|reset| *reset > now()))
+            .collect();
+        if let Some(resets) = resets {
+            runtime.cooldown_until = resets.into_iter().max();
+        }
+    }
+}
 async fn refresh_snapshots(
     state: &Arc<AppState>,
     src: &Source,
@@ -696,6 +793,7 @@ async fn refresh_snapshots(
         Ok(v) => v,
         Err(e) => stale(runtime.quota.clone(), "quota", &e.to_string()),
     };
+    recover_exhaustion(runtime);
     runtime.credits = match credits {
         Ok(v) => v,
         Err(e) => stale(runtime.credits.clone(), "credits", &e.to_string()),
@@ -766,6 +864,7 @@ async fn consume(
     let id = field(payload, "source_id")?;
     let credit = field(payload, "credit_id")?;
     let operation_id = field(payload, "operation_id")?;
+    let expected_account = field(payload, "expected_account_id")?;
     let initial = source(state, id).await?;
     let mutex = lock(
         state,
@@ -773,6 +872,9 @@ async fn consume(
     )
     .await;
     let _guard = mutex.lock().await;
+    if account(&source(state, id).await?) != Some(expected_account) {
+        bail!("确认的账号已变化，请重新确认重置卡操作");
+    }
     let path = operation_path(state, operation_id);
     if path.exists() {
         let bytes =
@@ -849,7 +951,8 @@ async fn consume(
             }
         }
     }
-    if !same_binding(&source(state, id).await?, &src) {
+    let latest = source(state, id).await?;
+    if account(&latest) != Some(expected_account) || !same_binding(&latest, &src) {
         bail!("来源在确认期间发生变化，请重新确认");
     }
     let mut operation = Operation {
@@ -894,29 +997,6 @@ async fn consume(
     if let Ok(refreshed) = refresh_snapshots(state, &src, endpoints).await {
         operation.result["quota"] = refreshed["quota"].clone();
         operation.result["credits"] = refreshed["credits"].clone();
-    }
-    // Clear only known global exhaustion when every reported window is now known usable.
-    if operation.result["code"] == "reset"
-        && operation.result["quota"]["stale"] == false
-        && operation.result["quota"]["complete"] == true
-    {
-        if let Some(windows) = operation.result["quota"]["windows"].as_array() {
-            if !windows.is_empty()
-                && windows
-                    .iter()
-                    .all(|w| w["used_percent"].as_f64().is_some_and(|n| n < 100.0))
-            {
-                let mut sources = state.sources.write().await;
-                if let Some(runtime) = sources
-                    .iter_mut()
-                    .find(|r| same_binding(&r.source, &src) && r.health == "exhausted")
-                {
-                    runtime.health = "ready".into();
-                    runtime.cooldown_until = None;
-                    runtime.last_error = None;
-                }
-            }
-        }
     }
     // If a final write fails the original durable pending marker remains, preventing another POST.
     if write_operation(state, &operation, false).is_err() {
@@ -1027,6 +1107,27 @@ pub(crate) mod fixture {
             id,
             flow,
             callback,
+            Endpoints {
+                token: &token,
+                usage: &usage,
+                credits: &credits,
+                consume: &consume,
+            },
+        )
+        .await
+    }
+    pub(crate) async fn install_secret(
+        state: &Arc<AppState>,
+        id: &str,
+        secret: Value,
+    ) -> Result<Source> {
+        install(state, &source(state, id).await?, secret).await
+    }
+    pub(crate) async fn snapshots_at(state: &Arc<AppState>, id: &str, base: &str) -> Result<Value> {
+        let (token, usage, credits, consume) = endpoints(base);
+        refresh_snapshots(
+            state,
+            &source(state, id).await?,
             Endpoints {
                 token: &token,
                 usage: &usage,

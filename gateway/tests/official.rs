@@ -23,6 +23,7 @@ struct Fixture {
     reads: AtomicUsize,
     uncertain: bool,
     headers: Mutex<Vec<String>>,
+    quota: Mutex<Option<Value>>,
 }
 async fn fixture(uncertain: bool) -> (String, Arc<Fixture>, tokio::task::JoinHandle<()>) {
     let data = Arc::new(Fixture {
@@ -35,7 +36,10 @@ async fn fixture(uncertain: bool) -> (String, Arc<Fixture>, tokio::task::JoinHan
             json!({"available_count":1,"credits":[{"id":"card-a","title":"模拟卡","status":"available","expires_at":"2099-01-01T00:00:00Z","reset_type":"codex_rate_limits"}]}),
         )
     }
-    async fn usage() -> Json<Value> {
+    async fn usage(State(s): State<Arc<Fixture>>) -> Json<Value> {
+        if let Some(value) = s.quota.lock().await.clone() {
+            return Json(value);
+        }
         Json(
             json!({"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":10,"reset_at":2000000000,"limit_window_seconds":18000},"secondary_window":{"used_percent":20}}}),
         )
@@ -205,7 +209,7 @@ async fn confirmed_reset_is_single_submission_and_clears_only_exhaustion() {
     let (proxy, counters, task) = fixture(false).await;
     let (_dir, state) = setup(&proxy).await;
     state.sources.write().await[0].health = "exhausted".into();
-    let payload = json!({"source_id":"official-a","credit_id":"card-a","operation_id":"stable-op","confirmed":true});
+    let payload = json!({"source_id":"official-a","expected_account_id":"account-a","credit_id":"card-a","operation_id":"stable-op","confirmed":true});
     let (first, second) = tokio::join!(
         official::fixture::consume_at(&state, &payload, "http://fixture.invalid"),
         official::fixture::consume_at(&state, &payload, "http://fixture.invalid")
@@ -215,21 +219,20 @@ async fn confirmed_reset_is_single_submission_and_clears_only_exhaustion() {
     assert_eq!(counters.posts.load(Ordering::SeqCst), 1);
     assert_eq!(state.sources.read().await[0].health, "ready");
     assert_eq!(*counters.headers.lock().await, vec!["account-a"]);
-    let wrong = json!({"source_id":"official-b","credit_id":"card-a","operation_id":"stable-op","confirmed":true});
+    let wrong = json!({"source_id":"official-b","expected_account_id":"account-b","credit_id":"card-a","operation_id":"stable-op","confirmed":true});
     assert!(
         official::fixture::consume_at(&state, &wrong, "http://fixture.invalid")
             .await
             .is_err()
     );
-    let unconfirmed =
-        json!({"source_id":"official-a","credit_id":"card-a","operation_id":"no-confirm"});
+    let unconfirmed = json!({"source_id":"official-a","expected_account_id":"account-a","credit_id":"card-a","operation_id":"no-confirm"});
     assert!(
         official::fixture::consume_at(&state, &unconfirmed, "http://fixture.invalid")
             .await
             .is_err()
     );
     state.sources.write().await[0].health = "proxy_error".into();
-    let again = json!({"source_id":"official-a","credit_id":"card-a","operation_id":"other-card-op","confirmed":true});
+    let again = json!({"source_id":"official-a","expected_account_id":"account-a","credit_id":"card-a","operation_id":"other-card-op","confirmed":true});
     official::fixture::consume_at(&state, &again, "http://fixture.invalid")
         .await
         .unwrap();
@@ -241,7 +244,7 @@ async fn confirmed_reset_is_single_submission_and_clears_only_exhaustion() {
 async fn timed_out_reset_remains_pending_across_restart_and_new_operation_ids() {
     let (proxy, counters, task) = fixture(true).await;
     let (dir, state) = setup(&proxy).await;
-    let payload = json!({"source_id":"official-a","credit_id":"card-a","operation_id":"uncertain-op","confirmed":true});
+    let payload = json!({"source_id":"official-a","expected_account_id":"account-a","credit_id":"card-a","operation_id":"uncertain-op","confirmed":true});
     let first = official::fixture::consume_at(&state, &payload, "http://fixture.invalid")
         .await
         .unwrap();
@@ -279,5 +282,177 @@ async fn timed_out_reset_remains_pending_across_restart_and_new_operation_ids() 
     assert!(text.contains("pending_verification"));
     assert!(!text.contains("fixture-access"));
     assert!(!text.contains("fixture-refresh"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn fresh_quota_recovers_natural_reset_but_preserves_unknown_and_other_restrictions() {
+    let (proxy, counters, task) = fixture(false).await;
+    let (_dir, state) = setup(&proxy).await;
+    {
+        let mut sources = state.sources.write().await;
+        sources[0].health = "exhausted".into();
+        sources[0].cooldown_until = None;
+        sources[0].source.enabled = false;
+    }
+    official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    {
+        let sources = state.sources.read().await;
+        assert_eq!(sources[0].health, "ready");
+        assert!(!sources[0].source.enabled);
+    }
+    for health in ["proxy_error", "auth_required", "cooldown"] {
+        state.sources.write().await[0].health = health.into();
+        official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+            .await
+            .unwrap();
+        assert_eq!(state.sources.read().await[0].health, health);
+    }
+    let unknowns = [
+        json!({"rate_limit":{"primary_window":{"used_percent":10}},"additional_rate_limits":[{"limit_name":"unknown","rate_limit":{"primary_window":{"used_percent":null}}}]}),
+        json!({"rate_limit":{"primary_window":{"used_percent":10}},"additional_rate_limits":[{"rate_limit":{}}]}),
+        json!({"rate_limit":{"primary_window":{"used_percent":10}},"additional_rate_limits":"changed-schema"}),
+        json!({"rate_limit":{}}),
+    ];
+    for quota in unknowns {
+        state.sources.write().await[0].health = "exhausted".into();
+        *counters.quota.lock().await = Some(quota);
+        official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+            .await
+            .unwrap();
+        assert_eq!(state.sources.read().await[0].health, "exhausted");
+    }
+    let reset = model::now() + 300;
+    *counters.quota.lock().await = Some(
+        json!({"rate_limit":{"primary_window":{"used_percent":100,"reset_at":reset},"secondary_window":{"used_percent":100,"reset_at":reset+500}}}),
+    );
+    official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    {
+        let sources = state.sources.read().await;
+        assert_eq!(sources[0].health, "exhausted");
+        assert_eq!(sources[0].cooldown_until, Some(reset + 500));
+    }
+    *counters.quota.lock().await =
+        Some(json!({"rate_limit":{"primary_window":{"used_percent":15},"secondary_window":null}}));
+    official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    assert_eq!(state.sources.read().await[0].health, "ready");
+    // Unknown quotas never introduce exhaustion for a source which was usable.
+    *counters.quota.lock().await =
+        Some(json!({"rate_limit":{"primary_window":{"used_percent":null}}}));
+    official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    assert_eq!(state.sources.read().await[0].health, "ready");
+    task.abort();
+}
+
+#[derive(Default)]
+struct CredentialFixture {
+    owner: std::sync::Mutex<std::sync::Weak<AppState>>,
+    saved: std::sync::Mutex<Vec<(String, Value)>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+impl codexpress_gateway::credentials::CredentialStore for CredentialFixture {
+    fn save(&self, id: &str, secret: &Value) -> anyhow::Result<()> {
+        // install must hold the runtime write lock while durability is established.
+        let state = self.owner.lock().unwrap().upgrade().unwrap();
+        assert!(state.sources.try_read().is_err());
+        if self.fail.load(Ordering::SeqCst) {
+            anyhow::bail!("fixture-store-error-with-sensitive-detail");
+        }
+        self.saved.lock().unwrap().push((id.into(), secret.clone()));
+        Ok(())
+    }
+}
+#[tokio::test]
+async fn token_persistence_precedes_publication_and_failure_blocks_further_use() {
+    let (proxy, counters, task) = fixture(false).await;
+    let (_dir, original) = setup(&proxy).await;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(CredentialFixture::default());
+    let state = AppState::new_with_credential_store(
+        directory.path().to_path_buf(),
+        0,
+        "fixture".into(),
+        Some(store.clone()),
+    )
+    .unwrap();
+    *store.owner.lock().unwrap() = Arc::downgrade(&state);
+    *state.sources.write().await = original.sources.read().await.clone();
+    state.sources.write().await[0].source.secret["expires_at"] = json!(1);
+    state
+        .bindings
+        .lock()
+        .await
+        .insert("prior-response".into(), "official-a".into());
+    let refreshed = official::fixture::refresh_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    assert_eq!(store.saved.lock().unwrap()[0].1, refreshed.secret);
+    assert_eq!(
+        state
+            .bindings
+            .lock()
+            .await
+            .get("prior-response")
+            .map(String::as_str),
+        Some("official-a")
+    );
+    let old = refreshed.secret.clone();
+    state.sources.write().await[0].source.secret["expires_at"] = json!(1);
+    store.fail.store(true, Ordering::SeqCst);
+    let error = official::fixture::refresh_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("保存失败"));
+    assert!(!error.contains("sensitive-detail"));
+    {
+        let sources = state.sources.read().await;
+        assert_eq!(sources[0].source.secret["generation"], old["generation"]);
+        assert_eq!(sources[0].health, "auth_required");
+    }
+    let token_requests = counters.tokens.load(Ordering::SeqCst);
+    assert!(
+        official::fixture::refresh_at(&state, "official-a", "http://fixture.invalid")
+            .await
+            .is_err()
+    );
+    assert_eq!(counters.tokens.load(Ordering::SeqCst), token_requests);
+    store.fail.store(false, Ordering::SeqCst);
+    let mut switched = old;
+    switched["account_id"] = json!("account-new");
+    official::fixture::install_secret(&state, "official-a", switched)
+        .await
+        .unwrap();
+    assert!(!state.bindings.lock().await.contains_key("prior-response"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn consume_requires_the_explicitly_confirmed_account_before_network_dispatch() {
+    let (proxy, counters, task) = fixture(false).await;
+    let (_dir, state) = setup(&proxy).await;
+    let mut payload = json!({"source_id":"official-a","credit_id":"card-a","operation_id":"account-confirm","confirmed":true});
+    assert!(
+        official::fixture::consume_at(&state, &payload, "http://fixture.invalid")
+            .await
+            .is_err()
+    );
+    payload["expected_account_id"] = json!("account-b");
+    assert!(
+        official::fixture::consume_at(&state, &payload, "http://fixture.invalid")
+            .await
+            .is_err()
+    );
+    assert_eq!(counters.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.reads.load(Ordering::SeqCst), 0);
     task.abort();
 }
