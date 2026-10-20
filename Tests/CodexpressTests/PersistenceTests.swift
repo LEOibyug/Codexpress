@@ -2,6 +2,26 @@ import XCTest
 @testable import Codexpress
 
 final class PersistenceTests: XCTestCase {
+    func testLocalProxyPortAndLegacyModelLists() throws {
+        let fresh = try ProxyPolicy().withLocalPort("7890")
+        XCTAssertEqual(fresh.url, "http://127.0.0.1:7890")
+        XCTAssertEqual(fresh.localPort, "7890")
+        XCTAssertEqual(try ProxyPolicy(mode: "explicit", url: "socks5h://localhost:7891").withLocalPort("7892").url, "socks5h://127.0.0.1:7892")
+        let remote = ProxyPolicy(mode: "explicit", url: "http://proxy.example:1234")
+        XCTAssertNil(remote.localPort)
+        XCTAssertEqual(try remote.withLocalPort("7890").url, fresh.url)
+        for invalid in ["", "0", "65536", "-1", "7890.0", "http://127.0.0.1:7890"] {
+            XCTAssertThrowsError(try fresh.withLocalPort(invalid))
+        }
+        var source = Source(); source.models = ["manual-model"]
+        // An old manual allowlist must not become an automatically overwritten cache.
+        let legacy = try JSONDecoder().decode(Source.self, from: JSONEncoder().encode(source))
+        XCTAssertFalse(legacy.discoversModels)
+        source.automaticModelDiscovery = true
+        let cached = try JSONDecoder().decode(Source.self, from: JSONEncoder().encode(source))
+        XCTAssertTrue(cached.discoversModels)
+        XCTAssertEqual(cached.models, ["manual-model"])
+    }
     func testModelCompactionMigrationAndValidation() throws {
         let legacy = Data(#"{"sources":[],"mode":"auto","port":17863,"codexHome":"/temporary/codex"}"#.utf8)
         var settings = try JSONDecoder().decode(AppSettings.self, from: legacy)

@@ -38,6 +38,7 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             )
         }
         "credentials" => Ok(credentials(state).await),
+        "models.list" => crate::discovery::list(state, payload).await,
         "sync" => {
             let sources: Vec<Source> =
                 serde_json::from_value(payload.get("sources").cloned().context("缺少来源列表")?)

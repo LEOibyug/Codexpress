@@ -22,6 +22,8 @@ import ServiceManagement
     @Published private(set) var launchAtLogin = false
     @Published private(set) var metadataLoadFailed = false
     @Published private(set) var pendingSync = false
+    @Published private(set) var refreshingModels = Set<String>()
+    @Published private(set) var modelErrors: [String: String] = [:]
     let directory: URL
     private let metadata: MetadataStore
     private let keychain: KeychainStore
@@ -37,6 +39,8 @@ import ServiceManagement
     private var refreshingOfficial = false
     private var startInProgress = false
     private var starting = false
+    private var lastModelRefresh: [String: Date] = [:]
+    private var modelRefreshTask: Task<Void, Never>?
     var sources: [Source] { settings.sources.sorted { $0.priority < $1.priority } }
     var baseURL: String { status["base_url"].string ?? "http://127.0.0.1:\(settings.port)/v1" }
     var routingMode: String { status["mode"].string ?? settings.mode }
@@ -127,7 +131,7 @@ import ServiceManagement
         if running { try? mergeCredentials(try await client.call("credentials")) }
         stop()
     }
-    func stop() { shuttingDown = true; timerTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
+    func stop() { shuttingDown = true; timerTask?.cancel(); modelRefreshTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
     func retry() { restartCount = 0; Task { await startHelper() } }
     func requireWritableMetadata() throws {
         guard !metadataLoadFailed else { throw AppError.message("来源文件无法读取，已禁止保存。请先从备份修复 sources.json，再重新启动应用；原文件保持不变。") }
@@ -190,6 +194,7 @@ import ServiceManagement
                 else if result["state"].string == "failed" { loginMessage = result["error"].string ?? "登录失败，请重新发起。"; loginFlow = nil }
             }
             await refreshOfficialIfDue()
+            scheduleModelRefresh()
         } catch { self.error = error.localizedDescription }
     }
     private func refreshOfficialIfDue() async {
@@ -218,13 +223,72 @@ import ServiceManagement
         try await updateStatus()
         var source = source
         if source.official { source = source.preservingOfficialIdentity(current: settings.sources.first { $0.id == source.id }, live: state(source.id)) }
-        if !source.official, !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { try keychain.saveAPIKey(apiKey, for: source.id) }
+        if !source.official, !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { try keychain.saveAPIKey(apiKey.trimmingCharacters(in: .whitespacesAndNewlines), for: source.id) }
         var updated = settings
         if let i = updated.sources.firstIndex(where: { $0.id == source.id }) { updated.sources[i] = source }
         else { var item = source; item.priority = updated.sources.count; updated.sources.append(item) }
         if updated.fixed_source_id == source.id && !source.enabled { updated.mode = "auto"; updated.fixed_source_id = nil }
         try persistSettings(updated)
         try await sync(); try await updateStatus()
+        modelErrors[source.id] = nil
+        lastModelRefresh[source.id] = nil
+        scheduleModelRefresh()
+    }
+    func fetchModels(for draft: Source, apiKey: String = "") async throws -> [String] {
+        guard running else { throw AppError.message("请先启动网关。") }
+        var source = draft
+        if source.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { source.name = "API" }
+        try source.validate()
+        let payload: JSONValue
+        if source.official {
+            guard let current = settings.sources.first(where: { $0.id == source.id }),
+                  current.proxy == source.proxy else { throw AppError.message("请先保存网络设置，再获取模型。") }
+            guard current.account_id != nil else { throw AppError.message("请先登录此账号。") }
+            payload = .object(["source_id": .string(source.id)])
+        } else {
+            let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            if key.isEmpty, settings.sources.first(where: { $0.id == source.id })?.base_url != source.base_url {
+                throw AppError.message("请填写 API 密钥后获取模型。")
+            }
+            let secret = key.isEmpty ? try keychain.load(source.id) : .object(["api_key": .string(key)])
+            guard let secret, secret["api_key"].string?.isEmpty == false else { throw AppError.message("请填写 API 密钥后获取模型。") }
+            guard case .object(var value) = try JSONValue.from(source) else { throw AppError.message("来源配置无效。") }
+            value["secret"] = secret
+            payload = .object(["source": .object(value)])
+        }
+        let result = try await client.call("models.list", payload)
+        let models = result["models"].array.compactMap(\.string)
+        guard !models.isEmpty else { throw AppError.message("供应商未返回可用模型。") }
+        return models
+    }
+    private func scheduleModelRefresh() {
+        guard modelRefreshTask == nil, running, !metadataLoadFailed else { return }
+        modelRefreshTask = Task {
+            defer { modelRefreshTask = nil }
+            for source in sources where source.enabled && source.discoversModels {
+                guard !busy, Date().timeIntervalSince(lastModelRefresh[source.id] ?? .distantPast) >= 3600 else { continue }
+                if source.official && source.account_id == nil { continue }
+                await refreshModels(source.id)
+            }
+        }
+    }
+    func refreshModels(_ id: String) async {
+        guard !refreshingModels.contains(id), let before = settings.sources.first(where: { $0.id == id }), before.discoversModels else { return }
+        refreshingModels.insert(id); lastModelRefresh[id] = Date(); modelErrors[id] = nil
+        defer { refreshingModels.remove(id) }
+        do {
+            let models = try await fetchModels(for: before)
+            // Discard a response if the editor, login or deletion changed its source.
+            guard !Task.isCancelled, running, !busy, let index = settings.sources.firstIndex(where: { $0.id == id }), settings.sources[index] == before else { lastModelRefresh[id] = nil; return }
+            guard before.models != models || before.automaticModelDiscovery != true else { return }
+            var next = settings
+            next.sources[index].automaticModelDiscovery = true
+            next.sources[index].models = models
+            try persistSettings(next)
+            try await sync()
+        } catch {
+            if settings.sources.contains(where: { $0 == before }) { modelErrors[id] = error.localizedDescription }
+        }
     }
     func removeSource(_ id: String) {
         perform {
@@ -283,6 +347,8 @@ import ServiceManagement
         if let i = next.sources.firstIndex(where: { $0.id == id }) { next.sources[i].account_id = durable["account_id"].string }
         try persistSettings(next); callbackURL = ""; loginSource = nil; loginFlow = nil; loginMessage = "官方账号已连接。"
         lastQuotaRefresh[id] = nil
+        lastModelRefresh[id] = nil
+        scheduleModelRefresh()
         Task { await refreshOfficialIfDue() }
     }
     func refresh(_ id: String) { perform { self.lastQuotaRefresh[id] = Date(); _ = try await self.client.call("official.refresh", .object(["source_id": .string(id)])); try self.mergeCredentials(try await self.client.call("credentials")); try await self.updateStatus() } }

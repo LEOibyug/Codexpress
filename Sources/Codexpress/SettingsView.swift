@@ -163,8 +163,19 @@ struct SourcesView: View {
                     .textSelection(.enabled).lineLimit(2)
                 Label(source.policyLabel + (source.proxy.url.map { " · \($0)" } ?? ""), systemImage: source.proxy.mode == "direct" ? "network" : "shield.lefthalf.filled")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Label(source.models.isEmpty ? (source.discoversModels ? "尚未获取模型" : "未限定模型") : "\(source.models.count) 个模型", systemImage: "square.stack.3d.up")
+                    Spacer()
+                    if source.discoversModels {
+                        if model.refreshingModels.contains(source.id) { ProgressView().controlSize(.mini) }
+                        Button("刷新模型") { Task { await model.refreshModels(source.id) } }
+                            .buttonStyle(.plain).foregroundStyle(Color.accentColor)
+                            .disabled(model.busy || !model.running || model.refreshingModels.contains(source.id) || (source.official && source.account_id == nil))
+                    }
+                }.font(.system(size: 11)).foregroundStyle(.secondary)
             }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
                 .background(AppPalette.well, in: RoundedRectangle(cornerRadius: 8))
+            if let error = model.modelErrors[source.id] { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
             if let reason = model.state(source.id)["last_error"].string { InfoNote(text: reason, symbol: "exclamationmark.triangle", color: .orange) }
             if source.official { Divider(); OfficialAccountView(source: source) }
         }.padding(18).cardSurface()

@@ -34,6 +34,20 @@ enum JSONValue: Codable, Sendable, Equatable {
 struct ProxyPolicy: Codable, Equatable, Sendable {
     var mode = "direct"
     var url: String? = nil
+    var localPort: String? {
+        guard let url, let parts = URLComponents(string: url),
+              ["127.0.0.1", "localhost", "::1", "[::1]"].contains(parts.host?.lowercased() ?? ""),
+              let port = parts.port else { return nil }
+        return String(port)
+    }
+    func withLocalPort(_ text: String) throws -> Self {
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, raw.allSatisfy(\.isASCII), raw.allSatisfy(\.isNumber),
+              let port = Int(raw), (1...65535).contains(port) else { throw AppError.message("代理端口须为 1–65535 的整数。") }
+        // Retain a previously configured local SOCKS listener when editing its port.
+        let scheme = localPort != nil ? URLComponents(string: url ?? "")?.scheme ?? "http" : "http"
+        return Self(mode: "explicit", url: "\(scheme)://127.0.0.1:\(port)")
+    }
 }
 struct Source: Codable, Identifiable, Equatable, Sendable {
     var id = UUID().uuidString
@@ -44,8 +58,10 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
     var priority = 0
     var proxy = ProxyPolicy()
     var models: [String] = []
+    var automaticModelDiscovery: Bool? = nil
     var account_id: String? = nil
     var official: Bool { kind == "official" }
+    var discoversModels: Bool { automaticModelDiscovery ?? models.isEmpty }
     var policyLabel: String { proxy.mode == "direct" ? "强制直连" : "指定代理" }
     static func newOfficial() -> Source {
         var s = Source(); s.kind = "official"; s.name = "官方账号"; s.base_url = "https://chatgpt.com/backend-api/codex"; s.proxy.mode = "explicit"; return s
@@ -57,7 +73,7 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
         guard ["api", "official"].contains(kind), ["direct", "explicit"].contains(proxy.mode) else { throw AppError.message("来源类型或网络策略无效。") }
         guard !official || proxy.mode == "explicit" else { throw AppError.message("官方账号必须使用指定代理。") }
         if proxy.mode == "explicit" {
-            guard let raw = proxy.url, let p = URLComponents(string: raw), ["http", "https", "socks5", "socks5h"].contains(p.scheme?.lowercased() ?? ""), p.host != nil, p.port != nil, p.user == nil, p.password == nil, p.query == nil, p.fragment == nil, p.path.isEmpty || p.path == "/" else { throw AppError.message("请填写明确的代理地址和端口，例如 http://127.0.0.1:7890；不支持在代理地址中保存密码。") }
+            guard let raw = proxy.url, let p = URLComponents(string: raw), ["http", "https", "socks5", "socks5h"].contains(p.scheme?.lowercased() ?? ""), p.host != nil, let port = p.port, (1...65535).contains(port), p.user == nil, p.password == nil, p.query == nil, p.fragment == nil, p.path.isEmpty || p.path == "/" else { throw AppError.message("请填写有效的代理端口（1–65535）。") }
         }
     }
 }

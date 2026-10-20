@@ -1,6 +1,7 @@
 pub mod compaction;
 pub mod config;
 pub mod credentials;
+pub mod discovery;
 pub mod management;
 pub mod model;
 pub mod official;
