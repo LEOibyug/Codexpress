@@ -83,6 +83,7 @@ bash scripts/run.sh
 - 受管 provider 关闭 WebSocket，使用 SSE。工具是否受支持仍取决于上游模型与接口。
 - 只覆盖系统代理模式；Clash TUN／透明代理关闭。应用不能凭一个网络选项绕过 TUN。
 - `previous_response_id`、已识别密文／上游状态会绑定原来源；完整可移植历史可重新按优先级选源。不会把生成到一半的结果拼接成另一来源的回复，也不会盲目重放结果不明的生成。
+- 识别 Codex 的 `thread-id`／`session-id`，工具执行后的请求沿用已知来源；同一客户端的不同线程互相隔离。HTTP 及 `response.metadata` 中的路由标记原样转发，内部只存摘要，不受短响应 ID 的长度限制。
 - 来源状态绑定在内存里；网关重启或绑定淘汰后，无法确认来源的服务端状态请求返回 409，需要客户端提供完整可移植历史或新开会话。
 - 压缩响应及超大单个观察事件仍按原字节转发，但 Token 采集可能不完整。
 
@@ -97,6 +98,14 @@ bash scripts/check.sh
 swift test
 bash scripts/build.sh
 ```
+
+完整工具续接的本地回归检查使用真实 Codex、临时配置目录及模拟上游，不访问真实账号：
+
+```sh
+python3 scripts/check-gateway-continuation.py
+```
+
+可用 `--codex /path/to/codex` 检查桌面端内置版本。问题复现与验证见 [网关续接修正记录](docs/gateway-continuation-fix-2026-10-20.md)。
 
 构建脚本编译 release Rust 和 Swift arm64，生成原生图标，打包并 ad-hoc 签名 `dist/Codexpress.app`。
 

@@ -598,6 +598,125 @@ async fn encrypted_reasoning_returns_to_origin_and_unknown_ciphertext_is_rejecte
 }
 
 #[tokio::test]
+async fn tool_continuation_keeps_long_http_and_stream_metadata_turn_state() {
+    // Routing tokens are opaque upstream values, not short response IDs.
+    let token = "fixture-routing-state-".repeat(100);
+    let metadata_token = "fixture-metadata-state-".repeat(100);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let copy = hits.clone();
+    let response_token = token.clone();
+    let stream_token = metadata_token.clone();
+    let (first, a) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let hits = copy.clone();
+            let token = response_token.clone();
+            let metadata = json!({"type":"response.metadata", "headers":{"X-Codex-Turn-State":stream_token}});
+            async move {
+                hits.fetch_add(1, Ordering::Relaxed);
+                let completed = json!({"type":"response.completed","response":{"id":"tool-response","output":[{"type":"function_call","call_id":"call-fixture","name":"local_tool","arguments":"{}"}],"usage":{"input_tokens":1,"output_tokens":1}}});
+                let wire = format!("data: {metadata}\n\ndata: {completed}\n\n");
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .header("x-codex-turn-state", token)
+                    .body(Body::from(wire))
+                    .unwrap()
+            }
+        }),
+    ))
+    .await;
+    let (second, b) =
+        serve(Router::new().route("/responses", post(|| async { StatusCode::IM_A_TEAPOT }))).await;
+    let (_dir, state) = state(vec![source("a", &first, 0), source("b", &second, 1)]).await;
+    let app = relay::router(state.clone());
+    let first = app
+        .clone()
+        .oneshot(request(br#"{"model":"m","input":"hello"}"#))
+        .await
+        .unwrap();
+    assert_eq!(first.headers()["x-codex-turn-state"], token);
+    let first_body = to_bytes(first.into_body(), 10000).await.unwrap();
+    assert!(String::from_utf8_lossy(&first_body).contains(&metadata_token));
+    state.sources.write().await[1].source.priority = -1;
+    for turn_state in [&token, &metadata_token] {
+        let mut next = request(br#"{"model":"m","input":[{"type":"function_call_output","call_id":"call-fixture","output":"ok"}]}"#);
+        next.headers_mut()
+            .insert("x-codex-turn-state", turn_state.parse().unwrap());
+        let response = app.clone().oneshot(next).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+    }
+    let mut unknown = request(br#"{"model":"m","input":"hello"}"#);
+    unknown.headers_mut().insert(
+        "x-codex-turn-state",
+        "unknown-routing-state".parse().unwrap(),
+    );
+    assert_eq!(
+        app.oneshot(unknown).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(hits.load(Ordering::Relaxed), 3);
+    // In-memory keys retain hashes, never the opaque upstream routing tokens.
+    assert!(!state
+        .bindings
+        .lock()
+        .await
+        .keys()
+        .any(|key| key.contains(&token) || key.contains(&metadata_token)));
+    a.abort();
+    b.abort();
+}
+
+#[tokio::test]
+async fn codex_thread_headers_bind_opaque_tool_continuations_without_crossing_threads() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let copy = hits.clone();
+    let (first, a) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let hits = copy.clone();
+            async move {
+                hits.fetch_add(1, Ordering::Relaxed);
+                axum::Json(json!({"id":"response-a","usage":{"input_tokens":1,"output_tokens":1}}))
+            }
+        }),
+    ))
+    .await;
+    let (second, b) =
+        serve(Router::new().route("/responses", post(|| async { StatusCode::IM_A_TEAPOT }))).await;
+    let (_dir, state) = state(vec![source("a", &first, 0), source("b", &second, 1)]).await;
+    let app = relay::router(state.clone());
+    let mut first = request(br#"{"model":"m","input":"hello"}"#);
+    first
+        .headers_mut()
+        .insert("session-id", "codex-process-session".parse().unwrap());
+    first
+        .headers_mut()
+        .insert("thread-id", "thread-a".parse().unwrap());
+    let response = app.clone().oneshot(first).await.unwrap();
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    state.sources.write().await[1].source.priority = -1;
+    for (thread, expected) in [
+        ("thread-a", StatusCode::OK),
+        ("thread-b", StatusCode::CONFLICT),
+    ] {
+        // An unobserved opaque item can be recovered via this thread's known
+        // origin, e.g. when its upstream response was compressed or oversized.
+        let mut next = request(br#"{"model":"m","input":[{"type":"reasoning","encrypted_content":"unobserved-reasoning"},{"type":"function_call_output","call_id":"call-fixture","output":"ok"}]}"#);
+        next.headers_mut()
+            .insert("session-id", "codex-process-session".parse().unwrap());
+        next.headers_mut()
+            .insert("thread-id", thread.parse().unwrap());
+        let response = app.clone().oneshot(next).await.unwrap();
+        assert_eq!(response.status(), expected);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+    a.abort();
+    b.abort();
+}
+
+#[tokio::test]
 async fn session_affinity_allows_opaque_context_only_after_known_response() {
     let hits = Arc::new(AtomicUsize::new(0));
     let copy = hits.clone();
@@ -619,14 +738,14 @@ async fn session_affinity_allows_opaque_context_only_after_known_response() {
     let mut initial = request(br#"{"model":"m"}"#);
     initial
         .headers_mut()
-        .insert("x-session-id", "my-session".parse().unwrap());
+        .insert("session-id", "my-session".parse().unwrap());
     let response = app.clone().oneshot(initial).await.unwrap();
     to_bytes(response.into_body(), 10000).await.unwrap();
     state.sources.write().await[1].source.priority = -1;
     let mut opaque = request(br#"{"model":"m","input":[{"encrypted_content":"new-opaque"}]}"#);
     opaque
         .headers_mut()
-        .insert("x-session-id", "my-session".parse().unwrap());
+        .insert("session-id", "my-session".parse().unwrap());
     let response = app.clone().oneshot(opaque).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     to_bytes(response.into_body(), 10000).await.unwrap();

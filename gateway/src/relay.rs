@@ -209,6 +209,17 @@ impl Observer {
             }
         }
         let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        if event_type == "response.metadata" {
+            if let Some(headers) = value.get("headers").and_then(Value::as_object) {
+                for (name, value) in headers {
+                    if name.eq_ignore_ascii_case("x-codex-turn-state") {
+                        if let Some(token) = value.as_str() {
+                            self.ids.push(turn_binding(token));
+                        }
+                    }
+                }
+            }
+        }
         if matches!(
             event_type,
             "response.completed" | "response.incomplete" | "response.failed"
@@ -356,6 +367,35 @@ fn opaque_bindings(value: &Value, keys: &mut Vec<String>) {
     }
 }
 
+fn turn_binding(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    // Upstream tokens have no response-ID length constraint. Keep only their
+    // digest in memory while forwarding the original header/event unchanged.
+    format!("turn:{:x}", Sha256::digest(token.as_bytes()))
+}
+
+fn session_binding(parsed: &Value, headers: &HeaderMap) -> Option<String> {
+    // Current Codex can share a session-id across threads/subagents. The more
+    // specific thread-id must win, and its namespace must remain separate.
+    let (namespace, id) = if let Some(thread) = headers.get("thread-id") {
+        ("thread", thread.to_str().ok()?)
+    } else {
+        let id = parsed
+            .get("session_id")
+            .or_else(|| parsed.get("conversation_id"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                headers
+                    .get("session-id")
+                    .or_else(|| headers.get("x-session-id"))
+                    .or_else(|| headers.get("session_id"))
+                    .and_then(|v| v.to_str().ok())
+            })?;
+        ("session", id)
+    };
+    (!id.is_empty() && id.len() <= 512).then(|| format!("{namespace}:{id}"))
+}
+
 async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response<Body> {
     let authorized = request
         .headers()
@@ -400,26 +440,18 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
     let model = parsed.get("model").and_then(Value::as_str).unwrap_or("");
     let mut opaque_keys = Vec::new();
     opaque_bindings(&parsed, &mut opaque_keys);
-    let session_value = parsed
-        .get("session_id")
-        .or_else(|| parsed.get("conversation_id"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            parts
-                .headers
-                .get("x-session-id")
-                .or_else(|| parts.headers.get("session_id"))
-                .and_then(|v| v.to_str().ok())
-        });
-    let session_key = session_value
-        .filter(|id| !id.is_empty() && id.len() <= 512)
-        .map(|id| format!("session:{id}"));
+    let session_key = session_binding(&parsed, &parts.headers);
     let session_known = if let Some(key) = &session_key {
         state.bindings.lock().await.contains_key(key)
     } else {
         false
     };
     let opaque_state = !opaque_keys.is_empty();
+    let turn_key = parts
+        .headers
+        .get("x-codex-turn-state")
+        .and_then(|v| v.to_str().ok())
+        .map(turn_binding);
     // Ordinary session IDs describe portable client history. They constrain
     // routing only when opaque upstream context needs an origin clue.
     let binding = parsed
@@ -430,12 +462,7 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                 .get("conversation")
                 .and_then(|v| v.as_str().or_else(|| v.get("id").and_then(Value::as_str)))
         })
-        .or_else(|| {
-            parts
-                .headers
-                .get("x-codex-turn-state")
-                .and_then(|v| v.to_str().ok())
-        })
+        .or(turn_key.as_deref())
         .or_else(|| {
             session_key
                 .as_deref()
@@ -647,15 +674,18 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                 attempt.finish("failed", None);
                 // Preserve the final source's native error body when there is no
                 // later candidate; streaming this response must not trigger replay.
-                last_error = Some(stream_response(
-                    state.clone(),
-                    source.clone(),
-                    upstream,
-                    prefix,
-                    attempt,
-                    discovery,
-                    session_key.clone(),
-                ));
+                last_error = Some(
+                    stream_response(
+                        state.clone(),
+                        source.clone(),
+                        upstream,
+                        prefix,
+                        attempt,
+                        discovery,
+                        session_key.clone(),
+                    )
+                    .await,
+                );
                 break;
             }
             if status.is_success() {
@@ -669,7 +699,8 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                 attempt,
                 discovery,
                 session_key.clone(),
-            );
+            )
+            .await;
         }
     }
     last_error.unwrap_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "所有来源暂时不可用"))
@@ -704,7 +735,7 @@ async fn finalize_response(
     }
 }
 
-fn stream_response(
+async fn stream_response(
     state: Arc<AppState>,
     source: Source,
     upstream: reqwest::Response,
@@ -740,17 +771,27 @@ fn stream_response(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("text/event-stream"));
-    let turn_state = headers
-        .get("x-codex-turn-state")
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| v.len() <= 512)
-        .map(String::from);
+    let mut observer = Observer {
+        sse,
+        ..Default::default()
+    };
+    if status.is_success() {
+        if let Some(session_key) = session_key {
+            observer.ids.push(session_key);
+        }
+        if let Some(token) = headers
+            .get("x-codex-turn-state")
+            .and_then(|v| v.to_str().ok())
+        {
+            observer.ids.push(turn_binding(token));
+        }
+        // Establish header affinity before returning headers to the client,
+        // including empty bodies that Hyper never polls.
+        bind_ids(&state, &source, &mut observer).await;
+    }
     let stream = async_stream::stream! {
         let prefix = futures_util::stream::iter(prefix.into_iter().map(Ok));
         let mut upstream = prefix.chain(upstream.bytes_stream());
-        let mut observer = Observer { sse, ..Default::default() };
-        if status.is_success() { if let Some(session_key) = session_key { observer.ids.push(session_key); } }
-        if let Some(turn_state) = turn_state { observer.ids.push(turn_state); }
         let mut received = 0u64;
         while let Some(chunk) = upstream.next().await {
             match chunk {
