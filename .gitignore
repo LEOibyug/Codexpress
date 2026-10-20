@@ -1,0 +1,13 @@
+references/
+.tools/
+.build/
+.swiftpm/
+target/
+dist/
+.runtime/
+.superpowers/
+.DS_Store
+*.xcuserstate
+xcuserdata/
+*.log
+
