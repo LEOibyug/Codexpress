@@ -310,17 +310,26 @@ impl Observer {
     }
 }
 
-async fn bind_ids(state: &Arc<AppState>, source: &str, observer: &mut Observer) {
+async fn bind_ids(state: &Arc<AppState>, source: &Source, observer: &mut Observer) {
     if observer.ids.is_empty() {
         return;
     }
+    let sources = state.sources.read().await;
+    if !sources.iter().any(|runtime| {
+        runtime.source.id == source.id && runtime.source.identity() == source.identity()
+    }) {
+        observer.ids.clear();
+        return;
+    }
+    // Keep the source read lock through insertion: relogin/sync takes the write
+    // lock before clearing bindings, so an old in-flight body cannot rebind it.
     let mut bindings = state.bindings.lock().await;
     // Bound runtime metadata too: do not retain an unbounded response-id history.
     if bindings.len() > 100_000 {
         bindings.clear();
     }
     for id in observer.ids.drain(..) {
-        bindings.insert(id, source.into());
+        bindings.insert(id, source.id.clone());
     }
 }
 
@@ -480,7 +489,8 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
         }
         let mut source = if candidate.kind == "official" {
             match crate::official::ensure_access(&state, &candidate.id).await {
-                Ok(source) => source,
+                Ok(source) if source.identity() == candidate.identity() => source,
+                Ok(_) => return error(StatusCode::CONFLICT, "来源身份已经变化，请重新开始请求"),
                 Err(_) => {
                     last_error = Some(error(
                         StatusCode::BAD_GATEWAY,
@@ -582,9 +592,12 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                 attempt.finish("failed", None);
                 drop(upstream);
                 match crate::official::refresh_access(&state, &source.id).await {
-                    Ok(fresh) => {
+                    Ok(fresh) if fresh.identity() == source.identity() => {
                         source = fresh;
                         continue;
+                    }
+                    Ok(_) => {
+                        return error(StatusCode::CONFLICT, "来源身份已经变化，请重新开始请求")
                     }
                     Err(_) => {
                         last_error = Some(error(
@@ -634,7 +647,7 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                 // later candidate; streaming this response must not trigger replay.
                 last_error = Some(stream_response(
                     state.clone(),
-                    source.id.clone(),
+                    source.clone(),
                     upstream,
                     prefix,
                     attempt,
@@ -648,7 +661,7 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
             }
             return stream_response(
                 state,
-                source.id.clone(),
+                source.clone(),
                 upstream,
                 prefix,
                 attempt,
@@ -662,7 +675,7 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
 
 async fn finalize_response(
     state: &Arc<AppState>,
-    source_id: &str,
+    source: &Source,
     status: StatusCode,
     discovery: bool,
     observer: &mut Observer,
@@ -670,10 +683,10 @@ async fn finalize_response(
 ) {
     observer.eof();
     if observer.failed {
-        routing::mark_failure(state, source_id, 500, None).await;
-        routing::mark_rejection(state, source_id, observer.failure_code.as_deref(), None).await;
+        routing::mark_failure(state, &source.id, 500, None).await;
+        routing::mark_rejection(state, &source.id, observer.failure_code.as_deref(), None).await;
     }
-    bind_ids(state, source_id, observer).await;
+    bind_ids(state, source, observer).await;
     let outcome = if !status.is_success() || observer.failed {
         "failed"
     } else if observer.sse && !observer.terminal {
@@ -691,7 +704,7 @@ async fn finalize_response(
 
 fn stream_response(
     state: Arc<AppState>,
-    source_id: String,
+    source: Source,
     upstream: reqwest::Response,
     prefix: Vec<Bytes>,
     mut attempt: Attempt,
@@ -741,14 +754,14 @@ fn stream_response(
             match chunk {
                 Ok(chunk) => {
                     observer.push(&chunk);
-                    bind_ids(&state, &source_id, &mut observer).await;
+                    bind_ids(&state, &source, &mut observer).await;
                     received = received.saturating_add(chunk.len() as u64);
                     let complete_body = content_length == Some(received);
                     // Hyper can stop polling as soon as Content-Length bytes
                     // arrive. Finalize before yielding the last chunk, rather
                     // than relying on a subsequent stream EOF poll.
                     if complete_body {
-                        finalize_response(&state, &source_id, status, discovery, &mut observer, &mut attempt).await;
+                        finalize_response(&state, &source, status, discovery, &mut observer, &mut attempt).await;
                     } else {
                         attempt.finish("interrupted", Some(&observer));
                     }
@@ -762,7 +775,7 @@ fn stream_response(
                 }
             }
         }
-        finalize_response(&state, &source_id, status, discovery, &mut observer, &mut attempt).await;
+        finalize_response(&state, &source, status, discovery, &mut observer, &mut attempt).await;
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;

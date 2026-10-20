@@ -793,3 +793,57 @@ async fn content_length_json_over_real_tcp_finalizes_usage_before_last_chunk() {
     origin_task.abort();
     gateway_task.abort();
 }
+
+#[tokio::test]
+async fn old_inflight_response_cannot_rebind_after_source_identity_changes() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let upstream_entered = entered.clone();
+    let upstream_release = release.clone();
+    let (origin, task) = serve(Router::new().route("/responses", post(move || {
+        let entered = upstream_entered.clone();
+        let release = upstream_release.clone();
+        async move {
+            entered.notify_one();
+            release.notified().await;
+            axum::Json(json!({"id":"old-response","output":[{"type":"reasoning","encrypted_content":"old-account-opaque"}],"usage":{"input_tokens":1,"output_tokens":1}}))
+        }
+    }))).await;
+    let (_dir, state) = state(vec![source("a", &origin, 0)]).await;
+    let app = relay::router(state.clone());
+    let mut initial = request(br#"{"model":"m"}"#);
+    initial
+        .headers_mut()
+        .insert("x-session-id", "old-session".parse().unwrap());
+    let pending_app = app.clone();
+    let pending = tokio::spawn(async move {
+        let response = pending_app.oneshot(initial).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    {
+        let mut sources = state.sources.write().await;
+        sources[0].source.secret = json!({"api_key":"new-account-key"});
+        state.bindings.lock().await.clear();
+    }
+    release.notify_one();
+    pending.await.unwrap();
+    assert!(
+        state.bindings.lock().await.is_empty(),
+        "old response, session and opaque bindings must remain invalidated"
+    );
+    assert!(routing::candidates(&state, "m", Some("old-response"))
+        .await
+        .is_empty());
+    let response = app
+        .oneshot(request(
+            br#"{"model":"m","previous_response_id":"old-response"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    task.abort();
+}

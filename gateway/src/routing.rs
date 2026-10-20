@@ -2,6 +2,10 @@ use crate::model::{now, AppState, Source};
 use std::sync::Arc;
 
 pub async fn candidates(state: &Arc<AppState>, model: &str, binding: Option<&str>) -> Vec<Source> {
+    let settings = state.settings.read().await.clone();
+    // Identity updates clear bindings while holding sources.write. Read both
+    // under the same lock order so an old binding cannot select a new identity.
+    let runtimes = state.sources.read().await;
     let bound_id = if let Some(binding) = binding {
         // Unknown server state must never be guessed onto an unrelated source.
         match state.bindings.lock().await.get(binding).cloned() {
@@ -11,12 +15,8 @@ pub async fn candidates(state: &Arc<AppState>, model: &str, binding: Option<&str
     } else {
         None
     };
-    let settings = state.settings.read().await.clone();
     let timestamp = now();
-    let mut sources: Vec<_> = state
-        .sources
-        .read()
-        .await
+    let mut sources: Vec<_> = runtimes
         .iter()
         .filter(|runtime| {
             let source = &runtime.source;
