@@ -570,6 +570,39 @@ async fn official_compaction_uses_required_proxy_without_direct_fallback() {
 }
 
 #[tokio::test]
+async fn official_sse_without_content_type_extracts_reported_details_without_rewriting_bytes() {
+    let payload = concat!(
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"headless\",\"usage\":{\"input_tokens\":1234,\"output_tokens\":56,\"total_tokens\":1290,\"input_tokens_details\":{\"cached_tokens\":1000,\"cache_write_tokens\":20},\"output_tokens_details\":{\"reasoning_tokens\":12}}}}\n\n"
+    );
+    let (origin, task) = serve(Router::new().route(
+        "/responses",
+        post(move || async move { Response::builder().body(Body::from(payload)).unwrap() }),
+    ))
+    .await;
+    let (_dir, state) = state(vec![source("a", &origin, 0)]).await;
+    let response = relay::router(state.clone())
+        .oneshot(request(br#"{"model":"m","stream":true,"input":"hello"}"#))
+        .await
+        .unwrap();
+    assert!(!response.headers().contains_key("content-type"));
+    assert_eq!(
+        &to_bytes(response.into_body(), 10000).await.unwrap()[..],
+        payload.as_bytes()
+    );
+    let usage = state.usage.summary(1).unwrap();
+    let row = &usage["recent"][0];
+    assert_eq!(row["input_tokens"], 1234);
+    assert_eq!(row["output_tokens"], 56);
+    assert_eq!(row["cached_input_tokens"], 1000);
+    assert_eq!(row["token_details"]["cache_write_input_tokens"], 20);
+    assert_eq!(row["token_details"]["reasoning_output_tokens"], 12);
+    assert_eq!(row["token_details"]["reported_total_tokens"], 1290);
+    assert_eq!(row["complete"], true);
+    task.abort();
+}
+
+#[tokio::test]
 async fn compact_and_models_keep_native_paths_and_compressed_bytes() {
     let compressed = vec![
         31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,

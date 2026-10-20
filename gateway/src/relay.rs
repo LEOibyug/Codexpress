@@ -889,7 +889,11 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                         upstream,
                         prefix,
                         attempt,
-                        (discovery, session_key.clone()),
+                        (
+                            discovery,
+                            session_key.clone(),
+                            parsed["stream"].as_bool() == Some(true),
+                        ),
                         None,
                     )
                     .await,
@@ -905,7 +909,11 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                 upstream,
                 prefix,
                 attempt,
-                (discovery, session_key.clone()),
+                (
+                    discovery,
+                    session_key.clone(),
+                    parsed["stream"].as_bool() == Some(true),
+                ),
                 route_lease.take(),
             )
             .await;
@@ -949,10 +957,10 @@ async fn stream_response(
     upstream: reqwest::Response,
     prefix: Vec<Bytes>,
     mut attempt: Attempt,
-    context: (bool, Option<String>),
+    context: (bool, Option<String>, bool),
     mut route_lease: Option<crate::affinity::RouteLease>,
 ) -> Response<Body> {
-    let (discovery, session_key) = context;
+    let (discovery, session_key, request_is_stream) = context;
     let status = upstream.status();
     let headers = clean_headers(upstream.headers(), false);
     let content_length = headers
@@ -976,10 +984,13 @@ async fn stream_response(
             }
         }
     }
-    let sse = headers
-        .get("content-type")
+    let content_type = headers.get("content-type");
+    let sse = content_type
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("text/event-stream"));
+        .is_some_and(|v| v.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream")))
+        // Official Codex can omit Content-Type while still returning SSE.
+        // Preserve explicit JSON/plain responses and all original wire bytes.
+        || (request_is_stream && status.is_success() && content_type.is_none());
     let mut observer = Observer {
         sse,
         ..Default::default()

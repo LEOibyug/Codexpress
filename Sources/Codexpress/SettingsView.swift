@@ -354,7 +354,7 @@ struct GeneralSettingsView: View {
                 }
                 if model.portNeedsRestart { InfoNote(text: "请重启 Codexpress 以启用新端口。", symbol: "arrow.clockwise", color: .orange) }
                 DisclosureGroup("生效方式", isExpanded: $connectionDetails) {
-                    Text("切换后自动重启 Codex。旧会话可能保留原来源，请新建会话验证。")
+                    Text("应用后自动重启 Codex。已有自定义供应商 ID 同时接入来源池；依赖原供应商加密状态的对话仍可能需要原来源。")
                         .font(.system(size: 11)).foregroundStyle(.secondary).padding(.top, 7)
                 }.font(.system(size: 11)).foregroundStyle(.secondary)
             }
@@ -402,6 +402,10 @@ struct GeneralSettingsView: View {
                         Text("压缩 \(countLabel(rule["auto_compact_token_limit"])) / 窗口 \(countLabel(rule["context_window"])) Token")
                             .font(.system(size: 11)).foregroundStyle(.secondary)
                     }
+                }
+                if !model.preview["compatibility_provider_ids"].array.isEmpty {
+                    Text("接入已有供应商连接：" + model.preview["compatibility_provider_ids"].array.compactMap(\.string).joined(separator: "、"))
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 InfoNote(text: "应用前自动备份配置与文件认证，并重启 Codex。")
                 HStack(spacing: 10) {

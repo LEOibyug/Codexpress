@@ -356,6 +356,67 @@ fn native_switch_conflicts_and_profile_overrides_never_modify_files() {
 }
 
 #[test]
+fn pool_aliases_resume_provider_ids_and_restore_original_tables_without_history_edits() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    let state = root.path().join("app");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let original = "model_provider = \"custom\"\n[model_providers.custom]\nname = \"Original\"\nbase_url = \"https://custom.invalid/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n[model_providers.second]\nname = \"Second\"\nbase_url = \"https://second.invalid/v1\"\nwire_api = \"responses\"\n[mcp_servers.keep]\ncommand = \"tool\"\n";
+    fs::write(home.join("config.toml"), original).unwrap();
+    fs::write(home.join("history.jsonl"), "unchanged-conversation").unwrap();
+    let preview = config::preview(&home, &state, 17863, "private-local").unwrap();
+    assert_eq!(
+        preview["compatibility_provider_ids"],
+        serde_json::json!(["custom", "second"])
+    );
+    assert!(!preview.to_string().contains("private-local"));
+    config::attach(&home, &state, 17863, "private-local").unwrap();
+    let active = fs::read_to_string(home.join("config.toml")).unwrap();
+    let doc = active.parse::<toml_edit::DocumentMut>().unwrap();
+    for id in ["custom", "second", "codexpress"] {
+        assert_eq!(
+            doc["model_providers"][id]["base_url"].as_str(),
+            Some("http://127.0.0.1:17863/v1")
+        );
+        assert_eq!(
+            doc["model_providers"][id]["requires_openai_auth"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            doc["model_providers"][id]["experimental_bearer_token"].as_str(),
+            Some("private-local")
+        );
+    }
+    // Idempotent application and official roundtrips keep the real originals.
+    config::attach(&home, &state, 17863, "private-local").unwrap();
+    config::use_official(&home, &state).unwrap();
+    config::attach(&home, &state, 17863, "private-local").unwrap();
+    let active = fs::read_to_string(home.join("config.toml")).unwrap();
+    fs::write(home.join("config.toml"), format!("{active}\n[model_providers.new]\nname = \"Added later\"\nbase_url = \"https://new.invalid/v1\"\nwire_api = \"responses\"\n")).unwrap();
+    config::restore(&home, &state).unwrap();
+    let restored = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(restored.contains("https://custom.invalid/v1"));
+    assert!(restored.contains("https://second.invalid/v1"));
+    assert!(restored.contains("https://new.invalid/v1"));
+    assert!(restored.contains("command = \"tool\""));
+    assert!(!restored.contains("private-local"));
+    assert_eq!(
+        fs::read_to_string(home.join("history.jsonl")).unwrap(),
+        "unchanged-conversation"
+    );
+    config::attach(&home, &state, 17863, "private-local").unwrap();
+    let active = fs::read_to_string(home.join("config.toml")).unwrap();
+    let changed = active.replacen("name = \"Codexpress\"", "name = \"External edit\"", 1);
+    fs::write(home.join("config.toml"), &changed).unwrap();
+    assert!(config::restore(&home, &state).is_err());
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        changed
+    );
+}
+
+#[test]
 fn original_gateway_snapshot_format_remains_compatible() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("codex");

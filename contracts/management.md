@@ -48,4 +48,8 @@ Opaque context may recover its origin from a known thread/session. A shared sess
 
 Each normalized quota window may include `observed_at:seconds`, the last valid observation time. A retained low/zero window keeps its original time even when the outer snapshot `fetched_at` advances. Legacy windows without this field use their original snapshot time.
 
+Successful Responses requests with `stream:true` are observed as SSE when the upstream omits Content-Type, matching official Codex behavior. Explicit MIME types retain their semantics (SSE comparison is case-insensitive and parameter-aware). Response headers/body remain unchanged. Terminal usage replaces estimates and supplies cache/reasoning/total details; old unobserved responses are not reconstructed from client history.
+
+`config.preview` also returns `compatibility_provider_ids:[string]`. Gateway attach redirects existing custom provider definitions, except reserved built-in IDs, to the local provider URL/key. The attachment optionally stores `gateway_aliases:{before:TOML,applied:TOML}` with only those definitions. Each managed alias is verified before apply/restore; original definitions are reinstated through official/gateway transitions and restore, preserving other providers added later. Legacy snapshots without this field remain readable. This does not rewrite conversation files or override unknown opaque-state safety checks. Production configuration changes still occur only through the explicit preview/apply transition and graceful Codex restart.
+
 `official::handle(state:&Arc<AppState>,op:&str,payload:Value)->anyhow::Result<Value>`; `official::ensure_access` as above. Config module receives state/paths and returns JSON to management dispatcher.

@@ -41,6 +41,14 @@ struct Snapshot {
     applied_compaction: Option<String>,
     #[serde(default)]
     compaction_before: Option<String>,
+    #[serde(default)]
+    gateway_aliases: Option<ProviderAliases>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProviderAliases {
+    before: String,
+    applied: String,
 }
 
 fn local_provider() -> String {
@@ -138,6 +146,74 @@ fn restore_official_fields(doc: &mut DocumentMut, snapshot: &Snapshot) -> Result
         }
     }
     Ok(())
+}
+
+fn alias_tables(doc: &DocumentMut) -> Option<&dyn toml_edit::TableLike> {
+    doc.get("model_providers").and_then(Item::as_table_like)
+}
+
+fn verify_gateway_aliases(doc: &DocumentMut, snapshot: &Snapshot) -> Result<()> {
+    if let Some(aliases) = &snapshot.gateway_aliases {
+        let applied = aliases.applied.parse::<DocumentMut>()?;
+        if let Some(providers) = alias_tables(&applied) {
+            for (id, expected) in providers.iter() {
+                if alias_tables(doc)
+                    .and_then(|p| p.get(id))
+                    .map(ToString::to_string)
+                    != Some(expected.to_string())
+                {
+                    bail!("已有对话的供应商连接已被其他程序修改，未覆盖；请先检查供应商配置。");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn restore_gateway_aliases(doc: &mut DocumentMut, snapshot: &Snapshot) -> Result<()> {
+    if let Some(aliases) = &snapshot.gateway_aliases {
+        let before = aliases.before.parse::<DocumentMut>()?;
+        if let Some(providers) = alias_tables(&before) {
+            for (id, item) in providers.iter() {
+                doc["model_providers"][id] = item.clone();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resume can retain a custom provider ID. Redirect its current definition,
+/// keeping the conversation itself untouched and the original table restorable.
+fn prepare_gateway_aliases(
+    doc: &mut DocumentMut,
+    port: u16,
+    key: &str,
+) -> Result<Option<ProviderAliases>> {
+    let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(Item::as_table_like_mut)
+    else {
+        return Ok(None);
+    };
+    let mut before = DocumentMut::new();
+    let mut applied = DocumentMut::new();
+    before["model_providers"] = Item::Table(Table::new());
+    applied["model_providers"] = Item::Table(Table::new());
+    for (id, item) in providers.iter_mut() {
+        let id = id.get();
+        if matches!(id, "codexpress" | "openai" | "ollama" | "lmstudio") {
+            continue;
+        }
+        before["model_providers"][id] = item.clone();
+        *item = Item::Table(provider_table(port, key));
+        applied["model_providers"][id] = item.clone();
+    }
+    Ok(alias_tables(&before)
+        .filter(|p| !p.is_empty())
+        .map(|_| ProviderAliases {
+            before: before.to_string(),
+            applied: applied.to_string(),
+        }))
 }
 
 pub fn secure_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -251,7 +327,7 @@ fn verify_attachment(doc: &DocumentMut, snapshot: &Snapshot) -> Result<()> {
     {
         bail!("模型目录或全局上下文设置已被其他程序修改；未覆盖，请先检查模型压缩配置。");
     }
-    Ok(())
+    verify_gateway_aliases(doc, snapshot)
 }
 
 fn compaction_text(doc: &DocumentMut) -> String {
@@ -362,6 +438,7 @@ pub fn preview_with_rules(
     }
     if let Some(snapshot) = &snapshot {
         restore_official_fields(&mut after, snapshot)?;
+        restore_gateway_aliases(&mut after, snapshot)?;
     }
     if let Some(item) = after.get("model_providers") {
         if !item.is_table() {
@@ -373,6 +450,14 @@ pub fn preview_with_rules(
         after["model_providers"] = Item::Table(Table::new());
     }
     after["model_providers"]["codexpress"] = Item::Table(provider_table(port, key));
+    let aliases = prepare_gateway_aliases(&mut after, port, key)?;
+    let compatibility_provider_ids = aliases
+        .as_ref()
+        .map(|a| a.applied.parse::<DocumentMut>().expect("generated TOML"))
+        .and_then(|doc| {
+            alias_tables(&doc).map(|p| p.iter().map(|(id, _)| id.to_owned()).collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
     let catalog = prepare_compaction(&mut after, &home, state_dir, snapshot.as_ref(), rules)?;
     let model_limits = catalog.as_ref().map(|(_, bytes)| {
         let catalog: Value = serde_json::from_slice(bytes).expect("generated JSON");
@@ -380,7 +465,7 @@ pub fn preview_with_rules(
             .map(|m| json!({"model":m["slug"],"auto_compact_token_limit":m["auto_compact_token_limit"],"context_window":m["context_window"]})).collect::<Vec<_>>()
     }).unwrap_or_default();
     Ok(
-        json!({"before":redact(&before),"after":redact(&after),"attached":snapshot.is_some(),"model_limits":model_limits,"warning":WARNING}),
+        json!({"before":redact(&before),"after":redact(&after),"attached":snapshot.is_some(),"model_limits":model_limits,"compatibility_provider_ids":compatibility_provider_ids,"warning":WARNING}),
     )
 }
 
@@ -420,6 +505,7 @@ pub fn attach_with_rules(
     preview_with_rules(&home, state_dir, port, key, rules)?;
     if let Some(snapshot) = &previous_snapshot {
         restore_official_fields(&mut doc, snapshot)?;
+        restore_gateway_aliases(&mut doc, snapshot)?;
     }
     let catalog = prepare_compaction(
         &mut doc,
@@ -433,6 +519,7 @@ pub fn attach_with_rules(
         doc["model_providers"] = Item::Table(Table::new());
     }
     doc["model_providers"]["codexpress"] = Item::Table(provider_table(port, key));
+    let gateway_aliases = prepare_gateway_aliases(&mut doc, port, key)?;
     let mut snapshot = Snapshot {
         codex_home: home.clone(),
         existed: previous_snapshot
@@ -443,6 +530,7 @@ pub fn attach_with_rules(
             .map_or_else(|| before.clone(), |s| s.before.clone()),
         applied_table: Some(table_text(&doc).context("无法生成连接配置")?),
         applied_provider: local_provider(),
+        gateway_aliases,
         owns_table: true,
         official_before: None,
         applied_official: None,
@@ -537,6 +625,7 @@ pub fn restore(home: &Path, state_dir: &Path) -> Result<Value> {
     verify_attachment(&doc, &snapshot)?;
     let original = snapshot.before.parse::<DocumentMut>()?;
     restore_official_fields(&mut doc, &snapshot)?;
+    restore_gateway_aliases(&mut doc, &snapshot)?;
     if snapshot.applied_compaction.is_some() {
         let original_compaction = snapshot
             .compaction_before
@@ -607,6 +696,7 @@ fn official_document(home: &Path, state_dir: &Path) -> Result<(String, DocumentM
             bail!("当前已接管其他 Codex 目录，请先恢复该目录。");
         }
         verify_attachment(&doc, snapshot)?;
+        restore_gateway_aliases(&mut doc, snapshot)?;
     }
     // A selected profile can take precedence over root settings. Refuse a
     // misleading switch rather than dropping its unrelated tools/permissions.
@@ -680,8 +770,10 @@ fn official_document(home: &Path, state_dir: &Path) -> Result<(String, DocumentM
         official_auth_backup_id: None,
         applied_compaction: None,
         compaction_before: None,
+        gateway_aliases: None,
     });
     snapshot.applied_provider = "openai".into();
+    snapshot.gateway_aliases = None;
     snapshot.official_schema = 3;
     if snapshot.owns_table {
         snapshot.applied_table = table_text(&doc);

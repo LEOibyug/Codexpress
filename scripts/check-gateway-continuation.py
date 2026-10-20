@@ -44,7 +44,7 @@ def check(helper, codex, scenario):
                     results = [i for i in data["input"] if i.get("type") == "function_call_output"]
                     assert len(results) == 1 and results[0].get("call_id") == "call-fixture", "tool result missing or duplicated"
                     assert "LOCAL_TOOL_OK" in str(results[0].get("output", "")), "local tool did not complete"
-                    if scenario == "long-turn-header":
+                    if scenario != "oversized-reasoning":
                         assert self.headers.get("x-codex-turn-state") == token, "routing token was changed"
                     else:
                         assert self.headers.get("thread-id"), "Codex thread-id missing"
@@ -62,8 +62,9 @@ def check(helper, codex, scenario):
                 events.append({"type": "response.completed", "response": response})
                 payload = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
                 self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                if scenario == "long-turn-header":
+                if scenario != "missing-content-type":
+                    self.send_header("Content-Type", "text/event-stream")
+                if scenario != "oversized-reasoning":
                     self.send_header("x-codex-turn-state", token)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
@@ -106,10 +107,13 @@ def check(helper, codex, scenario):
                           "base_url": f"http://127.0.0.1:{server.server_port}/v1", "enabled": True, "priority": 0,
                           "proxy": {"mode": "direct"}, "models": [], "secret": {"api_key": "fixture-key"}}
                 ipc("sync", {"sources": [source], "mode": "auto"})
+                if scenario == "legacy-provider-id":
+                    (home / "config.toml").write_text('model_provider = "legacy-source"\n[model_providers.legacy-source]\nname = "Old connection"\nbase_url = "http://127.0.0.1:1/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n')
                 ipc("config.attach", {"codex_home": str(home)})
                 env = {k: v for k, v in os.environ.items() if not k.startswith(("CODEX_", "OPENAI_", "CHATGPT_"))}
                 env["CODEX_HOME"] = str(home)
-                run = subprocess.run([codex, "--strict-config", "-c", "model_providers.codexpress.stream_max_retries=0",
+                provider_override = ["-c", 'model_provider="legacy-source"', "-c", "model_providers.legacy-source.stream_max_retries=0", "-c", "model_providers.legacy-source.request_max_retries=0"] if scenario == "legacy-provider-id" else []
+                run = subprocess.run([codex, "--strict-config", *provider_override, "-c", "model_providers.codexpress.stream_max_retries=0",
                                       "-c", "model_providers.codexpress.request_max_retries=0", "exec",
                                       "--skip-git-repo-check", "--ephemeral", "--ignore-rules", "--sandbox", "read-only",
                                       "--json", "-C", str(work), "-m", "fixture-model",
@@ -123,10 +127,10 @@ def check(helper, codex, scenario):
                 assert passed, f"local continuation check failed: {scenario}"
                 usage = ipc("usage", {"days": 1, "source_id": "fixture"})
                 assert usage["inflight"] == 0 and len(usage["recent"]) == 2, "usage attempt lifecycle incorrect"
-                if scenario == "long-turn-header":
+                if scenario != "oversized-reasoning":
                     assert usage["rows"][0]["input_tokens"] == 200 and usage["rows"][0]["output_tokens"] == 40, "usage counted incorrectly"
                 reported = [row for row in usage["recent"] if row["complete"]]
-                assert len(reported) == (2 if scenario == "long-turn-header" else 1), "bounded observation not respected"
+                assert len(reported) == (1 if scenario == "oversized-reasoning" else 2), "bounded observation not respected"
                 if scenario == "oversized-reasoning":
                     assert any(row["token_details"]["input_estimated"] for row in usage["recent"]), "oversized usage must remain estimated"
                 for row in usage["recent"]:
@@ -154,7 +158,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--helper", type=Path, default=Path(__file__).resolve().parents[1] / "dist/Codexpress.app/Contents/MacOS/codexpress-gateway")
     parser.add_argument("--codex", default="codex")
-    parser.add_argument("--scenario", choices=["long-turn-header", "oversized-reasoning"])
+    parser.add_argument("--scenario", choices=["long-turn-header", "oversized-reasoning", "missing-content-type", "legacy-provider-id"])
     args = parser.parse_args()
-    for scenario in [args.scenario] if args.scenario else ["long-turn-header", "oversized-reasoning"]:
+    for scenario in [args.scenario] if args.scenario else ["long-turn-header", "oversized-reasoning", "missing-content-type", "legacy-provider-id"]:
         check(args.helper.resolve(), args.codex, scenario)
