@@ -3,12 +3,14 @@ import Foundation
 enum SSHRemoteAgent {
     // Fixed program only; user fields, credentials and configuration travel on stdin.
     static let script = #"""
-import base64, fcntl, hashlib, json, os, pathlib, socket, stat, sys, tempfile, time, urllib.request, uuid
+import base64, fcntl, hashlib, json, os, pathlib, re, socket, stat, sys, tempfile, time, urllib.request, uuid
 LIMIT = 8 * 1024 * 1024
 NAMES = ('config.toml', 'auth.json', 'auth.json.bak')
 
+class AgentError(Exception): pass
+
 def fail(message):
-    raise ValueError(message)
+    raise AgentError(message)
 
 def read(path):
     try:
@@ -49,13 +51,13 @@ def home_path(raw):
     # User-selected CODEX_HOME may itself be a symlink; config/auth targets may not.
     return path.resolve()
 
-def backup(path):
+def backup(path, reason):
     root = path / '.codexpress-backups'
     if root.is_symlink(): fail('备份目录不能是符号链接。')
     root.mkdir(mode=0o700, exist_ok=True); os.chmod(str(root), 0o700)
     backup_id = time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:12]
     target = root / backup_id; target.mkdir(mode=0o700)
-    manifest = {'home': str(path), 'files': {}}
+    manifest = {'home': str(path), 'files': {}, 'reason': reason, 'created_at_ns': time.time_ns()}
     names = list(NAMES) + sorted(p.name for p in path.glob('*.config.toml'))
     if len(names) > 100: fail('远端配置档案过多；未修改。')
     total = 0
@@ -67,6 +69,71 @@ def backup(path):
         if value is not None: atomic(target / name, value)
     atomic(target / 'manifest.json', json.dumps(manifest).encode())
     return backup_id
+
+def load_backup(path, name):
+    if not isinstance(name, str) or not re.fullmatch(r'[0-9]{8}-[0-9]{6}-[0-9a-f]{12}', name): fail('备份标识无效。')
+    root = path / '.codexpress-backups'
+    target = root / name
+    if root.is_symlink() or target.is_symlink() or not target.is_dir(): fail('备份目录无效。')
+    try:
+        manifest = json.loads(read(target / 'manifest.json') or b'{}')
+    except (ValueError, UnicodeError):
+        fail('备份清单损坏；请检查远端 .codexpress-backups。')
+    if not isinstance(manifest, dict) or manifest.get('home') != str(path): fail('备份不属于此 Codex 目录。')
+    files = manifest.get('files', {})
+    if not isinstance(files, dict) or not all(n in files for n in NAMES) or len(files) > 100: fail('备份清单无效。')
+    values = {}; total = 0
+    for name, expected in files.items():
+        if '/' in name or '\\' in name or name not in NAMES and not name.endswith('.config.toml'): fail('备份文件名无效。')
+        value = read(target / name)
+        total += len(value or b'')
+        if digest(value) != expected or total > 32 * 1024 * 1024: fail('备份校验失败；未还原。')
+        values[name] = value
+    return values
+
+def managed(config):
+    try:
+        text = (config or b'').decode('utf-8').lower()
+    except UnicodeError:
+        fail('备份配置不是有效 UTF-8，无法确认接入前设置。')
+    # Every configuration written by this app contains these literal identifiers.
+    # Conservative matches (including comments) refuse rather than guess an original.
+    return any(marker in text for marker in ('codexpress', 'cxr-'))
+
+def original(path, optional=False):
+    root = path / '.codexpress-backups'
+    if root.is_symlink(): fail('备份目录不能是符号链接。')
+    pointer = read(root / 'original.json')
+    if pointer is not None:
+        try:
+            info = json.loads(pointer)
+        except (ValueError, UnicodeError):
+            fail('原始备份记录损坏；请检查远端 .codexpress-backups。')
+        if not isinstance(info, dict) or info.get('version') != 1 or info.get('home') != str(path): fail('原始备份记录无效；未还原。')
+        name = info.get('backup_id')
+        values = load_backup(path, name)
+        if digest(values['config.toml']) != info.get('config_digest') or managed(values['config.toml']): fail('原始备份无法确认；未还原。')
+        return name, values
+    # Upgrade old installations from the earliest checkpoint, never the last
+    # locally remembered ID. Never skip an incomplete or already-managed one.
+    candidates = []
+    if root.exists():
+        for child in root.iterdir():
+            if re.fullmatch(r'[0-9]{8}-[0-9]{6}-[0-9a-f]{12}', child.name):
+                if child.is_symlink() or not child.is_dir(): fail('备份目录无效。')
+                candidates.append(child)
+    candidates.sort(key=lambda p: (p.name[:15], p.stat().st_mtime_ns, p.name))
+    for target in candidates:
+        values = load_backup(path, target.name)
+        if managed(values['config.toml']): fail('最早备份已含 Codexpress 网关配置，无法确认接入前设置；请检查远端 .codexpress-backups。')
+        return target.name, values
+    if optional: return None
+    fail('未找到接入前备份；请检查远端 .codexpress-backups。')
+
+def pin_original(path, name, values):
+    target = path / '.codexpress-backups' / 'original.json'
+    if read(target) is None:
+        atomic(target, json.dumps({'version': 1, 'home': str(path), 'backup_id': name, 'config_digest': digest(values['config.toml'])}).encode())
 
 def probe(payload):
     base = payload.get('base_url', '')
@@ -113,35 +180,26 @@ def main(payload):
         if digest(value) != payload.get('expected_digest'): fail('远端配置已变化，请重新预览。')
         next_config = base64.b64decode(payload['config'], validate=True)
         if len(next_config) > LIMIT: fail('配置过大；未修改。')
-        backup_id = backup(path)
+        baseline = original(path, optional=True)
+        if baseline is None and managed(value): fail('当前已是 Codexpress 网关配置，但未找到接入前备份；未修改。')
+        backup_id = backup(path, 'before_apply')
         if digest(read(path / 'config.toml')) != payload['expected_digest']: fail('备份期间远端配置已变化，请重新预览。')
+        if baseline is None: baseline = (backup_id, load_backup(path, backup_id))
+        pin_original(path, *baseline)
         atomic(path / 'config.toml', next_config)
-        return {'applied': True, 'backup_id': backup_id, 'codex_home': str(path)}
+        return {'applied': True, 'backup_id': backup_id, 'original_backup_id': baseline[0], 'codex_home': str(path)}
     if action == 'restore':
-        name = payload.get('backup_id', '')
-        if not name or any(c not in '0123456789abcdef-' for c in name): fail('备份标识无效。')
-        root = path / '.codexpress-backups'
-        target = root / name
-        if root.is_symlink() or target.is_symlink() or not target.is_dir(): fail('备份目录无效。')
-        manifest = json.loads(read(target / 'manifest.json') or b'{}')
-        if manifest.get('home') != str(path): fail('备份不属于此 Codex 目录。')
-        files = manifest.get('files', {})
-        if not all(n in files for n in NAMES) or len(files) > 100: fail('备份清单无效。')
-        values = {}; total = 0
-        for n, expected in files.items():
-            if '/' in n or '\\' in n or n not in NAMES and not n.endswith('.config.toml'): fail('备份文件名无效。')
-            value = read(target / n)
-            total += len(value or b'')
-            if digest(value) != expected or total > 32 * 1024 * 1024: fail('备份校验失败；未还原。')
-            values[n] = value
-        recovery = backup(path)
+        if 'backup_id' in payload: fail('还原仅使用首次接入前备份，不接受上次备份标识。')
+        name, values = original(path)
+        pin_original(path, name, values)
+        recovery = backup(path, 'before_restore')
         current = {n: read(path / n) for n in values}
         try:
             for n, value in values.items(): atomic(path / n, value)
         except Exception:
             for n, value in current.items(): atomic(path / n, value)
             fail('还原失败，已尝试撤回本次变更；可使用还原前备份恢复。')
-        return {'restored': True, 'recovery_backup_id': recovery}
+        return {'restored': True, 'original_backup_id': name, 'recovery_backup_id': recovery}
     fail('未知远端操作。')
 
 try:
@@ -149,11 +207,9 @@ try:
     if len(raw) > 16 * 1024 * 1024: fail('远端请求过大。')
     result = main(json.loads(raw))
     print(json.dumps({'ok': True, 'data': result}, ensure_ascii=False))
-except ValueError as error:
-    allowed = str(error)
-    # Only explicitly raised, fixed product errors may cross the boundary.
-    if not any(allowed.startswith(prefix) for prefix in ('配置或', '请填写', '远端', '拒绝', '备份', '网关', '目标不是', '本机', '未知', '还原', '配置过大')): allowed = '远端操作失败，配置未完成更新。'
-    print(json.dumps({'ok': False, 'error': allowed}, ensure_ascii=False))
+except AgentError as error:
+    # Only deliberately raised, fixed product errors cross the boundary.
+    print(json.dumps({'ok': False, 'error': str(error)}, ensure_ascii=False))
 except Exception:
     print(json.dumps({'ok': False, 'error': '远端操作失败，请检查目录权限、Python 3 和连接状态。'}, ensure_ascii=False))
 """#

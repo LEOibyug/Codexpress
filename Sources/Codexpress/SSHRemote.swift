@@ -10,6 +10,7 @@ struct SSHRemoteProfile: Codable, Equatable, Identifiable, Sendable {
     var codexHome = ""
     var gatewayHost = ""
     var backupID: String? = nil
+    var originalBackupID: String? = nil
     var mapExistingProviders = false
 
     func arguments() throws -> [String] {

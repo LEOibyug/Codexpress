@@ -22,7 +22,7 @@ struct SSHRemoteView: View {
         }
         .task { await remote.loadSSHConfig(); await remote.refresh(model) }
         .disabled(remote.busy || model.busy || !model.running)
-        .alert(confirmation == "apply" ? "应用远端连接？" : confirmation == "restore" ? "还原远端备份？" : confirmation == "start" ? "开启远端入口？" : "撤销此机器的 Key？", isPresented: Binding(get:{confirmation != nil},set:{if !$0 {confirmation=nil}})) {
+        .alert(confirmation == "apply" ? "应用远端连接？" : confirmation == "restore" ? "还原接入前设置？" : confirmation == "start" ? "开启远端入口？" : "撤销此机器的 Key？", isPresented: Binding(get:{confirmation != nil},set:{if !$0 {confirmation=nil}})) {
             Button("取消", role:.cancel){confirmation=nil}
             Button("确认") {
                 switch confirmation {
@@ -34,7 +34,7 @@ struct SSHRemoteView: View {
                 };confirmation=nil
             }
         } message: {
-            Text(confirmation == "start" ? "将监听本机所有 IPv4 网络接口的所选端口。远端使用独立 Key；HTTP 连接仅适合可信局域网或 VPN，请勿直接暴露到公网。" : confirmation == "apply" ? "将先从远端验证网关连通性，再备份 config.toml、auth.json 等文件并更新配置。请先结束远端 Codex 的运行任务，应用后重启远端 Codex。" : confirmation == "restore" ? "将恢复此机器上次记录的配置与文件认证；还原前会再次备份。请先结束远端 Codex 任务，还原后重启。" : "此机器的旧 Key 将无法发起新请求，远端配置和对话记录保留。")
+            Text(confirmation == "start" ? "将监听本机所有 IPv4 网络接口的所选端口。远端使用独立 Key；HTTP 连接仅适合可信局域网或 VPN，请勿直接暴露到公网。" : confirmation == "apply" ? "将先从远端验证网关连通性，再备份 config.toml、auth.json 等文件并更新配置。请先结束远端 Codex 的运行任务，应用后重启远端 Codex。" : confirmation == "restore" ? "将恢复此 Codex 目录首次接入前的配置与文件认证，接入后自行修改的这些设置也会还原。当前状态会另行备份。请先结束远端 Codex 任务，还原后重启。" : "此机器的旧 Key 将无法发起新请求，远端配置和对话记录保留。")
         }
     }
     private var ingress: some View {
@@ -98,7 +98,7 @@ struct SSHRemoteView: View {
                 Toggle("同时接入已有自定义供应商 ID",isOn:$remote.profile.mapExistingProviders).font(.system(size:12))
                 if remote.profile.mapExistingProviders { Text("旧对话可能带有原来源的加密状态，接入后可能触发上下文降级。").font(.system(size:11)).foregroundStyle(.secondary) }
                 HStack {
-                    Button("还原上次备份…"){confirmation="restore"}.disabled(remote.profile.backupID==nil)
+                    Button("还原接入前设置…"){confirmation="restore"}.disabled(!remote.canRestore)
                     Spacer();Button("预览连接配置"){remote.preview(model)}.buttonStyle(.borderedProminent)
                 }
             }

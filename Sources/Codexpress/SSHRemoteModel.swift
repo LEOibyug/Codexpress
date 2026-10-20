@@ -21,6 +21,7 @@ import SwiftUI
     private var preparedPort = ""
     var canApply: Bool { prepared != .null && preparedProfile == profile && preparedPort == port }
     var running: Bool { status["running"].bool == true }
+    var canRestore: Bool { !profile.destination.isEmpty && profile.codexHome.hasPrefix("/") }
     private func perform(_ label: String, action: @escaping () async throws -> Void) {
         guard !busy else { return }; busy = true; phase = label; error = nil; notice = nil
         Task { defer { busy = false; phase = "" }; do { try await action() } catch { self.error = error.localizedDescription } }
@@ -97,6 +98,7 @@ import SwiftUI
             let fields: [String:JSONValue] = ["base_url":prepared["base_url"],"key":prepared["key"],"expected_digest":.string(digest),"config":.string(Data((prepared["config"].string ?? "").utf8).base64EncodedString())]
             let result = try await SSHRemoteClient(profile: original).call("apply", fields: fields)
             var saved = original; saved.backupID = result["backup_id"].string
+            saved.originalBackupID = result["original_backup_id"].string
             try self.remember(saved, in: model)
             if self.profile == original { self.profile = saved }
             self.prepared = .null
@@ -105,13 +107,14 @@ import SwiftUI
     }
     func restore(_ model: AppModel) {
         let original = profile
-        perform("正在备份当前状态并还原…") {
-            guard let backup = original.backupID else { throw AppError.message("此机器没有已记录的备份。") }
-            let result = try await SSHRemoteClient(profile: original).call("restore", fields: ["backup_id":.string(backup)])
+        perform("正在备份当前状态并还原接入前设置…") {
+            guard self.canRestore else { throw AppError.message("请先填写 SSH 连接和远端 Codex 目录。") }
+            let result = try await SSHRemoteClient(profile: original).call("restore")
             var saved = original; saved.backupID = result["recovery_backup_id"].string
+            saved.originalBackupID = result["original_backup_id"].string
             try self.remember(saved, in: model); if self.profile == original { self.profile = saved }
             self.prepared = .null; self.summary = ""
-            self.notice = "已还原远端配置和文件认证。请重启远端 Codex；还原前状态也已备份。"
+            self.notice = "已还原首次接入前的配置和文件认证。请重启远端 Codex；还原前状态另有备份。"
         }
     }
     func revoke(_ id: String, model: AppModel) {
