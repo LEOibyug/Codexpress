@@ -126,7 +126,7 @@ extension Source {
     func preservingOfficialIdentity(current: Source?, live: JSONValue) -> Source {
         guard official else { return self }
         var edited = self
-        edited.account_id = live["account_id"].string ?? current?.account_id
+        edited.account_id = current?.account_id ?? live["account_id"].string
         return edited
     }
     func sameConfiguration(as other: Source) -> Bool {
@@ -166,5 +166,24 @@ struct CreditConfirmation: Identifiable {
 enum ConfigConnectionPolicy {
     static func requireCurrentPort(saved: Int, live: Double?) throws {
         guard let live, Int(live) == saved else { throw AppError.message("本地端口尚未生效。请重新启动 Codexpress，再预览并接管连接；恢复接管前连接仍可操作。") }
+    }
+}
+
+
+enum OfficialCredentialMirror {
+    static func requireDurable(_ value: JSONValue?) throws -> JSONValue {
+        guard let value, value["access_token"].string?.isEmpty == false,
+              value["account_id"].string?.isEmpty == false else { throw AppError.message("官方凭据尚未持久保存到钥匙串，请重新登录；未使用 IPC 中的旧令牌覆盖凭据。") }
+        return value
+    }
+    static func mergedSources(_ sources: [Source], response: JSONValue, loadDurable: (String) throws -> JSONValue?) throws -> [Source] {
+        var next = sources
+        // An IPC result is an update notification only. Its secret may already be superseded.
+        for item in response["updated_secrets"].array {
+            guard let id = item["source_id"].string, let index = next.firstIndex(where: { $0.id == id && $0.official }) else { continue }
+            let durable = try requireDurable(loadDurable(id))
+            next[index].account_id = durable["account_id"].string
+        }
+        return next
     }
 }

@@ -140,12 +140,7 @@ import ServiceManagement
     private func mergeCredentials(_ data: JSONValue) throws {
         try requireWritableMetadata()
         var next = settings
-        for item in data["updated_secrets"].array {
-            if let id = item["source_id"].string, let index = next.sources.firstIndex(where: { $0.id == id && $0.official }), item["secret"] != .null {
-                if try keychain.load(id) != item["secret"] { try keychain.save(item["secret"], for: id) }
-                if let account = item["secret"]["account_id"].string, !account.isEmpty { next.sources[index].account_id = account }
-            }
-        }
+        next.sources = try OfficialCredentialMirror.mergedSources(settings.sources, response: data, loadDurable: keychain.load)
         if next.sources != settings.sources { try persistSettings(next) }
     }
     private func updateStatus() async throws {
@@ -154,7 +149,8 @@ import ServiceManagement
         status = fresh
         var next = settings
         for i in next.sources.indices where next.sources[i].official {
-            if let live = fresh["sources"].array.first(where: { $0["id"].string == next.sources[i].id }), let account = live["account_id"].string, !account.isEmpty { next.sources[i].account_id = account }
+            if let durable = try keychain.load(next.sources[i].id), let account = durable["account_id"].string, !account.isEmpty { next.sources[i].account_id = account }
+            else if let live = fresh["sources"].array.first(where: { $0["id"].string == next.sources[i].id }), let account = live["account_id"].string, !account.isEmpty { next.sources[i].account_id = account }
         }
         if next.sources != settings.sources { try persistSettings(next) }
     }
@@ -162,7 +158,9 @@ import ServiceManagement
         try requireWritableMetadata()
         pendingSync = true
         // Always retrieve helper-authoritative rotated tokens before building a source snapshot.
-        try mergeCredentials(try await client.call("credentials"))
+        let notification = try await client.call("credentials")
+        try mergeCredentials(notification)
+        let helperOwnedIDs = Set(notification["updated_secrets"].array.compactMap { $0["source_id"].string })
         var values: [JSONValue] = []
         var next = settings
         for index in next.sources.indices {
@@ -171,7 +169,7 @@ import ServiceManagement
             // After a crash, Keychain may be newer than the last metadata mirror.
             if next.sources[index].official, let account = secret["account_id"].string, !account.isEmpty { next.sources[index].account_id = account }
             guard case .object(var value) = try JSONValue.from(next.sources[index]) else { continue }
-            value["secret"] = secret
+            value["secret"] = next.sources[index].official && helperOwnedIDs.contains(sourceID) ? .object([:]) : secret
             values.append(.object(value))
         }
         if next.sources != settings.sources { try persistSettings(next) }
@@ -188,7 +186,7 @@ import ServiceManagement
             try mergeCredentials(try await client.call("credentials"))
             if let id = loginSource, let flow = loginFlow {
                 let result = try await client.call("official.login.status", .object(["source_id": .string(id), "flow_id": .string(flow)]))
-                if result["state"].string == "complete" { try finishLogin(id, result: result) }
+                if result["state"].string == "complete" { try finishLogin(id) }
                 else if result["state"].string == "failed" { loginMessage = result["error"].string ?? "登录失败，请重新发起。"; loginFlow = nil }
             }
             await refreshOfficialIfDue()
@@ -213,13 +211,14 @@ import ServiceManagement
     func saveSource(_ source: Source, apiKey: String) async throws {
         try requireWritableMetadata()
         try source.validate()
+        if let current = settings.sources.first(where: { $0.id == source.id }), current.kind != source.kind { throw AppError.message("不能更改已有来源的类型，请新建来源。") }
         guard settings.sources.contains(where: { $0.id == source.id }) || settings.sources.count < 200 else { throw AppError.message("最多支持 200 个来源。") }
         if !source.official, apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, try keychain.load(source.id) == nil { throw AppError.message("请输入 API 密钥。") }
         try mergeCredentials(try await client.call("credentials"))
         try await updateStatus()
         var source = source
         if source.official { source = source.preservingOfficialIdentity(current: settings.sources.first { $0.id == source.id }, live: state(source.id)) }
-        if !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { try keychain.save(.object(["api_key": .string(apiKey)]), for: source.id) }
+        if !source.official, !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { try keychain.saveAPIKey(apiKey, for: source.id) }
         var updated = settings
         if let i = updated.sources.firstIndex(where: { $0.id == source.id }) { updated.sources[i] = source }
         else { var item = source; item.priority = updated.sources.count; updated.sources.append(item) }
@@ -273,15 +272,15 @@ import ServiceManagement
     func completeLogin() {
         guard let id = loginSource, let flow = loginFlow else { return }
         perform {
-            let result = try await self.client.call("official.login.complete", .object(["source_id": .string(id), "flow_id": .string(flow), "callback_url": .string(self.callbackURL)]))
-            try self.finishLogin(id, result: result)
+            _ = try await self.client.call("official.login.complete", .object(["source_id": .string(id), "flow_id": .string(flow), "callback_url": .string(self.callbackURL)]))
+            try self.finishLogin(id)
         }
     }
-    private func finishLogin(_ id: String, result: JSONValue) throws {
-        guard result["secret"] != .null else { throw AppError.message("登录结果缺少凭据。") }
-        try keychain.save(result["secret"], for: id)
+    private func finishLogin(_ id: String) throws {
+        // The helper durably installs official credentials before returning; never replay an IPC token snapshot.
+        let durable = try OfficialCredentialMirror.requireDurable(keychain.load(id))
         var next = settings
-        if let i = next.sources.firstIndex(where: { $0.id == id }) { next.sources[i].account_id = result["account_id"].string ?? result["secret"]["account_id"].string }
+        if let i = next.sources.firstIndex(where: { $0.id == id }) { next.sources[i].account_id = durable["account_id"].string }
         try persistSettings(next); callbackURL = ""; loginSource = nil; loginFlow = nil; loginMessage = "官方账号已连接。"
         lastQuotaRefresh[id] = nil
         Task { await refreshOfficialIfDue() }

@@ -13,8 +13,9 @@ struct KeychainStore {
         guard status == errSecSuccess, let data = result as? Data else { throw AppError.message("无法读取 Codexpress 钥匙串凭据（\(status)）。") }
         return try JSONDecoder().decode(JSONValue.self, from: data)
     }
-    func save(_ secret: JSONValue, for id: String) throws {
-        let data = try JSONEncoder().encode(secret)
+    // Official OAuth items have a single writer: the helper's durable token installation.
+    func saveAPIKey(_ apiKey: String, for id: String) throws {
+        let data = try JSONEncoder().encode(JSONValue.object(["api_key": .string(apiKey)]))
         let q = query(id)
         var status = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if status == errSecItemNotFound {

@@ -27,6 +27,23 @@ final class ReviewRegressionTests: XCTestCase {
         XCTAssertThrowsError(try confirmation.validate(live: live(current, account: "account-B", stale: true)))
         XCTAssertThrowsError(try confirmation.validate(live: .null))
     }
+    func testDurableOfficialCredentialsWinOverStaleIPCAndMissingDurableBlocksMirror() throws {
+        var official = Source.newOfficial(); official.account_id = "account-A"
+        var api = Source(); api.name = "API"
+        let stale: JSONValue = .object(["access_token": .string("stale-generation"), "account_id": .string("account-A")])
+        let durable: JSONValue = .object(["access_token": .string("new-generation"), "refresh_token": .string("rotated"), "account_id": .string("account-B")])
+        let response: JSONValue = .object(["updated_secrets": .array([
+            .object(["source_id": .string(official.id), "secret": stale]),
+            .object(["source_id": .string(api.id), "secret": stale])
+        ])])
+        var reads: [String] = []
+        let merged = try OfficialCredentialMirror.mergedSources([official, api], response: response) { id in reads.append(id); return durable }
+        XCTAssertEqual(reads, [official.id])
+        XCTAssertEqual(merged[0].account_id, "account-B")
+        XCTAssertNil(merged[1].account_id)
+        XCTAssertEqual(try OfficialCredentialMirror.requireDurable(durable)["access_token"].string, "new-generation")
+        XCTAssertThrowsError(try OfficialCredentialMirror.mergedSources([official], response: response, loadDurable: { _ in nil }))
+    }
     func testPendingPortCannotCreateConnectionPreviewOrAttachment() {
         XCTAssertNoThrow(try ConfigConnectionPolicy.requireCurrentPort(saved: 17863, live: 17863))
         XCTAssertThrowsError(try ConfigConnectionPolicy.requireCurrentPort(saved: 17864, live: 17863)) { error in
