@@ -416,7 +416,7 @@ async fn explicit_proxy_is_used_and_unavailable_proxy_never_bypasses() {
 }
 
 #[tokio::test]
-async fn sse_bytes_usage_sticky_binding_and_cancellation() {
+async fn sse_completed_before_client_close_keeps_success_usage_and_cancels_transport() {
     use futures_util::StreamExt;
     let cancelled = Arc::new(AtomicUsize::new(0));
     struct Cancel(Arc<AtomicUsize>);
@@ -469,11 +469,116 @@ async fn sse_bytes_usage_sticky_binding_and_cancellation() {
     .await
     .unwrap();
     let summary = state.usage.summary(30).unwrap();
-    assert_eq!(summary["recent"][0]["status"], "interrupted");
+    assert_eq!(summary["recent"][0]["status"], "success");
+    assert_eq!(summary["rows"][0]["successes"], 1);
+    assert_eq!(summary["rows"][0]["failures"], 0);
     assert_eq!(summary["rows"][0]["input_tokens"], 30);
     assert_eq!(summary["rows"][0]["cached_input_tokens"], 12);
     task.abort();
     gateway_task.abort();
+}
+
+#[tokio::test]
+async fn terminal_sse_before_body_drop_retains_outcome_but_unfinished_output_is_interrupted() {
+    use futures_util::StreamExt;
+    for (wire, outcome, terminal) in [
+        ("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"complete-without-usage\",\"output\":[]}}\n\n", "success", true),
+        ("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"insufficient_quota\"}}}\n\n", "failed", true),
+        ("data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n", "success", true),
+        ("data: {\"type\":\"response.output_text.delta\",\"delta\":\"not finished\"}\n\n", "interrupted", false),
+        // An unterminated SSE event is not evidence of completion.
+        ("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"truncated-frame\"}}\n", "interrupted", false),
+    ] {
+        let (origin, task) = serve(Router::new().route("/responses", post(move || async move {
+            let stream = async_stream::stream! {
+                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(wire.as_bytes()));
+                futures_util::future::pending::<()>().await;
+            };
+            Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(stream)).unwrap()
+        }))).await;
+        let (_directory, state) = state(vec![source("a", &origin, 0)]).await;
+        let response = relay::router(state.clone()).oneshot(request(br#"{"model":"m","stream":true}"#)).await.unwrap();
+        let mut body = response.into_body().into_data_stream();
+        let mut received = Vec::new();
+        while received.len() < wire.len() {
+            received.extend_from_slice(&body.next().await.unwrap().unwrap());
+        }
+        assert_eq!(received, wire.as_bytes());
+        if terminal {
+            assert_eq!(state.usage.summary(1).unwrap()["recent"][0]["status"], outcome, "terminal state must be visible before yielding the last event");
+        }
+        drop(body); // Client stops polling immediately after the last event.
+        assert_eq!(state.inflight.load(Ordering::Relaxed), 0);
+        let summary = state.usage.summary(1).unwrap();
+        assert_eq!(summary["recent"][0]["status"], outcome);
+        assert_eq!(summary["recent"][0]["token_details"]["stream_complete"], terminal);
+        assert_eq!(summary["recent"][0]["complete"], false, "missing usage must remain independent of completion");
+        if outcome == "failed" { assert_eq!(state.sources.read().await[0].health, "exhausted"); }
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn transport_error_after_terminal_event_does_not_replace_success_or_failure() {
+    use futures_util::StreamExt;
+    for (event, outcome) in [
+        ("response.completed", "success"),
+        ("response.failed", "failed"),
+    ] {
+        let wire = format!("data: {{\"type\":\"{event}\",\"response\":{{\"id\":\"terminal-then-reset\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n\n");
+        let upstream_wire = wire.clone();
+        let (origin, task) = serve(Router::new().route(
+            "/responses",
+            post(move || {
+                let wire = upstream_wire.clone();
+                async move {
+                    let stream = async_stream::stream! {
+                        yield Ok::<_, std::io::Error>(bytes::Bytes::from(wire));
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        yield Ok(bytes::Bytes::from_static(b": trailing keep-alive\n\n"));
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        yield Err(std::io::Error::other("fixture transport reset after terminal"));
+                    };
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        ))
+        .await;
+        let (_directory, state) = state(vec![source("a", &origin, 0)]).await;
+        let response = relay::router(state.clone())
+            .oneshot(request(br#"{"model":"m","stream":true}"#))
+            .await
+            .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        let mut received = Vec::new();
+        while received.len() < wire.len() {
+            received.extend_from_slice(&body.next().await.unwrap().unwrap());
+        }
+        assert_eq!(received, wire.as_bytes());
+        assert_eq!(
+            &body.next().await.unwrap().unwrap()[..],
+            b": trailing keep-alive\n\n",
+            "normal bytes after completion must still be forwarded"
+        );
+        assert!(
+            body.next().await.unwrap().is_err(),
+            "transport errors must still reach the client"
+        );
+        drop(body);
+        let summary = state.usage.summary(1).unwrap();
+        assert_eq!(summary["recent"][0]["status"], outcome);
+        assert_eq!(
+            summary["recent"][0]["token_details"]["stream_complete"],
+            true
+        );
+        assert_eq!(summary["recent"][0]["input_tokens"], 10);
+        assert_eq!(summary["recent"][0]["output_tokens"], 2);
+        assert_eq!(summary["rows"][0]["requests"], 1);
+        task.abort();
+    }
 }
 
 #[tokio::test]

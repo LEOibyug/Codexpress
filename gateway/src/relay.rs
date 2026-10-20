@@ -1561,6 +1561,7 @@ async fn stream_response(
         let prefix = futures_util::stream::iter(prefix.into_iter().map(Ok));
         let mut upstream = prefix.chain(upstream.bytes_stream());
         let mut received = 0u64;
+        let mut finalized = content_length == Some(0);
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(chunk) => {
@@ -1569,25 +1570,27 @@ async fn stream_response(
                     bind_ids(&state, &source, &mut observer).await;
                     received = received.saturating_add(chunk.len() as u64);
                     let complete_body = content_length == Some(received);
-                    // Hyper can stop polling as soon as Content-Length bytes
-                    // arrive. Finalize before yielding the last chunk, rather
-                    // than relying on a subsequent stream EOF poll.
-                    if complete_body {
+                    // A client may stop polling as soon as it sees a terminal
+                    // SSE event, just as Hyper can stop at Content-Length.
+                    // Record the outcome before yielding those bytes. Continue
+                    // forwarding trailers unchanged without reopening the outcome.
+                    if !finalized && (complete_body || observer.terminal) {
                         finalize_response(&state, &source, status, discovery, &mut observer, &mut attempt).await;
-                    } else {
+                        finalized = true;
+                    } else if !finalized {
                         attempt.finish(if status.is_success() { "streaming" } else { "failed" }, Some(&observer));
                     }
                     yield Ok::<Bytes, std::io::Error>(chunk);
                     if complete_body { return; }
                 },
                 Err(_) => {
-                    attempt.finish("interrupted", Some(&observer));
+                    if !finalized { attempt.finish("interrupted", Some(&observer)); }
                     yield Err(std::io::Error::other("来源流已中断"));
                     return;
                 }
             }
         }
-        finalize_response(&state, &source, status, discovery, &mut observer, &mut attempt).await;
+        if !finalized { finalize_response(&state, &source, status, discovery, &mut observer, &mut attempt).await; }
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
