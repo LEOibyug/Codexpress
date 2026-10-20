@@ -483,7 +483,9 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
     let request_id = uuid::Uuid::new_v4().to_string();
     let mut last_error = None;
     for candidate in sources {
-        if candidate.kind == "official" && parts.uri.path() != "/v1/responses" {
+        if candidate.kind == "official"
+            && !matches!(parts.uri.path(), "/v1/responses" | "/v1/responses/compact")
+        {
             last_error = Some(error(StatusCode::NOT_IMPLEMENTED, "官方来源尚未验证此端点"));
             continue;
         }

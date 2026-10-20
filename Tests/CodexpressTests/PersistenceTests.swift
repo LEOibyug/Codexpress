@@ -2,6 +2,20 @@ import XCTest
 @testable import Codexpress
 
 final class PersistenceTests: XCTestCase {
+    func testModelCompactionMigrationAndValidation() throws {
+        let legacy = Data(#"{"sources":[],"mode":"auto","port":17863,"codexHome":"/temporary/codex"}"#.utf8)
+        var settings = try JSONDecoder().decode(AppSettings.self, from: legacy)
+        XCTAssertNil(settings.modelCompaction)
+        let first = try ModelCompactionRule.parse(model: "model-a", threshold: "180000", window: "300000")
+        let second = try ModelCompactionRule.parse(model: "model-b", threshold: "45000", window: "")
+        settings.modelCompaction = [first, second]
+        let restored = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertEqual(restored.modelCompaction, [first, second])
+        XCTAssertThrowsError(try ModelCompactionRule.validate([first, first]))
+        XCTAssertThrowsError(try ModelCompactionRule.parse(model: "m", threshold: "90001", window: "100000"))
+        XCTAssertThrowsError(try ModelCompactionRule.parse(model: "m", threshold: "1.5", window: ""))
+        XCTAssertThrowsError(try ModelCompactionRule.parse(model: "m", threshold: "0", window: ""))
+    }
     func testMetadataPersistsWithoutSecretAndRestrictsPermissions() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codexpress-test-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }

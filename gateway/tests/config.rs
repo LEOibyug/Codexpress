@@ -1,5 +1,166 @@
+use codexpress_gateway::compaction::ModelCompactionRule;
 use codexpress_gateway::config;
+use serde_json::Value;
 use std::fs;
+
+fn rule(model: &str, limit: i64, window: Option<i64>) -> ModelCompactionRule {
+    ModelCompactionRule {
+        model: model.into(),
+        auto_compact_token_limit: limit,
+        context_window: window,
+    }
+}
+
+fn active_catalog(home: &std::path::Path) -> Value {
+    let doc = fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    serde_json::from_slice(&fs::read(doc["model_catalog_json"].as_str().unwrap()).unwrap()).unwrap()
+}
+
+#[test]
+fn per_model_limits_apply_update_disable_and_restore_without_losing_other_settings() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    let state = root.path().join("app");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let original = "model = \"gpt-6.1-sol\"\nmodel_auto_compact_token_limit = 160000\nmodel_context_window = 250000\n[mcp_servers.keep]\ncommand = \"keep-tool\"\n";
+    fs::write(home.join("config.toml"), original).unwrap();
+    let rules = [
+        rule("gpt-6.1-sol", 180000, Some(300000)),
+        rule("custom-model", 45000, Some(64000)),
+    ];
+    let preview =
+        config::preview_with_rules(&home, &state, 17863, "private-local-key", &rules).unwrap();
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        original
+    );
+    assert!(!preview["after"]
+        .as_str()
+        .unwrap()
+        .contains("private-local-key"));
+    assert_eq!(preview["model_limits"].as_array().unwrap().len(), 2);
+    config::attach_with_rules(&home, &state, 17863, "private-local-key", &rules).unwrap();
+    let catalog = active_catalog(&home);
+    let models = catalog["models"].as_array().unwrap();
+    let configured = models.iter().find(|m| m["slug"] == "gpt-6.1-sol").unwrap();
+    assert_eq!(configured["auto_compact_token_limit"], 180000);
+    assert_eq!(configured["context_window"], 300000);
+    let untouched = models.iter().find(|m| m["slug"] == "gpt-6-astra").unwrap();
+    assert_eq!(untouched["auto_compact_token_limit"], 160000);
+    assert_eq!(untouched["context_window"], 250000);
+    let active = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(!active.contains("model_auto_compact_token_limit"));
+    fs::write(
+        home.join("config.toml"),
+        format!("{active}\n[mcp_servers.new]\ncommand = \"new-tool\"\n"),
+    )
+    .unwrap();
+    config::attach_with_rules(
+        &home,
+        &state,
+        17863,
+        "private-local-key",
+        &[rule("custom-model", 40000, Some(64000))],
+    )
+    .unwrap();
+    let updated = active_catalog(&home);
+    assert_eq!(
+        updated["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["slug"] == "gpt-6.1-sol")
+            .unwrap()["auto_compact_token_limit"],
+        160000
+    );
+    config::attach_with_rules(&home, &state, 17863, "private-local-key", &[]).unwrap();
+    let disabled = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(disabled.contains("model_auto_compact_token_limit = 160000"));
+    assert!(!disabled.contains("model_catalog_json"));
+    config::attach_with_rules(&home, &state, 17863, "private-local-key", &rules).unwrap();
+    config::restore(&home, &state).unwrap();
+    let restored = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(restored.contains("model_auto_compact_token_limit = 160000"));
+    assert!(restored.contains("model_context_window = 250000"));
+    assert!(restored.contains("new-tool"));
+    assert!(restored.contains("keep-tool"));
+    assert!(!restored.contains("model_catalog_json"));
+}
+
+#[test]
+fn custom_catalog_preserves_model_capabilities_and_conflicts_are_protected() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    let state = root.path().join("app");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let custom = serde_json::json!({"models":[{"slug":"custom","context_window":100000,"unknown_capability":{"keep":true},"model_messages":{"instructions_template":"preserve me"}}]});
+    fs::write(home.join("own.json"), custom.to_string()).unwrap();
+    let original = "model_catalog_json = \"own.json\"\n";
+    fs::write(home.join("config.toml"), original).unwrap();
+    config::attach(&home, &state, 17863, "key").unwrap();
+    // Compaction starts owning these fields only when rules are first applied.
+    let connected = fs::read_to_string(home.join("config.toml")).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!("model_auto_compact_token_limit = 30000\n{connected}"),
+    )
+    .unwrap();
+    let rules = [rule("custom", 80000, None), rule("custom-v2", 70000, None)];
+    config::attach_with_rules(&home, &state, 17863, "key", &rules).unwrap();
+    let catalog = active_catalog(&home);
+    assert_eq!(catalog["models"][0]["unknown_capability"]["keep"], true);
+    assert_eq!(
+        catalog["models"][0]["model_messages"]["instructions_template"],
+        "preserve me"
+    );
+    assert_eq!(catalog["models"][1]["unknown_capability"]["keep"], true);
+    let active = fs::read_to_string(home.join("config.toml")).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!("model_auto_compact_token_limit = 1\n{active}"),
+    )
+    .unwrap();
+    assert!(config::attach_with_rules(&home, &state, 17863, "key", &rules).is_err());
+    assert!(config::restore(&home, &state).is_err());
+    fs::write(home.join("config.toml"), active).unwrap();
+    config::restore(&home, &state).unwrap();
+    let restored = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(restored.contains("model_auto_compact_token_limit = 30000"));
+    assert!(restored.contains(original.trim()));
+    assert!(!restored.contains("model_providers.codexpress"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&fs::read_to_string(home.join("own.json")).unwrap()).unwrap(),
+        custom
+    );
+}
+
+#[test]
+fn invalid_rules_never_change_config_or_create_attachment() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("app");
+    let home = root.path().join("codex");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let original = "model = \"keep\"\n";
+    fs::write(home.join("config.toml"), original).unwrap();
+    for rules in [
+        vec![rule("same", 1, None), rule("same", 2, None)],
+        vec![rule("too-large", 250000, Some(100000))],
+        vec![rule("bad", 0, None)],
+    ] {
+        assert!(config::attach_with_rules(&home, &state, 17863, "key", &rules).is_err());
+        assert_eq!(
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            original
+        );
+        assert!(!state.join("config-attachment.json").exists());
+    }
+}
 
 #[test]
 fn attachment_preserves_history_auth_and_unrelated_live_edits() {

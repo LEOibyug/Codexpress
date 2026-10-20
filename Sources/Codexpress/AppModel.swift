@@ -337,19 +337,30 @@ import ServiceManagement
         }
     }
     func requireCurrentPort() throws { try ConfigConnectionPolicy.requireCurrentPort(saved: settings.port, live: status["port"].number) }
+    func saveModelCompaction(_ rules: [ModelCompactionRule]) {
+        perform {
+            try ModelCompactionRule.validate(rules)
+            var next = self.settings; next.modelCompaction = rules
+            try self.persistSettings(next); self.preview = .null
+            self.notice = "模型规则已保存。请预览连接配置并应用，再重启 Codex 使规则生效。"
+        }
+    }
+    func configPayload() throws -> JSONValue {
+        .object(["codex_home": .string(settings.codexHome), "model_compaction": try JSONValue.from(settings.modelCompaction ?? [])])
+    }
     func configPreview() {
         perform {
             try self.requireCurrentPort()
-            self.preview = try await self.client.call("config.preview", .object(["codex_home": .string(self.settings.codexHome)]))
+            self.preview = try await self.client.call("config.preview", self.configPayload())
         }
     }
     func configAction(_ operation: String) {
         perform {
             try self.requireWritableMetadata()
             if operation != "config.restore" { try self.requireCurrentPort() }
-            let result = try await self.client.call(operation, .object(["codex_home": .string(self.settings.codexHome)]))
+            let result = try await self.client.call(operation, self.configPayload())
             self.notice = result["message"].string ?? "连接配置已更新。"
-            if !self.portNeedsRestart { self.preview = try await self.client.call("config.preview", .object(["codex_home": .string(self.settings.codexHome)])) } else { self.preview = .null }
+            if !self.portNeedsRestart { self.preview = try await self.client.call("config.preview", self.configPayload()) } else { self.preview = .null }
         }
     }
     func setLaunchAtLogin(_ value: Bool) {

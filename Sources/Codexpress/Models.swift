@@ -67,6 +67,32 @@ struct AppSettings: Codable, Sendable {
     var fixed_source_id: String? = nil
     var port = 17863
     var codexHome = ""
+    // Optional for backwards-compatible decoding of existing sources.json files.
+    var modelCompaction: [ModelCompactionRule]? = nil
+}
+
+struct ModelCompactionRule: Codable, Equatable, Sendable {
+    var model: String
+    var auto_compact_token_limit: Int
+    var context_window: Int?
+
+    static func parse(model: String, threshold: String, window: String) throws -> Self {
+        let name = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name.utf8.count <= 256, !name.contains(where: \.isWhitespace) else { throw AppError.message("请填写不含空白的模型 ID。") }
+        guard let limit = Int(threshold.trimmingCharacters(in: .whitespacesAndNewlines)), (1...1_000_000_000).contains(limit) else { throw AppError.message("模型 \(name) 的压缩阈值须为正整数，最大十亿 Token。") }
+        let rawWindow = window.trimmingCharacters(in: .whitespacesAndNewlines)
+        var context: Int?
+        if !rawWindow.isEmpty {
+            guard let value = Int(rawWindow), (2...1_000_000_000).contains(value), limit <= value * 9 / 10 else { throw AppError.message("模型 \(name) 的上下文窗口须为整数，压缩阈值不能超过窗口的 90%。") }
+            context = value
+        }
+        return Self(model: name, auto_compact_token_limit: limit, context_window: context)
+    }
+
+    static func validate(_ rules: [Self]) throws {
+        guard rules.count <= 200, Set(rules.map(\.model)).count == rules.count else { throw AppError.message("模型 ID 不能重复，最多支持 200 条规则。") }
+        for rule in rules { _ = try parse(model: rule.model, threshold: String(rule.auto_compact_token_limit), window: rule.context_window.map(String.init) ?? "") }
+    }
 }
 enum AppError: LocalizedError {
     case message(String)

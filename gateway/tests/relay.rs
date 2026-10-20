@@ -394,6 +394,37 @@ async fn authenticated_requests_reject_foreign_hosts_and_browser_origins() {
 }
 
 #[tokio::test]
+async fn official_compaction_uses_required_proxy_without_direct_fallback() {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let copy = seen.clone();
+    let (proxy, task) = serve(Router::new().fallback(move |request: Request| {
+        let copy = copy.clone();
+        async move {
+            copy.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(request.method(), "CONNECT");
+            assert_eq!(request.uri().to_string(), "chatgpt.com:443");
+            Response::builder().status(502).body(Body::empty()).unwrap()
+        }
+    }))
+    .await;
+    let mut official = source("official", "https://chatgpt.com/backend-api/codex", 0);
+    official.kind = "official".into();
+    official.account_id = Some("account-test".into());
+    official.proxy = ProxyPolicy {
+        mode: "explicit".into(),
+        url: Some(proxy),
+    };
+    official.secret = json!({"access_token":"official-token","expires_at":4000000000_u64,"account_id":"account-test"});
+    let (_dir, state) = state(vec![official]).await;
+    let mut compact = request(br#"{"model":"m","input":[]}"#);
+    *compact.uri_mut() = "/v1/responses/compact".parse().unwrap();
+    let response = relay::router(state).oneshot(compact).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(seen.load(Ordering::Relaxed), 1);
+    task.abort();
+}
+
+#[tokio::test]
 async fn compact_and_models_keep_native_paths_and_compressed_bytes() {
     let compressed = vec![
         31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,

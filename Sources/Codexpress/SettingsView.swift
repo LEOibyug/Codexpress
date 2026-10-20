@@ -139,6 +139,7 @@ struct GeneralSettingsView: View {
                         Text("更改端口需重启应用，再重新预览并更新 Codex 连接配置。").font(.caption).foregroundStyle(.secondary)
                     }.padding(8)
                 }
+                ModelCompactionView()
                 GroupBox("Codex 连接") {
                     VStack(alignment: .leading, spacing: 12) {
                         TextField("Codex 配置目录（绝对路径）", text: $home)
@@ -153,11 +154,20 @@ struct GeneralSettingsView: View {
                     Text(model.preview["warning"].string ?? "请在接管后验证新会话和恢复会话的真实连接目标。").font(.callout).foregroundStyle(.orange)
                     GroupBox("当前配置（敏感字段已隐藏）") { Text(model.preview["before"].string ?? "").font(.system(.caption, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(8) }
                     GroupBox("接管后的配置") { Text(model.preview["after"].string ?? "").font(.system(.caption, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(8) }
-                    HStack { Button("接管所选 Codex 连接…") { confirming = "config.attach" }.buttonStyle(.borderedProminent).disabled(model.portNeedsRestart || model.metadataLoadFailed); Button("恢复接管前连接…") { confirming = "config.restore" }.disabled(model.preview["attached"].bool != true) }.disabled(model.busy)
+                    if !model.preview["model_limits"].array.isEmpty {
+                        GroupBox("将应用的模型压缩规则") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ForEach(Array(model.preview["model_limits"].array.enumerated()), id: \.offset) { _, rule in
+                                    Text("\(rule["model"].string ?? "")：达到 \(countLabel(rule["auto_compact_token_limit"])) Token 时压缩；窗口 \(countLabel(rule["context_window"])) Token").font(.callout)
+                                }
+                            }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                        }
+                    }
+                    HStack { Button(model.preview["attached"].bool == true ? "应用连接与模型规则…" : "接管所选 Codex 连接…") { confirming = "config.attach" }.buttonStyle(.borderedProminent).disabled(model.portNeedsRestart || model.metadataLoadFailed); Button("恢复接管前连接…") { confirming = "config.restore" }.disabled(model.preview["attached"].bool != true) }.disabled(model.busy)
                 }
             }.padding(24)
         }.onAppear { port = model.settings.port; home = model.settings.codexHome }
-            .alert(confirming == "config.restore" ? "恢复原连接？" : "接管 Codex 连接？", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
+            .alert(confirming == "config.restore" ? "恢复原连接和模型设置？" : "应用 Codex 连接和模型规则？", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
                 Button("取消", role: .cancel) { confirming = nil }
                 Button("确认") { if let op = confirming { model.configAction(op) }; confirming = nil }
             } message: { Text("操作目录：\(model.settings.codexHome)\n只更改本应用管理的字段。已有会话的连接需要另行验证。") }
