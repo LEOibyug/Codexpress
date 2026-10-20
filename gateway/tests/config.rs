@@ -248,8 +248,8 @@ fn official_gateway_roundtrip_preserves_compaction_tools_auth_and_history() {
     let official = fs::read_to_string(home.join("config.toml")).unwrap();
     assert!(official.contains("model_provider = \"openai\" # selected"));
     assert!(official.contains("forced_login_method = \"chatgpt\""));
-    assert!(!official.contains("openai_base_url"));
-    assert!(!official.contains("chatgpt_base_url"));
+    assert!(official.contains("openai_base_url = \"https://chatgpt.com/backend-api/codex\""));
+    assert!(official.contains("chatgpt_base_url = \"https://chatgpt.com/backend-api/\""));
     assert_eq!(active_catalog(&home), catalog);
     assert_eq!(config::connection_mode(&state).unwrap(), "official");
     // A second click is idempotent and does not replace the original snapshot.

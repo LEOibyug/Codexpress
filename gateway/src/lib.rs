@@ -1,3 +1,4 @@
+pub mod backups;
 pub mod compaction;
 pub mod config;
 pub mod credentials;

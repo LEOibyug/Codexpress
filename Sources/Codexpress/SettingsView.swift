@@ -255,6 +255,7 @@ struct GeneralSettingsView: View {
     @State private var home = ""
     @State private var confirming: String?
     @State private var connectionDetails = false
+    @State private var selectedBackup = ""
 
     private var preferencesChanged: Bool { port != model.settings.port || home != model.settings.codexHome }
     private var canPreview: Bool { !model.busy && model.running && !preferencesChanged && !model.portNeedsRestart && !model.metadataLoadFailed }
@@ -272,13 +273,15 @@ struct GeneralSettingsView: View {
                 gatewayCard
                 ModelCompactionView()
                 connectionCard
+                backupCard
                 if model.preview != .null { previewCard }
             }.settingsPage()
         }.onAppear { port = model.settings.port; home = model.settings.codexHome }
-            .alert(confirming == "config.restore" ? "恢复原连接？" : "应用连接设置？", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
+            .task { await model.refreshConfigurationBackups() }
+            .alert(confirming == "backup.restore" ? "还原所选备份？" : confirming == "config.restore" ? "恢复原连接？" : "应用连接设置？", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
                 Button("取消", role: .cancel) { confirming = nil }
-                Button("确认") { if let op = confirming { model.configAction(op) }; confirming = nil }
-            } message: { Text("配置目录：\(model.settings.codexHome)\n\(confirming == "config.restore" ? "将恢复连接前的供应商与模型设置。" : "将更新供应商与模型设置。")重启 Codex 后生效。") }
+                Button("确认") { if confirming == "backup.restore" { model.restoreConfigurationBackup(backupID) } else if let op = confirming { model.configAction(op) }; confirming = nil }
+            } message: { Text(confirming == "backup.restore" ? "将还原此备份的 config.toml、配置档案和 auth.json 文件认证，并重启 Codex。当前状态会先备份；钥匙串登录需在 Codex 中确认。" : "配置目录：\(model.settings.codexHome)\n旧配置与文件认证将先备份，再更新连接并重启 Codex。") }
     }
 
     private var gatewayCard: some View {
@@ -335,9 +338,36 @@ struct GeneralSettingsView: View {
                 }
                 if model.portNeedsRestart { InfoNote(text: "请重启 Codexpress 以启用新端口。", symbol: "arrow.clockwise", color: .orange) }
                 DisclosureGroup("生效方式", isExpanded: $connectionDetails) {
-                    Text("应用后重启 Codex，并新建会话。恢复原连接也需重启。")
+                    Text("切换后自动重启 Codex。旧会话可能保留原来源，请新建会话验证。")
                         .font(.system(size: 11)).foregroundStyle(.secondary).padding(.top, 7)
                 }.font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var backupID: String { model.configurationBackups.contains(where: { $0["id"].string == selectedBackup }) ? selectedBackup : model.configurationBackups.first?["id"].string ?? "" }
+    private func backupLabel(_ value: JSONValue) -> String {
+        let reasons = ["before_apply":"应用配置前", "before_official":"官方登录前", "before_restore":"还原备份前", "before_connection_restore":"恢复连接前"]
+        return timestampLabel(value["created_at"]) + " · " + (reasons[value["reason"].string ?? ""] ?? "配置备份")
+    }
+    private var backupCard: some View {
+        SettingsCard("配置备份", symbol: "clock.arrow.circlepath") {
+            VStack(alignment: .leading, spacing: 12) {
+                if model.configurationBackups.isEmpty {
+                    Text("暂无备份，应用配置时自动创建。 ").font(.system(size: 12)).foregroundStyle(.secondary)
+                } else {
+                    Picker("备份时间", selection: Binding(get: { backupID }, set: { selectedBackup = $0 })) {
+                        ForEach(Array(model.configurationBackups.enumerated()), id: \.offset) { _, item in Text(backupLabel(item)).tag(item["id"].string ?? "") }
+                    }
+                    Text("还原配置文件与 auth.json 等文件认证；钥匙串登录由 Codex 管理。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                HStack {
+                    Button("刷新") { Task { await model.refreshConfigurationBackups() } }.disabled(model.busy || !model.running)
+                    Spacer()
+                    Button("还原备份…") { confirming = "backup.restore" }
+                        .disabled(backupID.isEmpty || model.busy || !model.running || preferencesChanged)
+                }
             }
         }
     }
@@ -357,7 +387,7 @@ struct GeneralSettingsView: View {
                             .font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                 }
-                InfoNote(text: "应用后重启 Codex，并新建会话。")
+                InfoNote(text: "应用前自动备份配置与文件认证，并重启 Codex。")
                 HStack(spacing: 10) {
                     Button("恢复原连接…") { confirming = "config.restore" }.disabled(model.preview["attached"].bool != true)
                     Spacer()

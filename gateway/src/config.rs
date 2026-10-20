@@ -31,6 +31,12 @@ struct Snapshot {
     official_before: Option<String>,
     #[serde(default)]
     applied_official: Option<String>,
+    #[serde(default = "first_schema")]
+    official_schema: u32,
+    #[serde(default)]
+    gateway_auth_backup_id: Option<String>,
+    #[serde(default)]
+    official_auth_backup_id: Option<String>,
     #[serde(default)]
     applied_compaction: Option<String>,
     #[serde(default)]
@@ -43,7 +49,17 @@ fn local_provider() -> String {
 fn yes() -> bool {
     true
 }
-const OFFICIAL_KEYS: [&str; 3] = ["openai_base_url", "chatgpt_base_url", "forced_login_method"];
+fn first_schema() -> u32 {
+    1
+}
+const OFFICIAL_KEYS: [&str; 4] = [
+    "openai_base_url",
+    "chatgpt_base_url",
+    "forced_login_method",
+    "respect_system_proxy",
+];
+pub const OFFICIAL_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex";
+pub const OFFICIAL_SERVICE_URL: &str = "https://chatgpt.com/backend-api/";
 
 pub fn connection_mode(state_dir: &Path) -> Result<&'static str> {
     Ok(match snapshot_load(state_dir)? {
@@ -53,20 +69,40 @@ pub fn connection_mode(state_dir: &Path) -> Result<&'static str> {
     })
 }
 
-fn official_fields(doc: &DocumentMut) -> String {
+fn official_fields_version(doc: &DocumentMut, schema: u32) -> String {
     let mut fields = DocumentMut::new();
     for key in OFFICIAL_KEYS {
+        if schema < 2 && key == "respect_system_proxy" {
+            continue;
+        }
         if let Some(item) = doc.get(key) {
             fields[key] = item.clone();
         }
     }
+    if schema >= 3 {
+        if let Some(item) = doc.get("model_providers") {
+            fields["model_providers"] = item.clone();
+        }
+    } else if schema >= 2 {
+        if let Some(item) = doc.get("model_providers").and_then(|p| p.get("openai")) {
+            fields["model_providers"] = Item::Table(Table::new());
+            fields["model_providers"]["openai"] = item.clone();
+        }
+    }
     fields.to_string()
+}
+
+fn official_fields(doc: &DocumentMut) -> String {
+    official_fields_version(doc, 3)
 }
 
 fn restore_official_fields(doc: &mut DocumentMut, snapshot: &Snapshot) -> Result<()> {
     if let Some(before) = &snapshot.official_before {
         let original = before.parse::<DocumentMut>()?;
         for key in OFFICIAL_KEYS {
+            if snapshot.official_schema < 2 && key == "respect_system_proxy" {
+                continue;
+            }
             match original.get(key) {
                 Some(item) => {
                     doc[key] = item.clone();
@@ -74,6 +110,30 @@ fn restore_official_fields(doc: &mut DocumentMut, snapshot: &Snapshot) -> Result
                 None => {
                     doc.remove(key);
                 }
+            }
+        }
+        if snapshot.official_schema >= 3 {
+            if let Some(item) = original.get("model_providers") {
+                doc["model_providers"] = item.clone();
+            } else {
+                doc.remove("model_providers");
+            }
+        } else if snapshot.official_schema >= 2 {
+            if let Some(item) = original
+                .get("model_providers")
+                .and_then(|p| p.get("openai"))
+            {
+                if doc.get("model_providers").is_none() {
+                    let mut providers = Table::new();
+                    providers.set_implicit(true);
+                    doc["model_providers"] = Item::Table(providers);
+                }
+                doc["model_providers"]["openai"] = item.clone();
+            } else if let Some(table) = doc
+                .get_mut("model_providers")
+                .and_then(Item::as_table_like_mut)
+            {
+                table.remove("openai");
             }
         }
     }
@@ -180,7 +240,7 @@ fn verify_attachment(doc: &DocumentMut, snapshot: &Snapshot) -> Result<()> {
     if snapshot
         .applied_official
         .as_ref()
-        .is_some_and(|expected| official_fields(doc) != *expected)
+        .is_some_and(|expected| official_fields_version(doc, snapshot.official_schema) != *expected)
     {
         bail!("官方连接或登录设置已被其他程序修改，未覆盖；请先检查配置。");
     }
@@ -350,7 +410,10 @@ pub fn attach_with_rules(
         }
         verify_attachment(&doc, snapshot)?;
         let expected = provider_table(port, key).to_string();
-        if snapshot.owns_table && Some(expected) != snapshot.applied_table {
+        if snapshot.owns_table
+            && snapshot.applied_provider == "codexpress"
+            && Some(expected) != snapshot.applied_table
+        {
             bail!("本地连接端口或凭据已变化，请先恢复连接后重新接管");
         }
     }
@@ -370,7 +433,7 @@ pub fn attach_with_rules(
         doc["model_providers"] = Item::Table(Table::new());
     }
     doc["model_providers"]["codexpress"] = Item::Table(provider_table(port, key));
-    let snapshot = Snapshot {
+    let mut snapshot = Snapshot {
         codex_home: home.clone(),
         existed: previous_snapshot
             .as_ref()
@@ -383,6 +446,13 @@ pub fn attach_with_rules(
         owns_table: true,
         official_before: None,
         applied_official: None,
+        official_schema: 3,
+        gateway_auth_backup_id: previous_snapshot
+            .as_ref()
+            .and_then(|s| s.gateway_auth_backup_id.clone()),
+        official_auth_backup_id: previous_snapshot
+            .as_ref()
+            .and_then(|s| s.official_auth_backup_id.clone()),
         compaction_before: if rules.is_empty() {
             None
         } else {
@@ -408,6 +478,17 @@ pub fn attach_with_rules(
     if current != before {
         bail!("配置在预览后发生变化，未写入；请刷新后重试");
     }
+    let backup_id = crate::backups::create(&home, state_dir, "before_apply")?;
+    let restore_auth = previous_snapshot
+        .as_ref()
+        .filter(|s| s.applied_provider == "openai")
+        .and_then(|s| s.gateway_auth_backup_id.as_deref());
+    if previous_snapshot
+        .as_ref()
+        .is_some_and(|s| s.applied_provider == "openai")
+    {
+        snapshot.official_auth_backup_id = Some(backup_id);
+    }
     if let Some((path, bytes)) = &catalog {
         secure_write(path, bytes)?;
     }
@@ -421,8 +502,17 @@ pub fn attach_with_rules(
         rollback_snapshot(state_dir, previous_snapshot_bytes.as_deref());
         return Err(error).context("连接写入失败");
     }
+    if let Some(id) = restore_auth {
+        if let Err(error) = crate::backups::restore_auth(&home, state_dir, id) {
+            let _ = secure_write(&config, before.as_bytes());
+            rollback_snapshot(state_dir, previous_snapshot_bytes.as_deref());
+            return Err(error);
+        }
+    }
+    let warning = previous_snapshot.as_ref().filter(|s|s.applied_provider=="openai" && s.gateway_auth_backup_id.is_none())
+        .map(|_| "旧版切换前的 auth.json 没有备份，无法恢复其中的旧 API Key；来源池自身保存的密钥不受影响。");
     Ok(
-        json!({"attached":true,"message":"已应用连接与模型规则；请重启 Codex 并新建会话，已有会话需另行验证"}),
+        json!({"attached":true,"message":"已应用连接与模型规则；请重启 Codex 并新建会话，已有会话需另行验证","warning":warning}),
     )
 }
 
@@ -476,13 +566,33 @@ pub fn restore(home: &Path, state_dir: &Path) -> Result<Value> {
     if fs::read_to_string(&config)? != before {
         bail!("配置在恢复期间发生变化，未覆盖");
     }
+    crate::backups::create(&home, state_dir, "before_connection_restore")?;
     if !snapshot.existed && doc.as_table().is_empty() {
         fs::remove_file(&config)?;
     } else {
         secure_write(&config, doc.to_string().as_bytes())?;
     }
+    if snapshot.applied_provider == "openai" {
+        if let Some(id) = &snapshot.gateway_auth_backup_id {
+            if let Err(error) = crate::backups::restore_auth(&home, state_dir, id) {
+                let _ = secure_write(&config, before.as_bytes());
+                return Err(error);
+            }
+        }
+    }
     fs::remove_file(snapshot_path(state_dir))?;
     Ok(json!({"attached":false,"message":"已恢复原连接，保留接管期间的其他配置更改"}))
+}
+
+pub fn restore_preview(home: &Path, state_dir: &Path) -> Result<Value> {
+    let home = path_checked(home)?;
+    let snapshot = snapshot_load(state_dir)?.context("没有需要恢复的连接")?;
+    if snapshot.codex_home != home {
+        bail!("所选目录与原接管目录不一致");
+    }
+    let (_, doc) = read_document(&home.join("config.toml"))?;
+    verify_attachment(&doc, &snapshot)?;
+    Ok(json!({"restorable":true}))
 }
 
 fn official_document(home: &Path, state_dir: &Path) -> Result<(String, DocumentMut, Snapshot)> {
@@ -519,18 +629,43 @@ fn official_document(home: &Path, state_dir: &Path) -> Result<(String, DocumentM
             bail!("当前配置档案覆盖了连接或登录方式，请在 Codex 中取消该档案后重试。");
         }
     }
-    let official_before = previous
-        .as_ref()
-        .and_then(|s| s.official_before.clone())
-        .unwrap_or_else(|| official_fields(&doc));
+    let official_before =
+        if let Some(snapshot) = previous.as_ref().filter(|s| s.official_before.is_some()) {
+            let mut original = doc.clone();
+            restore_official_fields(&mut original, snapshot)?;
+            official_fields(&original)
+        } else {
+            official_fields(&doc)
+        };
     let mut selected = value("openai");
     if let Some(old) = doc.get("model_provider").and_then(Item::as_value) {
         *selected.as_value_mut().expect("string value").decor_mut() = old.decor().clone();
     }
     doc["model_provider"] = selected;
-    doc.remove("openai_base_url");
-    doc.remove("chatgpt_base_url");
+    // Pin both official services instead of letting a lower config/environment
+    // layer supply the custom endpoint again. Launch-side overrides match these.
+    doc["openai_base_url"] = value(OFFICIAL_RESPONSES_URL);
+    doc["chatgpt_base_url"] = value(OFFICIAL_SERVICE_URL);
     doc["forced_login_method"] = value("chatgpt");
+    doc["respect_system_proxy"] = value(true);
+    if let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(Item::as_table_like_mut)
+    {
+        providers.remove("openai");
+        // A resumed chat can still select its previous provider ID. Keep that
+        // ID resolvable while pinning its URL/auth to official for this mode.
+        // The complete original table is private-snapshotted and restored later.
+        for (_, item) in providers.iter_mut() {
+            let mut alias = Table::new();
+            alias["name"] = value("OpenAI");
+            alias["base_url"] = value(OFFICIAL_RESPONSES_URL);
+            alias["wire_api"] = value("responses");
+            alias["requires_openai_auth"] = value(true);
+            alias["supports_websockets"] = value(true);
+            *item = Item::Table(alias);
+        }
+    }
     let mut snapshot = previous.unwrap_or_else(|| Snapshot {
         codex_home: home.to_owned(),
         existed: config.exists(),
@@ -540,10 +675,17 @@ fn official_document(home: &Path, state_dir: &Path) -> Result<(String, DocumentM
         owns_table: false,
         official_before: None,
         applied_official: None,
+        official_schema: 3,
+        gateway_auth_backup_id: None,
+        official_auth_backup_id: None,
         applied_compaction: None,
         compaction_before: None,
     });
     snapshot.applied_provider = "openai".into();
+    snapshot.official_schema = 3;
+    if snapshot.owns_table {
+        snapshot.applied_table = table_text(&doc);
+    }
     snapshot.official_before = Some(official_before);
     snapshot.applied_official = Some(official_fields(&doc));
     Ok((before, doc, snapshot))
@@ -560,6 +702,7 @@ pub fn official_preview(home: &Path, state_dir: &Path) -> Result<Value> {
 pub fn use_official(home: &Path, state_dir: &Path) -> Result<Value> {
     let home = path_checked(home)?;
     // Preparing the document is read-only; a failed preflight creates nothing.
+    let previous_snapshot = snapshot_load(state_dir)?;
     let (before, doc, mut snapshot) = official_document(&home, state_dir)?;
     fs::create_dir_all(&home)?;
     let home = fs::canonicalize(home)?;
@@ -568,6 +711,16 @@ pub fn use_official(home: &Path, state_dir: &Path) -> Result<Value> {
     if fs::read_to_string(&config).unwrap_or_default() != before {
         bail!("配置在切换期间发生变化，未覆盖。");
     }
+    let backup_id = crate::backups::create(&home, state_dir, "before_official")?;
+    let entering = previous_snapshot
+        .as_ref()
+        .is_none_or(|s| s.applied_provider != "openai");
+    if entering {
+        snapshot.gateway_auth_backup_id = Some(backup_id);
+    }
+    let restore_auth = entering
+        .then(|| snapshot.official_auth_backup_id.clone())
+        .flatten();
     let previous = fs::read(snapshot_path(state_dir)).ok();
     secure_write(&snapshot_path(state_dir), &serde_json::to_vec(&snapshot)?)?;
     if fs::read_to_string(&config).unwrap_or_default() != before {
@@ -577,6 +730,13 @@ pub fn use_official(home: &Path, state_dir: &Path) -> Result<Value> {
     if let Err(error) = secure_write(&config, doc.to_string().as_bytes()) {
         rollback_snapshot(state_dir, previous.as_deref());
         return Err(error).context("官方连接设置写入失败");
+    }
+    if let Some(id) = restore_auth {
+        if let Err(error) = crate::backups::restore_auth(&home, state_dir, &id) {
+            let _ = secure_write(&config, before.as_bytes());
+            rollback_snapshot(state_dir, previous.as_deref());
+            return Err(error);
+        }
     }
     Ok(json!({"connection_mode":"official","attached":true}))
 }
@@ -611,8 +771,26 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
             &rules,
         ),
         "config.restore" => restore(home, &state.state_dir),
+        "config.restore.preview" => restore_preview(home, &state.state_dir),
         "config.official.preview" => official_preview(home, &state.state_dir),
         "config.official" => use_official(home, &state.state_dir),
+        "config.backups" => crate::backups::list(&path_checked(home)?, &state.state_dir),
+        "config.backup.preview" => crate::backups::preflight(
+            &path_checked(home)?,
+            &state.state_dir,
+            payload
+                .get("backup_id")
+                .and_then(Value::as_str)
+                .context("请选择备份")?,
+        ),
+        "config.backup.restore" => crate::backups::restore(
+            &path_checked(home)?,
+            &state.state_dir,
+            payload
+                .get("backup_id")
+                .and_then(Value::as_str)
+                .context("请选择备份")?,
+        ),
         _ => bail!("未知连接配置操作"),
     }
 }

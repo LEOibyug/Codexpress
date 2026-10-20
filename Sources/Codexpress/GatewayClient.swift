@@ -16,7 +16,7 @@ struct GatewayClient: Sendable {
             defer { close(fd) }
             var noSig: Int32 = 1
             setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSig, socklen_t(MemoryLayout.size(ofValue: noSig)))
-            let receiveSeconds: Int = op == "official.credits.consume" ? 180 : ["official.refresh", "models.list"].contains(op) ? 90 : op.hasPrefix("official.login.") ? 40 : 12
+            let receiveSeconds: Int = op == "official.credits.consume" ? 180 : ["official.refresh", "models.list"].contains(op) || op.hasPrefix("config.") ? 90 : op.hasPrefix("official.login.") ? 40 : 12
             var receiveTimeout = timeval(tv_sec: receiveSeconds, tv_usec: 0)
             var sendTimeout = timeval(tv_sec: 12, tv_usec: 0)
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout, socklen_t(MemoryLayout.size(ofValue: receiveTimeout)))

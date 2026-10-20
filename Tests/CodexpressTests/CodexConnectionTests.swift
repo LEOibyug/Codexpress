@@ -15,7 +15,7 @@ import XCTest
         events.append("quit")
         if quitFails { throw AppError.message("quit declined") }
     }
-    func launch(at url: URL, codexHome: String) async throws {
+    func launch(at url: URL, codexHome: String, target: CodexConnectionTarget) async throws {
         events.append("launch")
         XCTAssertEqual(url.path, "/temporary/Codex.app")
         XCTAssertEqual(codexHome, "/temporary/codex")
@@ -24,6 +24,18 @@ import XCTest
 }
 
 final class CodexConnectionTests: XCTestCase {
+    func testNativeLaunchOverridesInheritedCustomURLsKeysAndDaemon() {
+        let inherited = ["CODEX_APP_SERVER_OPENAI_BASE_URL":"https://custom.example/v1", "OPENAI_API_KEY":"PRIVATE-OLD-KEY", "CODEX_APP_SERVER_WS_URL":"ws://old-daemon", "HTTPS_PROXY":"http://127.0.0.1:7890"]
+        let official = inherited.merging(CodexLaunchPolicy.environment(codexHome: "/temporary/codex", target: .official)) { _, new in new }
+        XCTAssertEqual(official["CODEX_APP_SERVER_OPENAI_BASE_URL"], "https://chatgpt.com/backend-api/codex")
+        XCTAssertEqual(official["CODEX_APP_SERVER_CHATGPT_BASE_URL"], "https://chatgpt.com/backend-api/")
+        XCTAssertEqual(official["OPENAI_API_KEY"], "")
+        XCTAssertEqual(official["CODEX_APP_SERVER_WS_URL"], "")
+        XCTAssertEqual(official["CODEX_APP_SERVER_FORCE_CLI"], "1")
+        XCTAssertEqual(official["HTTPS_PROXY"], inherited["HTTPS_PROXY"])
+        let gateway = CodexLaunchPolicy.environment(codexHome: "/temporary/codex", target: .gateway)
+        XCTAssertEqual(gateway["CODEX_APP_SERVER_OPENAI_BASE_URL"], "")
+    }
     @MainActor func testSwitchChecksThenQuitsBeforeWritingAndReopens() async throws {
         let app = FakeCodexApplication()
         try await CodexConnectionTransition.run(controller: app, codexHome: "/temporary/codex", preflight: {

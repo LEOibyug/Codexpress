@@ -25,6 +25,7 @@ import ServiceManagement
     @Published private(set) var refreshingModels = Set<String>()
     @Published private(set) var modelErrors: [String: String] = [:]
     @Published private(set) var codexConnectionPhase: String?
+    @Published private(set) var configurationBackups: [JSONValue] = []
     let directory: URL
     private let metadata: MetadataStore
     private let keychain: KeychainStore
@@ -426,9 +427,44 @@ import ServiceManagement
         perform {
             try self.requireWritableMetadata()
             if operation != "config.restore" { try self.requireCurrentPort() }
-            _ = try await self.client.call(operation, self.configPayload())
-            self.notice = operation == "config.restore" ? "已恢复原连接，重启 Codex 后生效。" : "连接设置已应用，重启 Codex 后生效。"
-            if !self.portNeedsRestart { self.preview = try await self.client.call("config.preview", self.configPayload()) } else { self.preview = .null }
+            let payload = try self.configPayload()
+            self.codexConnectionPhase = "检查连接设置…"
+            defer { self.codexConnectionPhase = nil }
+            var result: JSONValue = .null
+            try await CodexConnectionTransition.run(controller: NativeCodexApplication(), codexHome: self.settings.codexHome, target: operation == "config.restore" ? .restored : .gateway, preflight: {
+                _ = try await self.client.call(operation == "config.restore" ? "config.restore.preview" : "config.preview",payload)
+            }, apply: {
+                result = try await self.client.call(operation,payload)
+            }, phase: { self.codexConnectionPhase = $0 })
+            self.preview = .null
+            try await self.updateStatus()
+            await self.refreshConfigurationBackups()
+            self.notice = operation == "config.restore" ? "已恢复原连接并重启 Codex。" : "旧配置与文件认证已备份，连接设置已应用并重启 Codex。"
+            if let warning = result["warning"].string { self.notice = warning }
+        }
+    }
+    func refreshConfigurationBackups() async {
+        guard running else { return }
+        do {
+            let result = try await client.call("config.backups", .object(["codex_home":.string(settings.codexHome)]))
+            configurationBackups = result["backups"].array
+        } catch { self.error = error.localizedDescription }
+    }
+    func restoreConfigurationBackup(_ id: String) {
+        perform {
+            try self.requireWritableMetadata()
+            let payload: JSONValue = .object(["codex_home":.string(self.settings.codexHome),"backup_id":.string(id)])
+            self.codexConnectionPhase = "检查备份…"
+            defer { self.codexConnectionPhase = nil }
+            try await CodexConnectionTransition.run(controller: NativeCodexApplication(), codexHome: self.settings.codexHome, target: .restored, preflight: {
+                _ = try await self.client.call("config.backup.preview",payload)
+            }, apply: {
+                _ = try await self.client.call("config.backup.restore",payload)
+            }, phase: { self.codexConnectionPhase = $0 })
+            self.preview = .null
+            try await self.updateStatus()
+            await self.refreshConfigurationBackups()
+            self.notice = "配置与文件认证已还原，Codex 已重启；还原前状态也已备份。"
         }
     }
     func switchCodexConnection(_ target: CodexConnectionTarget) {
@@ -445,14 +481,17 @@ import ServiceManagement
             self.codexConnectionPhase = "检查连接设置…"
             defer { self.codexConnectionPhase = nil }
             do {
-                try await CodexConnectionTransition.run(controller: NativeCodexApplication(), codexHome: home, preflight: {
+                var result: JSONValue = .null
+                try await CodexConnectionTransition.run(controller: NativeCodexApplication(), codexHome: home, target: target, preflight: {
                     _ = try await self.client.call(target == .official ? "config.official.preview" : "config.preview", payload)
                 }, apply: {
-                    _ = try await self.client.call(target == .official ? "config.official" : "config.attach", payload)
+                    result = try await self.client.call(target == .official ? "config.official" : "config.attach", payload)
                 }, phase: { self.codexConnectionPhase = $0 })
                 self.preview = .null
                 try await self.updateStatus()
+                await self.refreshConfigurationBackups()
                 self.notice = target == .official ? "Codex 已重启并切换为官方连接；如未登录，请在 Codex 中完成登录。" : "Codex 已重启并切换为来源池。"
+                if let warning = result["warning"].string { self.notice = warning }
             } catch {
                 self.preview = .null
                 try? await self.updateStatus()

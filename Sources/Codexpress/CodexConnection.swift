@@ -4,7 +4,7 @@ import SwiftUI
 @MainActor protocol CodexApplicationControlling {
     func applicationURL() throws -> URL
     func quit() async throws
-    func launch(at url: URL, codexHome: String) async throws
+    func launch(at url: URL, codexHome: String, target: CodexConnectionTarget) async throws
 }
 
 @MainActor struct NativeCodexApplication: CodexApplicationControlling {
@@ -30,22 +30,37 @@ import SwiftUI
         throw AppError.message("Codex 仍在运行，请处理退出提示后重试；连接设置未更改。")
     }
 
-    func launch(at url: URL, codexHome: String) async throws {
+    func launch(at url: URL, codexHome: String, target: CodexConnectionTarget) async throws {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         // Launch Services supplies the normal desktop environment and system
         // network settings. No source proxy or upstream credentials are injected.
-        configuration.environment = ["CODEX_HOME": codexHome]
+        configuration.environment = CodexLaunchPolicy.environment(codexHome: codexHome, target: target)
         _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
     }
 }
 
-enum CodexConnectionTarget { case official, gateway }
+enum CodexConnectionTarget { case official, gateway, restored }
+
+enum CodexLaunchPolicy {
+    static let clearedVariables = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "CODEX_AUTH_JSON", "CHATGPT_BASE_URL", "CODEX_APP_SERVER_WS_URL", "CODEX_APP_SERVER_USE_LOCAL_DAEMON", "CODEX_APP_SERVER_LOGIN_ISSUER", "CODEX_APP_SERVER_LOGIN_CLIENT_ID", "CODEX_REFRESH_TOKEN_URL_OVERRIDE", "CODEX_REVOKE_TOKEN_URL_OVERRIDE", "CODEX_CLI_PATH"]
+    static func environment(codexHome: String, target: CodexConnectionTarget) -> [String: String] {
+        // Explicit empty values override Launch Services' inherited environment.
+        // Merely omitting a key would retain a preexisting custom URL/API key.
+        var env = Dictionary(uniqueKeysWithValues: clearedVariables.map { ($0, "") })
+        env["CODEX_HOME"] = codexHome
+        env["CODEX_APP_SERVER_FORCE_CLI"] = "1"
+        env["CODEX_APP_SERVER_OPENAI_BASE_URL"] = target == .official ? "https://chatgpt.com/backend-api/codex" : ""
+        env["CODEX_APP_SERVER_CHATGPT_BASE_URL"] = target == .official ? "https://chatgpt.com/backend-api/" : ""
+        return env
+    }
+}
 
 @MainActor enum CodexConnectionTransition {
     static func run(
         controller: any CodexApplicationControlling,
         codexHome: String,
+        target: CodexConnectionTarget = .gateway,
         preflight: () async throws -> Void,
         apply: () async throws -> Void,
         phase: (String) -> Void
@@ -59,11 +74,11 @@ enum CodexConnectionTarget { case official, gateway }
         do { try await apply() }
         catch {
             // A failed configuration write must not strand an app that we quit.
-            try? await controller.launch(at: applicationURL, codexHome: codexHome)
+            try? await controller.launch(at: applicationURL, codexHome: codexHome, target: .restored)
             throw error
         }
         phase("正在启动 Codex…")
-        do { try await controller.launch(at: applicationURL, codexHome: codexHome) }
+        do { try await controller.launch(at: applicationURL, codexHome: codexHome, target: target) }
         catch { throw AppError.message("连接设置已更新，但 Codex 未能启动，请手动打开 Codex。") }
     }
 }
