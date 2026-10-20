@@ -19,7 +19,11 @@ import SwiftUI
     private var expectedDigest = ""
     private var preparedProfile: SSHRemoteProfile?
     private var preparedPort = ""
-    var canApply: Bool { prepared != .null && preparedProfile == profile && preparedPort == port }
+    private var preparedRules: [ModelCompactionRule] = []
+    private var expectedCatalogDigest = ""
+    private var expectedCompactionStateDigest = ""
+    private var expectedFiles: JSONValue = .array([])
+    func canApply(_ model: AppModel) -> Bool { prepared != .null && preparedProfile == profile && preparedPort == port && preparedRules == (model.settings.modelCompaction ?? []) }
     var running: Bool { status["running"].bool == true }
     var canRestore: Bool { !profile.destination.isEmpty && profile.codexHome.hasPrefix("/") }
     private func perform(_ label: String, action: @escaping () async throws -> Void) {
@@ -63,18 +67,39 @@ import SwiftUI
         }
     }
     func preview(_ model: AppModel) {
-        let original = profile; let originalPort = port
+        let original = profile; let originalPort = port; let rules = model.settings.modelCompaction ?? []
         perform("正在读取并预览远端配置…") {
+            try ModelCompactionRule.validate(rules)
             guard original.codexHome.hasPrefix("/"), !original.gatewayHost.isEmpty else { throw AppError.message("请先填写远端 Codex 目录和本机地址。") }
             // Preview does not start a network listener. Port configuration is applied separately.
             guard self.status["port"].number == Double(originalPort) else { throw AppError.message("入口端口尚未生效，请先开启入口或将端口改回当前值。") }
             let result = try await SSHRemoteClient(profile: original).call("read")
             guard let encoded = result["config"].string, let bytes = Data(base64Encoded: encoded), let config = String(data: bytes, encoding: .utf8) else { throw AppError.message("远端配置不是有效 UTF-8。") }
-            let rendered = try await model.remoteCall("remote.preview", .object(["id":.string(original.id),"name":.string(original.username.isEmpty ? original.destination : "\(original.username)@\(original.destination)"),"host":.string(original.gatewayHost),"config":.string(config),"aliases":.bool(original.mapExistingProviders)]))
-            guard self.profile == original, self.port == originalPort else { throw AppError.message("设置已变化，请重新预览。") }
+            var base: String?
+            if let encoded = result["compaction_base"].string {
+                guard let bytes = Data(base64Encoded: encoded), let text = String(data: bytes, encoding: .utf8) else { throw AppError.message("远端原模型配置不是有效 UTF-8。") }
+                base = text
+            }
+            var catalog: JSONValue = .null; var checks: JSONValue = .array([])
+            if !rules.isEmpty {
+                let source = try await model.remoteCall("remote.compaction.source", .object(["config": .string(base ?? config)]))
+                let fetched = try await SSHRemoteClient(profile: original).call("catalog", fields: ["catalog_path": source["catalog_path"]])
+                catalog = fetched["catalog"]; checks = fetched["expected_files"]
+            }
+            let rendered = try await model.remoteCall("remote.preview", .object(["id":.string(original.id),"name":.string(original.username.isEmpty ? original.destination : "\(original.username)@\(original.destination)"),"host":.string(original.gatewayHost),"config":.string(config),"aliases":.bool(original.mapExistingProviders),"codex_home":result["codex_home"],"model_compaction":try JSONValue.from(rules),"compaction_base":base.map(JSONValue.string) ?? .null,"catalog":catalog]))
+            guard self.profile == original, self.port == originalPort, (model.settings.modelCompaction ?? []) == rules else { throw AppError.message("设置已变化，请重新预览。") }
             self.prepared = rendered; self.expectedDigest = result["digest"].string ?? ""
+            self.expectedCatalogDigest = result["catalog_digest"].string ?? ""
+            self.expectedCompactionStateDigest = result["compaction_state_digest"].string ?? ""
+            self.expectedFiles = checks; self.preparedRules = rules
             self.preparedProfile = original; self.preparedPort = originalPort
-            self.summary = rendered["summary"].string ?? ""; self.aliases = rendered["aliases"].array.compactMap(\.string)
+            var summary = rendered["summary"].string ?? ""
+            if rules.isEmpty { summary += base == nil ? "\n模型压缩 = 保留远端设置" : "\n模型压缩 = 恢复远端原设置" }
+            else {
+                summary += "\n模型压缩（\(rules.count)）"
+                for rule in rules { summary += "\n\(rule.model)：压缩 \(rule.auto_compact_token_limit.formatted()) Token" + (rule.context_window.map { "，窗口 \($0.formatted())" } ?? "") }
+            }
+            self.summary = summary; self.aliases = rendered["aliases"].array.compactMap(\.string)
             self.status = try await model.remoteCall("remote.status")
             try self.remember(original, in: model)
         }
@@ -91,11 +116,11 @@ import SwiftUI
         perform("正在关闭远端入口…") { self.status = try await model.remoteCall("remote.stop") }
     }
     func apply(_ model: AppModel) {
-        guard canApply else { error = "请先重新预览远端配置。"; return }
+        guard canApply(model) else { error = "请先重新预览远端配置。"; return }
         let original = profile; let prepared = prepared; let digest = expectedDigest
         perform("正在验证连通性并备份远端配置…") {
             guard self.running else { throw AppError.message("请先开启远端入口。") }
-            let fields: [String:JSONValue] = ["base_url":prepared["base_url"],"key":prepared["key"],"expected_digest":.string(digest),"config":.string(Data((prepared["config"].string ?? "").utf8).base64EncodedString())]
+            let fields: [String:JSONValue] = ["base_url":prepared["base_url"],"key":prepared["key"],"expected_digest":.string(digest),"config":.string(Data((prepared["config"].string ?? "").utf8).base64EncodedString()),"catalog_action":prepared["catalog_action"],"catalog":prepared["catalog"],"expected_catalog_digest":.string(self.expectedCatalogDigest),"expected_compaction_state_digest":.string(self.expectedCompactionStateDigest),"expected_files":self.expectedFiles]
             let result = try await SSHRemoteClient(profile: original).call("apply", fields: fields)
             var saved = original; saved.backupID = result["backup_id"].string
             saved.originalBackupID = result["original_backup_id"].string

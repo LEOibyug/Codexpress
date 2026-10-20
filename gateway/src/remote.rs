@@ -18,6 +18,93 @@ use std::{
 use tokio::sync::Mutex as AsyncMutex;
 use toml_edit::{value, DocumentMut, Item, Table};
 
+pub const CATALOG_FILE: &str = ".codexpress-model-catalog.json";
+#[derive(Deserialize)]
+pub struct RemotePreview {
+    id: String,
+    name: String,
+    host: String,
+    config: String,
+    #[serde(default)]
+    aliases: bool,
+    #[serde(default)]
+    codex_home: Option<String>,
+    #[serde(default)]
+    model_compaction: Vec<crate::compaction::ModelCompactionRule>,
+    #[serde(default)]
+    compaction_base: Option<String>,
+    #[serde(default)]
+    catalog: Option<Value>,
+}
+
+pub fn compaction_source(config: &str) -> Result<Value> {
+    let doc = config
+        .parse::<DocumentMut>()
+        .map_err(|_| anyhow::anyhow!("远端配置不是有效 TOML"))?;
+    let path = doc
+        .get("model_catalog_json")
+        .map(|item| {
+            item.as_str()
+                .context("远端 model_catalog_json 须为路径字符串")
+        })
+        .transpose()?;
+    Ok(json!({"catalog_path":path}))
+}
+
+fn prepare_compaction(
+    after: &str,
+    preview: &RemotePreview,
+) -> Result<(String, Value, &'static str)> {
+    crate::compaction::validate(&preview.model_compaction)?;
+    if preview.model_compaction.is_empty() && preview.compaction_base.is_none() {
+        return Ok((after.into(), Value::Null, "keep"));
+    }
+    let base = preview
+        .compaction_base
+        .as_ref()
+        .unwrap_or(&preview.config)
+        .parse::<DocumentMut>()
+        .map_err(|_| anyhow::anyhow!("远端原模型设置不是有效 TOML"))?;
+    let mut doc = after.parse::<DocumentMut>()?;
+    if preview.model_compaction.is_empty() {
+        for key in crate::compaction::MANAGED_KEYS {
+            match base.get(key) {
+                Some(item) => doc[key] = item.clone(),
+                None => {
+                    doc.remove(key);
+                }
+            }
+        }
+        return Ok((doc.to_string(), Value::Null, "restore"));
+    }
+    let home = preview.codex_home.as_ref().context("缺少远端 Codex 目录")?;
+    let path = Path::new(home);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        bail!("远端 Codex 目录须为绝对路径");
+    }
+    let source = match &preview.catalog {
+        Some(catalog) => catalog.clone(),
+        None => crate::compaction::bundled_catalog()?,
+    };
+    let catalog = crate::compaction::catalog_from_value(source, &base, &preview.model_compaction)?;
+    let exported = serde_json::to_string_pretty(&catalog)?;
+    if exported.len() > 4 * 1024 * 1024 {
+        bail!("生成的远端模型目录超过 4 MiB，请减少模型规则");
+    }
+    doc["model_catalog_json"] = value(
+        path.join(CATALOG_FILE)
+            .to_str()
+            .context("远端模型目录路径无效")?,
+    );
+    doc.remove("model_auto_compact_token_limit");
+    doc.remove("model_context_window");
+    Ok((doc.to_string(), json!(exported), "write"))
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Peer {
     id: String,
@@ -122,14 +209,15 @@ impl RemoteAccess {
             json!({"enabled":settings.enabled,"running":listener.as_ref().is_some_and(|l|!l.task.is_finished()),"port":settings.port,"peers":settings.peers.iter().map(|p|json!({"id":p.id,"name":p.name,"host":p.host})).collect::<Vec<_>>()}),
         )
     }
-    pub fn prepare(
-        &self,
-        id: &str,
-        name: &str,
-        host: &str,
-        config: &str,
-        alias: bool,
-    ) -> Result<Value> {
+    pub fn prepare(&self, preview: RemotePreview) -> Result<Value> {
+        let RemotePreview {
+            id,
+            name,
+            host,
+            config,
+            aliases: alias,
+            ..
+        } = &preview;
         if id.is_empty()
             || id.len() > 128
             || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -147,7 +235,7 @@ impl RemoteAccess {
         let key = next
             .peers
             .iter()
-            .find(|p| p.id == id)
+            .find(|p| p.id == *id)
             .map(|p| p.key.clone())
             .unwrap_or_else(|| {
                 format!(
@@ -157,11 +245,12 @@ impl RemoteAccess {
                 )
             });
         let base_url = format!("http://{}/v1", authority(host, next.port));
-        let (after, aliases) = render_config(config, &base_url, &key, alias)?;
+        let (after, aliases) = render_config(config, &base_url, &key, *alias)?;
+        let (after, catalog, catalog_action) = prepare_compaction(&after, &preview)?;
         let mut accepted_hosts = next
             .peers
             .iter()
-            .find(|p| p.id == id)
+            .find(|p| p.id == *id)
             .map(|p| {
                 let mut names = p.accepted_hosts.clone();
                 names.push(p.host.clone());
@@ -174,14 +263,14 @@ impl RemoteAccess {
         if accepted_hosts.len() > 16 {
             bail!("此机器累计地址过多，请撤销旧 Key 后重新配置");
         }
-        next.peers.retain(|p| p.id != id);
+        next.peers.retain(|p| p.id != *id);
         if next.peers.len() >= 100 {
             bail!("最多支持100台远端机器");
         }
         next.peers.push(Peer {
-            id: id.into(),
-            name: name.into(),
-            host: host.into(),
+            id: id.clone(),
+            name: name.clone(),
+            host: host.clone(),
             key: key.clone(),
             accepted_hosts,
         });
@@ -189,7 +278,7 @@ impl RemoteAccess {
         *current = next;
         // Private IPC only. UI displays summary, never after/key/config.
         Ok(
-            json!({"base_url":base_url,"key":key,"config":after,"aliases":aliases,"provider":"codexpress","summary":format!("model_provider = codexpress\nbase_url = {base_url}\nAPI Key = 已设置（独立远端凭据）\n认证方式 = 来源池")}),
+            json!({"base_url":base_url,"key":key,"config":after,"catalog":catalog,"catalog_action":catalog_action,"model_limits":preview.model_compaction,"aliases":aliases,"provider":"codexpress","summary":format!("model_provider = codexpress\nbase_url = {base_url}\nAPI Key = 已设置（独立远端凭据）\n认证方式 = 来源池")}),
         )
     }
     pub async fn revoke(&self, id: &str) -> Result<Value> {

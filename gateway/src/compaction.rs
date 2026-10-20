@@ -57,7 +57,7 @@ pub fn catalog(
     rules: &[ModelCompactionRule],
 ) -> Result<Value> {
     validate(rules)?;
-    let mut catalog = if let Some(path) = original.get("model_catalog_json") {
+    let catalog = if let Some(path) = original.get("model_catalog_json") {
         let path = path
             .as_str()
             .context("model_catalog_json 必须是路径字符串")?;
@@ -70,8 +70,24 @@ pub fn catalog(
     } else if home.join("models_cache.json").exists() {
         load_catalog(&home.join("models_cache.json"))?
     } else {
-        serde_json::from_str(include_str!("../resources/codex-models-0.162.1.json"))?
+        bundled_catalog()?
     };
+    catalog_from_value(catalog, original, rules)
+}
+
+pub fn bundled_catalog() -> Result<Value> {
+    Ok(serde_json::from_str(include_str!(
+        "../resources/codex-models-0.162.1.json"
+    ))?)
+}
+
+/// Apply rules to supplied metadata without opening any local Codex files.
+pub fn catalog_from_value(
+    mut catalog: Value,
+    original: &DocumentMut,
+    rules: &[ModelCompactionRule],
+) -> Result<Value> {
+    validate(rules)?;
     let models = catalog
         .get_mut("models")
         .and_then(Value::as_array_mut)

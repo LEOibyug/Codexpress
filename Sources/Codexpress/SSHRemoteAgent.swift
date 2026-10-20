@@ -5,7 +5,9 @@ enum SSHRemoteAgent {
     static let script = #"""
 import base64, fcntl, hashlib, json, os, pathlib, re, socket, stat, sys, tempfile, time, urllib.request, uuid
 LIMIT = 8 * 1024 * 1024
-NAMES = ('config.toml', 'auth.json', 'auth.json.bak')
+CORE_NAMES = ('config.toml', 'auth.json', 'auth.json.bak')
+CATALOG = '.codexpress-model-catalog.json'
+NAMES = CORE_NAMES + (CATALOG,)
 
 class AgentError(Exception): pass
 
@@ -81,7 +83,7 @@ def load_backup(path, name):
         fail('备份清单损坏；请检查远端 .codexpress-backups。')
     if not isinstance(manifest, dict) or manifest.get('home') != str(path): fail('备份不属于此 Codex 目录。')
     files = manifest.get('files', {})
-    if not isinstance(files, dict) or not all(n in files for n in NAMES) or len(files) > 100: fail('备份清单无效。')
+    if not isinstance(files, dict) or not all(n in files for n in CORE_NAMES) or len(files) > 100: fail('备份清单无效。')
     values = {}; total = 0
     for name, expected in files.items():
         if '/' in name or '\\' in name or name not in NAMES and not name.endswith('.config.toml'): fail('备份文件名无效。')
@@ -135,6 +137,55 @@ def pin_original(path, name, values):
     if read(target) is None:
         atomic(target, json.dumps({'version': 1, 'home': str(path), 'backup_id': name, 'config_digest': digest(values['config.toml'])}).encode())
 
+def compaction_original(path):
+    root = path / '.codexpress-backups'
+    if root.is_symlink(): fail('备份目录不能是符号链接。')
+    raw = read(root / 'compaction-original.json')
+    if raw is None: return None
+    try:
+        info = json.loads(raw)
+    except (ValueError, UnicodeError):
+        fail('模型压缩原始记录损坏；未修改。')
+    if not isinstance(info, dict) or info.get('version') != 1 or info.get('home') != str(path): fail('模型压缩原始记录无效。')
+    values = load_backup(path, info.get('backup_id'))
+    if CATALOG not in values or digest(values['config.toml']) != info.get('config_digest') or digest(values[CATALOG]) != info.get('catalog_digest'): fail('模型压缩原始备份校验失败。')
+    return info['backup_id'], values
+
+def pin_compaction(path, name, values):
+    target = path / '.codexpress-backups' / 'compaction-original.json'
+    if read(target) is None:
+        atomic(target, json.dumps({'version': 1, 'home': str(path), 'backup_id': name, 'config_digest': digest(values['config.toml']), 'catalog_digest': digest(values[CATALOG])}).encode())
+
+def catalog_path(path, raw):
+    if not isinstance(raw, str) or not raw or '..' in pathlib.Path(raw).parts: fail('远端模型目录路径无效。')
+    selected = pathlib.Path(os.path.expanduser(raw))
+    return selected if selected.is_absolute() else path / selected
+
+def source_catalog(path, raw):
+    candidates = ([catalog_path(path, raw)] if raw is not None else []) + [path / 'models_cache.json']
+    expected = []
+    for selected in dict.fromkeys(candidates):
+        data = read(selected)
+        expected.append({'path': str(selected), 'digest': digest(data)})
+        if data is None: continue
+        try:
+            catalog = json.loads(data)
+        except (ValueError, UnicodeError):
+            fail('远端模型目录不是有效 JSON；未修改。')
+        if not isinstance(catalog, dict) or not isinstance(catalog.get('models'), list) or not catalog['models']: fail('远端模型目录缺少 models 列表。')
+        result = {'models': catalog['models']}
+        if len(json.dumps(result).encode()) > 4 * 1024 * 1024: fail('远端模型目录超过 4 MiB；未修改。')
+        return {'catalog': result, 'expected_files': expected}
+    return {'catalog': None, 'expected_files': expected}
+
+def verify_model_files(path, payload):
+    if 'expected_catalog_digest' in payload and digest(read(path / CATALOG)) != payload['expected_catalog_digest']: fail('远端模型目录已变化，请重新预览。')
+    if 'expected_compaction_state_digest' in payload and digest(read(path / '.codexpress-backups/compaction-original.json')) != payload['expected_compaction_state_digest']: fail('模型压缩原始记录已变化，请重新预览。')
+    checks = payload.get('expected_files', [])
+    if not isinstance(checks, list) or len(checks) > 2: fail('模型目录检查列表无效。')
+    for item in checks:
+        if digest(read(catalog_path(path, item['path']))) != item['digest']: fail('远端来源模型目录已变化，请重新预览。')
+
 def probe(payload):
     base = payload.get('base_url', '')
     from urllib.parse import urlsplit
@@ -165,6 +216,7 @@ def main(payload):
         return {'user_home': user_home, 'candidates': candidates, 'client_ip': parts[0] if len(parts) == 4 else '', 'remote_host': socket.gethostname()}
     if action == 'probe': return probe(payload)
     path = home_path(payload.get('codex_home', ''))
+    if action == 'catalog': return source_catalog(path, payload.get('catalog_path'))
     lock = None
     if action in ('apply', 'restore'):
         lock_fd = os.open(str(path / '.codexpress-remote.lock'), os.O_WRONLY | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
@@ -172,26 +224,55 @@ def main(payload):
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     if action == 'read':
         value = read(path / 'config.toml')
+        prior = compaction_original(path)
         # No auth.json contents leave the server.
-        return {'config': base64.b64encode(value or b'').decode(), 'digest': digest(value), 'codex_home': str(path)}
+        return {'config': base64.b64encode(value or b'').decode(), 'digest': digest(value), 'codex_home': str(path), 'catalog_digest': digest(read(path / CATALOG)), 'compaction_state_digest': digest(read(path / '.codexpress-backups/compaction-original.json')), 'compaction_base': base64.b64encode(prior[1]['config.toml'] or b'').decode() if prior else None}
     if action == 'apply':
         probe(payload)
         value = read(path / 'config.toml')
         if digest(value) != payload.get('expected_digest'): fail('远端配置已变化，请重新预览。')
         next_config = base64.b64decode(payload['config'], validate=True)
         if len(next_config) > LIMIT: fail('配置过大；未修改。')
+        catalog_action = payload.get('catalog_action', 'keep')
+        if catalog_action not in ('keep', 'write', 'restore'): fail('模型目录操作无效。')
+        if catalog_action != 'keep' and not all(key in payload for key in ('expected_catalog_digest', 'expected_compaction_state_digest')): fail('请重新预览模型压缩设置。')
+        verify_model_files(path, payload)
+        prior = compaction_original(path)
+        next_catalog = None
+        if catalog_action == 'write':
+            text = payload.get('catalog')
+            if not isinstance(text, str) or len(text.encode()) > 4 * 1024 * 1024: fail('模型目录内容无效或过大。')
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict) or not isinstance(parsed.get('models'), list) or not parsed['models']: fail('模型目录缺少 models 列表。')
+            next_catalog = text.encode()
+        elif catalog_action == 'restore':
+            if prior is None: fail('模型压缩原始记录不存在，未修改。')
+            next_catalog = prior[1][CATALOG]
         baseline = original(path, optional=True)
         if baseline is None and managed(value): fail('当前已是 Codexpress 网关配置，但未找到接入前备份；未修改。')
         backup_id = backup(path, 'before_apply')
         if digest(read(path / 'config.toml')) != payload['expected_digest']: fail('备份期间远端配置已变化，请重新预览。')
+        verify_model_files(path, payload)
+        checkpoint = load_backup(path, backup_id)
         if baseline is None: baseline = (backup_id, load_backup(path, backup_id))
         pin_original(path, *baseline)
-        atomic(path / 'config.toml', next_config)
+        if catalog_action == 'write': pin_compaction(path, backup_id, checkpoint)
+        try:
+            if catalog_action != 'keep': atomic(path / CATALOG, next_catalog)
+            atomic(path / 'config.toml', next_config)
+        except Exception:
+            for name in ('config.toml', CATALOG) if catalog_action != 'keep' else ('config.toml',):
+                try: atomic(path / name, checkpoint[name])
+                except Exception: pass
+            fail('远端应用失败，已尝试撤回变更；操作前备份仍保留。')
         return {'applied': True, 'backup_id': backup_id, 'original_backup_id': baseline[0], 'codex_home': str(path)}
     if action == 'restore':
         if 'backup_id' in payload: fail('还原仅使用首次接入前备份，不接受上次备份标识。')
         name, values = original(path)
         pin_original(path, name, values)
+        if CATALOG not in values:
+            prior = compaction_original(path)
+            if prior: values[CATALOG] = prior[1][CATALOG]
         recovery = backup(path, 'before_restore')
         current = {n: read(path / n) for n in values}
         try:

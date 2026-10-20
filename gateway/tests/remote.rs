@@ -13,6 +13,74 @@ use serde_json::json;
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn remote_compaction_uses_remote_paths_preserves_metadata_and_can_restore_prior_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(dir.path().to_path_buf(), 17863, "fixture-local".into()).unwrap();
+    let original = "model='custom'\nmodel_auto_compact_token_limit=30000\nmodel_context_window=100000\nmodel_catalog_json='own-models.json'\n[mcp_servers.keep]\ncommand='keep-tool'\n";
+    let catalog = json!({"models":[{"slug":"custom","context_window":120000,"max_context_window":200000,"custom_capability":{"keep":true},"model_messages":{"instructions_template":"fixture metadata"}}]});
+    let mut payload = json!({"id":"remote-limits","name":"Remote","host":"192.0.2.10","config":original,"codex_home":"/home/fixture/.codex","catalog":catalog,"model_compaction":[{"model":"custom","auto_compact_token_limit":60000,"context_window":100000},{"model":"custom-v2","auto_compact_token_limit":40000,"context_window":80000}]});
+    let prepared = management::dispatch(&state, "remote.preview", payload.clone())
+        .await
+        .unwrap();
+    let doc = prepared["config"]
+        .as_str()
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        doc["model_catalog_json"].as_str(),
+        Some("/home/fixture/.codex/.codexpress-model-catalog.json")
+    );
+    assert!(doc.get("model_auto_compact_token_limit").is_none());
+    assert!(doc.get("model_context_window").is_none());
+    assert_eq!(
+        doc["mcp_servers"]["keep"]["command"].as_str(),
+        Some("keep-tool")
+    );
+    let generated: serde_json::Value =
+        serde_json::from_str(prepared["catalog"].as_str().unwrap()).unwrap();
+    assert_eq!(prepared["catalog_action"], "write");
+    assert_eq!(generated["models"][0]["auto_compact_token_limit"], 60000);
+    assert_eq!(generated["models"][0]["custom_capability"]["keep"], true);
+    assert_eq!(
+        generated["models"][1]["model_messages"]["instructions_template"],
+        "fixture metadata"
+    );
+    assert_eq!(generated["models"][1]["context_window"], 80000);
+    payload["config"] = prepared["config"].clone();
+    payload["compaction_base"] = json!(original);
+    payload["model_compaction"] = json!([]);
+    let reset = management::dispatch(&state, "remote.preview", payload.clone())
+        .await
+        .unwrap();
+    let reset_doc = reset["config"]
+        .as_str()
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(reset["catalog_action"], "restore");
+    assert_eq!(
+        reset_doc["model_auto_compact_token_limit"].as_integer(),
+        Some(30000)
+    );
+    assert_eq!(reset_doc["model_context_window"].as_integer(), Some(100000));
+    assert_eq!(
+        reset_doc["model_catalog_json"].as_str(),
+        Some("own-models.json")
+    );
+    assert_eq!(reset_doc["model_provider"].as_str(), Some("codexpress"));
+    payload["model_compaction"] =
+        json!([{"model":"custom","auto_compact_token_limit":95000,"context_window":100000}]);
+    assert!(management::dispatch(&state, "remote.preview", payload)
+        .await
+        .is_err());
+    assert_eq!(
+        remote::compaction_source(original).unwrap()["catalog_path"],
+        "own-models.json"
+    );
+}
+
+#[tokio::test]
 async fn remote_listener_has_separate_credentials_host_restrictions_revoke_and_restart() {
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", upstream.local_addr().unwrap());

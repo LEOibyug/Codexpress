@@ -71,13 +71,12 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
                 .revoke(payload["id"].as_str().context("缺少机器标识")?)
                 .await
         }
-        "remote.preview" => state.remote.prepare(
-            payload["id"].as_str().context("缺少机器标识")?,
-            payload["name"].as_str().context("缺少机器名称")?,
-            payload["host"].as_str().context("缺少本机地址")?,
-            payload["config"].as_str().context("缺少配置内容")?,
-            payload["aliases"].as_bool().unwrap_or(false),
+        "remote.compaction.source" => crate::remote::compaction_source(
+            payload["config"].as_str().context("缺少远端模型配置")?,
         ),
+        "remote.preview" => state
+            .remote
+            .prepare(serde_json::from_value(payload).context("远端预览参数无效")?),
         "history.status" => state
             .history
             .status()

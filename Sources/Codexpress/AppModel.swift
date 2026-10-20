@@ -530,7 +530,7 @@ import ServiceManagement
             try ModelCompactionRule.validate(rules)
             var next = self.settings; next.modelCompaction = rules
             try self.persistSettings(next); self.preview = .null
-            self.notice = "模型规则已保存。请预览连接配置并应用，再重启 Codex 使规则生效。"
+            self.notice = "模型规则已保存。请在本机或远端预览并应用连接配置，再重启对应的 Codex。"
         }
     }
     func configPayload() throws -> JSONValue {

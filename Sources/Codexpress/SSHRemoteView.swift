@@ -34,7 +34,7 @@ struct SSHRemoteView: View {
                 };confirmation=nil
             }
         } message: {
-            Text(confirmation == "start" ? "将监听本机所有 IPv4 网络接口的所选端口。远端使用独立 Key；HTTP 连接仅适合可信局域网或 VPN，请勿直接暴露到公网。" : confirmation == "apply" ? "将先从远端验证网关连通性，再备份 config.toml、auth.json 等文件并更新配置。请先结束远端 Codex 的运行任务，应用后重启远端 Codex。" : confirmation == "restore" ? "将恢复此 Codex 目录首次接入前的配置与文件认证，接入后自行修改的这些设置也会还原。当前状态会另行备份。请先结束远端 Codex 任务，还原后重启。" : "此机器的旧 Key 将无法发起新请求，远端配置和对话记录保留。")
+            Text(confirmation == "start" ? "将监听本机所有 IPv4 网络接口的所选端口。远端使用独立 Key；HTTP 连接仅适合可信局域网或 VPN，请勿直接暴露到公网。" : confirmation == "apply" ? "将先从远端验证网关连通性，再备份配置、文件认证与模型目录，并应用本机已保存的模型压缩规则。请先结束远端 Codex 的运行任务，应用后重启远端 Codex。" : confirmation == "restore" ? "将恢复此 Codex 目录首次接入前的配置、文件认证与模型目录，接入后自行修改的这些设置也会还原。当前状态会另行备份。请先结束远端 Codex 任务，还原后重启。" : "此机器的旧 Key 将无法发起新请求，远端配置和对话记录保留。")
         }
     }
     private var ingress: some View {
@@ -109,8 +109,8 @@ struct SSHRemoteView: View {
             Text(remote.summary).font(.system(size:11,design:.monospaced)).textSelection(.enabled)
             if !remote.aliases.isEmpty { Text("接入已有供应商："+remote.aliases.joined(separator:"、")).font(.system(size:11)).foregroundStyle(.secondary) }
             HStack {
-                Text(remote.canApply ? "配置与文件认证将在远端备份。" : "设置已变化，请重新预览。").font(.system(size:11)).foregroundStyle(.secondary)
-                Spacer();Button("备份并应用…"){confirmation="apply"}.disabled(!remote.canApply || !remote.running).buttonStyle(.borderedProminent)
+                Text(!remote.canApply(model) ? "设置已变化，请重新预览。" : !remote.running ? "请先开启远端入口，再重新预览。" : "配置、文件认证与模型目录将在远端备份。").font(.system(size:11)).foregroundStyle(.secondary)
+                Spacer();Button("备份并应用…"){confirmation="apply"}.disabled(!remote.canApply(model) || !remote.running).buttonStyle(.borderedProminent)
             }
         }
     }
