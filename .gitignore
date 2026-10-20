@@ -11,3 +11,5 @@ dist/
 xcuserdata/
 *.log
 
+# Local agent instructions
+AGENTS.md
