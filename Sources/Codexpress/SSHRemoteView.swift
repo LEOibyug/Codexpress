@@ -20,7 +20,7 @@ struct SSHRemoteView: View {
                 if !remote.status["peers"].array.isEmpty { peers }
             }.settingsPage()
         }
-        .task { await remote.refresh(model) }
+        .task { await remote.loadSSHConfig(); await remote.refresh(model) }
         .disabled(remote.busy || model.busy || !model.running)
         .alert(confirmation == "apply" ? "应用远端连接？" : confirmation == "restore" ? "还原远端备份？" : confirmation == "start" ? "开启远端入口？" : "撤销此机器的 Key？", isPresented: Binding(get:{confirmation != nil},set:{if !$0 {confirmation=nil}})) {
             Button("取消", role:.cancel){confirmation=nil}
@@ -52,6 +52,21 @@ struct SSHRemoteView: View {
     private var connection: some View {
         SettingsCard("SSH 连接",symbol:"terminal") {
             VStack(alignment:.leading,spacing:12) {
+                HStack(spacing: 10) {
+                    Menu {
+                        ForEach(remote.configuredHosts, id: \.self) { host in
+                            Button(host) { remote.selectConfiguredHost(host, saved: model.settings.sshRemoteProfiles ?? []) }
+                        }
+                    } label: { Label("从 SSH 配置选择", systemImage: "list.bullet.rectangle") }
+                        .disabled(remote.configuredHosts.isEmpty || remote.readingSSHConfig)
+                    Text("~/.ssh/config" + (remote.configuredHosts.isEmpty ? "" : " · \(remote.configuredHosts.count) 个主机"))
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    if remote.readingSSHConfig { ProgressView().controlSize(.small) }
+                    Button { Task { await remote.loadSSHConfig() } } label: { Image(systemName: "arrow.clockwise") }
+                        .accessibilityLabel("刷新 SSH 配置").help("刷新 SSH 配置").disabled(remote.readingSSHConfig)
+                }
+                if let message = remote.sshConfigMessage { Text(message).font(.system(size: 11)).foregroundStyle(.secondary) }
                 if let profiles=model.settings.sshRemoteProfiles, !profiles.isEmpty {
                     HStack {
                         Menu("已保存的机器") { ForEach(profiles){p in Button(p.username.isEmpty ? p.destination : "\(p.username)@\(p.destination)"){remote.select(p)} } }

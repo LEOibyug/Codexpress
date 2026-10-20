@@ -12,6 +12,9 @@ import SwiftUI
     @Published private(set) var candidates: [String] = []
     @Published private(set) var summary = ""
     @Published private(set) var aliases: [String] = []
+    @Published private(set) var configuredHosts: [String] = []
+    @Published private(set) var readingSSHConfig = false
+    @Published private(set) var sshConfigMessage: String?
     private var prepared: JSONValue = .null
     private var expectedDigest = ""
     private var preparedProfile: SSHRemoteProfile?
@@ -28,6 +31,20 @@ import SwiftUI
         catch { self.error = error.localizedDescription }
     }
     func select(_ value: SSHRemoteProfile) { profile = value; summary = ""; prepared = .null; candidates = [] }
+    func loadSSHConfig() async {
+        guard !readingSSHConfig else { return }
+        readingSSHConfig = true
+        let catalog = await Task.detached(priority: .utility) { SSHConfigCatalog.load() }.value
+        configuredHosts = catalog.hosts
+        sshConfigMessage = catalog.incomplete ? "部分 SSH 配置未能读取，可手动填写别名。" : !catalog.exists ? "未找到 ~/.ssh/config，可手动填写连接。" : catalog.hosts.isEmpty ? "配置中没有明确的 Host 别名，可手动填写。" : nil
+        readingSSHConfig = false
+    }
+    func selectConfiguredHost(_ alias: String, saved: [SSHRemoteProfile]) {
+        var next = saved.first { $0.destination.caseInsensitiveCompare(alias) == .orderedSame } ?? SSHRemoteProfile()
+        next.destination = alias
+        next.username = ""; next.sshPort = ""; next.identityFile = ""
+        select(next); error = nil; notice = nil
+    }
     private func remember(_ value: SSHRemoteProfile, in model: AppModel) throws {
         var profiles = model.settings.sshRemoteProfiles ?? []; profiles.removeAll { $0.id == value.id }; profiles.append(value)
         try model.saveRemoteProfiles(profiles)

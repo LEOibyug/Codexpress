@@ -2,6 +2,67 @@ import XCTest
 @testable import Codexpress
 
 final class SSHRemoteTests: XCTestCase {
+    func testLocalSSHConfigDiscoversExplicitAliasesAcrossIncludesWithoutExecutingCommands() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let ssh = home.appendingPathComponent(".ssh")
+        try FileManager.default.createDirectory(at: ssh.appendingPathComponent("hosts"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: ssh.appendingPathComponent("with spaces"), withIntermediateDirectories: true)
+        try """
+        Host=alpha spare # comment
+            User worker
+            IdentityFile /not-read/private-key
+        Include hosts/*.conf "with spaces/extra.conf"
+        Include ~/.ssh/hosts/more.conf missing-*.conf
+        Host * !blocked stage-? stage-* [abc] -invalid
+        Match exec "touch \(home.path)/must-not-exist"
+            ProxyCommand touch \(home.path)/must-not-exist
+        hOsT "quoted-host" ALPHA
+        """.write(to: ssh.appendingPathComponent("config"), atomically: true, encoding: .utf8)
+        try "Host beta backup\nInclude config\n".write(to: ssh.appendingPathComponent("hosts/main.conf"), atomically: true, encoding: .utf8)
+        try "Host gamma\n".write(to: ssh.appendingPathComponent("hosts/more.conf"), atomically: true, encoding: .utf8)
+        try "Host delta\n".write(to: ssh.appendingPathComponent("with spaces/extra.conf"), atomically: true, encoding: .utf8)
+        let catalog = SSHConfigCatalog.load(home: home)
+        XCTAssertEqual(catalog.hosts, ["alpha", "backup", "beta", "delta", "gamma", "quoted-host", "spare"])
+        XCTAssertTrue(catalog.exists); XCTAssertFalse(catalog.incomplete)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent("must-not-exist").path))
+    }
+    func testLocalSSHConfigHandlesMissingFilesSymlinksAndOversizedIncludes() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let ssh = home.appendingPathComponent(".ssh")
+        XCTAssertFalse(SSHConfigCatalog.load(home: home).exists)
+        try FileManager.default.createDirectory(at: ssh, withIntermediateDirectories: true)
+        try Data().write(to: ssh.appendingPathComponent("config"))
+        let empty = SSHConfigCatalog.load(home: home)
+        XCTAssertTrue(empty.exists); XCTAssertFalse(empty.incomplete); XCTAssertTrue(empty.hosts.isEmpty)
+        try FileManager.default.removeItem(at: ssh.appendingPathComponent("config"))
+        let shared = home.appendingPathComponent("shared-config")
+        try "Host available\nInclude huge.conf\n".write(to: shared, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: ssh.appendingPathComponent("config"), withDestinationURL: shared)
+        try Data(repeating: 65, count: 1024 * 1024 + 1).write(to: ssh.appendingPathComponent("huge.conf"))
+        let catalog = SSHConfigCatalog.load(home: home)
+        XCTAssertEqual(catalog.hosts, ["available"])
+        XCTAssertTrue(catalog.exists); XCTAssertTrue(catalog.incomplete)
+    }
+    @MainActor func testSelectingConfiguredHostUsesSSHDefaultsAndKeepsMachineMetadataIsolated() {
+        let model = SSHRemoteModel()
+        model.profile.destination = "old-server"; model.profile.codexHome = "/old/.codex"; model.profile.backupID = "old-backup"
+        model.profile.username = "old-user"; model.profile.sshPort = "2222"; model.profile.identityFile = "/old/key"
+        let previousID = model.profile.id
+        model.profile.destination = "new-server" // Editing the field does not identify the saved machine.
+        model.selectConfiguredHost("new-server", saved: [])
+        XCTAssertNotEqual(model.profile.id, previousID)
+        XCTAssertEqual(model.profile.destination, "new-server"); XCTAssertEqual(model.profile.codexHome, ""); XCTAssertNil(model.profile.backupID)
+        var saved = SSHRemoteProfile(); saved.destination = "known-server"; saved.codexHome = "/known/.codex"; saved.backupID = "known-backup"
+        saved.username = "override"; saved.sshPort = "2222"; saved.identityFile = "/some/key"
+        model.selectConfiguredHost("known-server", saved: [saved])
+        XCTAssertEqual(model.profile.id, saved.id); XCTAssertEqual(model.profile.backupID, "known-backup")
+        XCTAssertEqual(model.profile.codexHome, "/known/.codex")
+        XCTAssertEqual(model.profile.username, ""); XCTAssertEqual(model.profile.sshPort, ""); XCTAssertEqual(model.profile.identityFile, "")
+        let args = try? model.profile.arguments()
+        XCTAssertFalse(args?.contains("-l") ?? true); XCTAssertFalse(args?.contains("-p") ?? true); XCTAssertFalse(args?.contains("-i") ?? true)
+    }
     func testSSHArgumentsUseKnownHostsAndSeparateOptionsWithoutShellInterpolation() throws {
         var profile=SSHRemoteProfile();profile.destination="server-alias";profile.username="worker";profile.sshPort="2222";profile.identityFile="/tmp/test key"
         let args=try profile.arguments()
