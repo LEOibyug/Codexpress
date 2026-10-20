@@ -53,7 +53,9 @@ def check(helper, codex, scenario):
                               "content": [{"type": "output_text", "text": "LOCAL_CONTINUATION_OK", "annotations": []}]}]
                 response = {"id": f"resp-fixture-{index}", "object": "response", "status": "completed",
                             "model": data["model"], "output": items,
-                            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}}
+                            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+                                      "input_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 5},
+                                      "output_tokens_details": {"reasoning_tokens": 8}}}
                 events = [{"type": "response.created", "response": {"id": response["id"], "output": [], "status": "in_progress"}}]
                 events.extend({"type": "response.output_item.done", "output_index": i, "item": item}
                               for i, item in enumerate(items))
@@ -116,8 +118,25 @@ def check(helper, codex, scenario):
                 passed = run.returncode == 0 and "LOCAL_CONTINUATION_OK" in run.stdout and len(calls) == 2 and not failures
                 result = {"scenario": scenario, "passed": passed, "upstream_requests": len(calls),
                           "conflict_409": "409 Conflict" in run.stderr + run.stdout, "fixture_failures": failures}
-                print(json.dumps(result), flush=True)
+                if not passed:
+                    print(json.dumps(result), flush=True)
                 assert passed, f"local continuation check failed: {scenario}"
+                usage = ipc("usage", {"days": 1, "source_id": "fixture"})
+                assert usage["inflight"] == 0 and len(usage["recent"]) == 2, "usage attempt lifecycle incorrect"
+                if scenario == "long-turn-header":
+                    assert usage["rows"][0]["input_tokens"] == 200 and usage["rows"][0]["output_tokens"] == 40, "usage counted incorrectly"
+                reported = [row for row in usage["recent"] if row["complete"]]
+                assert len(reported) == (2 if scenario == "long-turn-header" else 1), "bounded observation not respected"
+                if scenario == "oversized-reasoning":
+                    assert any(row["token_details"]["input_estimated"] for row in usage["recent"]), "oversized usage must remain estimated"
+                for row in usage["recent"]:
+                    if not row["complete"]:
+                        continue
+                    assert row["token_details"]["reasoning_output_tokens"] == 8, "reasoning usage missing"
+                    assert row["token_details"]["cache_write_input_tokens"] == 5, "cache write usage missing"
+                    assert row["token_details"]["input_estimated"] is False, "reported usage replaced by estimate"
+                result["usage_verified"] = True
+                print(json.dumps(result), flush=True)
                 ipc("config.restore", {"codex_home": str(home)})
             finally:
                 process.terminate()

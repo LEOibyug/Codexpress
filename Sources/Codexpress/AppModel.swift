@@ -8,6 +8,9 @@ import ServiceManagement
     @Published private(set) var settings = AppSettings()
     @Published private(set) var status: JSONValue = .null
     @Published private(set) var usage: JSONValue = .null
+    @Published private(set) var usageRefreshing = false
+    @Published private(set) var usageError: String?
+    @Published private(set) var usageUpdatedAt: Date?
     @Published var error: String?
     @Published var notice: String?
     @Published private(set) var busy = false
@@ -44,6 +47,8 @@ import ServiceManagement
     private var starting = false
     private var lastModelRefresh: [String: Date] = [:]
     private var modelRefreshTask: Task<Void, Never>?
+    private var usageDays = 30
+    private var usageSourceID: String?
     var sources: [Source] { settings.sources.sorted { $0.priority < $1.priority } }
     var baseURL: String { status["base_url"].string ?? "http://127.0.0.1:\(settings.port)/v1" }
     var routingMode: String { status["mode"].string ?? settings.mode }
@@ -364,7 +369,21 @@ import ServiceManagement
         try await updateStatus()
     }
     func refresh(_ id: String) { perform { try await self.queryOfficial(id, includeCredits: true) } }
-    func refreshUsage(days: Int) { perform { self.usage = try await self.client.call("usage", .object(["days": .number(Double(days))])) } }
+    func refreshUsage(days: Int, sourceID: String? = nil) { Task { await loadUsage(days: days, sourceID: sourceID) } }
+    func loadUsage(days: Int, sourceID: String? = nil) async {
+        if usageDays != days { usage = .null; usageUpdatedAt = nil }
+        usageDays = days; usageSourceID = sourceID
+        guard running, !usageRefreshing else { return }
+        usageRefreshing = true
+        defer { usageRefreshing = false }
+        do {
+            let snapshot = try await client.call("usage", .object(["days": .number(Double(days)), "source_id": sourceID.map(JSONValue.string) ?? .null]))
+            guard !Task.isCancelled, usageDays == days, usageSourceID == sourceID else { return }
+            usage = snapshot; usageError = nil; usageUpdatedAt = Date()
+        } catch {
+            if !Task.isCancelled, usageDays == days, usageSourceID == sourceID { usageError = error.localizedDescription }
+        }
+    }
     func prepareCredit(source: Source, credit: JSONValue) async throws -> CreditConfirmation {
         try requireWritableMetadata()
         guard let before = settings.sources.first(where: { $0.id == source.id }), before == source else { throw AppError.message("来源已删除或发生变化，请重新选择重置卡。") }

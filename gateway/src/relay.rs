@@ -1,7 +1,7 @@
 use crate::{
     model::{now, AppState, Source},
     routing, transport,
-    usage::UsageRecord,
+    usage::{content_units, estimated_tokens, text_units, TokenDetails, UsageRecord},
 };
 use axum::{
     body::{to_bytes, Body},
@@ -14,7 +14,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{atomic::Ordering, Arc},
     time::Instant,
 };
@@ -112,36 +112,97 @@ struct Attempt {
     state: Arc<AppState>,
     record: Option<UsageRecord>,
     started: Instant,
+    published: Instant,
+    first_output: Option<Instant>,
 }
 impl Attempt {
-    fn new(state: Arc<AppState>, source: &Source, request_id: &str, model: &str) -> Self {
+    fn new(
+        state: Arc<AppState>,
+        source: &Source,
+        request_id: &str,
+        model: &str,
+        input_units: u64,
+    ) -> Self {
         state.inflight.fetch_add(1, Ordering::Relaxed);
+        let record = UsageRecord {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            request_id: request_id.into(),
+            source_id: source.id.clone(),
+            source_name: source.name.clone(),
+            model: model.into(),
+            started_at: now(),
+            status: "connecting".into(),
+            input_tokens: estimated_tokens(input_units),
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            token_details: TokenDetails {
+                input_estimated: true,
+                output_estimated: true,
+                ..Default::default()
+            },
+            complete: false,
+            latency_ms: 0,
+            first_token_latency_ms: None,
+            generation_ms: None,
+        };
+        state.usage.start(&record);
         Self {
             state,
             started: Instant::now(),
-            record: Some(UsageRecord {
-                request_id: request_id.into(),
-                source_id: source.id.clone(),
-                source_name: source.name.clone(),
-                model: model.into(),
-                started_at: now(),
-                status: "interrupted".into(),
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_input_tokens: 0,
-                complete: false,
-                latency_ms: 0,
-            }),
+            published: Instant::now(),
+            record: Some(record),
+            first_output: None,
         }
     }
     fn finish(&mut self, status: &str, observer: Option<&Observer>) {
         if let Some(record) = &mut self.record {
+            let mut changed = record.status != status;
             record.status = status.into();
             if let Some(observer) = observer {
-                record.input_tokens = observer.input;
-                record.output_tokens = observer.output;
-                record.cached_input_tokens = observer.cached.min(observer.input);
-                record.complete = observer.usage_seen && observer.terminal;
+                changed |= observer.terminal && !record.token_details.stream_complete;
+                if observer.streaming_output && self.first_output.is_none() {
+                    changed = true;
+                    let first = Instant::now();
+                    record.first_token_latency_ms = Some(
+                        first
+                            .duration_since(self.started)
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64,
+                    );
+                    self.first_output = Some(first);
+                }
+                if let Some(first) = self.first_output {
+                    if !record.token_details.stream_complete {
+                        record.generation_ms =
+                            Some(first.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                    }
+                }
+                if let Some(input) = observer.input {
+                    record.input_tokens = input;
+                }
+                record.output_tokens = observer
+                    .output
+                    .unwrap_or_else(|| estimated_tokens(observer.output_units()));
+                record.cached_input_tokens = observer
+                    .cached
+                    .map(|cached| observer.input.map_or(cached, |input| cached.min(input)))
+                    .unwrap_or(0);
+                record.token_details = TokenDetails {
+                    input_estimated: observer.input.is_none(),
+                    output_estimated: observer.output.is_none(),
+                    output_available: observer.output.is_some() || observer.output_observed,
+                    cached_input_reported: observer.cached.is_some(),
+                    cache_write_input_tokens: observer.cache_write,
+                    reasoning_output_tokens: observer.reasoning,
+                    reported_total_tokens: observer.total,
+                    stream_complete: observer.terminal,
+                };
+                record.complete =
+                    observer.input.is_some() && observer.output.is_some() && observer.terminal;
+            }
+            if changed || status != "streaming" || self.published.elapsed().as_millis() >= 100 {
+                self.state.usage.update(record);
+                self.published = Instant::now();
             }
         }
     }
@@ -149,7 +210,17 @@ impl Attempt {
 impl Drop for Attempt {
     fn drop(&mut self) {
         if let Some(mut record) = self.record.take() {
+            if matches!(record.status.as_str(), "connecting" | "streaming") {
+                record.status = "interrupted".into();
+            }
             record.latency_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            if let Some(first) = self
+                .first_output
+                .filter(|_| !record.token_details.stream_complete)
+            {
+                record.generation_ms =
+                    Some(first.elapsed().as_millis().min(u64::MAX as u128) as u64);
+            }
             // Persistence failures cannot justify replaying a billable request.
             // No upstream data or database error is logged here.
             if self.state.usage.record(record).is_err() {
@@ -161,7 +232,7 @@ impl Drop for Attempt {
 }
 
 /// Observation is bounded and independent of forwarded bytes. Oversized or
-/// compressed frames still pass through; their usage remains explicitly unknown.
+/// compressed frames still pass through; unavailable usage is not invented.
 #[derive(Default)]
 struct Observer {
     buffer: Vec<u8>,
@@ -174,13 +245,56 @@ struct Observer {
     terminal: bool,
     failed: bool,
     failure_code: Option<String>,
-    usage_seen: bool,
-    input: u64,
-    output: u64,
-    cached: u64,
+    input: Option<u64>,
+    output: Option<u64>,
+    cached: Option<u64>,
+    cache_write: Option<u64>,
+    reasoning: Option<u64>,
+    total: Option<u64>,
+    delta_units: HashMap<String, u64>,
+    item_units: HashMap<String, u64>,
+    final_units: Option<u64>,
+    output_observed: bool,
+    streaming_output: bool,
     ids: Vec<String>,
 }
 impl Observer {
+    fn output_units(&self) -> u64 {
+        self.final_units.unwrap_or_else(|| {
+            let keys: HashSet<_> = self
+                .delta_units
+                .keys()
+                .chain(self.item_units.keys())
+                .collect();
+            keys.into_iter()
+                .map(|key| {
+                    self.delta_units
+                        .get(key)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(self.item_units.get(key).copied().unwrap_or(0))
+                })
+                .sum()
+        })
+    }
+    fn output_key(value: &Value) -> String {
+        value
+            .get("output_index")
+            .map(Value::to_string)
+            .or_else(|| {
+                value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .or_else(|| {
+                value
+                    .pointer("/item/id")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| "0".into())
+    }
     fn value(&mut self, value: &Value) {
         let mut opaque_keys = Vec::new();
         opaque_bindings(value, &mut opaque_keys);
@@ -209,6 +323,46 @@ impl Observer {
             }
         }
         let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        if matches!(
+            event_type,
+            "response.output_text.delta"
+                | "response.refusal.delta"
+                | "response.function_call_arguments.delta"
+                | "response.reasoning_summary_text.delta"
+                | "response.reasoning_text.delta"
+                | "response.custom_tool_call_input.delta"
+        ) {
+            if let Some(text) = value.get("delta").and_then(Value::as_str) {
+                let key = Self::output_key(value);
+                if self.delta_units.len() < 10000 || self.delta_units.contains_key(&key) {
+                    let units = self.delta_units.entry(key).or_default();
+                    *units = units.saturating_add(text_units(text));
+                }
+                self.output_observed = true;
+                if !text.is_empty() {
+                    self.streaming_output = true;
+                }
+            }
+        }
+        if event_type == "response.output_item.done" {
+            if let Some(item) = value.get("item") {
+                let key = Self::output_key(value);
+                if self.item_units.len() < 10000 {
+                    self.item_units.insert(key, content_units(item));
+                }
+                self.output_observed = true;
+            }
+        }
+        if (!self.sse
+            || matches!(
+                event_type,
+                "response.completed" | "response.incomplete" | "response.failed"
+            ))
+            && response.get("output").is_some_and(Value::is_array)
+        {
+            self.final_units = Some(content_units(&response["output"]));
+            self.output_observed = true;
+        }
         if event_type == "response.metadata" {
             if let Some(headers) = value.get("headers").and_then(Value::as_object) {
                 for (name, value) in headers {
@@ -241,18 +395,30 @@ impl Observer {
         if let Some(usage) = response.get("usage").filter(|u| u.is_object()) {
             // Snapshot values replace prior observations; final usage includes
             // cached input, so cached tokens must never be added to input.
-            if let (Some(input), Some(output)) = (
-                usage.get("input_tokens").and_then(Value::as_u64),
-                usage.get("output_tokens").and_then(Value::as_u64),
-            ) {
-                self.input = input;
-                self.output = output;
-                self.cached = usage
-                    .pointer("/input_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                self.usage_seen = true;
-            }
+            self.input = usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .or(self.input);
+            self.output = usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .or(self.output);
+            self.cached = usage
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .or(self.cached);
+            self.cache_write = usage
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .and_then(Value::as_u64)
+                .or(self.cache_write);
+            self.reasoning = usage
+                .pointer("/output_tokens_details/reasoning_tokens")
+                .and_then(Value::as_u64)
+                .or(self.reasoning);
+            self.total = usage
+                .get("total_tokens")
+                .and_then(Value::as_u64)
+                .or(self.total);
         }
     }
     fn event(&mut self) {
@@ -508,6 +674,10 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
         );
     }
     let request_id = uuid::Uuid::new_v4().to_string();
+    let input_units = ["input", "instructions", "tools"]
+        .iter()
+        .map(|key| content_units(&parsed[*key]))
+        .sum();
     let mut last_error = None;
     for candidate in sources {
         if candidate.kind == "official"
@@ -532,7 +702,7 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
             candidate
         };
         for authentication_attempt in 0..2 {
-            let mut attempt = Attempt::new(state.clone(), &source, &request_id, model);
+            let mut attempt = Attempt::new(state.clone(), &source, &request_id, model, input_units);
             let client = match transport::client(&source) {
                 Ok(client) => client,
                 Err(_) => {
@@ -775,6 +945,16 @@ async fn stream_response(
         sse,
         ..Default::default()
     };
+    if content_length != Some(0) {
+        attempt.finish(
+            if status.is_success() {
+                "streaming"
+            } else {
+                "failed"
+            },
+            None,
+        );
+    }
     if status.is_success() {
         if let Some(session_key) = session_key {
             observer.ids.push(session_key);
@@ -806,7 +986,7 @@ async fn stream_response(
                     if complete_body {
                         finalize_response(&state, &source, status, discovery, &mut observer, &mut attempt).await;
                     } else {
-                        attempt.finish("interrupted", Some(&observer));
+                        attempt.finish(if status.is_success() { "streaming" } else { "failed" }, Some(&observer));
                     }
                     yield Ok::<Bytes, std::io::Error>(chunk);
                     if complete_body { return; }
@@ -824,4 +1004,57 @@ async fn stream_response(
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     response
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_output_item_snapshots_and_deltas_sum_each_item_once() {
+        let mut observer = Observer {
+            sse: true,
+            ..Default::default()
+        };
+        observer.value(&json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"abcdefgh"}]}}));
+        observer
+            .value(&json!({"type":"response.output_text.delta","output_index":1,"delta":"你好"}));
+        assert_eq!(estimated_tokens(observer.output_units()), 4);
+        observer.value(&json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":"你好"}]}}));
+        assert_eq!(estimated_tokens(observer.output_units()), 4);
+        observer.value(&json!({"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"abcdefgh"}]},{"type":"message","content":[{"type":"output_text","text":"你好"}]}]}}));
+        assert_eq!(estimated_tokens(observer.output_units()), 4);
+    }
+
+    #[test]
+    fn generation_timing_stops_at_terminal_event_before_stream_is_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned(), 0, "fixture-key".into()).unwrap();
+        let source:Source = serde_json::from_value(json!({"id":"fixture","name":"fixture","kind":"api","base_url":"http://127.0.0.1:1","enabled":true,"priority":0,"proxy":{"mode":"direct"},"models":[],"secret":{"api_key":"fixture"}})).unwrap();
+        let mut attempt = Attempt::new(state.clone(), &source, "request", "model", 8);
+        let mut observer = Observer {
+            sse: true,
+            ..Default::default()
+        };
+        observer.value(
+            &json!({"type":"response.output_text.delta","output_index":0,"delta":"abcdefgh"}),
+        );
+        attempt.finish("streaming", Some(&observer));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        observer.value(&json!({"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":2}}}));
+        attempt.finish("streaming", Some(&observer));
+        let before = state.usage.summary(1).unwrap();
+        assert_eq!(
+            before["recent"][0]["token_details"]["stream_complete"],
+            true
+        );
+        let generation = before["recent"][0]["generation_ms"].clone();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let during = state.usage.summary(1).unwrap();
+        assert_eq!(during["recent"][0]["generation_ms"], generation);
+        attempt.finish("success", Some(&observer));
+        drop(attempt);
+        let final_usage = state.usage.summary(1).unwrap();
+        assert_eq!(final_usage["recent"][0]["generation_ms"], generation);
+    }
 }

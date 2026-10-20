@@ -10,7 +10,7 @@ use codexpress_gateway::{
     model::{AppState, ProxyPolicy, Source, SourceRuntime},
     relay, routing, transport,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -67,7 +67,7 @@ async fn state(sources: Vec<Source>) -> (tempfile::TempDir, Arc<AppState>) {
 async fn raw_json_headers_query_and_usage_survive_relay() {
     let seen = Arc::new(Mutex::new(None));
     let copy = seen.clone();
-    let response_body = br#"{ "id":"resp-one", "usage":{"input_tokens":100,"output_tokens":9,"input_tokens_details":{"cached_tokens":40}}, "unknown":true }"#;
+    let response_body = br#"{ "id":"resp-one", "usage":{"input_tokens":100,"output_tokens":9,"total_tokens":109,"input_tokens_details":{"cached_tokens":40},"output_tokens_details":{"reasoning_tokens":5}}, "unknown":true }"#;
     let (address, task) = serve(Router::new().route(
         "/v1/responses",
         post(move |request: Request| {
@@ -127,6 +127,18 @@ async fn raw_json_headers_query_and_usage_survive_relay() {
     assert_eq!(usage["rows"][0]["input_tokens"], 100);
     assert_eq!(usage["rows"][0]["cached_input_tokens"], 40);
     assert_eq!(usage["recent"][0]["complete"], true);
+    assert_eq!(
+        usage["recent"][0]["token_details"]["reasoning_output_tokens"],
+        5
+    );
+    assert_eq!(
+        usage["recent"][0]["token_details"]["reported_total_tokens"],
+        109
+    );
+    assert_eq!(
+        usage["recent"][0]["token_details"]["input_estimated"],
+        false
+    );
     assert_eq!(state.bindings.lock().await.get("resp-one").unwrap(), "a");
     for entry in std::fs::read_dir(_directory.path()).unwrap() {
         let stored = std::fs::read(entry.unwrap().path()).unwrap();
@@ -138,12 +150,140 @@ async fn raw_json_headers_query_and_usage_survive_relay() {
 }
 
 #[tokio::test]
+async fn live_usage_estimates_stream_then_replaces_with_reported_tokens_without_double_counting() {
+    for reported in [false, true] {
+        let connected = Arc::new(tokio::sync::Notify::new());
+        let headers_gate = Arc::new(tokio::sync::Notify::new());
+        let finish_gate = Arc::new(tokio::sync::Notify::new());
+        let connected_copy = connected.clone();
+        let headers_copy = headers_gate.clone();
+        let finish_copy = finish_gate.clone();
+        let (origin, task) = serve(Router::new().route("/responses", post(move || {
+            let connected = connected_copy.clone();
+            let headers_gate = headers_copy.clone();
+            let finish_gate = finish_copy.clone();
+            async move {
+                connected.notify_one();
+                headers_gate.notified().await;
+                let stream = async_stream::stream! {
+                    yield Ok::<_,std::io::Error>(bytes::Bytes::from_static("data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好abcd\"}\n\n".as_bytes()));
+                    finish_gate.notified().await;
+                    let mut response = json!({"id":"usage-final","output":[{"type":"message","content":[{"type":"output_text","text":"你好abcd"}]}]});
+                    if reported { response["usage"] = json!({"input_tokens":40,"output_tokens":20,"total_tokens":60,"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":2},"output_tokens_details":{"reasoning_tokens":8}}); }
+                    let event = json!({"type":"response.completed","response":response});
+                    yield Ok(bytes::Bytes::from(format!("data: {event}\n\n")));
+                };
+                Response::builder().header("content-type","text/event-stream").body(Body::from_stream(stream)).unwrap()
+            }
+        }))).await;
+        let (_dir, state) = state(vec![source("a", &origin, 0)]).await;
+        let router = relay::router(state.clone());
+        let request_task = tokio::spawn(async move {
+            router
+                .oneshot(request(
+                    "{\"model\":\"fixture\",\"input\":\"你好abcd\"}".as_bytes(),
+                ))
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(2), connected.notified())
+            .await
+            .unwrap();
+        let connecting = state.usage.summary(1).unwrap();
+        assert_eq!(connecting["recent"][0]["status"], "connecting");
+        assert_eq!(connecting["recent"][0]["input_tokens"], 3);
+        assert_eq!(connecting["rows"][0]["requests"], 1);
+        assert_eq!(connecting["rows"][0]["failures"], 0);
+        let attempt_id = connecting["recent"][0]["attempt_id"].clone();
+        headers_gate.notify_one();
+        let response = request_task.await.unwrap();
+        let drain =
+            tokio::spawn(async move { to_bytes(response.into_body(), 10000).await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let live = state.usage.summary(1).unwrap();
+                if live["recent"][0]["output_tokens"] == 3 {
+                    assert_eq!(live["recent"][0]["active"], true);
+                    assert_eq!(live["recent"][0]["token_details"]["output_estimated"], true);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        finish_gate.notify_one();
+        let wire = drain.await.unwrap();
+        assert!(wire
+            .windows("你好abcd".len())
+            .any(|v| v == "你好abcd".as_bytes()));
+        let final_usage = state.usage.summary(1).unwrap();
+        let recent = &final_usage["recent"][0];
+        assert_eq!(recent["attempt_id"], attempt_id);
+        assert_eq!(recent["active"], false);
+        assert_eq!(recent["status"], "success");
+        assert_eq!(final_usage["rows"][0]["requests"], 1);
+        assert_eq!(final_usage["inflight"], 0);
+        assert_eq!(recent["input_tokens"], if reported { 40 } else { 3 });
+        assert_eq!(recent["output_tokens"], if reported { 20 } else { 3 });
+        assert_eq!(recent["token_details"]["input_estimated"], !reported);
+        assert_eq!(recent["token_details"]["output_estimated"], !reported);
+        assert_eq!(
+            recent["token_details"]["cache_write_input_tokens"],
+            if reported { json!(2) } else { Value::Null }
+        );
+        assert_eq!(
+            recent["token_details"]["reasoning_output_tokens"],
+            if reported { json!(8) } else { Value::Null }
+        );
+        let duration = recent["generation_ms"].as_f64().unwrap();
+        assert!(duration >= 20.0);
+        let expected_tps = recent["output_tokens"].as_f64().unwrap() * 1000.0 / duration;
+        assert!((recent["output_tps"].as_f64().unwrap() - expected_tps).abs() < 0.001);
+        assert_eq!(
+            final_usage["rows"][0]["timed_output_tokens"],
+            recent["output_tokens"]
+        );
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn partial_usage_keeps_reported_zero_and_estimates_only_missing_input() {
+    let (origin, task) = serve(Router::new().route("/responses",post(|| async {
+        axum::Json(json!({"id":"zero-output","output":[],"usage":{"output_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}))
+    }))).await;
+    let (_dir, state) = state(vec![source("a", &origin, 0)]).await;
+    let response = relay::router(state.clone())
+        .oneshot(request(br#"{"model":"m","input":"abcdefgh"}"#))
+        .await
+        .unwrap();
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    let summary = state.usage.summary(1).unwrap();
+    let row = &summary["recent"][0];
+    assert_eq!(row["input_tokens"], 2);
+    assert_eq!(row["output_tokens"], 0);
+    assert_eq!(row["token_details"]["input_estimated"], true);
+    assert_eq!(row["token_details"]["output_estimated"], false);
+    assert_eq!(row["token_details"]["reasoning_output_tokens"], 0);
+    assert_eq!(row["token_details"]["cached_input_reported"], true);
+    assert!(row["output_tps"].is_null());
+    task.abort();
+}
+
+#[tokio::test]
 async fn fallback_is_ordered_fixed_mode_and_previous_id_never_cross_sources() {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_copy = calls.clone();
     let (first, a) = serve(Router::new().route(
         "/responses",
-        post(|| async { StatusCode::TOO_MANY_REQUESTS }),
+        post(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(json!({"error":{"code":"rate_limit_exceeded"}})),
+            )
+        }),
     ))
     .await;
     let (second, b) = serve(Router::new().route(
@@ -166,6 +306,11 @@ async fn fallback_is_ordered_fixed_mode_and_previous_id_never_cross_sources() {
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     let summary = state.usage.summary(30).unwrap();
     assert_eq!(summary["recent"].as_array().unwrap().len(), 2);
+    assert!(summary["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["status"] == "failed"));
     assert_eq!(
         summary["recent"][0]["request_id"],
         summary["recent"][1]["request_id"]

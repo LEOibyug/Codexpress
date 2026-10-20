@@ -125,12 +125,13 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             };
             Ok(credentials(state).await)
         }
-        "usage" => state.usage.summary(
+        "usage" => state.usage.summary_for(
             payload
                 .get("days")
                 .and_then(Value::as_u64)
                 .unwrap_or(30)
                 .clamp(1, 3660) as u32,
+            payload.get("source_id").and_then(Value::as_str),
         ),
         op if op.starts_with("config.") => config::handle(state, op, payload).await,
         op if op.starts_with("official.") => crate::official::handle(state, op, payload).await,
