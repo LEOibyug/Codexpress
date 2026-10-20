@@ -1,7 +1,11 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, path::PathBuf, sync::{atomic::AtomicUsize, Arc}};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{atomic::AtomicUsize, Arc},
+};
 use tokio::sync::{Mutex, RwLock};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,35 +34,62 @@ pub struct Source {
 
 impl Source {
     pub fn validate(&self) -> Result<()> {
-        if self.id.is_empty() || self.id.len() > 128 || !self.id.bytes().all(|b|b.is_ascii_alphanumeric() || b == b'-' || b == b'_') || self.name.trim().is_empty() {
+        if self.id.is_empty()
+            || self.id.len() > 128
+            || !self
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || self.name.trim().is_empty()
+        {
             bail!("来源的标识和名称不能为空");
         }
         if !["api", "official"].contains(&self.kind.as_str()) {
             bail!("未知来源类型");
         }
-        let base = url::Url::parse(&self.base_url).map_err(|_| anyhow::anyhow!("来源地址格式错误"))?;
-        if !["https", "http"].contains(&base.scheme()) || base.host_str().is_none()
-            || !base.username().is_empty() || base.password().is_some()
-            || base.query().is_some() || base.fragment().is_some() {
+        let base =
+            url::Url::parse(&self.base_url).map_err(|_| anyhow::anyhow!("来源地址格式错误"))?;
+        if !["https", "http"].contains(&base.scheme())
+            || base.host_str().is_none()
+            || !base.username().is_empty()
+            || base.password().is_some()
+            || base.query().is_some()
+            || base.fragment().is_some()
+        {
             bail!("来源地址必须是没有用户名、查询参数或片段的 HTTP(S) 基址");
         }
-        if self.kind == "official" && self.base_url.trim_end_matches('/') != "https://chatgpt.com/backend-api/codex" {
+        if self.kind == "official"
+            && self.base_url.trim_end_matches('/') != "https://chatgpt.com/backend-api/codex"
+        {
             bail!("官方来源必须使用官方 Codex 地址");
         }
         match self.proxy.mode.as_str() {
             "direct" if self.kind == "official" => bail!("官方来源必须指定代理"),
-            "direct" => {},
+            "direct" => {}
             "explicit" => {
                 let proxy = self.proxy.url.as_deref().unwrap_or("");
-                let parsed = url::Url::parse(proxy).map_err(|_| anyhow::anyhow!("请填写有效的代理地址"))?;
-                if !["http", "https", "socks5", "socks5h"].contains(&parsed.scheme()) || parsed.host_str().is_none()
-                    || parsed.query().is_some() || parsed.fragment().is_some() || !parsed.username().is_empty() || parsed.password().is_some() {
+                let parsed =
+                    url::Url::parse(proxy).map_err(|_| anyhow::anyhow!("请填写有效的代理地址"))?;
+                if !["http", "https", "socks5", "socks5h"].contains(&parsed.scheme())
+                    || parsed.host_str().is_none()
+                    || parsed.query().is_some()
+                    || parsed.fragment().is_some()
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                {
                     bail!("代理地址只支持 HTTP(S) 和 SOCKS5");
                 }
-            },
+            }
             _ => bail!("未知代理策略"),
         }
-        if self.kind == "api" && self.secret.get("api_key").and_then(Value::as_str).unwrap_or("").is_empty() {
+        if self.kind == "api"
+            && self
+                .secret
+                .get("api_key")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+        {
             bail!("API 来源需要密钥");
         }
         Ok(())
@@ -78,8 +109,20 @@ pub struct SourceRuntime {
 
 impl SourceRuntime {
     pub fn new(source: Source) -> Self {
-        let ready = source.kind == "api" || source.secret.get("access_token").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
-        Self { source, health: if ready { "ready" } else { "auth_required" }.into(), cooldown_until: None, last_error: None, quota: Value::Null, credits: Value::Null }
+        let ready = source.kind == "api"
+            || source
+                .secret
+                .get("access_token")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty());
+        Self {
+            source,
+            health: if ready { "ready" } else { "auth_required" }.into(),
+            cooldown_until: None,
+            last_error: None,
+            quota: Value::Null,
+            credits: Value::Null,
+        }
     }
 }
 
@@ -100,16 +143,50 @@ pub struct AppState {
     pub inflight: AtomicUsize,
     pub official_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub config_lock: Mutex<()>,
+    credential_store: Option<Arc<dyn crate::credentials::CredentialStore>>,
 }
 
 impl AppState {
     pub fn new(state_dir: PathBuf, port: u16, gateway_key: String) -> Result<Arc<Self>> {
+        Self::new_with_credential_store(state_dir, port, gateway_key, None)
+    }
+
+    pub fn new_with_credential_store(
+        state_dir: PathBuf,
+        port: u16,
+        gateway_key: String,
+        credential_store: Option<Arc<dyn crate::credentials::CredentialStore>>,
+    ) -> Result<Arc<Self>> {
         let usage = crate::usage::UsageStore::open(&state_dir.join("usage.sqlite"))?;
-        Ok(Arc::new(Self { sources: RwLock::new(Vec::new()), settings: RwLock::new(RoutingSettings { mode: "auto".into(), fixed_source_id: None }), bindings: Mutex::new(HashMap::new()), usage: Arc::new(usage), gateway_key, port, state_dir, inflight: AtomicUsize::new(0), official_locks: Mutex::new(HashMap::new()), config_lock:Mutex::new(()) }))
+        Ok(Arc::new(Self {
+            sources: RwLock::new(Vec::new()),
+            settings: RwLock::new(RoutingSettings {
+                mode: "auto".into(),
+                fixed_source_id: None,
+            }),
+            bindings: Mutex::new(HashMap::new()),
+            usage: Arc::new(usage),
+            gateway_key,
+            port,
+            state_dir,
+            inflight: AtomicUsize::new(0),
+            official_locks: Mutex::new(HashMap::new()),
+            config_lock: Mutex::new(()),
+            credential_store,
+        }))
+    }
+
+    pub fn persist_credential(&self, source_id: &str, secret: &Value) -> Result<()> {
+        if let Some(store) = &self.credential_store {
+            store.save(source_id, secret)?;
+        }
+        Ok(())
     }
 }
 
 pub fn now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
-

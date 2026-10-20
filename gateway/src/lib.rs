@@ -1,4 +1,5 @@
 pub mod config;
+pub mod credentials;
 pub mod management;
 pub mod model;
 pub mod official;

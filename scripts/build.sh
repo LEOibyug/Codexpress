@@ -9,9 +9,10 @@ if [ -x "$project_root/.tools/cargo/bin/cargo" ]; then
 fi
 cargo build --release --locked --manifest-path gateway/Cargo.toml
 swift build -c release --arch arm64
+swift_bin_dir="$(swift build -c release --arch arm64 --show-bin-path)"
 app="$project_root/dist/Codexpress.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp .build/arm64-apple-macosx/release/Codexpress "$app/Contents/MacOS/Codexpress"
+cp "$swift_bin_dir/Codexpress" "$app/Contents/MacOS/Codexpress"
 cp gateway/target/release/codexpress-gateway "$app/Contents/MacOS/codexpress-gateway"
 cp Resources/Info.plist "$app/Contents/Info.plist"
 swift scripts/make-icon.swift "$project_root/dist/AppIcon.iconset"

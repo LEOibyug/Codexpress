@@ -8,7 +8,8 @@ func render(_ size: Int) -> Data {
     let image = NSImage(size: NSSize(width: size, height: size))
     image.lockFocus()
     let scale = CGFloat(size) / 1024
-    let t = AffineTransform(scaleByX: scale, byY: scale)
+    let t = NSAffineTransform()
+    t.scaleX(by: scale, yBy: scale)
     t.concat()
     let rect = NSRect(x: 55, y: 55, width: 914, height: 914)
     let background = NSBezierPath(roundedRect: rect, xRadius: 208, yRadius: 208)
