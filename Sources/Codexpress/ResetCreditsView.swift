@@ -21,7 +21,7 @@ struct OfficialAccountView: View {
                 Button { model.refresh(source.id) } label: { Label("刷新额度", systemImage: "arrow.clockwise") }.disabled(model.busy)
             }.controlSize(.small)
             if quota["windows"].array.isEmpty {
-                InfoNote(text: "额度尚未知，查询失败不表示额度耗尽。")
+                Text("暂无额度数据").font(.system(size: 11)).foregroundStyle(.secondary)
             } else {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 12)], spacing: 12) {
                     ForEach(Array(quota["windows"].array.enumerated()), id: \.offset) { _, window in
@@ -32,7 +32,7 @@ struct OfficialAccountView: View {
             if quota != .null {
                 HStack(spacing: 5) {
                     Image(systemName: "clock").font(.system(size: 9))
-                    Text("更新于 \(timestampLabel(quota["fetched_at"]))" + (quota["stale"].bool == true ? " · 陈旧缓存" : ""))
+                    Text("更新于 \(timestampLabel(quota["fetched_at"]))" + (quota["stale"].bool == true ? " · 待刷新" : ""))
                 }.font(.system(size: 10)).foregroundStyle(quota["stale"].bool == true ? Color.orange : Color.secondary)
             }
             if let error = quota["error"].string { InfoNote(text: error, color: .orange) }
@@ -47,8 +47,8 @@ struct OfficialAccountView: View {
             if model.loginSource == source.id {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(model.loginMessage ?? "等待浏览器授权…").font(.system(size: 12, weight: .medium))
-                    InfoNote(text: "授权网页遵循浏览器的网络设置。若未自动完成，可粘贴完整 localhost 回调地址。")
-                    SecureField("完整回调地址（包含一次性授权码）", text: $model.callbackURL).settingsField()
+                    InfoNote(text: "未自动完成时，粘贴浏览器中的完整回调地址。")
+                    SecureField("回调地址", text: $model.callbackURL).settingsField()
                     HStack {
                         Button("完成登录") { model.completeLogin() }.buttonStyle(.borderedProminent).disabled(model.callbackURL.isEmpty || model.busy || model.loginFlow == nil)
                         Button("取消等待") { model.cancelLogin() }.disabled(model.busy)
@@ -89,9 +89,9 @@ struct ResetCreditsView: View {
     var body: some View {
         let credits = model.state(source.id)["credits"]
         VStack(alignment: .leading, spacing: 10) {
-            if credits["stale"].bool == true { Label("卡片信息已陈旧，请刷新后使用。", systemImage: "clock").font(.caption).foregroundStyle(.orange) }
+            if credits["stale"].bool == true { Label("请刷新卡片后使用。", systemImage: "clock").font(.caption).foregroundStyle(.orange) }
             if let message = credits["error"].string { Text(message).font(.caption).foregroundStyle(.orange) }
-            if credits["credits"].array.isEmpty { Text(credits["available_count"].number == 0 ? "暂无可用重置卡。" : "卡片信息未知，尚无可操作卡片。").font(.caption).foregroundStyle(.secondary) }
+            if credits["credits"].array.isEmpty { Text(credits["available_count"].number == 0 ? "暂无可用重置卡" : "暂无卡片数据").font(.caption).foregroundStyle(.secondary) }
             ForEach(Array(credits["credits"].array.enumerated()), id: \.offset) { _, credit in
                 let key = source.id + ":" + (credit["id"].string ?? "")
                 HStack(alignment: .top) {
@@ -106,7 +106,6 @@ struct ResetCreditsView: View {
                 }
             }
             if let localError { Text(localError).font(.caption).foregroundStyle(.orange) }
-            Text("仅手动使用；不自动消耗卡片。本地累计用量不会清零。").font(.caption2).foregroundStyle(.secondary)
         }.sheet(item: $confirmation) { item in
             VStack(alignment: .leading, spacing: 16) {
                 Text("确认使用重置卡").font(.title2.bold())
@@ -116,7 +115,7 @@ struct ResetCreditsView: View {
                 LabeledContent("到期时间", value: timestampLabel(item.credit["expires_at"]))
                 Divider()
                 ForEach(Array(item.quota["windows"].array.enumerated()), id: \.offset) { _, window in Text("\(window["name"].string ?? "用量窗口")：已用 \(window["used_percent"].number.map { "\(Int($0))%" } ?? "未知")").font(.callout) }
-                Text("当前用量较低时可能浪费卡片。具体重置哪些窗口以官方返回和后续查询为准。提交结果不明时必须先核实，不会自动再次消耗。").font(.callout).foregroundStyle(.secondary)
+                Text("此操作将消耗一张重置卡。若结果待确认，请刷新额度后再操作。").font(.callout).foregroundStyle(.secondary)
                 HStack { Spacer(); Button("取消") { confirmation = nil }.keyboardShortcut(.cancelAction); Button("确认使用") { model.consume(item); confirmation = nil }.buttonStyle(.borderedProminent) }
             }.padding(24).frame(width: 470)
         }

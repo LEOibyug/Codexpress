@@ -19,10 +19,10 @@ enum AppPalette {
 
 struct PageHeading<Actions: View>: View {
     let title: String
-    let subtitle: String
+    let subtitle: String?
     @ViewBuilder var actions: Actions
 
-    init(_ title: String, subtitle: String, @ViewBuilder actions: () -> Actions) {
+    init(_ title: String, subtitle: String? = nil, @ViewBuilder actions: () -> Actions) {
         self.title = title; self.subtitle = subtitle; self.actions = actions()
     }
 
@@ -30,7 +30,9 @@ struct PageHeading<Actions: View>: View {
         HStack(alignment: .center, spacing: 20) {
             VStack(alignment: .leading, spacing: 7) {
                 Text(title).font(.system(size: 25, weight: .bold))
-                Text(subtitle).font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if let subtitle {
+                    Text(subtitle).font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer(minLength: 0)
             actions.fixedSize(horizontal: true, vertical: false)
@@ -39,7 +41,7 @@ struct PageHeading<Actions: View>: View {
 }
 
 extension PageHeading where Actions == EmptyView {
-    init(_ title: String, subtitle: String) { self.init(title, subtitle: subtitle) { EmptyView() } }
+    init(_ title: String, subtitle: String? = nil) { self.init(title, subtitle: subtitle) { EmptyView() } }
 }
 
 struct CardSurface: ViewModifier {
@@ -67,12 +69,12 @@ extension View {
 
 struct SettingsCard<Accessory: View, Content: View>: View {
     let title: String
-    let subtitle: String
+    let subtitle: String?
     let symbol: String
     let accessory: Accessory
     let content: Content
 
-    init(_ title: String, subtitle: String, symbol: String, @ViewBuilder accessory: () -> Accessory, @ViewBuilder content: () -> Content) {
+    init(_ title: String, subtitle: String? = nil, symbol: String, @ViewBuilder accessory: () -> Accessory, @ViewBuilder content: () -> Content) {
         self.title = title; self.subtitle = subtitle; self.symbol = symbol
         self.accessory = accessory(); self.content = content()
     }
@@ -85,7 +87,9 @@ struct SettingsCard<Accessory: View, Content: View>: View {
                     .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 9))
                 VStack(alignment: .leading, spacing: 4) {
                     Text(title).font(.system(size: 13, weight: .semibold))
-                    Text(subtitle).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    if let subtitle {
+                        Text(subtitle).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 Spacer(minLength: 8)
                 accessory
@@ -96,7 +100,7 @@ struct SettingsCard<Accessory: View, Content: View>: View {
 }
 
 extension SettingsCard where Accessory == EmptyView {
-    init(_ title: String, subtitle: String, symbol: String, @ViewBuilder content: () -> Content) {
+    init(_ title: String, subtitle: String? = nil, symbol: String, @ViewBuilder content: () -> Content) {
         self.init(title, subtitle: subtitle, symbol: symbol, accessory: { EmptyView() }, content: content)
     }
 }

@@ -18,7 +18,7 @@ struct SourceEditor: View {
                     .background(Color.accentColor.opacity(0.09), in: RoundedRectangle(cornerRadius: 13))
                 VStack(alignment: .leading, spacing: 5) {
                     Text(isNew ? "添加来源" : "编辑来源").font(.system(size: 21, weight: .semibold))
-                    Text(source.official ? "连接官方 ChatGPT 账号" : "连接原生 Responses API")
+                    Text(source.official ? "ChatGPT 账号" : "Responses API")
                         .font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -30,8 +30,9 @@ struct SourceEditor: View {
                     TextField("API 基址", text: $source.base_url).textContentType(.URL).disabled(source.official)
                     if !source.official {
                         SecureField(isNew ? "API 密钥" : "新 API 密钥", text: $apiKey)
-                        Text(isNew ? "密钥安全存放于 macOS 钥匙串。" : "密钥留空保留现有值；新密钥存放于 macOS 钥匙串。")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                        if !isNew {
+                            Text("留空保留现有密钥。").font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
                     }
                     Toggle("启用此来源", isOn: $source.enabled).toggleStyle(.switch).controlSize(.small)
                 }
@@ -42,36 +43,25 @@ struct SourceEditor: View {
                     }
                     if source.proxy.mode == "explicit" {
                         TextField("代理地址", text: Binding(get: { source.proxy.url ?? "" }, set: { source.proxy.url = $0 }), prompt: Text("http://127.0.0.1:端口"))
-                        Text("代理不可达时停止此来源。Clash TUN／增强模式应保持关闭。")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    } else {
-                        Text("忽略系统和环境代理，直接连接此来源。")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                 }
                 Section("模型") {
                     TextField("支持模型", text: $modelsText, prompt: Text("模型 ID，以逗号分隔"))
-                    Text("留空表示允许请求中的原始模型名称，不进行模型映射。")
+                    Text("留空表示不限模型，多个模型 ID 用逗号分隔。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
-                }
-                if source.official {
-                    Section {
-                        InfoNote(text: "保存后可发起登录。应用请求使用指定代理；授权网页遵循浏览器网络设置。")
-                    }
                 }
             }.formStyle(.grouped).scrollContentBackground(.hidden)
 
             VStack(spacing: 12) {
                 if let localError { InfoNote(text: localError, symbol: "exclamationmark.triangle", color: .orange).frame(maxWidth: .infinity, alignment: .leading) }
                 HStack {
-                    Label("钥匙串保护", systemImage: "lock.shield").font(.system(size: 11)).foregroundStyle(.tertiary)
                     Spacer()
                     Button("取消") { dismiss() }.keyboardShortcut(.cancelAction).disabled(saving)
                     Button(saving ? "保存中…" : "保存来源") { save() }
                         .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(saving || !model.running || model.busy)
                 }
             }.padding(.horizontal, 26).padding(.bottom, 22).padding(.top, 14)
-        }.font(.system(size: 13)).background(AppPalette.canvas).frame(width: 580, height: source.official ? 700 : 660)
+        }.font(.system(size: 13)).background(AppPalette.canvas).frame(width: 580, height: 600)
             .onAppear { modelsText = source.models.joined(separator: ", ") }
     }
 

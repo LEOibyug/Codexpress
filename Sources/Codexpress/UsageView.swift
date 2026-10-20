@@ -6,7 +6,7 @@ struct UsageView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            PageHeading("用量", subtitle: "查看各来源经过本地网关的请求与 Token。") {
+            PageHeading("用量") {
                 HStack(spacing: 8) {
                     Picker("时间范围", selection: $days) {
                         Text("近 24 小时").tag(1); Text("近 7 天").tag(7); Text("近 30 天").tag(30)
@@ -16,7 +16,7 @@ struct UsageView: View {
                 }
             }
             if model.usage["rows"].array.isEmpty {
-                EmptyState("用量会从这里开始", subtitle: "请求通过 Codexpress 后，将显示各来源的用量。缺失的 Token 数据会标记为未知。", symbol: "chart.bar.xaxis")
+                EmptyState("暂无用量", subtitle: "所选时间范围内没有请求记录。", symbol: "chart.bar.xaxis")
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
@@ -44,7 +44,6 @@ struct UsageView: View {
                     }.padding(.bottom, 2)
                 }
             }
-            InfoNote(text: "总 Token = 输入 + 输出，缓存输入已包含在输入中。仅记录请求元数据，不保存对话正文。")
         }.settingsPage()
             .onAppear { if model.running { model.refreshUsage(days: days) } }
             .onChange(of: days) { _, value in model.refreshUsage(days: value) }

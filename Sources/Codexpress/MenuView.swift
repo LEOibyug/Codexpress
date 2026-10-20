@@ -10,19 +10,14 @@ struct MenuView: View {
                 Image(systemName: "arrow.triangle.branch").font(.system(size: 16, weight: .medium))
                     .foregroundStyle(.white).frame(width: 34, height: 34)
                     .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 10))
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Codexpress").font(.system(size: 13, weight: .semibold))
-                    Text("本地模型网关").font(.system(size: 10)).foregroundStyle(.secondary)
-                }
+                Text("Codexpress").font(.system(size: 13, weight: .semibold))
                 Spacer()
                 StatusPill(text: model.running ? "运行中" : "未连接", color: model.running ? .green : .orange)
             }
             Divider()
             if model.sources.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("连接你的第一个来源").font(.system(size: 13, weight: .medium))
-                    Text("官方账号与 API，在同一个优先级池中使用。")
-                        .font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(3)
+                    Text("暂无来源").font(.system(size: 13, weight: .medium))
                     Button { showSettings() } label: { Label("添加来源", systemImage: "plus") }
                         .buttonStyle(.borderedProminent).controlSize(.small).padding(.top, 3)
                 }.padding(.vertical, 4)
@@ -30,7 +25,7 @@ struct MenuView: View {
                 HStack {
                     Text("当前路由").foregroundStyle(.secondary)
                     Spacer()
-                    Text(model.routingMode == "auto" ? "自动优先级池" : "固定 · \(model.fixedName)").fontWeight(.medium)
+                    Text(model.routingMode == "auto" ? "自动切换" : "固定 · \(model.fixedName)").fontWeight(.medium)
                 }.font(.system(size: 11))
                 VStack(spacing: 13) {
                     ForEach(Array(model.sources.prefix(4))) { source in
@@ -58,8 +53,6 @@ struct MenuView: View {
                 Spacer()
                 Button("退出") { NSApp.terminate(nil) }.keyboardShortcut("q").foregroundStyle(.secondary)
             }.buttonStyle(.borderless).font(.system(size: 11))
-            Text("退出后网关停止，原连接可在设置中恢复。")
-                .font(.system(size: 10)).foregroundStyle(.tertiary)
         }.padding(18).frame(width: 340)
     }
 

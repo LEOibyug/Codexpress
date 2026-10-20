@@ -25,10 +25,7 @@ struct SettingsView: View {
                         .font(.system(size: 17, weight: .semibold)).foregroundStyle(.white)
                         .frame(width: 34, height: 34)
                         .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 10))
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Codexpress").font(.system(size: 14, weight: .semibold))
-                        Text("本地模型网关").font(.system(size: 10)).foregroundStyle(.secondary)
-                    }
+                    Text("Codexpress").font(.system(size: 14, weight: .semibold))
                     Spacer(minLength: 0)
                 }.padding(.horizontal, 18).padding(.top, 18).padding(.bottom, 23)
 
@@ -46,7 +43,6 @@ struct SettingsView: View {
                         Circle().fill(model.running ? .green : .orange).frame(width: 6, height: 6)
                         Text(model.running ? "网关运行中" : "网关未连接").font(.system(size: 11, weight: .medium))
                     }
-                    Text("仅在此 Mac 上运行").font(.system(size: 10)).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
             }.navigationSplitViewColumnWidth(min: 178, ideal: 190, max: 210)
         } detail: {
@@ -108,7 +104,7 @@ struct SourcesView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            PageHeading("来源", subtitle: "连接官方账号与 API，统一管理每个来源。") {
+            PageHeading("来源") {
                 Menu {
                     Button("官方账号") { addOfficial() }
                     Button("Responses API") { addAPI() }
@@ -118,16 +114,12 @@ struct SourcesView: View {
                     .disabled(!canEdit)
             }
             if model.sources.isEmpty {
-                EmptyState("连接第一个来源", subtitle: "使用官方 ChatGPT 账号或 Responses API。凭据安全存放在 macOS 钥匙串中。", symbol: "server.rack") {
+                EmptyState("暂无来源", subtitle: "添加 ChatGPT 账号或 API 服务。", symbol: "server.rack") {
                     HStack(spacing: 10) {
                         Button("添加官方账号") { addOfficial() }.buttonStyle(.borderedProminent)
                         Button("添加 API") { addAPI() }.buttonStyle(.bordered)
                     }.controlSize(.large).disabled(!canEdit)
                 }
-                HStack(spacing: 22) {
-                    Label("独立网络策略", systemImage: "network.badge.shield.half.filled")
-                    Label("共享优先级池", systemImage: "arrow.triangle.branch")
-                }.font(.system(size: 11)).foregroundStyle(.tertiary).frame(maxWidth: .infinity)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 14) {
@@ -140,7 +132,7 @@ struct SourcesView: View {
             .alert("删除来源？", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
                 Button("取消", role: .cancel) { deleting = nil }
                 Button("删除", role: .destructive) { if let source = deleting { model.removeSource(source.id) }; deleting = nil }
-            } message: { Text("将删除此来源的元数据和钥匙串凭据。已有用量记录会保留。") }
+            } message: { Text("将移除此来源及其登录信息，用量记录保留。") }
     }
 
     private var canEdit: Bool { model.running && !model.busy && !model.metadataLoadFailed }
@@ -189,21 +181,23 @@ struct RoutingView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            PageHeading("路由", subtitle: "按优先级分配请求，或固定使用一个来源。")
-            SettingsCard("分配方式", subtitle: "自动模式优先使用排序靠前的可用来源。", symbol: "arrow.triangle.branch") {
+            PageHeading("路由")
+            SettingsCard("路由模式", symbol: "arrow.triangle.branch") {
                 Picker("分配方式", selection: Binding(get: { model.routingMode }, set: { model.changeRouting(mode: $0, fixed: model.settings.fixed_source_id ?? model.sources.first?.id) })) {
-                    Text("自动优先级池").tag("auto")
+                    Text("自动切换").tag("auto")
                     Text("固定来源").tag("fixed")
                 }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 330).disabled(model.busy || model.sources.isEmpty)
                 if model.routingMode == "fixed" {
                     Picker("固定来源", selection: Binding(get: { model.fixedSourceID ?? "" }, set: { model.changeRouting(mode: "fixed", fixed: $0) })) {
                         ForEach(model.sources.filter(\.enabled)) { Text($0.name).tag($0.id) }
                     }.disabled(model.busy)
-                    InfoNote(text: "请求仅交给所选来源，失败时不会自动切换。")
+                    InfoNote(text: "来源不可用时暂停请求。")
+                } else {
+                    InfoNote(text: "按优先级使用可用来源。")
                 }
             }
             if model.sources.isEmpty {
-                EmptyState("暂无可排序的来源", subtitle: "先在「来源」中添加账号或 API，再设置请求的分配顺序。", symbol: "arrow.triangle.branch")
+                EmptyState("暂无来源", subtitle: "添加来源后可设置优先级。", symbol: "arrow.triangle.branch")
             } else {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -231,7 +225,6 @@ struct RoutingView: View {
                     }.listStyle(.plain).scrollContentBackground(.hidden).padding(7).cardSurface().disabled(model.busy)
                 }
             }
-            InfoNote(text: "带有上游状态的请求保留原来源。生成开始后，不会拼接其他来源的响应。")
         }.settingsPage()
     }
 }
@@ -249,7 +242,7 @@ struct GeneralSettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                PageHeading("设置", subtitle: "管理网关、模型上下文与 Codex 连接。") {
+                PageHeading("设置") {
                     HStack(spacing: 10) {
                         if preferencesChanged { Text("未保存").font(.system(size: 11)).foregroundStyle(.secondary) }
                         Button("保存设置") { model.savePreferences(port: port, codexHome: home) }
@@ -262,14 +255,14 @@ struct GeneralSettingsView: View {
                 if model.preview != .null { previewCard }
             }.settingsPage()
         }.onAppear { port = model.settings.port; home = model.settings.codexHome }
-            .alert(confirming == "config.restore" ? "恢复原连接和模型设置？" : "应用 Codex 连接和模型规则？", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
+            .alert(confirming == "config.restore" ? "恢复原连接？" : "应用连接设置？", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
                 Button("取消", role: .cancel) { confirming = nil }
                 Button("确认") { if let op = confirming { model.configAction(op) }; confirming = nil }
-            } message: { Text("操作目录：\(model.settings.codexHome)\n只更改本应用管理的字段。已有会话的连接需要另行验证。") }
+            } message: { Text("配置目录：\(model.settings.codexHome)\n\(confirming == "config.restore" ? "将恢复连接前的供应商与模型设置。" : "将更新供应商与模型设置。")重启 Codex 后生效。") }
     }
 
     private var gatewayCard: some View {
-        SettingsCard("本地网关", subtitle: "仅接受来自此 Mac 的连接。", symbol: "network", accessory: {
+        SettingsCard("本地网关", symbol: "network", accessory: {
             StatusPill(text: model.running ? "运行中" : "未连接", color: model.running ? .green : .orange)
         }) {
             VStack(spacing: 13) {
@@ -281,7 +274,7 @@ struct GeneralSettingsView: View {
                     }
                 }
                 Divider().overlay(AppPalette.border)
-                SettingRow(title: "登录时启动", subtitle: "在菜单栏中保持可用") {
+                SettingRow(title: "登录时启动") {
                     Toggle("登录时启动 Codexpress", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
                         .toggleStyle(.switch).labelsHidden().controlSize(.small)
                 }
@@ -295,30 +288,28 @@ struct GeneralSettingsView: View {
     }
 
     private var connectionCard: some View {
-        SettingsCard("Codex 连接", subtitle: "预览变更，再将 Codex 连接到本地网关。", symbol: "link") {
+        SettingsCard("Codex 连接", symbol: "link") {
             VStack(alignment: .leading, spacing: 13) {
                 Text("配置目录").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
                 TextField("Codex 配置目录（绝对路径）", text: $home)
                     .font(.system(size: 12, design: .monospaced)).settingsField()
                 HStack(alignment: .center, spacing: 18) {
-                    InfoNote(text: preferencesChanged ? "先保存设置，再预览连接配置。" : "历史记录与工具设置会保留。")
+                    if preferencesChanged { InfoNote(text: "请先保存设置。") }
                     Spacer(minLength: 0)
                     Button { model.configPreview() } label: { Label("预览连接配置", systemImage: "doc.text.magnifyingglass") }
                         .buttonStyle(.borderedProminent).disabled(!canPreview)
                 }
-                if model.portNeedsRestart { InfoNote(text: "端口变更待重启。重启后可预览并接管连接。", symbol: "arrow.clockwise", color: .orange) }
-                DisclosureGroup("连接与恢复说明", isExpanded: $connectionDetails) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("预览将读取所选目录的配置；确认后只更新受管字段，不修改原生登录、历史或工具设置。")
-                        Text("已有会话可能保留原连接，需要重新载入并验证。根配置更新不代表所有历史会话已切换。")
-                    }.font(.system(size: 11)).foregroundStyle(.secondary).padding(.top, 7).lineSpacing(3)
+                if model.portNeedsRestart { InfoNote(text: "请重启 Codexpress 以启用新端口。", symbol: "arrow.clockwise", color: .orange) }
+                DisclosureGroup("生效方式", isExpanded: $connectionDetails) {
+                    Text("应用后重启 Codex，并新建会话。恢复原连接也需重启。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary).padding(.top, 7)
                 }.font(.system(size: 11)).foregroundStyle(.secondary)
             }
         }
     }
 
     private var previewCard: some View {
-        SettingsCard("连接预览", subtitle: "敏感字段已隐藏。确认后应用以下变更。", symbol: "doc.text") {
+        SettingsCard("连接预览", symbol: "doc.text") {
             VStack(alignment: .leading, spacing: 16) {
                 HStack(alignment: .top, spacing: 12) {
                     configurationBlock("当前配置", value: model.preview["before"].string ?? "")
@@ -332,11 +323,11 @@ struct GeneralSettingsView: View {
                             .font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                 }
-                InfoNote(text: model.preview["warning"].string ?? "已有会话需重新载入并验证。")
+                InfoNote(text: "应用后重启 Codex，并新建会话。")
                 HStack(spacing: 10) {
-                    Button("恢复接管前连接…") { confirming = "config.restore" }.disabled(model.preview["attached"].bool != true)
+                    Button("恢复原连接…") { confirming = "config.restore" }.disabled(model.preview["attached"].bool != true)
                     Spacer()
-                    Button(model.preview["attached"].bool == true ? "应用连接与模型规则…" : "接管 Codex 连接…") { confirming = "config.attach" }
+                    Button("应用连接设置…") { confirming = "config.attach" }
                         .buttonStyle(.borderedProminent).disabled(model.portNeedsRestart || model.metadataLoadFailed || preferencesChanged)
                 }.disabled(model.busy)
             }

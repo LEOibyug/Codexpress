@@ -5,6 +5,7 @@ Work in Simplified Chinese for user-facing copy and reports. Product: arm64 macO
 - Do not read or modify real ~/.codex credentials/config/history, Keychain entries belonging to other apps, system proxy or Clash configuration. Public reference repository source may be read, but not modified.
 - Tests use temporary state directories and simulated localhost upstreams/proxies. No real paid generation or reset-card consumption.
 - User requested reduced TDD ceremony. Test critical observable behaviors; do not add repetitive tests for simple structs or UI layout.
+- Product UI is for end users. Avoid internal discussion, implementation assurances and decorative feature slogans. Keep labels, state, field requirements, actionable errors and necessary activation/consumption consequences. Put engineering details in documentation, not persistent page copy.
 - Never log upstream secrets, request/response bodies, OAuth callback values or local gateway key.
 - Keep work scoped to assigned files when collaborating. Do not overwrite another worker's edits. No subagents from worker agents.
 - Source code must compile and important failures must be fixed before marking complete.

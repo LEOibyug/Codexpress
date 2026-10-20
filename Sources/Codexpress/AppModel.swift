@@ -262,7 +262,7 @@ import ServiceManagement
             try await self.sync()
             let result = try await self.client.call("official.login.start", .object(["source_id": .string(source.id)]))
             guard let urlString = result["auth_url"].string, let url = URL(string: urlString), url.scheme == "https", url.host == "auth.openai.com", let flow = result["flow_id"].string else { throw AppError.message("网关返回了无效的登录地址。") }
-            self.loginSource = source.id; self.loginFlow = flow; self.loginMessage = "已打开系统浏览器，等待授权回调。"; self.callbackURL = ""
+            self.loginSource = source.id; self.loginFlow = flow; self.loginMessage = "请在浏览器中完成登录。"; self.callbackURL = ""
             NSWorkspace.shared.open(url)
         }
     }
@@ -358,8 +358,8 @@ import ServiceManagement
         perform {
             try self.requireWritableMetadata()
             if operation != "config.restore" { try self.requireCurrentPort() }
-            let result = try await self.client.call(operation, self.configPayload())
-            self.notice = result["message"].string ?? "连接配置已更新。"
+            _ = try await self.client.call(operation, self.configPayload())
+            self.notice = operation == "config.restore" ? "已恢复原连接，重启 Codex 后生效。" : "连接设置已应用，重启 Codex 后生效。"
             if !self.portNeedsRestart { self.preview = try await self.client.call("config.preview", self.configPayload()) } else { self.preview = .null }
         }
     }

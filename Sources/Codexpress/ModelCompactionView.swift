@@ -22,7 +22,7 @@ struct ModelCompactionView: View {
     private var hasChanges: Bool { rules.map(\.values) != (model.settings.modelCompaction ?? []).map { CompactionDraft($0).values } }
 
     var body: some View {
-        SettingsCard("上下文压缩", subtitle: "为不同模型设定独立的自动压缩阈值。", symbol: "text.alignleft", accessory: {
+        SettingsCard("上下文压缩", symbol: "text.alignleft", accessory: {
             Text(rules.isEmpty ? "模型默认" : "\(rules.count) 条规则").font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.secondary).padding(.horizontal, 8).padding(.vertical, 5)
                 .background(AppPalette.well, in: Capsule())
@@ -31,10 +31,7 @@ struct ModelCompactionView: View {
                 if rules.isEmpty {
                     HStack(spacing: 12) {
                         Image(systemName: "text.badge.plus").font(.system(size: 23, weight: .light)).foregroundStyle(.tertiary)
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text("使用模型默认值").font(.system(size: 12, weight: .medium))
-                            Text("添加规则，精细控制上下文的压缩时机。").font(.system(size: 11)).foregroundStyle(.secondary)
-                        }
+                        Text("未设置自定义阈值").font(.system(size: 12)).foregroundStyle(.secondary)
                         Spacer()
                         Button { addRule() } label: { Label("添加模型", systemImage: "plus") }.controlSize(.small)
                     }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
@@ -67,16 +64,14 @@ struct ModelCompactionView: View {
                     if !rules.isEmpty {
                         Button { addRule() } label: { Label("添加模型", systemImage: "plus") }
                             .buttonStyle(.plain).foregroundStyle(Color.accentColor).font(.system(size: 11)).disabled(rules.count >= 200)
-                    } else {
-                        InfoNote(text: "压缩阈值上限为窗口的 90%。")
                     }
                     Spacer(minLength: 0)
                     Button("保存规则") { save() }.controlSize(.small).disabled(!hasChanges)
                 }
-                DisclosureGroup("规则与生效方式", isExpanded: $detailsExpanded) {
+                DisclosureGroup("填写说明", isExpanded: $detailsExpanded) {
                     VStack(alignment: .leading, spacing: 7) {
-                        Text("单位为 Token，阈值不能超过上下文窗口的 90%。窗口留空时沿用已有元数据，未知模型默认窗口为 272000。")
-                        Text("同一模型在不同来源间共用规则。保存后，在下方预览并应用连接配置，再重启 Codex、新建会话。")
+                        Text("单位为 Token，压缩阈值不能超过上下文窗口的 90%。窗口留空使用模型默认值；未知模型默认为 272000。")
+                        Text("保存规则后，应用连接设置并重启 Codex。同一模型的所有来源使用相同阈值。")
                     }.font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(3).padding(.top, 6)
                 }.font(.system(size: 11)).foregroundStyle(.secondary)
             }.disabled(model.busy || model.metadataLoadFailed)
