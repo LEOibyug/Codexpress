@@ -14,7 +14,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{atomic::Ordering, Arc},
     time::Instant,
 };
@@ -257,6 +257,11 @@ struct Observer {
     output_observed: bool,
     streaming_output: bool,
     ids: Vec<String>,
+    history_request: Option<HistoryCapture>,
+    history_response: Option<Value>,
+    history_items: BTreeMap<u64, Value>,
+    history_bytes: usize,
+    history_invalid: bool,
 }
 impl Observer {
     fn output_units(&self) -> u64 {
@@ -323,6 +328,48 @@ impl Observer {
             }
         }
         let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        if self.history_request.is_some() && event_type == "response.output_item.done" {
+            if let (Some(index), Some(item)) = (value["output_index"].as_u64(), value.get("item")) {
+                self.history_bytes = self.history_bytes.saturating_add(item.to_string().len());
+                if self.history_bytes <= OBSERVATION_LIMIT {
+                    self.history_items.insert(index, item.clone());
+                } else {
+                    self.history_invalid = true;
+                    self.history_items.clear();
+                }
+            } else {
+                self.history_invalid = true;
+            }
+        }
+        if self.history_request.is_some()
+            && !self.history_invalid
+            && (!self.sse || event_type == "response.completed")
+            && response.get("output").is_some_and(Value::is_array)
+        {
+            let mut snapshot = response.clone();
+            if snapshot["output"].as_array().is_some_and(Vec::is_empty)
+                && !self.history_items.is_empty()
+            {
+                if self
+                    .history_items
+                    .keys()
+                    .copied()
+                    .eq(0..self.history_items.len() as u64)
+                {
+                    snapshot["output"] =
+                        Value::Array(self.history_items.values().cloned().collect());
+                } else {
+                    self.history_invalid = true;
+                }
+            } else if snapshot["output"].as_array().is_some_and(Vec::is_empty)
+                && self.streaming_output
+            {
+                self.history_invalid = true;
+            }
+            if !self.history_invalid {
+                self.history_response = Some(snapshot);
+            }
+        }
         if matches!(
             event_type,
             "response.output_text.delta"
@@ -422,6 +469,9 @@ impl Observer {
         }
     }
     fn event(&mut self) {
+        if self.discarding_event {
+            self.history_invalid = true;
+        }
         if !self.discarding_event {
             if let Ok(value) = serde_json::from_slice::<Value>(&self.data) {
                 self.value(&value);
@@ -590,12 +640,12 @@ fn strip_opaque_state(value: &mut Value) {
     }
 }
 
-fn portable_request(
+async fn portable_request(
     state: &Arc<AppState>,
     parts: &axum::http::request::Parts,
     parsed: &Value,
     affinity: Option<&str>,
-) -> (Request<Body>, RebuildContext) {
+) -> Result<(Request<Body>, RebuildContext), Box<Response<Body>>> {
     let mut excluded = crate::continuity::keys(
         parsed,
         parts
@@ -605,6 +655,22 @@ fn portable_request(
     );
     excluded.insert("rebuilt".into());
     let mut portable = parsed.clone();
+    let scope = history_scope(parts, parsed);
+    if let Some(previous) = parsed["previous_response_id"]
+        .as_str()
+        .filter(|_| state.history.enabled())
+    {
+        portable["input"] = match cached_input(state, &scope, previous, parsed).await {
+            Ok(input) => input,
+            Err((status, message)) => return Err(Box::new(error(status, message))),
+        };
+    } else if state.history.enabled() && parsed.get("conversation").is_some_and(|v| !v.is_null()) {
+        return Err(Box::new(error(
+            StatusCode::CONFLICT,
+            "此上游会话未保存完整本地历史，请让客户端发送完整上下文。",
+        )));
+    }
+    excluded.extend(crate::continuity::keys(&portable, None));
     strip_opaque_state(&mut portable);
     for field in ["previous_response_id", "conversation", "conversation_id"] {
         portable.as_object_mut().expect("object").remove(field);
@@ -628,18 +694,84 @@ fn portable_request(
     *retry.method_mut() = parts.method.clone();
     *retry.uri_mut() = parts.uri.clone();
     *retry.headers_mut() = headers;
-    (
+    Ok((
         retry,
         RebuildContext {
             key: affinity.map(str::to_owned),
             excluded,
+            scope,
         },
-    )
+    ))
 }
 
 struct RebuildContext {
     key: Option<String>,
     excluded: HashSet<String>,
+    scope: String,
+}
+
+#[derive(Clone)]
+struct HistoryCapture {
+    scope: String,
+    request: Value,
+    generation: u64,
+}
+struct ResponseContext {
+    discovery: bool,
+    session_key: Option<String>,
+    request_is_stream: bool,
+    rebuild: Option<RebuildContext>,
+    history: Option<HistoryCapture>,
+}
+fn history_scope(parts: &axum::http::request::Parts, parsed: &Value) -> String {
+    let session = session_binding(parsed, &parts.headers).or_else(|| {
+        parsed["prompt_cache_key"]
+            .as_str()
+            .map(|s| format!("cache:{s}"))
+    });
+    let credential = parts
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    crate::continuity::digest(
+        "history",
+        &serde_json::to_string(&(credential, session)).expect("strings"),
+    )
+}
+
+async fn cached_input(
+    state: &Arc<AppState>,
+    scope: &str,
+    previous: &str,
+    parsed: &Value,
+) -> Result<Value, (StatusCode, &'static str)> {
+    let history = state.history.clone();
+    let scope = scope.to_owned();
+    let previous = previous.to_owned();
+    let mut items =
+        match tokio::task::spawn_blocking(move || history.restore(&scope, &previous)).await {
+            Ok(Ok(items)) => items,
+            _ => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "本地历史不完整：所需增量块已淘汰或未采集。请让客户端发送完整上下文后重试。",
+                ))
+            }
+        };
+    match parsed.get("input") {
+        Some(Value::Array(input)) => items.extend(input.iter().cloned()),
+        Some(Value::String(text)) => items.push(json!({"role":"user","content":text})),
+        _ => return Err((StatusCode::BAD_REQUEST, "无法重建此输入格式")),
+    }
+    let input = Value::Array(items);
+    if serde_json::to_vec(&input).map_or(true, |v| v.len() > BODY_LIMIT) {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "恢复后的上下文超过 32 MiB，请先压缩上下文。",
+        ));
+    }
+    Ok(input)
 }
 
 async fn forward_once(
@@ -712,6 +844,22 @@ async fn forward_once(
         .unwrap_or_default();
     let previously_rebuilt = !exclusions.is_empty();
     if previously_rebuilt {
+        if let Some(previous) = parsed["previous_response_id"].as_str().filter(|id| {
+            state.history.enabled()
+                && exclusions.contains(&crate::continuity::digest("previous_response_id", id))
+        }) {
+            parsed["input"] = match cached_input(
+                &state,
+                &history_scope(&parts, &parsed),
+                previous,
+                &parsed,
+            )
+            .await
+            {
+                Ok(input) => input,
+                Err((status, message)) => return error(status, message),
+            };
+        }
         let (changed, remove_turn) = crate::continuity::apply(
             &mut parsed,
             parts
@@ -855,8 +1003,17 @@ async fn forward_once(
             let settings = state.settings.read().await.clone();
             let eligible = !routing::candidates(&state, model, None).await.is_empty();
             if eligible && settings.degraded_context_fallback {
-                let (retry, context) =
-                    portable_request(&state, &parts, &parsed, affinity_key.as_deref());
+                let (retry, context) = match portable_request(
+                    &state,
+                    &parts,
+                    &parsed,
+                    affinity_key.as_deref(),
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(response) => return *response,
+                };
                 return Box::pin(forward_once(state, retry, Some(context))).await;
             }
         }
@@ -878,6 +1035,38 @@ async fn forward_once(
         .iter()
         .map(|key| content_units(&parsed[*key]))
         .sum();
+    let history_capture =
+        if !discovery && parts.uri.path() == "/v1/responses" && state.history.enabled() {
+            let generation = state.history.generation();
+            let scope = rebuild
+                .as_ref()
+                .map(|r| r.scope.clone())
+                .unwrap_or_else(|| history_scope(&parts, &parsed));
+            let mut request = parsed.clone();
+            let mut complete = true;
+            if let Some(previous) = parsed["previous_response_id"].as_str() {
+                match cached_input(&state, &scope, previous, &parsed).await {
+                    Ok(input) => {
+                        request["input"] = input;
+                        request
+                            .as_object_mut()
+                            .expect("object")
+                            .remove("previous_response_id");
+                    }
+                    Err(_) => {
+                        state.history.record_skip();
+                        complete = false;
+                    }
+                }
+            }
+            complete.then_some(HistoryCapture {
+                scope,
+                request,
+                generation,
+            })
+        } else {
+            None
+        };
     let mut last_error = None;
     for candidate in sources {
         if candidate.kind == "official"
@@ -1029,8 +1218,17 @@ async fn forward_once(
                         {
                             drop(route_lease.take());
                             drop(attempt);
-                            let (retry, context) =
-                                portable_request(&state, &parts, &parsed, affinity_key.as_deref());
+                            let (retry, context) = match portable_request(
+                                &state,
+                                &parts,
+                                &parsed,
+                                affinity_key.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(value) => value,
+                                Err(response) => return *response,
+                            };
                             return Box::pin(forward_once(state, retry, Some(context))).await;
                         }
                         last_error = Some(error(
@@ -1112,8 +1310,17 @@ async fn forward_once(
                 drop(upstream);
                 drop(route_lease.take());
                 drop(attempt);
-                let (retry, context) =
-                    portable_request(&state, &parts, &parsed, affinity_key.as_deref());
+                let (retry, context) = match portable_request(
+                    &state,
+                    &parts,
+                    &parsed,
+                    affinity_key.as_deref(),
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(response) => return *response,
+                };
                 return Box::pin(forward_once(state, retry, Some(context))).await;
             }
             let safe_to_fallback = binding.is_none()
@@ -1132,12 +1339,13 @@ async fn forward_once(
                         upstream,
                         prefix,
                         attempt,
-                        (
+                        ResponseContext {
                             discovery,
-                            session_key.clone(),
-                            parsed["stream"].as_bool() == Some(true),
-                            None,
-                        ),
+                            session_key: session_key.clone(),
+                            request_is_stream: parsed["stream"].as_bool() == Some(true),
+                            rebuild: None,
+                            history: None,
+                        },
                         None,
                     )
                     .await,
@@ -1153,18 +1361,36 @@ async fn forward_once(
                 upstream,
                 prefix,
                 attempt,
-                (
+                ResponseContext {
                     discovery,
-                    session_key.clone(),
-                    parsed["stream"].as_bool() == Some(true),
+                    session_key: session_key.clone(),
+                    request_is_stream: parsed["stream"].as_bool() == Some(true),
                     rebuild,
-                ),
+                    history: history_capture,
+                },
                 route_lease.take(),
             )
             .await;
         }
     }
     last_error.unwrap_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "所有来源暂时不可用"))
+}
+
+async fn persist_history(state: &Arc<AppState>, observer: &mut Observer) {
+    if let Some(response) = observer.history_response.take() {
+        if let Some(capture) = observer.history_request.take() {
+            let history = state.history.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                history.capture_at(
+                    &capture.scope,
+                    &capture.request,
+                    &response,
+                    capture.generation,
+                )
+            })
+            .await;
+        }
+    }
 }
 
 async fn finalize_response(
@@ -1176,6 +1402,10 @@ async fn finalize_response(
     attempt: &mut Attempt,
 ) {
     observer.eof();
+    persist_history(state, observer).await;
+    if observer.history_request.take().is_some() {
+        state.history.record_skip();
+    }
     if observer.failed {
         routing::mark_failure(state, &source.id, 500, None).await;
         routing::mark_rejection(state, &source.id, observer.failure_code.as_deref(), None).await;
@@ -1202,10 +1432,16 @@ async fn stream_response(
     upstream: reqwest::Response,
     prefix: Vec<Bytes>,
     mut attempt: Attempt,
-    context: (bool, Option<String>, bool, Option<RebuildContext>),
+    context: ResponseContext,
     mut route_lease: Option<crate::affinity::RouteLease>,
 ) -> Response<Body> {
-    let (discovery, session_key, request_is_stream, rebuild) = context;
+    let ResponseContext {
+        discovery,
+        session_key,
+        request_is_stream,
+        rebuild,
+        history,
+    } = context;
     let status = upstream.status();
     let headers = clean_headers(upstream.headers(), false);
     let content_length = headers
@@ -1238,6 +1474,7 @@ async fn stream_response(
         || (request_is_stream && status.is_success() && content_type.is_none());
     let mut observer = Observer {
         sse,
+        history_request: if status.is_success() { history } else { None },
         ..Default::default()
     };
     if content_length != Some(0) {
@@ -1299,6 +1536,7 @@ async fn stream_response(
             match chunk {
                 Ok(chunk) => {
                     observer.push(&chunk);
+                    persist_history(&state, &mut observer).await;
                     bind_ids(&state, &source, &mut observer).await;
                     received = received.saturating_add(chunk.len() as u64);
                     let complete_body = content_length == Some(received);
@@ -1331,6 +1569,29 @@ async fn stream_response(
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+
+    #[test]
+    fn history_capture_reconstructs_completed_items_but_never_trusts_missing_stream_frames() {
+        let mut observer = Observer {
+            sse: true,
+            history_request: Some(HistoryCapture {
+                scope: "scope".into(),
+                request: json!({"input":[]}),
+                generation: 0,
+            }),
+            ..Default::default()
+        };
+        observer.value(&json!({"type":"response.output_item.done","output_index":0,"item":{"role":"assistant","content":"full answer"}}));
+        observer.value(&json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[]}}));
+        assert_eq!(
+            observer.history_response.as_ref().unwrap()["output"][0]["content"],
+            "full answer"
+        );
+        observer.history_response = None;
+        observer.history_invalid = true;
+        observer.value(&json!({"type":"response.completed","response":{"id":"r","output":[]}}));
+        assert!(observer.history_response.is_none());
+    }
 
     #[test]
     fn mixed_output_item_snapshots_and_deltas_sum_each_item_once() {

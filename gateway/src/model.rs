@@ -169,6 +169,7 @@ pub struct AppState {
     pub bindings: Mutex<HashMap<String, String>>,
     pub usage: Arc<crate::usage::UsageStore>,
     pub affinity: Arc<crate::affinity::AffinityStore>,
+    pub history: Arc<crate::history::HistoryStore>,
     pub notifications: crate::notifications::Notifications,
     pub gateway_key: String,
     pub port: u16,
@@ -202,6 +203,9 @@ impl AppState {
             bindings: Mutex::new(HashMap::new()),
             usage: Arc::new(usage),
             affinity: crate::affinity::AffinityStore::open(&state_dir.join("affinity.sqlite"))?,
+            history: Arc::new(crate::history::HistoryStore::open(
+                &state_dir.join("history.sqlite"),
+            )?),
             notifications: Default::default(),
             gateway_key,
             port,

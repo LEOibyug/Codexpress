@@ -53,6 +53,26 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             )
         }
         "credentials" => Ok(credentials(state).await),
+        "history.status" => state
+            .history
+            .status()
+            .map_err(|_| anyhow::anyhow!("无法读取原文缓存状态")),
+        "history.configure" => {
+            let enabled = payload["enabled"].as_bool().context("请指定是否保存原文")?;
+            let max_bytes = payload["max_bytes"]
+                .as_u64()
+                .context("请填写有效缓存容量")?;
+            let history = state.history.clone();
+            tokio::task::spawn_blocking(move || history.configure(enabled, max_bytes))
+                .await
+                .context("原文缓存设置失败")?
+        }
+        "history.clear" => {
+            let history = state.history.clone();
+            tokio::task::spawn_blocking(move || history.clear())
+                .await
+                .context("原文缓存清理失败")?
+        }
         "notifications.list" => Ok(json!({"events":state.notifications.list()})),
         "notifications.ack" => {
             let ids: Vec<String> =

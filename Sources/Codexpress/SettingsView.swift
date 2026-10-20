@@ -293,6 +293,7 @@ struct GeneralSettingsView: View {
                     }
                 }
                 gatewayCard
+                HistoryCacheView()
                 ModelCompactionView()
                 connectionCard
                 backupCard

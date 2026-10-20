@@ -2,6 +2,17 @@ import XCTest
 @testable import Codexpress
 
 final class PersistenceTests: XCTestCase {
+    func testHistoryCacheCapacityMigrationAndValidation() throws {
+        let old = Data(#"{"sources":[],"mode":"auto","port":17863,"codexHome":"/temporary/codex"}"#.utf8)
+        var settings = try JSONDecoder().decode(AppSettings.self, from: old)
+        XCTAssertTrue(settings.historyCacheSettings.enabled)
+        XCTAssertEqual(settings.historyCacheSettings.maxBytes, 5_000_000_000)
+        settings.historyCache = try .parse(enabled: false, gigabytes: "0.5")
+        let restored = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertEqual(restored.historyCacheSettings.maxBytes, 500_000_000)
+        XCTAssertFalse(restored.historyCacheSettings.enabled)
+        for value in ["0", "-1", "NaN", "inf", "1001", "bad"] { XCTAssertThrowsError(try HistoryCacheSettings.parse(enabled: true, gigabytes: value)) }
+    }
     func testLocalProxyPortAndLegacyModelLists() throws {
         let fresh = try ProxyPolicy().withLocalPort("7890")
         XCTAssertEqual(fresh.url, "http://127.0.0.1:7890")

@@ -1641,3 +1641,114 @@ async fn expired_official_auth_preflight_can_migrate_portable_session_without_pr
     );
     task.abort();
 }
+
+#[tokio::test]
+async fn cached_incremental_history_survives_restart_and_rebuilds_tool_pairs_for_new_source() {
+    let first_wire = br#"{ "model":"m", "input":[{"role":"user","content":"remember original prompt"}], "store":false }"#;
+    let output =
+        json!({"type":"function_call","call_id":"cached-tool","name":"shell","arguments":"{}"});
+    let output_copy = output.clone();
+    let (a, task_a) = serve(Router::new().route(
+        "/responses",
+        post(move |req: Request| {
+            let output = output_copy.clone();
+            async move {
+                assert_eq!(
+                    &to_bytes(req.into_body(), 10000).await.unwrap()[..],
+                    first_wire
+                );
+                axum::Json(json!({"id":"cached-parent","status":"completed","output":[output]}))
+            }
+        }),
+    ))
+    .await;
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let copy = received.clone();
+    let (b,task_b)=serve(Router::new().route("/responses",post(move |req:Request|{let copy=copy.clone();async move{
+        let body:Value=serde_json::from_slice(&to_bytes(req.into_body(),10000).await.unwrap()).unwrap();
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["input"][0]["content"],"remember original prompt");
+        assert_eq!(body["input"][1]["call_id"],body["input"][2]["call_id"]);
+        assert_eq!(body["input"][2]["output"],"tool result");
+        copy.lock().await.push(body);
+        axum::Json(json!({"id":"new-source-response","status":"completed","output":[{"role":"assistant","content":"continued"}]}))
+    }}))).await;
+    let (dir, state) = state(vec![source("a", &a, 0)]).await;
+    state.history.configure(true, 64_000_000).unwrap();
+    let response = relay::router(state.clone())
+        .oneshot(request(first_wire))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert!(state.history.status().unwrap()["blocks"].as_u64().unwrap() > 0);
+    drop(state);
+    let restored = AppState::new(dir.path().to_owned(), 0, "local-key".into()).unwrap();
+    *restored.sources.write().await = vec![SourceRuntime::new(source("b", &b, 0))];
+    let next=br#"{"model":"m","previous_response_id":"cached-parent","input":[{"type":"function_call_output","call_id":"cached-tool","output":"tool result"}]}"#;
+    let response = relay::router(restored.clone())
+        .oneshot(request(next))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert_eq!(received.lock().await.len(), 1);
+    restored.history.clear().unwrap();
+    restored.bindings.lock().await.clear();
+    let response = relay::router(restored)
+        .oneshot(request(next))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        received.lock().await.len(),
+        1,
+        "missing blocks must never submit partial history"
+    );
+    task_a.abort();
+    task_b.abort();
+}
+
+#[tokio::test]
+async fn sse_capture_keeps_completed_output_and_usage_never_returns_bodies() {
+    let wire="data: {\"type\":\"response.completed\",\"response\":{\"id\":\"sse-cached\",\"status\":\"completed\",\"output\":[{\"role\":\"assistant\",\"content\":\"private-response-text\"}],\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\n";
+    let (origin, task) = serve(Router::new().route(
+        "/responses",
+        post(move || async move {
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from(wire))
+                .unwrap()
+        }),
+    ))
+    .await;
+    let (_dir, state) = state(vec![source("a", &origin, 0)]).await;
+    state.history.configure(true, 64_000_000).unwrap();
+    let response = relay::router(state.clone())
+        .oneshot(request(
+            br#"{"model":"m","stream":true,"input":"private-input-text"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        &to_bytes(response.into_body(), 10000).await.unwrap()[..],
+        wire.as_bytes()
+    );
+    assert!(
+        state.history.status().unwrap()["raw_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    for op in ["history.status", "status", "usage"] {
+        let result = codexpress_gateway::management::dispatch(&state, op, json!({}))
+            .await
+            .unwrap()
+            .to_string();
+        assert!(
+            !result.contains("private-input-text") && !result.contains("private-response-text")
+        );
+        assert!(!result.contains("upstream-a") && !result.contains("local-key"));
+    }
+    task.abort();
+}

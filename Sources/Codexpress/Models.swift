@@ -88,7 +88,19 @@ struct AppSettings: Codable, Sendable {
     var officialLowQuotaPercent: Int? = nil
     var legacyProviderOrigins: [LegacyProviderOrigin]? = nil
     var degradedContextFallback: Bool? = nil
+    var historyCache: HistoryCacheSettings? = nil
     var lowQuotaPercent: Int { officialLowQuotaPercent ?? 10 }
+    var historyCacheSettings: HistoryCacheSettings { historyCache ?? HistoryCacheSettings() }
+}
+
+struct HistoryCacheSettings: Codable, Equatable, Sendable {
+    var enabled = true
+    var maxBytes: Int64 = 5_000_000_000
+    static func parse(enabled: Bool, gigabytes: String) throws -> Self {
+        guard let value = Double(gigabytes.trimmingCharacters(in: .whitespacesAndNewlines)), value.isFinite,
+              (0.064...1000).contains(value) else { throw AppError.message("缓存容量须为 0.064–1000 GB。") }
+        return Self(enabled: enabled, maxBytes: Int64((value * 1_000_000_000).rounded()))
+    }
 }
 
 struct LegacyProviderOrigin: Codable, Equatable, Sendable {

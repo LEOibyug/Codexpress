@@ -11,6 +11,7 @@ import ServiceManagement
     @Published private(set) var usageRefreshing = false
     @Published private(set) var usageError: String?
     @Published private(set) var usageUpdatedAt: Date?
+    @Published private(set) var historyStatus: JSONValue = .null
     @Published var error: String?
     @Published var notice: String?
     @Published private(set) var busy = false
@@ -194,6 +195,7 @@ import ServiceManagement
         if next.sources != settings.sources { try persistSettings(next) }
         do {
             try mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true)])))
+            historyStatus = try await client.call("history.configure", historyPayload(settings.historyCacheSettings))
             try await updateStatus()
             pendingSync = false
         } catch { pendingSync = true; throw error }
@@ -449,6 +451,25 @@ import ServiceManagement
             if changed { self.notice = "端口已保存，重新启动应用后生效；随后请重新预览连接配置。" }
             else { self.notice = "设置已保存。" }
         }
+    }
+    private func historyPayload(_ settings: HistoryCacheSettings) -> JSONValue {
+        .object(["enabled": .bool(settings.enabled), "max_bytes": .number(Double(settings.maxBytes))])
+    }
+    func saveHistoryCache(_ preferences: HistoryCacheSettings) {
+        perform {
+            _ = try HistoryCacheSettings.parse(enabled: preferences.enabled, gigabytes: String(Double(preferences.maxBytes) / 1_000_000_000))
+            var next = self.settings; next.historyCache = preferences
+            try self.persistSettings(next)
+            if self.running { self.historyStatus = try await self.client.call("history.configure", self.historyPayload(preferences)) }
+        }
+    }
+    func refreshHistoryStatus() async {
+        guard running, !busy else { return }
+        do { historyStatus = try await client.call("history.status") }
+        catch { self.error = "无法读取原文缓存状态。" }
+    }
+    func clearHistoryCache() {
+        perform { self.historyStatus = try await self.client.call("history.clear") }
     }
     func requireCurrentPort() throws { try ConfigConnectionPolicy.requireCurrentPort(saved: settings.port, live: status["port"].number) }
     func saveModelCompaction(_ rules: [ModelCompactionRule]) {

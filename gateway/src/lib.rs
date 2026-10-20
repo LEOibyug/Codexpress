@@ -5,6 +5,7 @@ pub mod config;
 pub mod continuity;
 pub mod credentials;
 pub mod discovery;
+pub mod history;
 pub mod management;
 pub mod model;
 pub mod notifications;
