@@ -33,6 +33,27 @@ pub struct Source {
 }
 
 impl Source {
+    /// Stable across token refresh for an official workspace, but different for
+    /// another workspace, API credential or upstream. Used only for routing
+    /// consistency; the digest itself is never sent to upstreams or logged.
+    pub fn identity(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let authority = if self.kind == "official" {
+            self.account_id
+                .as_deref()
+                .or_else(|| self.secret.get("account_id").and_then(Value::as_str))
+                .unwrap_or("")
+        } else {
+            self.secret
+                .get("api_key")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        };
+        let encoded =
+            serde_json::to_vec(&(&self.kind, &self.base_url, authority)).unwrap_or_default();
+        format!("{:x}", Sha256::digest(encoded))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.id.is_empty()
             || self.id.len() > 128

@@ -1,0 +1,71 @@
+# Codexpress
+
+Apple Silicon Mac 上的原生菜单栏工具。Codex 连接本机 Responses 网关，由 Codexpress 选择官方 ChatGPT 账号或第三方 API 来源，并按来源执行直连／指定代理。
+
+首版使用 SwiftUI／AppKit + Rust，要求 macOS 14 或更新版本。仅构建 arm64。两个上游参考仓库保留在 `references/`，本产品独立实现，研究记录见 [源码调研](docs/research/2026-10-20-upstream-study.md)。
+
+## 使用
+
+本机构建产物：`dist/Codexpress.app`。双击打开，或执行：
+
+```sh
+bash scripts/run.sh
+```
+
+首次启动会打开设置窗口，之后常驻菜单栏。可以把应用移到 `/Applications`；应用与网关必须作为完整 `.app` 一起移动。
+
+1. 在「来源」添加原生 Responses API，填写基址、密钥和可选模型列表。默认强制直连，不继承系统代理或代理环境变量。
+2. 添加官方账号时先填写本地 Clash 的 HTTP 或 SOCKS 代理地址和端口，再点击「登录」。授权网页由系统浏览器打开；浏览器网络遵循浏览器设置，应用侧的令牌交换、刷新、额度查询和生成均使用该源指定代理。
+3. 在「路由」调整优先级，或固定一个来源。自动池优先使用排在前面的兼容来源，识别到拒绝／限流时按规则转给下一来源。指定代理失效不会悄悄直连。
+4. 在「设置」核对 Codex 配置目录，点击「预览连接配置」，审阅后点击「接管」。这一步必须由用户主动执行，应用启动时不会修改 Codex 配置。
+5. 在 Codex 中新开会话验证连接。已有会话可能保留旧连接，需要重新载入；历史文件和工具设置会保留，但不能保证旧会话的运行时连接已经改变。
+
+退出应用会停止网关，Codex 的本地连接保留。需要恢复原供应商时，先在设置中选择「恢复接管前连接」。已接管期间不能更改端口；恢复后修改端口、重启，再预览和接管。
+
+## 官方重置卡
+
+在官方来源卡片里展开重置卡列表。使用前刷新卡片和额度，确认账号／工作区、卡片及到期时间，再手动提交。应用不会自动消耗卡片。
+
+操作在提交前持久化稳定 ID，并绑定确认的账号。重复点击不重复提交；网络结果不明时保留「待核实」，只重新查询卡片和额度，不自动重放消费请求。重置成功后刷新额度，并在确认恢复时解除该来源的额度耗尽限制。累计 Token 统计保留。
+
+## 配置和数据
+
+- 保持一个原有 `CODEX_HOME`。只管理根 `model_provider` 和新建的 `model_providers.codexpress` 连接表。
+- 保留原生认证、MCP、skills、plugins、hooks、权限、项目、模型目录和历史；不改写会话数据库。
+- 恢复采用局部合并。接管期间新增的其他设置会保留；受管字段被外部修改时拒绝覆盖，提示人工检查。
+- 上游密钥和官方凭据存入 Codexpress 专属 macOS Keychain 项。官方刷新后的凭据先写钥匙串再投入使用；钥匙串不可用会明确失败。
+- 应用数据默认位于 `~/Library/Application Support/Codexpress`，目录权限 0700；源元数据、管理 socket、本地访问凭据和连接快照使用受限权限。
+- 独立 SQLite 只记录请求元数据及 Token，不存对话正文、工具参数或认证头。缓存输入是总输入的子集，总 Token 为输入 + 输出。
+- 当前统计覆盖经过本地网关的流量；缺失或无法解析的 usage 标为不完整。官方额度和重置卡属于当前客户端内部接口，接口变化时显示失败／陈旧缓存，不伪造余额。
+
+## 兼容范围
+
+- 原生 Responses HTTP/SSE，API 请求体与响应正文尽量按原字节转发；没有 Chat Completions 或 Anthropic 转换。
+- 第三方支持 `/responses`、`/responses/compact` 和 `/models` 路径；官方首版验证范围限定在 Responses 生成与认证／额度／重置卡链路。未覆盖端点明确报错。
+- 受管 provider 关闭 WebSocket，使用 SSE。工具是否受支持仍取决于上游模型与接口。
+- 只覆盖系统代理模式；Clash TUN／透明代理关闭。应用不能凭一个网络选项绕过 TUN。
+- `previous_response_id`、已识别密文／上游状态会绑定原来源；完整可移植历史可重新按优先级选源。不会把生成到一半的结果拼接成另一来源的回复，也不会盲目重放结果不明的生成。
+- 来源状态绑定在内存里；网关重启或绑定淘汰后，无法确认来源的服务端状态请求返回 409，需要客户端提供完整可移植历史或新开会话。
+- 压缩响应及超大单个观察事件仍按原字节转发，但 Token 采集可能不完整。
+
+这是本地开发构建，使用 ad-hoc 签名，尚未 Apple 公证。真实账号 OAuth、供应商模型兼容性、实际 Codex Desktop 恢复旧会话仍需要使用者的账号与客户端完成验收；开发检查不读取原有账号凭据。
+
+## 构建与检查
+
+需要 Xcode/Swift 和 Rust stable。若项目内 `.tools/` 已安装 Rust，脚本会自动使用；否则使用 PATH 上的工具链。
+
+```sh
+bash scripts/check.sh
+swift test
+bash scripts/build.sh
+```
+
+构建脚本编译 release Rust 和 Swift arm64，生成原生图标，打包并 ad-hoc 签名 `dist/Codexpress.app`。
+
+开发时可通过 `CODEXPRESS_STATE_DIR` 指定隔离状态目录，通过 `CODEXPRESS_GATEWAY_PATH` 指定 helper。状态目录路径需足够短，满足 Unix socket 的系统路径长度限制。helper 启动参数：
+
+```sh
+codexpress-gateway --state-dir /absolute/private/path --port 17863
+```
+
+自动测试使用临时目录和本地模拟上游／代理，不消耗真实额度或重置卡。设计与验收规则见 [设计文档](docs/superpowers/specs/2026-10-20-codexpress-design.md)。

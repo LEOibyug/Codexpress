@@ -110,16 +110,18 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
                 next.push(SourceRuntime::new(source));
             }
             *current = next;
-            drop(current);
-            *state.settings.write().await = RoutingSettings {
-                mode: mode.into(),
-                fixed_source_id: fixed,
-            };
+            // Keep the source write lock through binding invalidation. Relay
+            // readers and binding writers use sources -> bindings consistently.
             state
                 .bindings
                 .lock()
                 .await
                 .retain(|_, source| ids.contains(source) && !invalidated.contains(source));
+            drop(current);
+            *state.settings.write().await = RoutingSettings {
+                mode: mode.into(),
+                fixed_source_id: fixed,
+            };
             Ok(credentials(state).await)
         }
         "usage" => state.usage.summary(
