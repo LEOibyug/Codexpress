@@ -175,6 +175,22 @@ pub fn catalog_from_value(
         }
         model["auto_compact_token_limit"] = json!(rule.auto_compact_token_limit);
     }
+    // Older Codex clients deserialize every catalog entry and require the
+    // pre-model_messages instruction field. Retain modern metadata verbatim;
+    // supply only the missing legacy representation, including unruled models.
+    for model in models.iter_mut() {
+        if model
+            .get("base_instructions")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            let instructions = model
+                .pointer("/model_messages/instructions_template")
+                .and_then(Value::as_str)
+                .unwrap_or(include_str!("../resources/codex-prompt-0.162.1.md"));
+            model["base_instructions"] = json!(instructions);
+        }
+    }
     // Cache envelopes may contain authentication/cache identity; export model metadata only.
     Ok(json!({"models":models}))
 }

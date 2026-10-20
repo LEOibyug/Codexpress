@@ -43,6 +43,14 @@ async fn remote_compaction_uses_remote_paths_preserves_metadata_and_can_restore_
     assert_eq!(generated["models"][0]["auto_compact_token_limit"], 60000);
     assert_eq!(generated["models"][0]["custom_capability"]["keep"], true);
     assert_eq!(
+        generated["models"][0]["base_instructions"],
+        "fixture metadata"
+    );
+    assert_eq!(
+        generated["models"][1]["base_instructions"],
+        "fixture metadata"
+    );
+    assert_eq!(
         generated["models"][1]["model_messages"]["instructions_template"],
         "fixture metadata"
     );

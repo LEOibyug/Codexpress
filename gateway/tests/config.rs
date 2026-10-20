@@ -20,6 +20,36 @@ fn active_catalog(home: &std::path::Path) -> Value {
 }
 
 #[test]
+fn catalog_legacy_instructions_preserve_existing_values_and_empty_modern_instructions() {
+    let original = toml_edit::DocumentMut::new();
+    let catalog = serde_json::json!({"models":[
+        {"slug":"configured","context_window":1000000,"base_instructions":"legacy unchanged","model_messages":{"instructions_template":"modern unchanged"}},
+        {"slug":"empty","model_messages":{"instructions_template":""}},
+        {"slug":"fallback","base_instructions":null}
+    ]});
+    let rendered = codexpress_gateway::compaction::catalog_from_value(
+        catalog,
+        &original,
+        &[rule("configured", 512000, Some(1000000))],
+    )
+    .unwrap();
+    assert_eq!(
+        rendered["models"][0]["base_instructions"],
+        "legacy unchanged"
+    );
+    assert_eq!(
+        rendered["models"][0]["model_messages"]["instructions_template"],
+        "modern unchanged"
+    );
+    assert_eq!(rendered["models"][0]["auto_compact_token_limit"], 512000);
+    assert_eq!(rendered["models"][1]["base_instructions"], "");
+    assert!(!rendered["models"][2]["base_instructions"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn per_model_limits_apply_update_disable_and_restore_without_losing_other_settings() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("codex");
@@ -49,6 +79,9 @@ fn per_model_limits_apply_update_disable_and_restore_without_losing_other_settin
     let configured = models.iter().find(|m| m["slug"] == "gpt-6.1-sol").unwrap();
     assert_eq!(configured["auto_compact_token_limit"], 180000);
     assert_eq!(configured["context_window"], 300000);
+    assert!(models
+        .iter()
+        .all(|model| model["base_instructions"].is_string()));
     let untouched = models.iter().find(|m| m["slug"] == "gpt-6-astra").unwrap();
     assert_eq!(untouched["auto_compact_token_limit"], 160000);
     assert_eq!(untouched["context_window"], 250000);
@@ -118,6 +151,10 @@ fn custom_catalog_preserves_model_capabilities_and_conflicts_are_protected() {
         catalog["models"][0]["model_messages"]["instructions_template"],
         "preserve me"
     );
+    // Codex 0.144.x still requires this string even when modern metadata is
+    // supplied. Both instruction representations must retain the same source.
+    assert_eq!(catalog["models"][0]["base_instructions"], "preserve me");
+    assert_eq!(catalog["models"][1]["base_instructions"], "preserve me");
     assert_eq!(catalog["models"][1]["unknown_capability"]["keep"], true);
     let active = fs::read_to_string(home.join("config.toml")).unwrap();
     fs::write(

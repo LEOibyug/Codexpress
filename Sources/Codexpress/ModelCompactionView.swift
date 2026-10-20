@@ -71,7 +71,7 @@ struct ModelCompactionView: View {
                 DisclosureGroup("填写说明", isExpanded: $detailsExpanded) {
                     VStack(alignment: .leading, spacing: 7) {
                         Text("单位为 Token，压缩阈值不能超过上下文窗口的 90%。窗口留空使用模型默认值；未知模型默认为 272000。")
-                        Text("保存规则后，应用连接设置并重启 Codex。同一模型的所有来源使用相同阈值。")
+                        Text("保存后预览并应用连接配置，再完整退出并重开 Codex。远端使用 VS Code 时请重载对应窗口。同一模型的所有来源使用相同阈值。")
                     }.font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(3).padding(.top, 6)
                 }.font(.system(size: 11)).foregroundStyle(.secondary)
             }.disabled(model.busy || model.metadataLoadFailed)

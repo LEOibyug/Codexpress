@@ -127,7 +127,7 @@ import SwiftUI
             try self.remember(saved, in: model)
             if self.profile == original { self.profile = saved }
             self.prepared = .null
-            self.notice = "已备份并应用远端来源池配置。请重启远端 Codex，已运行的对话不会热更新。"
+            self.notice = "已备份并应用远端来源池配置。请重启远端 Codex；使用 VS Code 时，请重载对应的远端窗口。"
         }
     }
     func restore(_ model: AppModel) {
