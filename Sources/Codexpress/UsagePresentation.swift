@@ -24,9 +24,28 @@ struct UsageTotals {
 }
 
 func usageCount(_ number: Double, estimated: Bool = false) -> String {
-    (estimated ? "≈" : "") + number.formatted(.number.precision(.fractionLength(0)))
+    (estimated ? "≈" : "") + compactUsageNumber(number)
 }
 func usageRate(_ number: Double?, estimated: Bool = false) -> String {
-    number.map { (estimated ? "≈" : "") + String(format: "%.1f", $0) } ?? "—"
+    number.map { (estimated ? "≈" : "") + compactUsageNumber($0, minimumFractionDigits: 1) } ?? "—"
+}
+private func compactUsageNumber(_ number: Double, minimumFractionDigits: Int = 0) -> String {
+    guard number.isFinite else { return "—" }
+    let units = ["", "K", "M", "B", "T", "Q"]
+    var scaled = number
+    var unit = 0
+    while abs(scaled) >= 1000 && unit < units.count - 1 {
+        scaled /= 1000
+        unit += 1
+    }
+    // Rounding at a unit boundary should display 1M rather than 1000K.
+    if unit > 0 && (abs(scaled) * 100).rounded() >= 100_000 && unit < units.count - 1 {
+        scaled /= 1000
+        unit += 1
+    }
+    let precision: FloatingPointFormatStyle<Double>.Configuration.Precision = unit == 0
+        ? .fractionLength(minimumFractionDigits)
+        : .fractionLength(0...2)
+    return scaled.formatted(.number.locale(Locale(identifier: "en_US_POSIX")).grouping(.never).precision(precision)) + units[unit]
 }
 func usageSeconds(_ milliseconds: Double?) -> String { milliseconds.map { String(format: "%.2f 秒", $0 / 1000) } ?? "—" }

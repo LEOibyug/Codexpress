@@ -198,7 +198,7 @@ struct UsageView: View {
                     .font(.system(size: 12, weight: .semibold, design: .rounded)).monospacedDigit().help(tpsHelp)
             }
             HStack(spacing: 14) {
-                Text("缓存命中 \(details["cached_input_reported"].bool == true ? countLabel(item["cached_input_tokens"]) : "未报告")")
+                Text("缓存命中 \(details["cached_input_reported"].bool == true ? optionalCount(item["cached_input_tokens"]) : "未报告")")
                 Text("缓存写入 \(optionalCount(details["cache_write_input_tokens"]))")
                 Text("推理 \(optionalCount(details["reasoning_output_tokens"]))")
                 Spacer(minLength: 0)
@@ -214,15 +214,15 @@ struct UsageView: View {
         }.padding(16)
     }
 
-    private func optionalCount(_ value: JSONValue) -> String { value == .null ? "未报告" : countLabel(value) }
+    private func optionalCount(_ value: JSONValue) -> String { value.number.map { usageCount($0) } ?? "未报告" }
     private func requestStatus(_ status: String?) -> String {
         switch status { case "connecting": return "连接中"; case "streaming": return "接收中"; case "success": return "完成"; case "failed": return "失败"; case "interrupted": return "已中断"; default: return "未知" }
     }
     private func tokenMetric(_ title: String, value: JSONValue, estimated: Bool, available: Bool) -> some View {
         HStack(spacing: 4) {
             Text(title).foregroundStyle(.secondary)
-            Text(available ? (estimated ? "≈" : "") + countLabel(value) : "—").fontWeight(.medium).monospacedDigit()
-        }.font(.system(size: 11)).help(estimated ? estimateHelp : "上游报告的 Token 计数")
+            Text(available ? value.number.map { usageCount($0, estimated: estimated) } ?? "—" : "—").fontWeight(.medium).monospacedDigit()
+        }.font(.system(size: 11)).help(available ? "\(title)：\(estimated ? "≈" : "")\(countLabel(value)) Token\n" + (estimated ? estimateHelp : "上游报告的 Token 计数") : "未报告")
     }
     private func metric(_ title: String, _ value: String, detail: String, help: String = "") -> some View {
         VStack(alignment: .leading, spacing: 7) {
