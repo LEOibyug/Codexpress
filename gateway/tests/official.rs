@@ -427,12 +427,26 @@ async fn token_persistence_precedes_publication_and_failure_blocks_further_use()
     );
     assert_eq!(counters.tokens.load(Ordering::SeqCst), token_requests);
     store.fail.store(false, Ordering::SeqCst);
+    {
+        let mut sources = state.sources.write().await;
+        sources[0].quota = json!({"windows":[{"used_percent":100}]});
+        sources[0].credits = json!({"credits":[{"id":"previous-account-card"}]});
+        sources[0].health = "exhausted".into();
+        sources[0].cooldown_until = Some(model::now() + 1000);
+    }
     let mut switched = old;
     switched["account_id"] = json!("account-new");
     official::fixture::install_secret(&state, "official-a", switched)
         .await
         .unwrap();
     assert!(!state.bindings.lock().await.contains_key("prior-response"));
+    {
+        let sources = state.sources.read().await;
+        assert!(sources[0].quota.is_null());
+        assert!(sources[0].credits.is_null());
+        assert_eq!(sources[0].health, "ready");
+        assert_eq!(sources[0].cooldown_until, None);
+    }
     task.abort();
 }
 

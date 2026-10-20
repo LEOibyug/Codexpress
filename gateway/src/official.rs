@@ -165,6 +165,15 @@ async fn install(state: &Arc<AppState>, before: &Source, secret: Value) -> Resul
     }
     for &index in &targets {
         let runtime = &mut sources[index];
+        if changed_accounts.contains(&runtime.source.id) {
+            runtime.quota = Value::Null;
+            runtime.credits = Value::Null;
+            if runtime.health == "exhausted" {
+                runtime.health = "ready".into();
+                runtime.cooldown_until = None;
+                runtime.last_error = None;
+            }
+        }
         runtime.source.account_id = secret
             .get("account_id")
             .and_then(Value::as_str)
