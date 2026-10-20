@@ -727,3 +727,69 @@ async fn portable_history_with_same_session_can_move_and_restore_priority() {
     a.abort();
     b.abort();
 }
+
+#[tokio::test]
+async fn content_length_json_over_real_tcp_finalizes_usage_before_last_chunk() {
+    let wire = br#"{"id":"tcp-json","usage":{"input_tokens":17,"output_tokens":3}}"#;
+    let (origin, origin_task) = serve(Router::new().route(
+        "/responses",
+        post(move || async move {
+            Response::builder()
+                .header("content-type", "application/json")
+                .header("content-length", wire.len())
+                .body(Body::from(wire.as_slice()))
+                .unwrap()
+        }),
+    ))
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = AppState::new(
+        directory.path().to_owned(),
+        address.port(),
+        "local-key".into(),
+    )
+    .unwrap();
+    state
+        .sources
+        .write()
+        .await
+        .push(SourceRuntime::new(source("a", &origin, 0)));
+    let app = relay::router(state.clone());
+    let gateway_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}/v1/responses"))
+        .bearer_auth("local-key")
+        .json(&json!({"model":"m","input":"portable"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.content_length(), Some(wire.len() as u64));
+    assert_eq!(&response.bytes().await.unwrap()[..], wire);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.inflight.load(Ordering::Relaxed) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let usage = state.usage.summary(1).unwrap();
+    assert_eq!(usage["recent"][0]["status"], "success");
+    assert_eq!(usage["recent"][0]["input_tokens"], 17);
+    assert_eq!(usage["recent"][0]["output_tokens"], 3);
+    assert_eq!(usage["recent"][0]["complete"], true);
+    assert_eq!(
+        state
+            .bindings
+            .lock()
+            .await
+            .get("tcp-json")
+            .map(String::as_str),
+        Some("a")
+    );
+    origin_task.abort();
+    gateway_task.abort();
+}

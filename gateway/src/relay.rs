@@ -660,6 +660,35 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
     last_error.unwrap_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "所有来源暂时不可用"))
 }
 
+async fn finalize_response(
+    state: &Arc<AppState>,
+    source_id: &str,
+    status: StatusCode,
+    discovery: bool,
+    observer: &mut Observer,
+    attempt: &mut Attempt,
+) {
+    observer.eof();
+    if observer.failed {
+        routing::mark_failure(state, source_id, 500, None).await;
+        routing::mark_rejection(state, source_id, observer.failure_code.as_deref(), None).await;
+    }
+    bind_ids(state, source_id, observer).await;
+    let outcome = if !status.is_success() || observer.failed {
+        "failed"
+    } else if observer.sse && !observer.terminal {
+        "interrupted"
+    } else {
+        "success"
+    };
+    attempt.finish(outcome, Some(observer));
+    if discovery {
+        if let Some(record) = &mut attempt.record {
+            record.complete = true;
+        }
+    }
+}
+
 fn stream_response(
     state: Arc<AppState>,
     source_id: String,
@@ -671,6 +700,27 @@ fn stream_response(
 ) -> Response<Body> {
     let status = upstream.status();
     let headers = clean_headers(upstream.headers(), false);
+    let content_length = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    // A zero-length body may never be polled by Hyper either. Usage stays
+    // unknown, but receiving an empty successful response is not cancellation.
+    if content_length == Some(0) {
+        attempt.finish(
+            if status.is_success() {
+                "success"
+            } else {
+                "failed"
+            },
+            None,
+        );
+        if discovery {
+            if let Some(record) = &mut attempt.record {
+                record.complete = true;
+            }
+        }
+    }
     let sse = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -686,15 +736,24 @@ fn stream_response(
         let mut observer = Observer { sse, ..Default::default() };
         if status.is_success() { if let Some(session_key) = session_key { observer.ids.push(session_key); } }
         if let Some(turn_state) = turn_state { observer.ids.push(turn_state); }
+        let mut received = 0u64;
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(chunk) => {
                     observer.push(&chunk);
                     bind_ids(&state, &source_id, &mut observer).await;
-                    // Update guard before yielding: dropping the downstream body
-                    // immediately records the last known usage and cancels reqwest.
-                    attempt.finish("interrupted", Some(&observer));
+                    received = received.saturating_add(chunk.len() as u64);
+                    let complete_body = content_length == Some(received);
+                    // Hyper can stop polling as soon as Content-Length bytes
+                    // arrive. Finalize before yielding the last chunk, rather
+                    // than relying on a subsequent stream EOF poll.
+                    if complete_body {
+                        finalize_response(&state, &source_id, status, discovery, &mut observer, &mut attempt).await;
+                    } else {
+                        attempt.finish("interrupted", Some(&observer));
+                    }
                     yield Ok::<Bytes, std::io::Error>(chunk);
+                    if complete_body { return; }
                 },
                 Err(_) => {
                     attempt.finish("interrupted", Some(&observer));
@@ -703,17 +762,7 @@ fn stream_response(
                 }
             }
         }
-        observer.eof();
-        if observer.failed {
-            routing::mark_failure(&state, &source_id, 500, None).await;
-            routing::mark_rejection(&state, &source_id, observer.failure_code.as_deref(), None).await;
-        }
-        bind_ids(&state, &source_id, &mut observer).await;
-        let outcome = if !status.is_success() || observer.failed { "failed" }
-            else if observer.sse && !observer.terminal { "interrupted" }
-            else { "success" };
-        attempt.finish(outcome, Some(&observer));
-        if discovery { if let Some(record) = &mut attempt.record { record.complete = true; } }
+        finalize_response(&state, &source_id, status, discovery, &mut observer, &mut attempt).await;
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
