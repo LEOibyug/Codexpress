@@ -3,7 +3,6 @@ import AppKit
 
 struct MenuView: View {
     @EnvironmentObject var model: AppModel
-    @Environment(\.openWindow) private var openWindow
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
             HStack {
@@ -20,7 +19,7 @@ struct MenuView: View {
                     Button("添加来源…") { showSettings() }.buttonStyle(.borderedProminent)
                 }.padding(.vertical, 6)
             } else {
-                HStack { Text("路由").foregroundStyle(.secondary); Spacer(); Text(model.settings.mode == "auto" ? "自动优先级池" : "固定 · \(model.fixedName)") }
+                HStack { Text("路由").foregroundStyle(.secondary); Spacer(); Text(model.routingMode == "auto" ? "自动优先级池" : "固定 · \(model.fixedName)") }
                 ForEach(Array(model.sources.prefix(4))) { source in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
@@ -33,6 +32,7 @@ struct MenuView: View {
                     }
                 }
             }
+            if model.pendingSync { Label("已保存的配置尚未应用，当前路由以网关状态为准。", systemImage: "clock").font(.caption).foregroundStyle(.orange) }
             if let error = model.error { Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange).lineLimit(3) }
             Divider()
             HStack {
@@ -44,7 +44,7 @@ struct MenuView: View {
             Text("退出应用后本地网关停止；恢复原连接请在设置中操作。").font(.caption2).foregroundStyle(.tertiary)
         }.padding(18).frame(width: 340)
     }
-    private func showSettings() { openWindow(id: "settings"); NSApp.activate(ignoringOtherApps: true) }
+    private func showSettings() { AppDelegate.current?.showSettings() }
 }
 func quotaSummary(_ quota: JSONValue) -> String {
     guard let window = quota["windows"].array.first, let used = window["used_percent"].number else { return "额度未知" }

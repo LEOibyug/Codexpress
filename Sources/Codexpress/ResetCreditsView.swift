@@ -13,7 +13,7 @@ struct OfficialAccountView: View {
                 Button("登录…") { model.login(source) }.disabled(model.busy || model.loginFlow != nil)
                 Button { model.refresh(source.id) } label: { Label("刷新额度", systemImage: "arrow.clockwise") }.disabled(model.busy)
             }
-            if let account = source.account_id { Text("账号／工作区 · \(account)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+            if let account = model.state(source.id)["account_id"].string { Text("账号／工作区 · \(account)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
             if quota["windows"].array.isEmpty { Text("额度尚未知；查询失败不表示额度耗尽。").font(.caption).foregroundStyle(.secondary) }
             ForEach(Array(quota["windows"].array.enumerated()), id: \.offset) { _, window in
                 VStack(alignment: .leading, spacing: 5) {
@@ -42,11 +42,6 @@ struct OfficialAccountView: View {
             } else if model.loginMessage == "官方账号已连接。" { Text("官方账号已连接。").font(.caption).foregroundStyle(.green) }
         }
     }
-}
-private struct CreditConfirmation: Identifiable {
-    var id: String { source.id + (credit["id"].string ?? "") }
-    let source: Source
-    let credit: JSONValue
 }
 struct ResetCreditsView: View {
     @EnvironmentObject var model: AppModel
@@ -79,20 +74,20 @@ struct ResetCreditsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 Text("确认使用重置卡").font(.title2.bold())
                 LabeledContent("来源", value: item.source.name)
-                LabeledContent("账号／工作区", value: item.source.account_id ?? "未提供")
+                LabeledContent("账号／工作区", value: item.accountID)
                 LabeledContent("卡片", value: item.credit["title"].string ?? "重置卡")
                 LabeledContent("到期时间", value: timestampLabel(item.credit["expires_at"]))
                 Divider()
-                ForEach(Array(model.state(item.source.id)["quota"]["windows"].array.enumerated()), id: \.offset) { _, window in Text("\(window["name"].string ?? "用量窗口")：已用 \(window["used_percent"].number.map { "\(Int($0))%" } ?? "未知")").font(.callout) }
+                ForEach(Array(item.quota["windows"].array.enumerated()), id: \.offset) { _, window in Text("\(window["name"].string ?? "用量窗口")：已用 \(window["used_percent"].number.map { "\(Int($0))%" } ?? "未知")").font(.callout) }
                 Text("当前用量较低时可能浪费卡片。具体重置哪些窗口以官方返回和后续查询为准。提交结果不明时必须先核实，不会自动再次消耗。").font(.callout).foregroundStyle(.secondary)
-                HStack { Spacer(); Button("取消") { confirmation = nil }.keyboardShortcut(.cancelAction); Button("确认使用") { model.consume(source: item.source, credit: item.credit); confirmation = nil }.buttonStyle(.borderedProminent) }
+                HStack { Spacer(); Button("取消") { confirmation = nil }.keyboardShortcut(.cancelAction); Button("确认使用") { model.consume(item); confirmation = nil }.buttonStyle(.borderedProminent) }
             }.padding(24).frame(width: 470)
         }
     }
     private func prepare(_ credit: JSONValue) {
         refreshing = true; localError = nil
         Task {
-            do { let current = try await model.prepareCredit(source: source, credit: credit); confirmation = CreditConfirmation(source: source, credit: current) }
+            do { confirmation = try await model.prepareCredit(source: source, credit: credit) }
             catch { localError = error.localizedDescription }
             refreshing = false
         }

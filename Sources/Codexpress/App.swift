@@ -12,18 +12,33 @@ import AppKit
                 .accessibilityLabel("Codexpress")
         }
         .menuBarExtraStyle(.window)
-        Window("Codexpress 设置", id: "settings") {
-            SettingsView().environmentObject(model).task { delegate.model = model; await model.start() }
-        }
-        .defaultSize(width: 860, height: 620)
-        .windowResizability(.contentMinSize)
+
     }
 }
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
+    static weak var current: AppDelegate?
     weak var model: AppModel?
+    private var settingsWindow: NSWindow?
+    func showSettings() {
+        if settingsWindow == nil {
+            let content = SettingsView().environmentObject(AppModel.shared)
+            let window = NSWindow(contentViewController: NSHostingController(rootView: content))
+            window.title = "Codexpress 设置"
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            window.setContentSize(NSSize(width: 860, height: 620))
+            window.minSize = NSSize(width: 800, height: 570)
+            window.isReleasedWhenClosed = false
+            window.center()
+            settingsWindow = window
+        }
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        Self.current = self
         model = AppModel.shared
+        if model?.sources.isEmpty == true { showSettings() }
         Task { await model?.start() }
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

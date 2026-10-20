@@ -20,6 +20,8 @@ import ServiceManagement
     @Published private(set) var consuming = Set<String>()
     @Published private(set) var resetResults: [String: String] = [:]
     @Published private(set) var launchAtLogin = false
+    @Published private(set) var metadataLoadFailed = false
+    @Published private(set) var pendingSync = false
     let directory: URL
     private let metadata: MetadataStore
     private let keychain: KeychainStore
@@ -37,13 +39,16 @@ import ServiceManagement
     private var starting = false
     var sources: [Source] { settings.sources.sorted { $0.priority < $1.priority } }
     var baseURL: String { status["base_url"].string ?? "http://127.0.0.1:\(settings.port)/v1" }
-    var fixedName: String { sources.first { $0.id == settings.fixed_source_id }?.name ?? "未选择" }
-    init() {
+    var routingMode: String { status["mode"].string ?? settings.mode }
+    var fixedSourceID: String? { status == .null ? settings.fixed_source_id : status["fixed_source_id"].string }
+    var fixedName: String { sources.first { $0.id == fixedSourceID }?.name ?? "未选择" }
+    var portNeedsRestart: Bool { status["port"].number.map { Int($0) != settings.port } ?? false }
+    init(stateDirectory: URL? = nil) {
         let override = ProcessInfo.processInfo.environment["CODEXPRESS_STATE_DIR"]
-        directory = override.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Codexpress", isDirectory: true)
+        directory = stateDirectory ?? override.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Codexpress", isDirectory: true)
         metadata = MetadataStore(directory: directory); keychain = KeychainStore(stateDirectory: directory)
         client = GatewayClient(socketPath: directory.appendingPathComponent("control.sock").path)
-        do { settings = try metadata.load() } catch { self.error = "来源设置读取失败，未覆盖原文件：\(error.localizedDescription)" }
+        do { settings = try metadata.load() } catch { metadataLoadFailed = true; self.error = "来源文件无法读取，已进入只读保护。原文件未改动，请从备份修复后重新启动应用。" }
         // Merely display the path; reading/modifying it requires explicit preview/attach actions.
         if settings.codexHome.isEmpty { settings.codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path }
         do {
@@ -66,6 +71,7 @@ import ServiceManagement
         }
     }
     func startHelper() async {
+        guard !metadataLoadFailed else { return }
         guard !startInProgress else { return }
         startInProgress = true
         defer { startInProgress = false }
@@ -123,30 +129,62 @@ import ServiceManagement
     }
     func stop() { shuttingDown = true; timerTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
     func retry() { restartCount = 0; Task { await startHelper() } }
+    func requireWritableMetadata() throws {
+        guard !metadataLoadFailed else { throw AppError.message("来源文件无法读取，已禁止保存。请先从备份修复 sources.json，再重新启动应用；原文件保持不变。") }
+    }
+    func persistSettings(_ next: AppSettings) throws {
+        try requireWritableMetadata()
+        try metadata.save(next)
+        settings = next
+    }
     private func mergeCredentials(_ data: JSONValue) throws {
+        try requireWritableMetadata()
+        var next = settings
         for item in data["updated_secrets"].array {
-            if let id = item["source_id"].string, settings.sources.contains(where: { $0.id == id && $0.official }), item["secret"] != .null {
+            if let id = item["source_id"].string, let index = next.sources.firstIndex(where: { $0.id == id && $0.official }), item["secret"] != .null {
                 if try keychain.load(id) != item["secret"] { try keychain.save(item["secret"], for: id) }
+                if let account = item["secret"]["account_id"].string, !account.isEmpty { next.sources[index].account_id = account }
             }
         }
+        if next.sources != settings.sources { try persistSettings(next) }
+    }
+    private func updateStatus() async throws {
+        let fresh = try await client.call("status")
+        guard let child = helper, child.isRunning, fresh["process_id"].number == Double(child.processIdentifier) else { running = false; throw AppError.message("网关实例已改变，停止发送管理请求。") }
+        status = fresh
+        var next = settings
+        for i in next.sources.indices where next.sources[i].official {
+            if let live = fresh["sources"].array.first(where: { $0["id"].string == next.sources[i].id }), let account = live["account_id"].string, !account.isEmpty { next.sources[i].account_id = account }
+        }
+        if next.sources != settings.sources { try persistSettings(next) }
     }
     private func sync() async throws {
+        try requireWritableMetadata()
+        pendingSync = true
         // Always retrieve helper-authoritative rotated tokens before building a source snapshot.
         try mergeCredentials(try await client.call("credentials"))
         var values: [JSONValue] = []
-        for source in settings.sources {
-            guard case .object(var value) = try JSONValue.from(source) else { continue }
-            value["secret"] = try keychain.load(source.id) ?? (source.official ? .object(["access_token": .string(""), "refresh_token": .string(""), "id_token": .string(""), "expires_at": .number(0)]) : .object([:]))
+        var next = settings
+        for index in next.sources.indices {
+            let sourceID = next.sources[index].id
+            let secret = try keychain.load(sourceID) ?? (next.sources[index].official ? .object(["access_token": .string(""), "refresh_token": .string(""), "id_token": .string(""), "expires_at": .number(0)]) : .object([:]))
+            // After a crash, Keychain may be newer than the last metadata mirror.
+            if next.sources[index].official, let account = secret["account_id"].string, !account.isEmpty { next.sources[index].account_id = account }
+            guard case .object(var value) = try JSONValue.from(next.sources[index]) else { continue }
+            value["secret"] = secret
             values.append(.object(value))
         }
-        try mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null])))
+        if next.sources != settings.sources { try persistSettings(next) }
+        do {
+            try mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null])))
+            try await updateStatus()
+            pendingSync = false
+        } catch { pendingSync = true; throw error }
     }
     func poll() async {
         guard running, !busy else { return }
         do {
-            let fresh = try await client.call("status")
-            guard let child = helper, child.isRunning, fresh["process_id"].number == Double(child.processIdentifier) else { running = false; throw AppError.message("网关实例已改变，停止发送管理请求。") }
-            status = fresh
+            try await updateStatus()
             try mergeCredentials(try await client.call("credentials"))
             if let id = loginSource, let flow = loginFlow {
                 let result = try await client.call("official.login.status", .object(["source_id": .string(id), "flow_id": .string(flow)]))
@@ -166,48 +204,56 @@ import ServiceManagement
             _ = try? await client.call("official.refresh", .object(["source_id": .string(source.id)]))
             try? mergeCredentials(try await client.call("credentials"))
         }
-        if let fresh = try? await client.call("status") { status = fresh }
+        try? await updateStatus()
     }
     func perform(_ action: @escaping () async throws -> Void) {
         guard !busy else { return }; busy = true; error = nil
         Task { do { try await action() } catch { self.error = error.localizedDescription }; busy = false }
     }
     func saveSource(_ source: Source, apiKey: String) async throws {
+        try requireWritableMetadata()
         try source.validate()
         guard settings.sources.contains(where: { $0.id == source.id }) || settings.sources.count < 200 else { throw AppError.message("最多支持 200 个来源。") }
         if !source.official, apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, try keychain.load(source.id) == nil { throw AppError.message("请输入 API 密钥。") }
         try mergeCredentials(try await client.call("credentials"))
+        try await updateStatus()
+        var source = source
+        if source.official { source = source.preservingOfficialIdentity(current: settings.sources.first { $0.id == source.id }, live: state(source.id)) }
         if !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { try keychain.save(.object(["api_key": .string(apiKey)]), for: source.id) }
         var updated = settings
         if let i = updated.sources.firstIndex(where: { $0.id == source.id }) { updated.sources[i] = source }
         else { var item = source; item.priority = updated.sources.count; updated.sources.append(item) }
         if updated.fixed_source_id == source.id && !source.enabled { updated.mode = "auto"; updated.fixed_source_id = nil }
-        try metadata.save(updated); settings = updated
-        try await sync(); status = try await client.call("status")
+        try persistSettings(updated)
+        try await sync(); try await updateStatus()
     }
     func removeSource(_ id: String) {
         perform {
+            try self.requireWritableMetadata()
             try self.mergeCredentials(try await self.client.call("credentials"))
             var next = self.settings; next.sources.removeAll { $0.id == id }
             if next.fixed_source_id == id { next.fixed_source_id = nil; next.mode = "auto" }
-            try self.metadata.save(next); self.settings = next
+            try self.persistSettings(next)
             try await self.sync(); try self.keychain.delete(id)
             if self.loginSource == id { self.loginSource = nil; self.loginFlow = nil; self.callbackURL = "" }
-            self.status = try await self.client.call("status")
+            try await self.updateStatus()
         }
     }
     func changeRouting(mode: String, fixed: String?) {
         perform {
             if mode == "fixed", !self.settings.sources.contains(where: { $0.id == fixed && $0.enabled }) { throw AppError.message("请选择已启用的固定来源。") }
-            self.settings.mode = mode; self.settings.fixed_source_id = fixed
-            try self.metadata.save(self.settings); try await self.sync(); self.status = try await self.client.call("status")
+            var next = self.settings; next.mode = mode; next.fixed_source_id = fixed
+            try self.persistSettings(next); try await self.sync(); try await self.updateStatus()
         }
     }
     func move(_ offsets: IndexSet, to destination: Int) {
-        var next = sources; next.move(fromOffsets: offsets, toOffset: destination)
+        var order = sources.map(\.id); order.move(fromOffsets: offsets, toOffset: destination)
         perform {
+            var next = order.compactMap { id in self.settings.sources.first { $0.id == id } }
+            guard next.count == self.settings.sources.count else { throw AppError.message("来源已变化，请重新排序。") }
             for i in next.indices { next[i].priority = i }
-            self.settings.sources = next; try self.metadata.save(self.settings); try await self.sync()
+            var settings = self.settings; settings.sources = next
+            try self.persistSettings(settings); try await self.sync(); try await self.updateStatus()
         }
     }
     func toggle(_ source: Source) { var next = source; next.enabled.toggle(); perform { try await self.saveSource(next, apiKey: "") } }
@@ -234,34 +280,36 @@ import ServiceManagement
     private func finishLogin(_ id: String, result: JSONValue) throws {
         guard result["secret"] != .null else { throw AppError.message("登录结果缺少凭据。") }
         try keychain.save(result["secret"], for: id)
-        if let i = settings.sources.firstIndex(where: { $0.id == id }) { settings.sources[i].account_id = result["account_id"].string ?? result["secret"]["account_id"].string }
-        try metadata.save(settings); callbackURL = ""; loginSource = nil; loginFlow = nil; loginMessage = "官方账号已连接。"
+        var next = settings
+        if let i = next.sources.firstIndex(where: { $0.id == id }) { next.sources[i].account_id = result["account_id"].string ?? result["secret"]["account_id"].string }
+        try persistSettings(next); callbackURL = ""; loginSource = nil; loginFlow = nil; loginMessage = "官方账号已连接。"
         lastQuotaRefresh[id] = nil
         Task { await refreshOfficialIfDue() }
     }
-    func refresh(_ id: String) { perform { self.lastQuotaRefresh[id] = Date(); _ = try await self.client.call("official.refresh", .object(["source_id": .string(id)])); try self.mergeCredentials(try await self.client.call("credentials")); self.status = try await self.client.call("status") } }
+    func refresh(_ id: String) { perform { self.lastQuotaRefresh[id] = Date(); _ = try await self.client.call("official.refresh", .object(["source_id": .string(id)])); try self.mergeCredentials(try await self.client.call("credentials")); try await self.updateStatus() } }
     func refreshUsage(days: Int) { perform { self.usage = try await self.client.call("usage", .object(["days": .number(Double(days))])) } }
-    func prepareCredit(source: Source, credit: JSONValue) async throws -> JSONValue {
+    func prepareCredit(source: Source, credit: JSONValue) async throws -> CreditConfirmation {
+        try requireWritableMetadata()
+        guard let before = settings.sources.first(where: { $0.id == source.id }), before == source else { throw AppError.message("来源已删除或发生变化，请重新选择重置卡。") }
         _ = try await client.call("official.refresh", .object(["source_id": .string(source.id)]))
-        status = try await client.call("status")
-        let snapshot = state(source.id)["credits"]
-        guard settings.sources.first(where: { $0.id == source.id }) == source else { throw AppError.message("来源或账号已变化，请重新选择重置卡。") }
-        guard snapshot["stale"].bool == false, snapshot["error"] == .null,
-              let current = snapshot["credits"].array.first(where: { $0["id"] == credit["id"] }),
-              current["status"].string == "available", current["expiry_known"].bool == true,
-              current["expires_at"].number.map({ $0 > Date().timeIntervalSince1970 }) ?? true else { throw AppError.message("此卡片状态未知、已过期或当前不可用，请刷新后重新选择。") }
-        return current
+        try mergeCredentials(try await client.call("credentials"))
+        try await updateStatus()
+        guard let current = settings.sources.first(where: { $0.id == source.id }), current.sameConfiguration(as: before) else { throw AppError.message("来源已删除或网络策略发生变化，请重新选择重置卡。") }
+        return try CreditConfirmation.make(source: current, live: state(source.id), creditID: credit["id"].string)
     }
-    func consume(source: Source, credit: JSONValue) {
+    func consume(_ confirmation: CreditConfirmation) {
+        let source = confirmation.source
+        let credit = confirmation.credit
         guard let creditID = credit["id"].string, !creditID.isEmpty else { return }
         let key = source.id + ":" + creditID
         guard !consuming.contains("all"), !consuming.contains(key), resetResults[key] == nil else { return }
-        guard settings.sources.first(where: { $0.id == source.id }) == source,
-              let current = state(source.id)["credits"]["credits"].array.first(where: { $0["id"] == credit["id"] }),
-              ["status", "expires_at", "reset_type", "expiry_known"].allSatisfy({ current[$0] == credit[$0] }),
-              state(source.id)["credits"]["stale"].bool == false else { error = "来源或卡片信息已变化，请重新确认。"; return }
+        do {
+            try requireWritableMetadata()
+            guard let currentSource = settings.sources.first(where: { $0.id == source.id }), currentSource == source else { throw AppError.message("来源或账号已变化，请重新确认。") }
+            try confirmation.validate(live: state(source.id))
+        } catch { self.error = error.localizedDescription; return }
         let operation = UUID().uuidString
-        operations[key] = ResetOperation(sourceID: source.id, creditID: creditID, operationID: operation, createdAt: Date().timeIntervalSince1970, result: "结果待核实，请刷新额度和卡片。")
+        operations[key] = ResetOperation(sourceID: source.id, creditID: creditID, operationID: operation, createdAt: Date().timeIntervalSince1970, result: "结果待核实，请刷新额度和卡片。", accountID: confirmation.accountID)
         do { try ResetOperationStore(directory: directory).save(operations) } catch { self.error = error.localizedDescription; return }
         consuming.insert(key)
         Task {
@@ -270,10 +318,10 @@ import ServiceManagement
                 if let result = resetResults[key] { operations[key]?.result = result; do { try ResetOperationStore(directory: directory).save(operations) } catch { self.error = error.localizedDescription } }
             }
             do {
-                let result = try await client.call("official.credits.consume", .object(["source_id": .string(source.id), "credit_id": .string(creditID), "operation_id": .string(operation), "confirmed": .bool(true)]))
+                let result = try await client.call("official.credits.consume", confirmation.consumePayload(operationID: operation))
                 let labels = ["reset": "已重置；以刷新后的窗口为准", "nothing_to_reset": "当前无需重置", "no_credit": "无可用重置卡", "already_redeemed": "卡片已使用", "unknown": "结果待核实，请刷新，勿重复提交", "pending_verification": "结果待核实，请刷新，勿重复提交"]
                 resetResults[key] = labels[result["code"].string ?? "unknown"] ?? "结果待核实，请刷新"
-                status = try await client.call("status")
+                try await updateStatus()
             } catch { resetResults[key] = "结果待核实，请先刷新额度和卡片。"; self.error = error.localizedDescription }
         }
     }
@@ -283,13 +331,28 @@ import ServiceManagement
             guard codexHome.hasPrefix("/") else { throw AppError.message("请填写 Codex 配置目录的绝对路径。") }
             let changed = self.settings.port != port
             if changed, FileManager.default.fileExists(atPath: self.directory.appendingPathComponent("config-attachment.json").path) { throw AppError.message("Codex 连接仍由本应用接管。请先预览并恢复接管前连接，再更改本地端口。") }
-            self.settings.port = port; self.settings.codexHome = codexHome; self.preview = .null; try self.metadata.save(self.settings)
+            var next = self.settings; next.port = port; next.codexHome = codexHome
+            try self.persistSettings(next); self.preview = .null
             if changed { self.notice = "端口已保存，重新启动应用后生效；随后请重新预览连接配置。" }
             else { self.notice = "设置已保存。" }
         }
     }
-    func configPreview() { perform { self.preview = try await self.client.call("config.preview", .object(["codex_home": .string(self.settings.codexHome)])) } }
-    func configAction(_ operation: String) { perform { let r = try await self.client.call(operation, .object(["codex_home": .string(self.settings.codexHome)])); self.notice = r["message"].string ?? "连接配置已更新。"; self.preview = try await self.client.call("config.preview", .object(["codex_home": .string(self.settings.codexHome)])) } }
+    func requireCurrentPort() throws { try ConfigConnectionPolicy.requireCurrentPort(saved: settings.port, live: status["port"].number) }
+    func configPreview() {
+        perform {
+            try self.requireCurrentPort()
+            self.preview = try await self.client.call("config.preview", .object(["codex_home": .string(self.settings.codexHome)]))
+        }
+    }
+    func configAction(_ operation: String) {
+        perform {
+            try self.requireWritableMetadata()
+            if operation != "config.restore" { try self.requireCurrentPort() }
+            let result = try await self.client.call(operation, .object(["codex_home": .string(self.settings.codexHome)]))
+            self.notice = result["message"].string ?? "连接配置已更新。"
+            if !self.portNeedsRestart { self.preview = try await self.client.call("config.preview", .object(["codex_home": .string(self.settings.codexHome)])) } else { self.preview = .null }
+        }
+    }
     func setLaunchAtLogin(_ value: Bool) {
         do { if value { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }; launchAtLogin = SMAppService.mainApp.status == .enabled }
         catch { self.error = "无法更新登录启动设置：\(error.localizedDescription)" }
