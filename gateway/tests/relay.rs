@@ -683,3 +683,47 @@ async fn socks5h_keeps_dns_at_explicit_proxy() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn portable_history_with_same_session_can_move_and_restore_priority() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let first_calls = calls.clone();
+    let (first, a) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let calls = first_calls.clone();
+            async move {
+                calls.lock().await.push("a");
+                axum::Json(json!({"id":"portable-a","usage":{"input_tokens":1,"output_tokens":1}}))
+            }
+        }),
+    ))
+    .await;
+    let second_calls = calls.clone();
+    let (second, b) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let calls = second_calls.clone();
+            async move {
+                calls.lock().await.push("b");
+                axum::Json(json!({"id":"portable-b","usage":{"input_tokens":1,"output_tokens":1}}))
+            }
+        }),
+    ))
+    .await;
+    let (_dir, state) = state(vec![source("a", &first, 0), source("b", &second, 1)]).await;
+    let app = relay::router(state.clone());
+    for enabled in [true, false, true] {
+        state.sources.write().await[0].source.enabled = enabled;
+        let mut portable = request(br#"{"model":"m","input":[{"role":"user","content":"complete portable input"}],"store":false}"#);
+        portable
+            .headers_mut()
+            .insert("x-session-id", "same-local-session".parse().unwrap());
+        let response = app.clone().oneshot(portable).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+    }
+    assert_eq!(*calls.lock().await, vec!["a", "b", "a"]);
+    a.abort();
+    b.abort();
+}

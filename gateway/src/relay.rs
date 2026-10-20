@@ -410,6 +410,9 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
     } else {
         false
     };
+    let opaque_state = !opaque_keys.is_empty();
+    // Ordinary session IDs describe portable client history. They constrain
+    // routing only when opaque upstream context needs an origin clue.
     let binding = parsed
         .get("previous_response_id")
         .and_then(Value::as_str)
@@ -424,7 +427,11 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                 .get("x-codex-turn-state")
                 .and_then(|v| v.to_str().ok())
         })
-        .or_else(|| session_key.as_deref().filter(|_| session_known))
+        .or_else(|| {
+            session_key
+                .as_deref()
+                .filter(|_| opaque_state && session_known)
+        })
         .or_else(|| opaque_keys.first().map(String::as_str));
     if parsed
         .get("previous_response_id")
@@ -432,7 +439,6 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
     {
         return error(StatusCode::BAD_REQUEST, "previous_response_id 格式无效");
     }
-    let opaque_state = !opaque_keys.is_empty();
     let mut sources = routing::candidates(&state, model, binding).await;
     if opaque_state {
         let bindings = state.bindings.lock().await;
@@ -445,7 +451,7 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
             })
         });
     }
-    if session_known {
+    if opaque_state && session_known {
         let bindings = state.bindings.lock().await;
         sources.retain(|source| {
             session_key.as_ref().and_then(|key| bindings.get(key)) == Some(&source.id)
