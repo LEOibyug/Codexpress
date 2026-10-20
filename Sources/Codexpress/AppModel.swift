@@ -160,6 +160,12 @@ import ServiceManagement
         let fresh = try await client.call("status")
         guard let child = helper, child.isRunning, fresh["process_id"].number == Double(child.processIdentifier) else { running = false; throw AppError.message("网关实例已改变，停止发送管理请求。") }
         status = fresh
+        if Bundle.main.bundleIdentifier == "local.codexpress.mac" {
+            let events = try await client.call("notifications.list")
+            let result = await LocalNotifications.shared.deliver(events["events"].array)
+            if let text = result.undelivered { notice = text }
+            if !result.ids.isEmpty { _ = try await client.call("notifications.ack", .object(["ids":.array(result.ids.map(JSONValue.string))])) }
+        }
         var next = settings
         for i in next.sources.indices where next.sources[i].official {
             if let durable = try keychain.load(next.sources[i].id), let account = durable["account_id"].string, !account.isEmpty { next.sources[i].account_id = account }
@@ -187,7 +193,7 @@ import ServiceManagement
         }
         if next.sources != settings.sources { try persistSettings(next) }
         do {
-            try mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent))])))
+            try mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true)])))
             try await updateStatus()
             pendingSync = false
         } catch { pendingSync = true; throw error }
@@ -324,6 +330,12 @@ import ServiceManagement
             try self.persistSettings(next); try await self.sync(); try await self.updateStatus()
         }
     }
+    func changeContextFallback(_ enabled: Bool) {
+        perform {
+            var next = self.settings; next.degradedContextFallback = enabled
+            try self.persistSettings(next); try await self.sync()
+        }
+    }
     func move(_ offsets: IndexSet, to destination: Int) {
         var order = sources.map(\.id); order.move(fromOffsets: offsets, toOffset: destination)
         perform {
@@ -432,7 +444,7 @@ import ServiceManagement
             guard codexHome.hasPrefix("/") else { throw AppError.message("请填写 Codex 配置目录的绝对路径。") }
             let changed = self.settings.port != port
             if changed, FileManager.default.fileExists(atPath: self.directory.appendingPathComponent("config-attachment.json").path) { throw AppError.message("Codex 连接仍由本应用接管。请先预览并恢复接管前连接，再更改本地端口。") }
-            var next = self.settings; next.port = port; next.codexHome = codexHome
+            var next = self.settings; next.port = port; if next.codexHome != codexHome { next.legacyProviderOrigins = nil }; next.codexHome = codexHome
             try self.persistSettings(next); self.preview = .null
             if changed { self.notice = "端口已保存，重新启动应用后生效；随后请重新预览连接配置。" }
             else { self.notice = "设置已保存。" }
@@ -448,7 +460,18 @@ import ServiceManagement
         }
     }
     func configPayload() throws -> JSONValue {
-        .object(["codex_home": .string(settings.codexHome), "model_compaction": try JSONValue.from(settings.modelCompaction ?? [])])
+        .object(["codex_home": .string(settings.codexHome), "model_compaction": try JSONValue.from(settings.modelCompaction ?? []), "provider_origins":try JSONValue.from(settings.legacyProviderOrigins ?? [])])
+    }
+    func saveLegacyOrigins(_ values: [String:String]) {
+        perform {
+            var next = self.settings
+            next.legacyProviderOrigins = try values.filter { !$0.value.isEmpty }.map { provider, id in
+                guard let source = self.sources.first(where: {$0.id == id && !$0.official}), let identity = self.state(id)["identity_digest"].string else { throw AppError.message("来源状态已变化，请刷新后重新选择。") }
+                return LegacyProviderOrigin(provider_id: provider, source_id: source.id, source_identity: identity)
+            }.sorted { $0.provider_id < $1.provider_id }
+            try self.persistSettings(next)
+            self.preview = try await self.client.call("config.preview", self.configPayload())
+        }
     }
     func configPreview() {
         perform {

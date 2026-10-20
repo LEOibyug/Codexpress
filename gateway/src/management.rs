@@ -33,10 +33,12 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
         "status" => {
             let settings = state.settings.read().await.clone();
             let sources = state.sources.read().await.clone();
+            crate::routing::notify_quotas(state, &sources);
             let sources: Vec<_> = sources
                 .iter()
                 .map(|runtime| {
                     let mut value = serde_json::to_value(runtime).expect("source status");
+                    value["identity_digest"] = json!(runtime.source.identity());
                     value["admission"] = crate::routing::admission(
                         state,
                         runtime,
@@ -47,10 +49,17 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
                 })
                 .collect();
             Ok(
-                json!({"running":true,"process_id":std::process::id(),"port":state.port,"base_url":format!("http://127.0.0.1:{}/v1",state.port),"mode":settings.mode,"fixed_source_id":settings.fixed_source_id,"official_low_quota_percent":settings.official_low_quota_percent,"sources":sources,"inflight":state.inflight.load(Ordering::Relaxed),"connection_mode":config::connection_mode(&state.state_dir).unwrap_or("unknown")}),
+                json!({"running":true,"process_id":std::process::id(),"port":state.port,"base_url":format!("http://127.0.0.1:{}/v1",state.port),"mode":settings.mode,"fixed_source_id":settings.fixed_source_id,"official_low_quota_percent":settings.official_low_quota_percent,"degraded_context_fallback":settings.degraded_context_fallback,"sources":sources,"inflight":state.inflight.load(Ordering::Relaxed),"connection_mode":config::connection_mode(&state.state_dir).unwrap_or("unknown")}),
             )
         }
         "credentials" => Ok(credentials(state).await),
+        "notifications.list" => Ok(json!({"events":state.notifications.list()})),
+        "notifications.ack" => {
+            let ids: Vec<String> =
+                serde_json::from_value(payload["ids"].clone()).context("通知标识无效")?;
+            state.notifications.acknowledge(&ids);
+            Ok(json!({"acknowledged":true}))
+        }
         "models.list" => crate::discovery::list(state, payload).await,
         "sync" => {
             let sources: Vec<Source> =
@@ -72,6 +81,11 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
                     .ok_or_else(|| anyhow::anyhow!("官方余量阈值须为1–99的整数"))?
                     as u8,
             };
+            let degraded_context_fallback = payload
+                .get("degraded_context_fallback")
+                .map(|v| v.as_bool().context("上下文兜底须为布尔值"))
+                .transpose()?
+                .unwrap_or(true);
             if !["auto", "fixed"].contains(&mode) {
                 bail!("未知路由模式");
             }
@@ -150,6 +164,7 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
                 mode: mode.into(),
                 fixed_source_id: fixed,
                 official_low_quota_percent: threshold,
+                degraded_context_fallback,
             };
             Ok(credentials(state).await)
         }

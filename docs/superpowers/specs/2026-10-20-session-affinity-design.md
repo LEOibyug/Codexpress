@@ -6,8 +6,10 @@
 - 身份：优先thread-id，兼容旧thread_id，再用现有session标识，最后prompt_cache_key。模型参与键；原始缓存键、正文、代理和上游协议不改。只保存键摘要、source_id、source.identity摘要、最近活动时间，不读取Codex历史。
 - 低额度：主短周期/主周窗口任一已知剩余<=10%，且本身份已有30分钟内活跃或在途对话时，不接收另一个新对话；无活跃时允许一个。现有同源对话继续。剩余0则全部跳过。未知额度不当作0或100；失败后的已知低/零缓存保守沿用直到明确恢复；每窗口保留实际有效观测时间，同账号副本的旧缓存不能盖过更新恢复值。
 - 并发：选择前在同一亲和锁下再次验证，给当前请求保留会话/来源；相同对话并发不能落到不同来源。成功后持久化；失败不覆盖已确认绑定。来源身份变化不继承旧绑定。无稳定会话键时仅保守计为在途新会话，不伪造可恢复绑定。
-- 迁移边界：previous_response_id、上游turn state和encrypted_content属于硬绑定，沿用现有禁止跨源规则。归零时新对话和完整可移植请求跳过官方；不能搬迁的原源上下文明确报错，不删字段、改正文或猜测其他账号可解密。流已开始或提交结果不明不重放。
+- 迁移边界：previous_response_id、上游turn state和encrypted_content属于硬绑定，沿用现有禁止跨源规则。归零时新对话和完整可移植请求跳过官方；正常路径不能搬迁的原源上下文不跨源；用户后续明确追加最终兜底，启用时仅删请求副本中的加密块与旧状态引用，以可见历史尝试新上下文并通知，关闭时才返回409。流已开始或提交结果不明不重放。
 - 持久化：本应用私有SQLite，保存长期绑定，不因30分钟活跃结束删除绑定。最多100000项，新增时逐项淘汰最久未用项；不批量清空。不会重写来源凭据/对话。恢复仅用于身份一致的来源；硬上游状态仍受原有来源验证约束。
 - UI：路由页可调低额度阈值（默认10%）；来源路由状态显示活跃数及“仅续接/额度耗尽/可接新对话”。固定来源保持用户明确锁定，不静默跨源。
 
 参考只读研究：[One API distributor](https://github.com/songquanpeng/one-api/blob/main/middleware/distributor.go)、[New API affinity](https://github.com/QuantumNous/new-api/blob/main/service/channel_affinity.go)、[New API rules](https://github.com/QuantumNous/new-api/blob/main/setting/operation_setting/channel_affinity_setting.go)。独立实现，不复制授权代码、不引入Redis/协议转换。
+
+2026-10-20追加：已确认同账号密钥的旧供应商使用受限本地凭据回原身份；未确认保留原连接。最终兜底后保存丢弃状态摘要和新来源偏好，未来只排除旧状态，不反复丢弃新密文。官方额度耗尽及上下文降级使用系统通知，按账号状态／对话去重。

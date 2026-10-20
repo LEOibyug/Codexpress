@@ -86,7 +86,16 @@ struct AppSettings: Codable, Sendable {
     // Optional for backwards-compatible decoding of existing sources.json files.
     var modelCompaction: [ModelCompactionRule]? = nil
     var officialLowQuotaPercent: Int? = nil
+    var legacyProviderOrigins: [LegacyProviderOrigin]? = nil
+    var degradedContextFallback: Bool? = nil
     var lowQuotaPercent: Int { officialLowQuotaPercent ?? 10 }
+}
+
+struct LegacyProviderOrigin: Codable, Equatable, Sendable {
+    var provider_id: String
+    var source_id: String
+    var source_identity: String
+    var confirmed = true
 }
 
 struct ModelCompactionRule: Codable, Equatable, Sendable {

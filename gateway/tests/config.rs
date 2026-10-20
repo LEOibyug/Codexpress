@@ -365,13 +365,27 @@ fn pool_aliases_resume_provider_ids_and_restore_original_tables_without_history_
     let original = "model_provider = \"custom\"\n[model_providers.custom]\nname = \"Original\"\nbase_url = \"https://custom.invalid/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n[model_providers.second]\nname = \"Second\"\nbase_url = \"https://second.invalid/v1\"\nwire_api = \"responses\"\n[mcp_servers.keep]\ncommand = \"tool\"\n";
     fs::write(home.join("config.toml"), original).unwrap();
     fs::write(home.join("history.jsonl"), "unchanged-conversation").unwrap();
-    let preview = config::preview(&home, &state, 17863, "private-local").unwrap();
+    let origins: Vec<config::ProviderOrigin> = serde_json::from_value(serde_json::json!([
+        {"provider_id":"custom","source_id":"api-one","source_identity":"identity-one","base_url":"https://custom.invalid/v1"},
+        {"provider_id":"second","source_id":"api-two","source_identity":"identity-two","base_url":"https://second.invalid/v1"}
+    ])).unwrap();
+    let unconfirmed = config::preview(&home, &state, 17863, "private-local").unwrap();
+    assert_eq!(
+        unconfirmed["compatibility_provider_ids"],
+        serde_json::json!([])
+    );
+    assert!(unconfirmed["after"]
+        .as_str()
+        .unwrap()
+        .contains("https://custom.invalid/v1"));
+    let preview =
+        config::preview_with_origins(&home, &state, 17863, "private-local", &[], &origins).unwrap();
     assert_eq!(
         preview["compatibility_provider_ids"],
         serde_json::json!(["custom", "second"])
     );
     assert!(!preview.to_string().contains("private-local"));
-    config::attach(&home, &state, 17863, "private-local").unwrap();
+    config::attach_with_origins(&home, &state, 17863, "private-local", &[], &origins).unwrap();
     let active = fs::read_to_string(home.join("config.toml")).unwrap();
     let doc = active.parse::<toml_edit::DocumentMut>().unwrap();
     for id in ["custom", "second", "codexpress"] {
@@ -383,15 +397,23 @@ fn pool_aliases_resume_provider_ids_and_restore_original_tables_without_history_
             doc["model_providers"][id]["requires_openai_auth"].as_bool(),
             Some(false)
         );
-        assert_eq!(
-            doc["model_providers"][id]["experimental_bearer_token"].as_str(),
-            Some("private-local")
-        );
+        let credential = doc["model_providers"][id]["experimental_bearer_token"]
+            .as_str()
+            .unwrap();
+        if id == "codexpress" {
+            assert_eq!(credential, "private-local");
+        } else {
+            assert_ne!(credential, "private-local");
+            let origin = config::confirmed_origin(&state, credential)
+                .unwrap()
+                .unwrap();
+            assert_eq!(origin.provider_id, id);
+        }
     }
     // Idempotent application and official roundtrips keep the real originals.
-    config::attach(&home, &state, 17863, "private-local").unwrap();
+    config::attach_with_origins(&home, &state, 17863, "private-local", &[], &origins).unwrap();
     config::use_official(&home, &state).unwrap();
-    config::attach(&home, &state, 17863, "private-local").unwrap();
+    config::attach_with_origins(&home, &state, 17863, "private-local", &[], &origins).unwrap();
     let active = fs::read_to_string(home.join("config.toml")).unwrap();
     fs::write(home.join("config.toml"), format!("{active}\n[model_providers.new]\nname = \"Added later\"\nbase_url = \"https://new.invalid/v1\"\nwire_api = \"responses\"\n")).unwrap();
     config::restore(&home, &state).unwrap();
@@ -405,7 +427,7 @@ fn pool_aliases_resume_provider_ids_and_restore_original_tables_without_history_
         fs::read_to_string(home.join("history.jsonl")).unwrap(),
         "unchanged-conversation"
     );
-    config::attach(&home, &state, 17863, "private-local").unwrap();
+    config::attach_with_origins(&home, &state, 17863, "private-local", &[], &origins).unwrap();
     let active = fs::read_to_string(home.join("config.toml")).unwrap();
     let changed = active.replacen("name = \"Codexpress\"", "name = \"External edit\"", 1);
     fs::write(home.join("config.toml"), &changed).unwrap();

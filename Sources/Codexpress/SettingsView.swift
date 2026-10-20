@@ -228,6 +228,12 @@ struct RoutingView: View {
                 Text("任一短周期或周额度不高于此值时，为已有活跃对话保留余量；额度归零后跳过此来源。")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
+            SettingsCard("对话接续", symbol: "arrow.triangle.2.circlepath") {
+                Toggle("无法续接时移除加密块并重建上下文", isOn: Binding(get: { model.settings.degradedContextFallback ?? true }, set: { model.changeContextFallback($0) }))
+                    .disabled(model.busy)
+                Text("仅在正常路由无法续接时尝试，可能缺失隐藏推理或压缩摘要。触发时发送系统通知，本地对话记录保留。")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
             if model.sources.isEmpty {
                 EmptyState("暂无来源", subtitle: "添加来源后可设置优先级。", symbol: "arrow.triangle.branch")
             } else {
@@ -354,7 +360,7 @@ struct GeneralSettingsView: View {
                 }
                 if model.portNeedsRestart { InfoNote(text: "请重启 Codexpress 以启用新端口。", symbol: "arrow.clockwise", color: .orange) }
                 DisclosureGroup("生效方式", isExpanded: $connectionDetails) {
-                    Text("应用后自动重启 Codex。已有自定义供应商 ID 同时接入来源池；依赖原供应商加密状态的对话仍可能需要原来源。")
+                    Text("应用后自动重启 Codex。已有对话须确认原来源的同一账号和密钥，才能接入网关；未确认的供应商保持原连接。")
                         .font(.system(size: 11)).foregroundStyle(.secondary).padding(.top, 7)
                 }.font(.system(size: 11)).foregroundStyle(.secondary)
             }
@@ -408,6 +414,7 @@ struct GeneralSettingsView: View {
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 InfoNote(text: "应用前自动备份配置与文件认证，并重启 Codex。")
+                if !model.preview["legacy_providers"].array.isEmpty || model.preview["origin_error"].string != nil { LegacyProviderOriginsView() }
                 HStack(spacing: 10) {
                     Button("恢复原连接…") { confirming = "config.restore" }.disabled(model.preview["attached"].bool != true)
                     Spacer()

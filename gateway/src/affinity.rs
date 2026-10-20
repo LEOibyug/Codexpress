@@ -43,6 +43,7 @@ impl AffinityStore {
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
             CREATE TABLE IF NOT EXISTS affinity (key TEXT PRIMARY KEY, source_id TEXT NOT NULL, identity TEXT NOT NULL, last_seen INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS affinity_activity ON affinity(last_seen);")?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS context_exclusions (key TEXT PRIMARY KEY, hashes TEXT NOT NULL, last_seen INTEGER NOT NULL);")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -85,6 +86,43 @@ impl AffinityStore {
             .iter()
             .find(|source| &source.id == id && source.identity() == *identity)
             .map(|source| source.id.clone())
+    }
+    pub fn exclusions(&self, key: &str) -> HashSet<String> {
+        let Ok(data) = self.data.lock() else {
+            return HashSet::new();
+        };
+        data.connection
+            .query_row(
+                "SELECT hashes FROM context_exclusions WHERE key=?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+    pub fn confirm_exclusions(&self, key: &str, hashes: &HashSet<String>) -> Result<()> {
+        let data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("上下文状态不可用"))?;
+        let mut merged: HashSet<String> = data
+            .connection
+            .query_row(
+                "SELECT hashes FROM context_exclusions WHERE key=?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        merged.extend(hashes.iter().cloned());
+        if merged.len() > 10000 {
+            anyhow::bail!("上下文降级记录超过限制");
+        }
+        data.connection.execute("INSERT INTO context_exclusions(key,hashes,last_seen) VALUES (?1,?2,?3) ON CONFLICT(key) DO UPDATE SET hashes=excluded.hashes,last_seen=excluded.last_seen",params![key,serde_json::to_string(&merged)?,now()])?;
+        data.connection.execute("DELETE FROM context_exclusions WHERE key NOT IN (SELECT key FROM context_exclusions ORDER BY last_seen DESC LIMIT 100000)",[])?;
+        Ok(())
     }
     pub fn active_count(&self, source: &Source) -> usize {
         let Ok(data) = self.data.lock() else { return 0 };

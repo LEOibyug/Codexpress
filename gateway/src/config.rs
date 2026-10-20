@@ -49,6 +49,52 @@ struct Snapshot {
 struct ProviderAliases {
     before: String,
     applied: String,
+    #[serde(default)]
+    origins: Vec<ProviderOrigin>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ProviderOrigin {
+    pub provider_id: String,
+    pub source_id: String,
+    pub source_identity: String,
+    pub base_url: String,
+    #[serde(default)]
+    credential_digest: String,
+}
+
+pub fn normalized_base(raw: &str) -> String {
+    raw.trim_end_matches('/')
+        .strip_suffix("/responses")
+        .unwrap_or(raw.trim_end_matches('/'))
+        .to_owned()
+}
+
+pub fn confirmed_origin(state_dir: &Path, credential: &str) -> Result<Option<ProviderOrigin>> {
+    let digest = format!("{:x}", Sha256::digest(credential.as_bytes()));
+    Ok(snapshot_load(state_dir)?
+        .filter(|s| s.applied_provider == "codexpress")
+        .and_then(|s| s.gateway_aliases)
+        .and_then(|a| {
+            a.origins
+                .into_iter()
+                .find(|origin| origin.credential_digest == digest)
+        }))
+}
+
+fn origin_credential(key: &str, origin: &ProviderOrigin) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(
+                key,
+                &origin.provider_id,
+                &origin.source_id,
+                &origin.source_identity
+            ))
+            .expect("strings")
+        )
+    )
 }
 
 fn local_provider() -> String {
@@ -188,6 +234,7 @@ fn prepare_gateway_aliases(
     doc: &mut DocumentMut,
     port: u16,
     key: &str,
+    origins: &[ProviderOrigin],
 ) -> Result<Option<ProviderAliases>> {
     let Some(providers) = doc
         .get_mut("model_providers")
@@ -199,20 +246,41 @@ fn prepare_gateway_aliases(
     let mut applied = DocumentMut::new();
     before["model_providers"] = Item::Table(Table::new());
     applied["model_providers"] = Item::Table(Table::new());
+    let mut confirmed = Vec::new();
     for (id, item) in providers.iter_mut() {
         let id = id.get();
         if matches!(id, "codexpress" | "openai" | "ollama" | "lmstudio") {
             continue;
         }
+        let Some(origin) = origins.iter().find(|origin| origin.provider_id == id) else {
+            continue;
+        };
+        if item
+            .get("base_url")
+            .and_then(Item::as_str)
+            .map(normalized_base)
+            .as_deref()
+            != Some(origin.base_url.as_str())
+        {
+            bail!("已有供应商与所选来源的地址不一致，未接入；请重新确认原来源。");
+        }
+        let credential = origin_credential(key, origin);
         before["model_providers"][id] = item.clone();
-        *item = Item::Table(provider_table(port, key));
+        *item = Item::Table(provider_table(port, &credential));
         applied["model_providers"][id] = item.clone();
+        let mut origin = origin.clone();
+        origin.credential_digest = format!("{:x}", Sha256::digest(credential.as_bytes()));
+        confirmed.push(origin);
+    }
+    if confirmed.len() != origins.len() {
+        bail!("原供应商不存在或不支持接入，请重新选择已有对话来源");
     }
     Ok(alias_tables(&before)
         .filter(|p| !p.is_empty())
         .map(|_| ProviderAliases {
             before: before.to_string(),
             applied: applied.to_string(),
+            origins: confirmed,
         }))
 }
 
@@ -418,6 +486,17 @@ pub fn preview_with_rules(
     key: &str,
     rules: &[ModelCompactionRule],
 ) -> Result<Value> {
+    preview_with_origins(home, state_dir, port, key, rules, &[])
+}
+
+pub fn preview_with_origins(
+    home: &Path,
+    state_dir: &Path,
+    port: u16,
+    key: &str,
+    rules: &[ModelCompactionRule],
+    origins: &[ProviderOrigin],
+) -> Result<Value> {
     let home = path_checked(home)?;
     let (_, before) = read_document(&home.join("config.toml"))?;
     let snapshot = snapshot_load(state_dir)?;
@@ -450,7 +529,8 @@ pub fn preview_with_rules(
         after["model_providers"] = Item::Table(Table::new());
     }
     after["model_providers"]["codexpress"] = Item::Table(provider_table(port, key));
-    let aliases = prepare_gateway_aliases(&mut after, port, key)?;
+    let legacy_providers: Vec<_> = alias_tables(&after).map(|p| p.iter().filter(|(id,_)| !matches!(*id,"codexpress"|"openai"|"ollama"|"lmstudio")).map(|(id,item)| json!({"provider_id":id,"base_url":item.get("base_url").and_then(Item::as_str).map(normalized_base)})).collect()).unwrap_or_default();
+    let aliases = prepare_gateway_aliases(&mut after, port, key, origins)?;
     let compatibility_provider_ids = aliases
         .as_ref()
         .map(|a| a.applied.parse::<DocumentMut>().expect("generated TOML"))
@@ -465,7 +545,7 @@ pub fn preview_with_rules(
             .map(|m| json!({"model":m["slug"],"auto_compact_token_limit":m["auto_compact_token_limit"],"context_window":m["context_window"]})).collect::<Vec<_>>()
     }).unwrap_or_default();
     Ok(
-        json!({"before":redact(&before),"after":redact(&after),"attached":snapshot.is_some(),"model_limits":model_limits,"compatibility_provider_ids":compatibility_provider_ids,"warning":WARNING}),
+        json!({"before":redact(&before),"after":redact(&after),"attached":snapshot.is_some(),"model_limits":model_limits,"legacy_providers":legacy_providers,"compatibility_provider_ids":compatibility_provider_ids,"warning":WARNING}),
     )
 }
 
@@ -479,6 +559,17 @@ pub fn attach_with_rules(
     port: u16,
     key: &str,
     rules: &[ModelCompactionRule],
+) -> Result<Value> {
+    attach_with_origins(home, state_dir, port, key, rules, &[])
+}
+
+pub fn attach_with_origins(
+    home: &Path,
+    state_dir: &Path,
+    port: u16,
+    key: &str,
+    rules: &[ModelCompactionRule],
+    origins: &[ProviderOrigin],
 ) -> Result<Value> {
     let home = path_checked(home)?;
     fs::create_dir_all(&home)?;
@@ -502,7 +593,7 @@ pub fn attach_with_rules(
             bail!("本地连接端口或凭据已变化，请先恢复连接后重新接管");
         }
     }
-    preview_with_rules(&home, state_dir, port, key, rules)?;
+    preview_with_origins(&home, state_dir, port, key, rules, origins)?;
     if let Some(snapshot) = &previous_snapshot {
         restore_official_fields(&mut doc, snapshot)?;
         restore_gateway_aliases(&mut doc, snapshot)?;
@@ -519,7 +610,7 @@ pub fn attach_with_rules(
         doc["model_providers"] = Item::Table(Table::new());
     }
     doc["model_providers"]["codexpress"] = Item::Table(provider_table(port, key));
-    let gateway_aliases = prepare_gateway_aliases(&mut doc, port, key)?;
+    let gateway_aliases = prepare_gateway_aliases(&mut doc, port, key, origins)?;
     let mut snapshot = Snapshot {
         codex_home: home.clone(),
         existed: previous_snapshot
@@ -847,20 +938,90 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
             .unwrap_or_else(|| json!([])),
     )
     .context("模型压缩规则格式无效")?;
+    let mut origins = Vec::new();
+    let mut origin_error = None;
+    if matches!(op, "config.preview" | "config.attach") {
+        let sources = state.sources.read().await;
+        let parsed_origins: Result<Vec<ProviderOrigin>> = (|| {
+            let mut origins = Vec::new();
+            if let Some(selections) = payload.get("provider_origins") {
+                let selections = selections.as_array().context("已有对话来源格式无效")?;
+                if selections.len() > 200 {
+                    bail!("已有供应商映射最多200项");
+                }
+                let mut ids = std::collections::HashSet::new();
+                for selection in selections {
+                    let provider_id = selection["provider_id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= 128)
+                        .context("缺少原供应商ID")?;
+                    if !ids.insert(provider_id) || selection["confirmed"].as_bool() != Some(true) {
+                        bail!("请确认原供应商与所选来源使用同一账号和密钥");
+                    }
+                    let source = sources
+                        .iter()
+                        .find(|s| {
+                            selection["source_id"].as_str() == Some(s.source.id.as_str())
+                                && s.source.kind == "api"
+                        })
+                        .context("请选择已保存的原API来源")?;
+                    if selection["source_identity"].as_str()
+                        != Some(source.source.identity().as_str())
+                    {
+                        bail!("原来源的身份已变化，请重新确认同一账号和密钥");
+                    }
+                    origins.push(ProviderOrigin {
+                        provider_id: provider_id.into(),
+                        source_id: source.source.id.clone(),
+                        source_identity: source.source.identity(),
+                        base_url: normalized_base(&source.source.base_url),
+                        credential_digest: String::new(),
+                    });
+                }
+            }
+            Ok(origins)
+        })();
+        match parsed_origins {
+            Ok(values) => origins = values,
+            Err(error) if op == "config.preview" => origin_error = Some(error.to_string()),
+            Err(error) => return Err(error),
+        }
+    }
     match op {
-        "config.preview" => preview_with_rules(
+        "config.preview" => {
+            let preview = preview_with_origins(
+                home,
+                &state.state_dir,
+                state.port,
+                &state.gateway_key,
+                &rules,
+                &origins,
+            );
+            let mut result = match preview {
+                Ok(result) => result,
+                Err(error) if !origins.is_empty() => {
+                    origin_error = Some(error.to_string());
+                    preview_with_origins(
+                        home,
+                        &state.state_dir,
+                        state.port,
+                        &state.gateway_key,
+                        &rules,
+                        &[],
+                    )?
+                }
+                Err(error) => return Err(error),
+            };
+            result["origin_error"] = json!(origin_error);
+            Ok(result)
+        }
+        "config.attach" => attach_with_origins(
             home,
             &state.state_dir,
             state.port,
             &state.gateway_key,
             &rules,
-        ),
-        "config.attach" => attach_with_rules(
-            home,
-            &state.state_dir,
-            state.port,
-            &state.gateway_key,
-            &rules,
+            &origins,
         ),
         "config.restore" => restore(home, &state.state_dir),
         "config.restore.preview" => restore_preview(home, &state.state_dir),

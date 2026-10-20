@@ -153,6 +153,11 @@ pub struct RoutingSettings {
     pub fixed_source_id: Option<String>,
     #[serde(default = "default_low_quota")]
     pub official_low_quota_percent: u8,
+    #[serde(default = "default_fallback")]
+    pub degraded_context_fallback: bool,
+}
+fn default_fallback() -> bool {
+    true
 }
 fn default_low_quota() -> u8 {
     10
@@ -164,6 +169,7 @@ pub struct AppState {
     pub bindings: Mutex<HashMap<String, String>>,
     pub usage: Arc<crate::usage::UsageStore>,
     pub affinity: Arc<crate::affinity::AffinityStore>,
+    pub notifications: crate::notifications::Notifications,
     pub gateway_key: String,
     pub port: u16,
     pub state_dir: PathBuf,
@@ -191,10 +197,12 @@ impl AppState {
                 mode: "auto".into(),
                 fixed_source_id: None,
                 official_low_quota_percent: 10,
+                degraded_context_fallback: true,
             }),
             bindings: Mutex::new(HashMap::new()),
             usage: Arc::new(usage),
             affinity: crate::affinity::AffinityStore::open(&state_dir.join("affinity.sqlite"))?,
+            notifications: Default::default(),
             gateway_key,
             port,
             state_dir,

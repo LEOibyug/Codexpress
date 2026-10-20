@@ -2,6 +2,27 @@ use crate::model::{now, AppState, Source};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+pub fn notify_quotas(state: &Arc<AppState>, sources: &[crate::model::SourceRuntime]) {
+    let mut seen = std::collections::HashSet::new();
+    for runtime in sources.iter().filter(|r| r.source.kind == "official") {
+        let identity = runtime.source.identity();
+        if !seen.insert(identity.clone()) {
+            continue;
+        }
+        let remaining = account_remaining(runtime, sources);
+        let exhausted = sources.iter().any(|r| {
+            r.source.kind == "official"
+                && r.source.identity() == identity
+                && r.health == "exhausted"
+        }) || remaining == Some(0.0);
+        if exhausted || remaining.is_some_and(|v| v > 0.0) {
+            state
+                .notifications
+                .quota(&identity, &runtime.source.name, exhausted);
+        }
+    }
+}
+
 pub async fn candidates(state: &Arc<AppState>, model: &str, binding: Option<&str>) -> Vec<Source> {
     candidates_with_session(state, model, binding, None).await
 }
@@ -328,6 +349,11 @@ pub async fn mark_rejection(
             } else {
                 None
             };
+            if exhausted && runtime.source.kind == "official" {
+                state
+                    .notifications
+                    .quota(&runtime.source.identity(), &runtime.source.name, true);
+            }
         }
     }
 }

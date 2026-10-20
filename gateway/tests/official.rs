@@ -1,5 +1,5 @@
 //! These tests run only against a local simulated explicit proxy and temporary state.
-use codexpress_gateway::{model, transport};
+use codexpress_gateway::{model, routing, transport};
 #[allow(dead_code)]
 #[path = "../src/official.rs"]
 mod official;

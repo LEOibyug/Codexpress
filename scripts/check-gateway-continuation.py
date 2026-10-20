@@ -77,7 +77,7 @@ def check(helper, codex, scenario):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        with tempfile.TemporaryDirectory(prefix="cx-continuation-", dir="/tmp") as temp:
+        with tempfile.TemporaryDirectory(prefix="cx-continuation-", dir="/tmp", ignore_cleanup_errors=True) as temp:
             root = Path(temp)
             home, state, work = [root / name for name in ("codex", "app", "work")]
             for directory in (home, state, work):
@@ -108,8 +108,14 @@ def check(helper, codex, scenario):
                           "proxy": {"mode": "direct"}, "models": [], "secret": {"api_key": "fixture-key"}}
                 ipc("sync", {"sources": [source], "mode": "auto"})
                 if scenario == "legacy-provider-id":
-                    (home / "config.toml").write_text('model_provider = "legacy-source"\n[model_providers.legacy-source]\nname = "Old connection"\nbase_url = "http://127.0.0.1:1/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n')
-                ipc("config.attach", {"codex_home": str(home)})
+                    upstream_base = f"http://127.0.0.1:{server.server_port}/v1"
+                    (home / "config.toml").write_text(f'model_provider = "legacy-source"\n[model_providers.legacy-source]\nname = "Old connection"\nbase_url = "{upstream_base}"\nwire_api = "responses"\nrequires_openai_auth = false\n')
+                origins = []
+                if scenario == "legacy-provider-id":
+                    status = ipc("status", {})
+                    identity = status["sources"][0]["identity_digest"]
+                    origins = [{"provider_id":"legacy-source","source_id":"fixture","source_identity":identity,"confirmed":True}]
+                ipc("config.attach", {"codex_home": str(home), "provider_origins":origins})
                 env = {k: v for k, v in os.environ.items() if not k.startswith(("CODEX_", "OPENAI_", "CHATGPT_"))}
                 env["CODEX_HOME"] = str(home)
                 provider_override = ["-c", 'model_provider="legacy-source"', "-c", "model_providers.legacy-source.stream_max_retries=0", "-c", "model_providers.legacy-source.request_max_retries=0"] if scenario == "legacy-provider-id" else []

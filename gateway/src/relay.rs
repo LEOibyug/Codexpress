@@ -520,8 +520,15 @@ fn opaque_bindings(value: &Value, keys: &mut Vec<String>) {
                     Sha256::digest(encrypted.as_bytes())
                 ));
             }
-            for value in object.values() {
-                opaque_bindings(value, keys);
+            for (name, value) in object {
+                if matches!(
+                    name.as_str(),
+                    "response" | "input" | "output" | "item" | "content"
+                ) && !(name == "output"
+                    && object.get("type").and_then(Value::as_str) == Some("function_call_output"))
+                {
+                    opaque_bindings(value, keys);
+                }
             }
         }
         Value::Array(values) => {
@@ -566,12 +573,98 @@ fn session_binding(parsed: &Value, headers: &HeaderMap) -> Option<String> {
 }
 
 async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response<Body> {
-    let authorized = request
+    forward_once(state, request, None).await
+}
+
+fn strip_opaque_state(value: &mut Value) {
+    if let Some(items) = value.get_mut("input").and_then(Value::as_array_mut) {
+        items.retain(|item| {
+            !matches!(item["type"].as_str(), Some("reasoning" | "compaction"))
+                || item.get("encrypted_content").is_none()
+        });
+        for item in items {
+            if let Some(fields) = item.as_object_mut() {
+                fields.remove("encrypted_content");
+            }
+        }
+    }
+}
+
+fn portable_request(
+    state: &Arc<AppState>,
+    parts: &axum::http::request::Parts,
+    parsed: &Value,
+    affinity: Option<&str>,
+) -> (Request<Body>, RebuildContext) {
+    let mut excluded = crate::continuity::keys(
+        parsed,
+        parts
+            .headers
+            .get("x-codex-turn-state")
+            .and_then(|v| v.to_str().ok()),
+    );
+    excluded.insert("rebuilt".into());
+    let mut portable = parsed.clone();
+    strip_opaque_state(&mut portable);
+    for field in ["previous_response_id", "conversation", "conversation_id"] {
+        portable.as_object_mut().expect("object").remove(field);
+    }
+    let mut headers = parts.headers.clone();
+    headers.remove("x-codex-turn-state");
+    headers.remove("content-length");
+    headers.remove("content-md5");
+    headers.remove("digest");
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {}", state.gateway_key)).expect("local key"),
+    );
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    state.notifications.fallback(
+        &affinity
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+    );
+    let mut retry = Request::new(Body::from(serde_json::to_vec(&portable).expect("JSON")));
+    *retry.method_mut() = parts.method.clone();
+    *retry.uri_mut() = parts.uri.clone();
+    *retry.headers_mut() = headers;
+    (
+        retry,
+        RebuildContext {
+            key: affinity.map(str::to_owned),
+            excluded,
+        },
+    )
+}
+
+struct RebuildContext {
+    key: Option<String>,
+    excluded: HashSet<String>,
+}
+
+async fn forward_once(
+    state: Arc<AppState>,
+    request: Request<Body>,
+    rebuild: Option<RebuildContext>,
+) -> Response<Body> {
+    let degraded = rebuild.is_some();
+    let credential = request
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.strip_prefix("Bearer ") == Some(state.gateway_key.as_str()));
-    if !authorized {
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let origin = match credential {
+        Some(credential) if credential == state.gateway_key => None,
+        Some(credential) => match crate::config::confirmed_origin(&state.state_dir, credential) {
+            Ok(Some(origin)) => Some(origin),
+            _ => return error(StatusCode::UNAUTHORIZED, "本地网关认证失败"),
+        },
+        None => return error(StatusCode::UNAUTHORIZED, "本地网关认证失败"),
+    };
+    if origin
+        .as_ref()
+        .is_some_and(|origin| origin.source_identity.is_empty())
+    {
         return error(StatusCode::UNAUTHORIZED, "本地网关认证失败");
     }
     let host = request.headers().get_all("host");
@@ -592,13 +685,13 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
     if request.headers().contains_key("origin") {
         return error(StatusCode::FORBIDDEN, "网关不接受浏览器跨站请求");
     }
-    let (parts, body) = request.into_parts();
-    let bytes = match to_bytes(body, BODY_LIMIT).await {
+    let (mut parts, body) = request.into_parts();
+    let mut bytes = match to_bytes(body, BODY_LIMIT).await {
         Ok(body) => body,
         Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "请求正文过大或无法读取"),
     };
     let discovery = parts.method == axum::http::Method::GET;
-    let parsed = if discovery {
+    let mut parsed = if discovery {
         json!({})
     } else {
         match serde_json::from_slice::<Value>(&bytes) {
@@ -606,6 +699,37 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
             _ => return error(StatusCode::BAD_REQUEST, "Responses 请求需要 JSON 对象"),
         }
     };
+    let stored_key = session_binding(&parsed, &parts.headers)
+        .or_else(|| {
+            parsed["prompt_cache_key"]
+                .as_str()
+                .map(|s| format!("cache:{s}"))
+        })
+        .map(|session| crate::affinity::key(&session, parsed["model"].as_str().unwrap_or("")));
+    let exclusions = stored_key
+        .as_deref()
+        .map(|key| state.affinity.exclusions(key))
+        .unwrap_or_default();
+    let previously_rebuilt = !exclusions.is_empty();
+    if previously_rebuilt {
+        let (changed, remove_turn) = crate::continuity::apply(
+            &mut parsed,
+            parts
+                .headers
+                .get("x-codex-turn-state")
+                .and_then(|v| v.to_str().ok()),
+            &exclusions,
+        );
+        if remove_turn {
+            parts.headers.remove("x-codex-turn-state");
+        }
+        if changed {
+            bytes = Bytes::from(serde_json::to_vec(&parsed).expect("JSON"));
+            parts.headers.remove("content-length");
+            parts.headers.remove("digest");
+            parts.headers.remove("content-md5");
+        }
+    }
     let model = parsed.get("model").and_then(Value::as_str).unwrap_or("");
     let mut opaque_keys = Vec::new();
     opaque_bindings(&parsed, &mut opaque_keys);
@@ -654,8 +778,61 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
     let affinity_key = affinity_session
         .as_deref()
         .map(|session| crate::affinity::key(session, model));
-    let mut sources =
-        routing::candidates_with_session(&state, model, binding, affinity_key.as_deref()).await;
+    let mut hard_keys: Vec<&str> = opaque_keys.iter().map(String::as_str).collect();
+    hard_keys.extend(parsed.get("previous_response_id").and_then(Value::as_str));
+    hard_keys.extend(
+        parsed
+            .get("conversation")
+            .and_then(|v| v.as_str().or_else(|| v.get("id").and_then(Value::as_str))),
+    );
+    hard_keys.extend(turn_key.as_deref());
+    if opaque_state && session_known {
+        hard_keys.extend(session_key.as_deref());
+    }
+    let migrated_source = if previously_rebuilt {
+        let runtimes = state.sources.read().await;
+        let all: Vec<_> = runtimes.iter().map(|r| r.source.clone()).collect();
+        stored_key
+            .as_deref()
+            .and_then(|key| state.affinity.preferred(key, &all))
+    } else {
+        None
+    };
+    let mut sources = if let Some(origin) = &origin {
+        // A scoped legacy-provider credential explicitly confirms the original
+        // account/key. It can carry old opaque state only to that exact identity.
+        let all =
+            routing::candidates_with_session(&state, model, None, affinity_key.as_deref()).await;
+        let bindings = state.bindings.lock().await;
+        all.into_iter()
+            .filter(|source| {
+                (migrated_source.as_ref().is_some_and(|id| id == &source.id)
+                    || (migrated_source.is_none()
+                        && source.id == origin.source_id
+                        && source.identity() == origin.source_identity))
+                    && hard_keys
+                        .iter()
+                        .all(|key| bindings.get(*key).is_none_or(|id| id == &source.id))
+            })
+            .collect()
+    } else {
+        if let Some(migrated) = &migrated_source {
+            let all =
+                routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
+                    .await;
+            let bindings = state.bindings.lock().await;
+            all.into_iter()
+                .filter(|source| {
+                    source.id == *migrated
+                        && hard_keys
+                            .iter()
+                            .all(|key| bindings.get(*key).is_none_or(|id| id == &source.id))
+                })
+                .collect()
+        } else {
+            routing::candidates_with_session(&state, model, binding, affinity_key.as_deref()).await
+        }
+    };
     if opaque_state {
         let bindings = state.bindings.lock().await;
         sources.retain(|source| {
@@ -674,6 +851,15 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
         });
     }
     if sources.is_empty() {
+        if !degraded && !discovery && (binding.is_some() || opaque_state) {
+            let settings = state.settings.read().await.clone();
+            let eligible = !routing::candidates(&state, model, None).await.is_empty();
+            if eligible && settings.degraded_context_fallback {
+                let (retry, context) =
+                    portable_request(&state, &parts, &parsed, affinity_key.as_deref());
+                return Box::pin(forward_once(state, retry, Some(context))).await;
+            }
+        }
         return error(
             if binding.is_some() {
                 StatusCode::CONFLICT
@@ -707,7 +893,7 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                 &state,
                 &candidate,
                 affinity_key.as_deref(),
-                binding.is_some(),
+                binding.is_some() || origin.is_some(),
                 model,
             )
             .await
@@ -836,6 +1022,17 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                         return error(StatusCode::CONFLICT, "来源身份已经变化，请重新开始请求")
                     }
                     Err(_) => {
+                        routing::mark_auth_preflight_failure(&state, &source).await;
+                        if !degraded
+                            && state.settings.read().await.degraded_context_fallback
+                            && !routing::candidates(&state, model, None).await.is_empty()
+                        {
+                            drop(route_lease.take());
+                            drop(attempt);
+                            let (retry, context) =
+                                portable_request(&state, &parts, &parsed, affinity_key.as_deref());
+                            return Box::pin(forward_once(state, retry, Some(context))).await;
+                        }
                         last_error = Some(error(
                             StatusCode::BAD_GATEWAY,
                             "官方来源认证刷新失败，请检查登录或网络",
@@ -845,6 +1042,37 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                 }
             }
             let mut prefix = Vec::new();
+            let mut context_rejected = false;
+            if matches!(status.as_u16(), 400 | 404) && (binding.is_some() || opaque_state) {
+                let mut observed = Vec::new();
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                while observed.len() < 65536 {
+                    match tokio::time::timeout_at(deadline, upstream.chunk()).await {
+                        Ok(Ok(Some(chunk))) => {
+                            observed.extend_from_slice(
+                                &chunk[..chunk.len().min(65536 - observed.len())],
+                            );
+                            prefix.push(chunk);
+                            if serde_json::from_slice::<Value>(&observed).is_ok() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                if let Ok(value) = serde_json::from_slice::<Value>(&observed) {
+                    context_rejected = matches!(
+                        value.pointer("/error/code").and_then(Value::as_str),
+                        Some(
+                            "invalid_encrypted_content"
+                                | "invalid_previous_response_id"
+                                | "previous_response_not_found"
+                                | "response_not_found"
+                                | "conversation_not_found"
+                        )
+                    );
+                }
+            }
             if matches!(status.as_u16(), 401 | 402 | 403 | 429 | 500..=599) {
                 routing::mark_failure(&state, &source.id, status.as_u16(), retry_after).await;
                 if matches!(status.as_u16(), 402 | 403 | 429) {
@@ -874,8 +1102,23 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                     }
                 }
             }
+            if !degraded
+                && (binding.is_some() || opaque_state || origin.is_some())
+                && (context_rejected || matches!(status.as_u16(), 401 | 402 | 403 | 429))
+                && state.settings.read().await.degraded_context_fallback
+                && !routing::candidates(&state, model, None).await.is_empty()
+            {
+                attempt.finish("failed", None);
+                drop(upstream);
+                drop(route_lease.take());
+                drop(attempt);
+                let (retry, context) =
+                    portable_request(&state, &parts, &parsed, affinity_key.as_deref());
+                return Box::pin(forward_once(state, retry, Some(context))).await;
+            }
             let safe_to_fallback = binding.is_none()
                 && !opaque_state
+                && origin.is_none()
                 && matches!(status.as_u16(), 401 | 402 | 403 | 429);
             if safe_to_fallback {
                 attempt.finish("failed", None);
@@ -893,6 +1136,7 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                             discovery,
                             session_key.clone(),
                             parsed["stream"].as_bool() == Some(true),
+                            None,
                         ),
                         None,
                     )
@@ -913,6 +1157,7 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                     discovery,
                     session_key.clone(),
                     parsed["stream"].as_bool() == Some(true),
+                    rebuild,
                 ),
                 route_lease.take(),
             )
@@ -957,10 +1202,10 @@ async fn stream_response(
     upstream: reqwest::Response,
     prefix: Vec<Bytes>,
     mut attempt: Attempt,
-    context: (bool, Option<String>, bool),
+    context: (bool, Option<String>, bool, Option<RebuildContext>),
     mut route_lease: Option<crate::affinity::RouteLease>,
 ) -> Response<Body> {
-    let (discovery, session_key, request_is_stream) = context;
+    let (discovery, session_key, request_is_stream, rebuild) = context;
     let status = upstream.status();
     let headers = clean_headers(upstream.headers(), false);
     let content_length = headers
@@ -1013,6 +1258,23 @@ async fn stream_response(
             }) && lease.commit().is_err()
             {
                 eprintln!("会话来源保存失败");
+            }
+        }
+        if let Some(context) = rebuild {
+            let sources = state.sources.read().await;
+            if sources
+                .iter()
+                .any(|r| r.source.id == source.id && r.source.identity() == source.identity())
+            {
+                if let Some(key) = context.key {
+                    if state
+                        .affinity
+                        .confirm_exclusions(&key, &context.excluded)
+                        .is_err()
+                    {
+                        eprintln!("上下文降级状态保存失败");
+                    }
+                }
             }
         }
         if let Some(session_key) = session_key {

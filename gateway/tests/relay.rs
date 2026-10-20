@@ -60,6 +60,8 @@ async fn state(sources: Vec<Source>) -> (tempfile::TempDir, Arc<AppState>) {
     let directory = tempfile::tempdir().unwrap();
     let state = AppState::new(directory.path().to_owned(), 0, "local-key".into()).unwrap();
     *state.sources.write().await = sources.into_iter().map(SourceRuntime::new).collect();
+    // Strict-mode safety fixtures; degraded rebuilding is exercised separately.
+    state.settings.write().await.degraded_context_fallback = false;
     (directory, state)
 }
 
@@ -566,6 +568,351 @@ async fn official_compaction_uses_required_proxy_without_direct_fallback() {
     let response = relay::router(state).oneshot(compact).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(seen.load(Ordering::Relaxed), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn explicit_invalid_ciphertext_can_rebuild_once_without_replaying_unknown_errors() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let copy = hits.clone();
+    let (origin, task) = serve(Router::new().route(
+        "/responses",
+        post(move |req: Request| {
+            let copy = copy.clone();
+            async move {
+                let body: Value =
+                    serde_json::from_slice(&to_bytes(req.into_body(), 10000).await.unwrap())
+                        .unwrap();
+                let n = copy.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(json!({"error":{"code":"invalid_encrypted_content"}})),
+                    )
+                } else {
+                    assert_eq!(body["input"].as_array().unwrap().len(), 1);
+                    assert!(body.get("previous_response_id").is_none());
+                    (
+                        StatusCode::OK,
+                        axum::Json(
+                            json!({"id":"fresh","usage":{"input_tokens":5,"output_tokens":1}}),
+                        ),
+                    )
+                }
+            }
+        }),
+    ))
+    .await;
+    let (_dir, state) = state(vec![source("a", &origin, 0)]).await;
+    state.settings.write().await.degraded_context_fallback = true;
+    state
+        .bindings
+        .lock()
+        .await
+        .insert("known-old".into(), "a".into());
+    let response=relay::router(state.clone()).oneshot(request(br#"{"model":"m","previous_response_id":"known-old","input":[{"type":"message","content":"visible"},{"type":"reasoning","encrypted_content":"invalid-cipher"}]}"#)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+    assert_eq!(state.notifications.list().len(), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn scoped_origin_migrates_once_preserves_new_ciphertext_and_survives_recovery_and_restart() {
+    let original_hits = Arc::new(AtomicUsize::new(0));
+    let copy = original_hits.clone();
+    let (a, a_task) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let copy = copy.clone();
+            async move {
+                copy.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(json!({"error":{"code":"rate_limit_exceeded"}})),
+                )
+            }
+        }),
+    ))
+    .await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let copy = hits.clone();
+    let (b,b_task)=serve(Router::new().route("/responses",post(move |req:Request|{let copy=copy.clone();async move{
+        let body:Value=serde_json::from_slice(&to_bytes(req.into_body(),10000).await.unwrap()).unwrap();
+        let n=copy.fetch_add(1,Ordering::Relaxed);
+        assert!(!body.to_string().contains("old-A-cipher"));
+        assert_eq!(body.to_string().contains("new-B-cipher"),n>0);
+        axum::Json(json!({"id":"response-B","output":[{"type":"reasoning","encrypted_content":"new-B-cipher"}],"usage":{"input_tokens":100,"output_tokens":10}}))
+    }}))).await;
+    let originals = vec![source("a", &a, 0), source("b", &b, 1)];
+    let (dir, state) = state(originals.clone()).await;
+    state.settings.write().await.degraded_context_fallback = true;
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        format!("[model_providers.old]\nname=\"Old\"\nbase_url=\"{a}\"\nwire_api=\"responses\"\n"),
+    )
+    .unwrap();
+    codexpress_gateway::config::handle(&state,"config.attach",json!({"codex_home":home,"provider_origins":[{"provider_id":"old","source_id":"a","source_identity":originals[0].identity(),"confirmed":true}]})).await.unwrap();
+    let doc = std::fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    let credential = doc["model_providers"]["old"]["experimental_bearer_token"]
+        .as_str()
+        .unwrap();
+    let make = |n| {
+        let mut body = json!({"model":"m","input":[{"type":"message","role":"user","content":"visible history"},{"type":"reasoning","encrypted_content":"old-A-cipher"}]});
+        if n > 0 {
+            body["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"reasoning","encrypted_content":"new-B-cipher"}));
+            body["previous_response_id"] = json!("response-B");
+        }
+        let mut req = request(&serde_json::to_vec(&body).unwrap());
+        req.headers_mut().insert(
+            "authorization",
+            format!("Bearer {credential}").parse().unwrap(),
+        );
+        req.headers_mut()
+            .insert("thread-id", "legacy-migrating-thread".parse().unwrap());
+        req
+    };
+    for n in 0..2 {
+        if n > 0 {
+            let mut sources = state.sources.write().await;
+            sources[0].health = "ready".into();
+            sources[0].cooldown_until = None;
+        }
+        let response = relay::router(state.clone()).oneshot(make(n)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+    }
+    drop(state);
+    let restored = AppState::new(dir.path().to_owned(), 0, "local-key".into()).unwrap();
+    *restored.sources.write().await = originals.into_iter().map(SourceRuntime::new).collect();
+    let response = relay::router(restored.clone())
+        .oneshot(make(2))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    restored.bindings.lock().await.clear();
+    let mut generic = make(3);
+    generic
+        .headers_mut()
+        .insert("authorization", "Bearer local-key".parse().unwrap());
+    let response = relay::router(restored).oneshot(generic).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert_eq!(original_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(hits.load(Ordering::Relaxed), 4);
+    a_task.abort();
+    b_task.abort();
+}
+
+#[tokio::test]
+async fn degraded_fallback_removes_only_wire_state_and_notifies_once_while_official_is_empty() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let copy = seen.clone();
+    let (origin, task) = serve(Router::new().route(
+        "/responses",
+        post(move |req: Request| {
+            let copy = copy.clone();
+            async move {
+                assert!(!req.headers().contains_key("x-codex-turn-state"));
+                let body = to_bytes(req.into_body(), 10000).await.unwrap();
+                let value: Value = serde_json::from_slice(&body).unwrap();
+                assert!(value.get("previous_response_id").is_none());
+                assert!(value.get("conversation").is_none());
+                assert_eq!(value["input"].as_array().unwrap().len(), 2);
+                assert_eq!(value["input"][0]["content"], "visible history");
+                assert_eq!(value["input"][1]["output"], "tool output");
+                assert_eq!(value["metadata"]["encrypted_content"], "unrelated-metadata");
+                copy.lock().await.push(value);
+                axum::Json(
+                    json!({"id":"fresh-response","usage":{"input_tokens":30,"output_tokens":5}}),
+                )
+            }
+        }),
+    ))
+    .await;
+    let mut official = source("official", "https://chatgpt.com/backend-api/codex", 0);
+    official.kind = "official".into();
+    official.account_id = Some("fixture-account".into());
+    let (_dir, state) = state(vec![official, source("api", &origin, 1)]).await;
+    state.sources.write().await[0].quota =
+        json!({"windows":[{"name":"secondary","used_percent":100}]});
+    state.settings.write().await.degraded_context_fallback = true;
+    let body=br#"{"model":"m","previous_response_id":"old-id","conversation":"old-conversation","input":[{"type":"message","role":"user","content":"visible history"},{"type":"reasoning","encrypted_content":"old-private-block","summary":[]},{"type":"compaction","encrypted_content":"old-compact-block"},{"type":"function_call_output","call_id":"call","output":"tool output"}],"metadata":{"encrypted_content":"unrelated-metadata"}}"#;
+    for _ in 0..2 {
+        let mut req = request(body);
+        req.headers_mut()
+            .insert("thread-id", "same-thread".parse().unwrap());
+        req.headers_mut()
+            .insert("x-codex-turn-state", "old-turn".parse().unwrap());
+        let response = relay::router(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+    }
+    assert_eq!(seen.lock().await.len(), 2);
+    let events = codexpress_gateway::management::dispatch(&state, "notifications.list", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(events["events"].as_array().unwrap().len(), 1);
+    for _ in 0..2 {
+        codexpress_gateway::management::dispatch(&state, "status", json!({}))
+            .await
+            .unwrap();
+    }
+    let events = state.notifications.list();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1]["kind"], "official_exhausted");
+    let ids: Vec<_> = events
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_owned())
+        .collect();
+    codexpress_gateway::management::dispatch(&state, "notifications.ack", json!({"ids":ids}))
+        .await
+        .unwrap();
+    assert!(state.notifications.list().is_empty());
+    state.sources.write().await[0].quota =
+        json!({"windows":[{"name":"secondary","used_percent":10}]});
+    codexpress_gateway::management::dispatch(&state, "status", json!({}))
+        .await
+        .unwrap();
+    state.sources.write().await[0].quota =
+        json!({"windows":[{"name":"secondary","used_percent":100}]});
+    codexpress_gateway::management::dispatch(&state, "status", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(state.notifications.list().len(), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn confirmed_legacy_origin_bootstraps_old_opaque_context_only_to_matching_identity() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let copy = hits.clone();
+    let body = br#"{"model":"m","previous_response_id":"old-unknown-response","input":[{"type":"reasoning","encrypted_content":"old-private-state"},{"type":"function_call_output","call_id":"old-call","output":"unchanged"}]}"#;
+    let (origin, task) = serve(Router::new().route("/responses", post(move |req: Request| {
+        let copy = copy.clone();
+        async move {
+            assert_eq!(req.headers()["authorization"],"Bearer upstream-original");
+            assert_eq!(to_bytes(req.into_body(),10000).await.unwrap().as_ref(),body);
+            copy.fetch_add(1,Ordering::Relaxed);
+            axum::Json(json!({"id":"accepted-old-context","usage":{"input_tokens":100,"output_tokens":20}}))
+        }
+    }))).await;
+    let original = source("original", &origin, 1);
+    let (_dir, state) = state(vec![
+        source("priority-first", "http://127.0.0.1:1", 0),
+        original.clone(),
+    ])
+    .await;
+    let home = state.state_dir.join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("config.toml"),format!("model_provider=\"old\"\n[model_providers.old]\nname=\"Old\"\nbase_url=\"{origin}\"\nwire_api=\"responses\"\n")).unwrap();
+    let payload = json!({"codex_home":home,"provider_origins":[{"provider_id":"old","source_id":"original","source_identity":original.identity(),"confirmed":true}]});
+    codexpress_gateway::config::handle(&state, "config.attach", payload.clone())
+        .await
+        .unwrap();
+    let doc = std::fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    let credential = doc["model_providers"]["old"]["experimental_bearer_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let make_request = || {
+        let mut req = request(body);
+        req.headers_mut().insert(
+            "authorization",
+            format!("Bearer {credential}").parse().unwrap(),
+        );
+        req
+    };
+    assert_eq!(
+        relay::router(state.clone())
+            .oneshot(request(body))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    for _ in 0..2 {
+        state.bindings.lock().await.clear();
+        let response = relay::router(state.clone())
+            .oneshot(make_request())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+    let mut conflicting_turn = make_request();
+    conflicting_turn
+        .headers_mut()
+        .insert("x-codex-turn-state", "known-other-turn".parse().unwrap());
+    use sha2::Digest;
+    let key = format!("turn:{:x}", sha2::Sha256::digest(b"known-other-turn"));
+    state
+        .bindings
+        .lock()
+        .await
+        .insert(key, "priority-first".into());
+    assert_eq!(
+        relay::router(state.clone())
+            .oneshot(conflicting_turn)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    state.bindings.lock().await.clear();
+    state
+        .bindings
+        .lock()
+        .await
+        .insert("old-unknown-response".into(), "priority-first".into());
+    assert_eq!(
+        relay::router(state.clone())
+            .oneshot(make_request())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    state.bindings.lock().await.clear();
+    state.sources.write().await[1].source.secret = json!({"api_key":"changed-key"});
+    assert_eq!(
+        relay::router(state.clone())
+            .oneshot(make_request())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let invalid = codexpress_gateway::config::handle(&state, "config.preview", payload.clone())
+        .await
+        .unwrap();
+    assert!(invalid["origin_error"].is_string());
+    assert!(
+        codexpress_gateway::config::handle(&state, "config.attach", payload.clone())
+            .await
+            .is_err()
+    );
+    codexpress_gateway::config::handle(&state, "config.restore.preview", payload.clone())
+        .await
+        .unwrap();
+    codexpress_gateway::config::handle(&state, "config.restore", payload)
+        .await
+        .unwrap();
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
     task.abort();
 }
 

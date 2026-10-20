@@ -828,7 +828,9 @@ async fn refresh_selected_snapshots(
             Err(e) => stale(runtime.credits.clone(), "credits", &e.to_string()),
         };
     }
-    Ok(json!({"quota":runtime.quota,"credits":runtime.credits}))
+    let result = json!({"quota":runtime.quota,"credits":runtime.credits});
+    crate::routing::notify_quotas(state, &sources);
+    Ok(result)
 }
 
 fn preserve_low_windows(fresh: &mut Value, previous: &Value, threshold: u8) {
