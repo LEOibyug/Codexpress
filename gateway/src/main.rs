@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use codexpress_gateway::{config, management, model::AppState, relay};
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{fs, os::{fd::AsRawFd, unix::fs::{PermissionsExt, OpenOptionsExt}}, path::PathBuf};
 
 #[tokio::main]
 async fn main() {
@@ -18,6 +18,12 @@ async fn run()->Result<()> {
     let state_dir=state_dir.context("必须指定 --state-dir")?;
     if !state_dir.is_absolute() || port==0 {bail!("状态目录必须为绝对路径，端口必须大于零");}
     fs::create_dir_all(&state_dir)?;fs::set_permissions(&state_dir,fs::Permissions::from_mode(0o700))?;
+    let process_lock=fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(state_dir.join("gateway.lock"))?;
+    // Held for the full process lifetime. This also prevents simultaneous
+    // startup on different ports from racing over the same control socket.
+    if unsafe { libc::flock(process_lock.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB) } != 0 {
+        bail!("此状态目录已有网关进程，未接管已有实例");
+    }
     let key_path=state_dir.join("gateway-key");
     let key=if key_path.exists(){fs::read_to_string(&key_path)?}else{
         let key=format!("cx-{}{}",uuid::Uuid::new_v4().simple(),uuid::Uuid::new_v4().simple());
@@ -33,6 +39,8 @@ async fn run()->Result<()> {
         result=server=>result?,
         _=tokio::signal::ctrl_c()=>{},
     }
-    let _=fs::remove_file(state_dir.join("control.sock"));
+    // The OS releases listeners on exit. Keep the socket path: the next owner
+    // checks liveness before removing it, so a shutdown cannot unlink another
+    // process's socket after a race or a failed startup.
     Ok(())
 }

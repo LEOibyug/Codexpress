@@ -6,6 +6,7 @@
   <key>CFBundleDisplayName</key><string>Codexpress</string>
   <key>CFBundleExecutable</key><string>Codexpress</string>
   <key>CFBundleIdentifier</key><string>local.codexpress.mac</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Codexpress</string>
   <key>CFBundlePackageType</key><string>APPL</string>
