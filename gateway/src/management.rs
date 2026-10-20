@@ -53,6 +53,9 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             )
         }
         "credentials" => Ok(credentials(state).await),
+        op if op.starts_with("credentials.") => {
+            crate::credentials::handle(state, op, payload).await
+        }
         "remote.status" => state.remote.status().await,
         "remote.start" => {
             let port = payload["port"]

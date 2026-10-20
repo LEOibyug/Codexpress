@@ -239,7 +239,7 @@ enum ConfigConnectionPolicy {
 enum OfficialCredentialMirror {
     static func requireDurable(_ value: JSONValue?) throws -> JSONValue {
         guard let value, value["access_token"].string?.isEmpty == false,
-              value["account_id"].string?.isEmpty == false else { throw AppError.message("官方凭据尚未持久保存到钥匙串，请重新登录；未使用 IPC 中的旧令牌覆盖凭据。") }
+              value["account_id"].string?.isEmpty == false else { throw AppError.message("官方凭据尚未完整保存，请重新登录。") }
         return value
     }
     static func mergedSources(_ sources: [Source], response: JSONValue, loadDurable: (String) throws -> JSONValue?) throws -> [Source] {

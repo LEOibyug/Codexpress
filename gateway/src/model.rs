@@ -225,6 +225,11 @@ impl AppState {
         }
         Ok(())
     }
+    pub fn credential_store(&self) -> Result<Arc<dyn crate::credentials::CredentialStore>> {
+        self.credential_store
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("凭据存储未启用"))
+    }
 }
 
 pub fn now() -> u64 {

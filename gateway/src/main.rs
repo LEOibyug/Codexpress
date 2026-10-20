@@ -1,5 +1,11 @@
 use anyhow::{bail, Context, Result};
-use codexpress_gateway::{config, credentials::KeychainStore, management, model::AppState, relay};
+use codexpress_gateway::{
+    config,
+    credentials::{KeychainStore, ManagedCredentialStore},
+    management,
+    model::AppState,
+    relay,
+};
 use std::{
     fs,
     os::{
@@ -73,7 +79,10 @@ async fn run() -> Result<()> {
     if key.trim().len() < 32 {
         bail!("本地访问凭据无效，请检查应用状态目录");
     }
-    let credential_store = std::sync::Arc::new(KeychainStore::new(&state_dir));
+    let credential_store = std::sync::Arc::new(ManagedCredentialStore::open(
+        &state_dir,
+        std::sync::Arc::new(KeychainStore::new(&state_dir)),
+    )?);
     let state = AppState::new_with_credential_store(
         state_dir.clone(),
         port,

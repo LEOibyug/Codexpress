@@ -21,7 +21,7 @@ use tokio::{
     sync::Mutex,
 };
 
-const PERSISTENCE_FAILURE: &str = "新凭据保存失败，账号已暂停；请检查钥匙串后重新登录";
+const PERSISTENCE_FAILURE: &str = "新凭据保存失败，账号已暂停；请检查凭据存储后重新登录";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REDIRECT: &str = "http://localhost:1455/auth/callback";
 const TOKEN: &str = "https://auth.openai.com/oauth/token";

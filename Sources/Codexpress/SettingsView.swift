@@ -295,6 +295,7 @@ struct GeneralSettingsView: View {
                     }
                 }
                 gatewayCard
+                CredentialStorageView()
                 HistoryCacheView()
                 ModelCompactionView()
                 connectionCard
