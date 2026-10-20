@@ -50,12 +50,12 @@ struct SourcesView: View {
                 Menu {
                     Button("官方账号") { editing = EditingSource(source: .newOfficial(), isNew: true) }
                     Button("Responses API") { editing = EditingSource(source: Source(), isNew: true) }
-                } label: { Label("添加来源", systemImage: "plus") }.disabled(!model.running || model.busy || model.metadataLoadFailed)
+                } label: { Label("添加来源", systemImage: "plus") }.fixedSize(horizontal: true, vertical: true).disabled(!model.running || model.busy || model.metadataLoadFailed)
             }
             if model.sources.isEmpty {
                 ContentUnavailableView { Label("还没有来源", systemImage: "server.rack") } description: { Text("添加一个官方账号或 API 来源。真实凭据只保存在钥匙串中。") } actions: {
                     Button("添加 API 来源") { editing = EditingSource(source: Source(), isNew: true) }.disabled(!model.running)
-                }
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 12) {
@@ -84,7 +84,7 @@ struct SourcesView: View {
                     }
                 }
             }
-        }.padding(24)
+        }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .sheet(item: $editing) { item in SourceEditor(source: item.source, isNew: item.isNew).environmentObject(model) }
             .alert("删除来源？", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
                 Button("取消", role: .cancel) { deleting = nil }
@@ -104,7 +104,7 @@ struct RoutingView: View {
                 Picker("固定来源", selection: Binding(get: { model.fixedSourceID ?? "" }, set: { model.changeRouting(mode: "fixed", fixed: $0) })) { ForEach(model.sources.filter(\.enabled)) { Text($0.name).tag($0.id) } }.disabled(model.busy)
             }
             Text(model.routingMode == "auto" ? "从上到下选择可用且支持请求模型的来源。拖动调整优先级。" : "请求仅交给所选来源；发生错误时不会改用其他账号或供应商。").font(.callout).foregroundStyle(.secondary)
-            if model.sources.isEmpty { ContentUnavailableView("暂无可排序的来源", systemImage: "arrow.triangle.branch", description: Text("请先在“来源”中添加账号或 API。")) }
+            if model.sources.isEmpty { ContentUnavailableView("暂无可排序的来源", systemImage: "arrow.triangle.branch", description: Text("请先在“来源”中添加账号或 API。")).frame(maxWidth: .infinity, maxHeight: .infinity) }
             else {
                 List {
                     ForEach(Array(model.sources.enumerated()), id: \.element.id) { index, source in
@@ -119,7 +119,7 @@ struct RoutingView: View {
                 }.listStyle(.inset).disabled(model.busy)
             }
             Label("依赖 previous_response_id 的请求优先保留原来源；已开始的生成不会拼接其他源的响应。", systemImage: "info.circle").font(.caption).foregroundStyle(.secondary)
-        }.padding(24)
+        }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 struct GeneralSettingsView: View {

@@ -8,11 +8,11 @@ struct UsageView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 4) { Text("用量").font(.largeTitle.bold()); Text("仅统计经过本地网关的请求，不保存对话正文。").foregroundStyle(.secondary) }
                 Spacer()
-                Picker("时间范围", selection: $days) { Text("今天").tag(1); Text("7 天").tag(7); Text("30 天").tag(30) }.labelsHidden().frame(width: 100)
+                Picker("时间范围", selection: $days) { Text("近24小时").tag(1); Text("7 天").tag(7); Text("30 天").tag(30) }.labelsHidden().frame(width: 112)
                 Button { model.refreshUsage(days: days) } label: { Image(systemName: "arrow.clockwise") }.disabled(model.busy || !model.running).help("刷新用量")
             }
             if model.usage["rows"].array.isEmpty {
-                ContentUnavailableView("暂无网关用量", systemImage: "chart.bar.xaxis", description: Text("请求通过 Codexpress 后会在这里显示。未知 Token 用量不会伪装成零。"))
+                ContentUnavailableView("暂无网关用量", systemImage: "chart.bar.xaxis", description: Text("请求通过 Codexpress 后会在这里显示。未知 Token 用量不会伪装成零。")).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
@@ -40,7 +40,7 @@ struct UsageView: View {
                 }
             }
             Text("总 Token = 输入 + 输出。缓存输入是输入的子集；此页面不是供应商账单。").font(.caption).foregroundStyle(.secondary)
-        }.padding(24).onAppear { if model.running { model.refreshUsage(days: days) } }.onChange(of: days) { _, value in model.refreshUsage(days: value) }
+        }.padding(24).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).onAppear { if model.running { model.refreshUsage(days: days) } }.onChange(of: days) { _, value in model.refreshUsage(days: value) }
     }
     private func metric(_ title: String, _ value: JSONValue) -> some View {
         VStack(alignment: .leading, spacing: 4) { Text(countLabel(value)).font(.title3.monospacedDigit()); Text(title).font(.caption).foregroundStyle(.secondary) }
