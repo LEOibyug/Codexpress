@@ -133,14 +133,11 @@ python3 scripts/check-legacy-resume.py
 
 </details>
 
-## 文档与参考
+## 文档与致谢
 
 | 文档 | 内容 |
 | :-- | :-- |
 | [使用指南](docs/usage.md) | 模型发现、代理、压缩阈值、官方额度、重置卡、备份与兼容范围 |
-| [设计规格](docs/superpowers/specs/2026-10-20-codexpress-design.md) | 产品行为、架构及验收边界 |
-| [管理接口](contracts/management.md) | Swift 客户端与 Rust 网关的 IPC 契约 |
-| [接续与兜底验证](docs/context-recovery-2026-10-20.md) | 原来源确认、上下文降级、通知及实际接入结果 |
-| [实时用量验证](docs/realtime-usage-2026-10-20.md) | Token 明细、字符估算与 TPS 的统计规则 |
+| [第三方资源说明](gateway/resources/README.md) | 随应用分发的 Codex 模型资源及许可证 |
 
-界面与工作流参考 [CodexBar](https://github.com/lizhelang/codexbar) 和 [CC Switch](https://github.com/farion1231/cc-switch)，路由策略研究参考 [One API](https://github.com/songquanpeng/one-api) 与 [New API](https://github.com/QuantumNous/new-api)。Codexpress 使用独立实现，源码调研与归属见[研究记录](docs/research/2026-10-20-upstream-study.md)。
+界面与工作流参考 [CodexBar](https://github.com/lizhelang/codexbar) 和 [CC Switch](https://github.com/farion1231/cc-switch)，来源池设计参考 [One API](https://github.com/songquanpeng/one-api) 与 [New API](https://github.com/QuantumNous/new-api)。

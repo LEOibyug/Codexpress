@@ -13,3 +13,17 @@ xcuserdata/
 
 # Local agent instructions
 AGENTS.md
+
+# Local implementation contracts
+/contracts/
+
+# Publish only user documentation and referenced images
+/docs/*
+!/docs/usage.md
+!/docs/images/
+/docs/images/*
+!/docs/images/app-icon.png
+!/docs/images/usage-live-overview.png
+!/docs/images/sources-clean.png
+!/docs/images/model-compaction.png
+!/docs/images/official-weekly-menu.png
