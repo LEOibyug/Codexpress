@@ -11,6 +11,7 @@ pub mod model;
 pub mod notifications;
 pub mod official;
 pub mod relay;
+pub mod remote;
 pub mod routing;
 pub mod transport;
 pub mod usage;

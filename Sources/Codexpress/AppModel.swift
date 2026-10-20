@@ -471,6 +471,14 @@ import ServiceManagement
     func clearHistoryCache() {
         perform { self.historyStatus = try await self.client.call("history.clear") }
     }
+    func remoteCall(_ operation: String, _ payload: JSONValue = .object([:])) async throws -> JSONValue {
+        guard running else { throw AppError.message("请先启动本机网关。") }
+        return try await client.call(operation, payload)
+    }
+    func saveRemoteProfiles(_ profiles: [SSHRemoteProfile]) throws {
+        var next = settings; next.sshRemoteProfiles = profiles
+        try persistSettings(next)
+    }
     func requireCurrentPort() throws { try ConfigConnectionPolicy.requireCurrentPort(saved: settings.port, live: status["port"].number) }
     func saveModelCompaction(_ rules: [ModelCompactionRule]) {
         perform {

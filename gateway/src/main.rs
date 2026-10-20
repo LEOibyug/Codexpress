@@ -83,6 +83,12 @@ async fn run() -> Result<()> {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
         .await
         .context("本地端口被占用，未更改 Codex 连接")?;
+    if codexpress_gateway::remote::resume(state.clone())
+        .await
+        .is_err()
+    {
+        eprintln!("远端入口未能启动，请在应用中检查端口后重试");
+    }
     let management = management::serve(state.clone());
     let server = axum::serve(listener, relay::router(state));
     tokio::select! {

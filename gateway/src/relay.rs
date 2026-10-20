@@ -622,6 +622,20 @@ fn session_binding(parsed: &Value, headers: &HeaderMap) -> Option<String> {
     (!id.is_empty() && id.len() <= 512).then(|| format!("{namespace}:{id}"))
 }
 
+fn scoped_session(parsed: &Value, parts: &axum::http::request::Parts) -> Option<String> {
+    let session = session_binding(parsed, &parts.headers);
+    match parts.extensions.get::<crate::remote::RemoteIngress>() {
+        Some(ingress) => session
+            .or_else(|| {
+                parsed["prompt_cache_key"]
+                    .as_str()
+                    .map(|s| format!("cache:{s}"))
+            })
+            .map(|s| format!("remote:{}:{s}", ingress.peer_id)),
+        None => session,
+    }
+}
+
 async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response<Body> {
     forward_once(state, request, None).await
 }
@@ -680,10 +694,16 @@ async fn portable_request(
     headers.remove("content-length");
     headers.remove("content-md5");
     headers.remove("digest");
-    headers.insert(
-        "authorization",
-        HeaderValue::from_str(&format!("Bearer {}", state.gateway_key)).expect("local key"),
-    );
+    if parts
+        .extensions
+        .get::<crate::remote::RemoteIngress>()
+        .is_none()
+    {
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", state.gateway_key)).expect("local key"),
+        );
+    }
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     state.notifications.fallback(
         &affinity
@@ -694,6 +714,9 @@ async fn portable_request(
     *retry.method_mut() = parts.method.clone();
     *retry.uri_mut() = parts.uri.clone();
     *retry.headers_mut() = headers;
+    if let Some(ingress) = parts.extensions.get::<crate::remote::RemoteIngress>() {
+        retry.extensions_mut().insert(ingress.clone());
+    }
     Ok((
         retry,
         RebuildContext {
@@ -724,7 +747,7 @@ struct ResponseContext {
     history: Option<HistoryCapture>,
 }
 fn history_scope(parts: &axum::http::request::Parts, parsed: &Value) -> String {
-    let session = session_binding(parsed, &parts.headers).or_else(|| {
+    let session = scoped_session(parsed, parts).or_else(|| {
         parsed["prompt_cache_key"]
             .as_str()
             .map(|s| format!("cache:{s}"))
@@ -780,12 +803,18 @@ async fn forward_once(
     rebuild: Option<RebuildContext>,
 ) -> Response<Body> {
     let degraded = rebuild.is_some();
+    let remote_ingress = request.extensions().get::<crate::remote::RemoteIngress>();
+    let remote_peer = state.remote.peer(request.headers());
+    if remote_ingress.is_some_and(|ingress| remote_peer.as_ref() != Some(&ingress.peer_id)) {
+        return error(StatusCode::UNAUTHORIZED, "远端网关认证失败");
+    }
     let credential = request
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     let origin = match credential {
+        Some(_) if remote_ingress.is_some() => None,
         Some(credential) if credential == state.gateway_key => None,
         Some(credential) => match crate::config::confirmed_origin(&state.state_dir, credential) {
             Ok(Some(origin)) => Some(origin),
@@ -808,7 +837,7 @@ async fn forward_once(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case(&expected_local) || v == expected_ip)
         && hosts.next().is_none();
-    if !valid_host {
+    if !valid_host && remote_ingress.is_none() {
         return error(
             StatusCode::MISDIRECTED_REQUEST,
             "网关只接受匹配端口的本机 Host",
@@ -831,7 +860,7 @@ async fn forward_once(
             _ => return error(StatusCode::BAD_REQUEST, "Responses 请求需要 JSON 对象"),
         }
     };
-    let stored_key = session_binding(&parsed, &parts.headers)
+    let stored_key = scoped_session(&parsed, &parts)
         .or_else(|| {
             parsed["prompt_cache_key"]
                 .as_str()
@@ -881,7 +910,7 @@ async fn forward_once(
     let model = parsed.get("model").and_then(Value::as_str).unwrap_or("");
     let mut opaque_keys = Vec::new();
     opaque_bindings(&parsed, &mut opaque_keys);
-    let session_key = session_binding(&parsed, &parts.headers);
+    let session_key = scoped_session(&parsed, &parts);
     let session_known = if let Some(key) = &session_key {
         state.bindings.lock().await.contains_key(key)
     } else {

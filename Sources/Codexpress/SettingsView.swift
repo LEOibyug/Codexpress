@@ -1,13 +1,14 @@
 import SwiftUI
 
 private enum SettingsPage: String, CaseIterable, Identifiable {
-    case sources = "来源", routing = "路由", usage = "用量", general = "设置"
+    case sources = "来源", routing = "路由", usage = "用量", remote = "远端", general = "设置"
     var id: String { rawValue }
     var symbol: String {
         switch self {
         case .sources: return "server.rack"
         case .routing: return "arrow.triangle.branch"
         case .usage: return "chart.bar.xaxis"
+        case .remote: return "desktopcomputer.and.arrow.down"
         case .general: return "slider.horizontal.3"
         }
     }
@@ -53,6 +54,7 @@ struct SettingsView: View {
                     case .sources: SourcesView()
                     case .routing: RoutingView()
                     case .usage: UsageView()
+                    case .remote: SSHRemoteView()
                     case .general: GeneralSettingsView()
                     }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)

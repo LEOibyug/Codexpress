@@ -53,6 +53,28 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             )
         }
         "credentials" => Ok(credentials(state).await),
+        "remote.status" => state.remote.status().await,
+        "remote.start" => {
+            let port = payload["port"]
+                .as_u64()
+                .filter(|p| (1..=65535).contains(p))
+                .context("远端入口端口无效")? as u16;
+            crate::remote::start(state.clone(), port).await
+        }
+        "remote.stop" => crate::remote::stop(state).await,
+        "remote.revoke" => {
+            state
+                .remote
+                .revoke(payload["id"].as_str().context("缺少机器标识")?)
+                .await
+        }
+        "remote.preview" => state.remote.prepare(
+            payload["id"].as_str().context("缺少机器标识")?,
+            payload["name"].as_str().context("缺少机器名称")?,
+            payload["host"].as_str().context("缺少本机地址")?,
+            payload["config"].as_str().context("缺少配置内容")?,
+            payload["aliases"].as_bool().unwrap_or(false),
+        ),
         "history.status" => state
             .history
             .status()

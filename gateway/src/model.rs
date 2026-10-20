@@ -170,6 +170,7 @@ pub struct AppState {
     pub usage: Arc<crate::usage::UsageStore>,
     pub affinity: Arc<crate::affinity::AffinityStore>,
     pub history: Arc<crate::history::HistoryStore>,
+    pub remote: crate::remote::RemoteAccess,
     pub notifications: crate::notifications::Notifications,
     pub gateway_key: String,
     pub port: u16,
@@ -206,6 +207,7 @@ impl AppState {
             history: Arc::new(crate::history::HistoryStore::open(
                 &state_dir.join("history.sqlite"),
             )?),
+            remote: crate::remote::RemoteAccess::open(&state_dir)?,
             notifications: Default::default(),
             gateway_key,
             port,

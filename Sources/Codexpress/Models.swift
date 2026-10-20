@@ -89,6 +89,7 @@ struct AppSettings: Codable, Sendable {
     var legacyProviderOrigins: [LegacyProviderOrigin]? = nil
     var degradedContextFallback: Bool? = nil
     var historyCache: HistoryCacheSettings? = nil
+    var sshRemoteProfiles: [SSHRemoteProfile]? = nil
     var lowQuotaPercent: Int { officialLowQuotaPercent ?? 10 }
     var historyCacheSettings: HistoryCacheSettings { historyCache ?? HistoryCacheSettings() }
 }
