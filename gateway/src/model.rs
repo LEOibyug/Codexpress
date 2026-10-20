@@ -30,7 +30,7 @@ pub struct Source {
 
 impl Source {
     pub fn validate(&self) -> Result<()> {
-        if self.id.is_empty() || self.id.len() > 128 || self.name.trim().is_empty() {
+        if self.id.is_empty() || self.id.len() > 128 || !self.id.bytes().all(|b|b.is_ascii_alphanumeric() || b == b'-' || b == b'_') || self.name.trim().is_empty() {
             bail!("来源的标识和名称不能为空");
         }
         if !["api", "official"].contains(&self.kind.as_str()) {
@@ -52,7 +52,7 @@ impl Source {
                 let proxy = self.proxy.url.as_deref().unwrap_or("");
                 let parsed = url::Url::parse(proxy).map_err(|_| anyhow::anyhow!("请填写有效的代理地址"))?;
                 if !["http", "https", "socks5", "socks5h"].contains(&parsed.scheme()) || parsed.host_str().is_none()
-                    || parsed.query().is_some() || parsed.fragment().is_some() {
+                    || parsed.query().is_some() || parsed.fragment().is_some() || !parsed.username().is_empty() || parsed.password().is_some() {
                     bail!("代理地址只支持 HTTP(S) 和 SOCKS5");
                 }
             },
@@ -99,12 +99,13 @@ pub struct AppState {
     pub state_dir: PathBuf,
     pub inflight: AtomicUsize,
     pub official_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    pub config_lock: Mutex<()>,
 }
 
 impl AppState {
     pub fn new(state_dir: PathBuf, port: u16, gateway_key: String) -> Result<Arc<Self>> {
         let usage = crate::usage::UsageStore::open(&state_dir.join("usage.sqlite"))?;
-        Ok(Arc::new(Self { sources: RwLock::new(Vec::new()), settings: RwLock::new(RoutingSettings { mode: "auto".into(), fixed_source_id: None }), bindings: Mutex::new(HashMap::new()), usage: Arc::new(usage), gateway_key, port, state_dir, inflight: AtomicUsize::new(0), official_locks: Mutex::new(HashMap::new()) }))
+        Ok(Arc::new(Self { sources: RwLock::new(Vec::new()), settings: RwLock::new(RoutingSettings { mode: "auto".into(), fixed_source_id: None }), bindings: Mutex::new(HashMap::new()), usage: Arc::new(usage), gateway_key, port, state_dir, inflight: AtomicUsize::new(0), official_locks: Mutex::new(HashMap::new()), config_lock:Mutex::new(()) }))
     }
 }
 
