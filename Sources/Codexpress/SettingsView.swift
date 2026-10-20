@@ -105,6 +105,7 @@ struct SourcesView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             PageHeading("来源") {
+                DirectOfficialLoginButton().controlSize(.small)
                 Menu {
                     Button("官方账号") { addOfficial() }
                     Button("Responses API") { addAPI() }
@@ -112,6 +113,14 @@ struct SourcesView: View {
                     .menuStyle(.borderlessButton).fixedSize().padding(.horizontal, 12).padding(.vertical, 8)
                     .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 7)).foregroundStyle(.white)
                     .disabled(!canEdit)
+            }
+            if model.connectionMode == "official" {
+                HStack {
+                    Label("官方连接 · 系统代理", systemImage: "person.crop.circle").foregroundStyle(.secondary)
+                    Spacer()
+                    Button("使用来源池") { model.switchCodexConnection(.gateway) }
+                        .disabled(!canEdit)
+                }.font(.system(size: 12))
             }
             if model.sources.isEmpty {
                 EmptyState("暂无来源", subtitle: "添加 ChatGPT 账号或 API 服务。", symbol: "server.rack") {
@@ -301,6 +310,20 @@ struct GeneralSettingsView: View {
     private var connectionCard: some View {
         SettingsCard("Codex 连接", symbol: "link") {
             VStack(alignment: .leading, spacing: 13) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(model.connectionMode == "official" ? "官方连接 · 系统代理" : model.connectionMode == "gateway" ? "来源池" : "连接方式")
+                            .font(.system(size: 12, weight: .medium))
+                        Text("切换时会重启 Codex").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if model.connectionMode == "official" {
+                        Button("使用来源池") { model.switchCodexConnection(.gateway) }
+                            .disabled(model.busy || !model.running || preferencesChanged)
+                    }
+                    DirectOfficialLoginButton().disabled(preferencesChanged)
+                }
+                Divider().overlay(AppPalette.border)
                 Text("配置目录").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
                 TextField("Codex 配置目录（绝对路径）", text: $home)
                     .font(.system(size: 12, design: .monospaced)).settingsField()

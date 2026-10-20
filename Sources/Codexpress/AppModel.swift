@@ -24,6 +24,7 @@ import ServiceManagement
     @Published private(set) var pendingSync = false
     @Published private(set) var refreshingModels = Set<String>()
     @Published private(set) var modelErrors: [String: String] = [:]
+    @Published private(set) var codexConnectionPhase: String?
     let directory: URL
     private let metadata: MetadataStore
     private let keychain: KeychainStore
@@ -47,6 +48,7 @@ import ServiceManagement
     var fixedSourceID: String? { status == .null ? settings.fixed_source_id : status["fixed_source_id"].string }
     var fixedName: String { sources.first { $0.id == fixedSourceID }?.name ?? "未选择" }
     var portNeedsRestart: Bool { status["port"].number.map { Int($0) != settings.port } ?? false }
+    var connectionMode: String { status["connection_mode"].string ?? "unmanaged" }
     init(stateDirectory: URL? = nil) {
         let override = ProcessInfo.processInfo.environment["CODEXPRESS_STATE_DIR"]
         directory = stateDirectory ?? override.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Codexpress", isDirectory: true)
@@ -427,6 +429,35 @@ import ServiceManagement
             _ = try await self.client.call(operation, self.configPayload())
             self.notice = operation == "config.restore" ? "已恢复原连接，重启 Codex 后生效。" : "连接设置已应用，重启 Codex 后生效。"
             if !self.portNeedsRestart { self.preview = try await self.client.call("config.preview", self.configPayload()) } else { self.preview = .null }
+        }
+    }
+    func switchCodexConnection(_ target: CodexConnectionTarget) {
+        perform {
+            try self.requireWritableMetadata()
+            guard self.running else { throw AppError.message("请先启动网关以更新连接设置。") }
+            if target == .gateway {
+                try self.requireCurrentPort()
+                guard self.sources.contains(where: \.enabled) else { throw AppError.message("请先添加并启用一个来源。") }
+                try await self.sync()
+            }
+            let payload = try self.configPayload()
+            let home = self.settings.codexHome
+            self.codexConnectionPhase = "检查连接设置…"
+            defer { self.codexConnectionPhase = nil }
+            do {
+                try await CodexConnectionTransition.run(controller: NativeCodexApplication(), codexHome: home, preflight: {
+                    _ = try await self.client.call(target == .official ? "config.official.preview" : "config.preview", payload)
+                }, apply: {
+                    _ = try await self.client.call(target == .official ? "config.official" : "config.attach", payload)
+                }, phase: { self.codexConnectionPhase = $0 })
+                self.preview = .null
+                try await self.updateStatus()
+                self.notice = target == .official ? "Codex 已重启并切换为官方连接；如未登录，请在 Codex 中完成登录。" : "Codex 已重启并切换为来源池。"
+            } catch {
+                self.preview = .null
+                try? await self.updateStatus()
+                throw error
+            }
         }
     }
     func setLaunchAtLogin(_ value: Bool) {

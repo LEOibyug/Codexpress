@@ -22,11 +22,62 @@ struct Snapshot {
     codex_home: PathBuf,
     existed: bool,
     before: String,
-    applied_table: String,
+    applied_table: Option<String>,
+    #[serde(default = "local_provider")]
+    applied_provider: String,
+    #[serde(default = "yes")]
+    owns_table: bool,
+    #[serde(default)]
+    official_before: Option<String>,
+    #[serde(default)]
+    applied_official: Option<String>,
     #[serde(default)]
     applied_compaction: Option<String>,
     #[serde(default)]
     compaction_before: Option<String>,
+}
+
+fn local_provider() -> String {
+    "codexpress".into()
+}
+fn yes() -> bool {
+    true
+}
+const OFFICIAL_KEYS: [&str; 3] = ["openai_base_url", "chatgpt_base_url", "forced_login_method"];
+
+pub fn connection_mode(state_dir: &Path) -> Result<&'static str> {
+    Ok(match snapshot_load(state_dir)? {
+        Some(snapshot) if snapshot.applied_provider == "openai" => "official",
+        Some(_) => "gateway",
+        None => "unmanaged",
+    })
+}
+
+fn official_fields(doc: &DocumentMut) -> String {
+    let mut fields = DocumentMut::new();
+    for key in OFFICIAL_KEYS {
+        if let Some(item) = doc.get(key) {
+            fields[key] = item.clone();
+        }
+    }
+    fields.to_string()
+}
+
+fn restore_official_fields(doc: &mut DocumentMut, snapshot: &Snapshot) -> Result<()> {
+    if let Some(before) = &snapshot.official_before {
+        let original = before.parse::<DocumentMut>()?;
+        for key in OFFICIAL_KEYS {
+            match original.get(key) {
+                Some(item) => {
+                    doc[key] = item.clone();
+                }
+                None => {
+                    doc.remove(key);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn secure_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -121,10 +172,17 @@ fn snapshot_load(state_dir: &Path) -> Result<Option<Snapshot>> {
 }
 
 fn verify_attachment(doc: &DocumentMut, snapshot: &Snapshot) -> Result<()> {
-    if doc.get("model_provider").and_then(Item::as_str) != Some("codexpress")
-        || table_text(doc).as_deref() != Some(snapshot.applied_table.as_str())
+    if doc.get("model_provider").and_then(Item::as_str) != Some(snapshot.applied_provider.as_str())
+        || (snapshot.owns_table && table_text(doc) != snapshot.applied_table)
     {
         bail!("连接设置已被其他程序修改；为保留你的更改，未覆盖或恢复。请先检查 model_provider 和 model_providers.codexpress。");
+    }
+    if snapshot
+        .applied_official
+        .as_ref()
+        .is_some_and(|expected| official_fields(doc) != *expected)
+    {
+        bail!("官方连接或登录设置已被其他程序修改，未覆盖；请先检查配置。");
     }
     if snapshot
         .applied_compaction
@@ -234,13 +292,16 @@ pub fn preview_with_rules(
         verify_attachment(&before, snapshot)?;
     }
     let mut after = before.clone();
-    if snapshot.is_none()
+    if snapshot.as_ref().is_none_or(|s| !s.owns_table)
         && after
             .get("model_providers")
             .and_then(|p| p.get("codexpress"))
             .is_some()
     {
         bail!("已有名为 codexpress 的供应商且不属于本应用，未覆盖");
+    }
+    if let Some(snapshot) = &snapshot {
+        restore_official_fields(&mut after, snapshot)?;
     }
     if let Some(item) = after.get("model_providers") {
         if !item.is_table() {
@@ -289,11 +350,14 @@ pub fn attach_with_rules(
         }
         verify_attachment(&doc, snapshot)?;
         let expected = provider_table(port, key).to_string();
-        if expected != snapshot.applied_table {
+        if snapshot.owns_table && Some(expected) != snapshot.applied_table {
             bail!("本地连接端口或凭据已变化，请先恢复连接后重新接管");
         }
     }
     preview_with_rules(&home, state_dir, port, key, rules)?;
+    if let Some(snapshot) = &previous_snapshot {
+        restore_official_fields(&mut doc, snapshot)?;
+    }
     let catalog = prepare_compaction(
         &mut doc,
         &home,
@@ -314,7 +378,11 @@ pub fn attach_with_rules(
         before: previous_snapshot
             .as_ref()
             .map_or_else(|| before.clone(), |s| s.before.clone()),
-        applied_table: table_text(&doc).context("无法生成连接配置")?,
+        applied_table: Some(table_text(&doc).context("无法生成连接配置")?),
+        applied_provider: local_provider(),
+        owns_table: true,
+        official_before: None,
+        applied_official: None,
         compaction_before: if rules.is_empty() {
             None
         } else {
@@ -378,6 +446,7 @@ pub fn restore(home: &Path, state_dir: &Path) -> Result<Value> {
     let (before, mut doc) = read_document(&config)?;
     verify_attachment(&doc, &snapshot)?;
     let original = snapshot.before.parse::<DocumentMut>()?;
+    restore_official_fields(&mut doc, &snapshot)?;
     if snapshot.applied_compaction.is_some() {
         let original_compaction = snapshot
             .compaction_before
@@ -394,7 +463,11 @@ pub fn restore(home: &Path, state_dir: &Path) -> Result<Value> {
             doc.remove("model_provider");
         }
     }
-    if let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) {
+    if let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .filter(|_| snapshot.owns_table)
+    {
         providers.remove("codexpress");
         if providers.is_empty() && original.get("model_providers").is_none() {
             doc.remove("model_providers");
@@ -410,6 +483,102 @@ pub fn restore(home: &Path, state_dir: &Path) -> Result<Value> {
     }
     fs::remove_file(snapshot_path(state_dir))?;
     Ok(json!({"attached":false,"message":"已恢复原连接，保留接管期间的其他配置更改"}))
+}
+
+fn official_document(home: &Path, state_dir: &Path) -> Result<(String, DocumentMut, Snapshot)> {
+    let config = home.join("config.toml");
+    if fs::symlink_metadata(&config).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!("配置文件是符号链接，请先选择真实配置目录。");
+    }
+    let (before, mut doc) = read_document(&config)?;
+    let previous = snapshot_load(state_dir)?;
+    if let Some(snapshot) = &previous {
+        if snapshot.codex_home != home {
+            bail!("当前已接管其他 Codex 目录，请先恢复该目录。");
+        }
+        verify_attachment(&doc, snapshot)?;
+    }
+    // A selected profile can take precedence over root settings. Refuse a
+    // misleading switch rather than dropping its unrelated tools/permissions.
+    if let Some(profile) = doc.get("profile").and_then(Item::as_str) {
+        if profile.is_empty() || profile.contains(['/', '\\']) || profile == "." || profile == ".."
+        {
+            bail!("配置档案名称无效，请先检查 profile。");
+        }
+        let overrides = |table: &dyn toml_edit::TableLike| {
+            table.contains_key("model_provider")
+                || OFFICIAL_KEYS.iter().any(|key| table.contains_key(key))
+        };
+        let inline = doc
+            .get("profiles")
+            .and_then(|p| p.get(profile))
+            .and_then(Item::as_table_like)
+            .is_some_and(overrides);
+        let (_, external) = read_document(&home.join(format!("{profile}.config.toml")))?;
+        if inline || overrides(external.as_table()) {
+            bail!("当前配置档案覆盖了连接或登录方式，请在 Codex 中取消该档案后重试。");
+        }
+    }
+    let official_before = previous
+        .as_ref()
+        .and_then(|s| s.official_before.clone())
+        .unwrap_or_else(|| official_fields(&doc));
+    let mut selected = value("openai");
+    if let Some(old) = doc.get("model_provider").and_then(Item::as_value) {
+        *selected.as_value_mut().expect("string value").decor_mut() = old.decor().clone();
+    }
+    doc["model_provider"] = selected;
+    doc.remove("openai_base_url");
+    doc.remove("chatgpt_base_url");
+    doc["forced_login_method"] = value("chatgpt");
+    let mut snapshot = previous.unwrap_or_else(|| Snapshot {
+        codex_home: home.to_owned(),
+        existed: config.exists(),
+        before: before.clone(),
+        applied_table: None,
+        applied_provider: local_provider(),
+        owns_table: false,
+        official_before: None,
+        applied_official: None,
+        applied_compaction: None,
+        compaction_before: None,
+    });
+    snapshot.applied_provider = "openai".into();
+    snapshot.official_before = Some(official_before);
+    snapshot.applied_official = Some(official_fields(&doc));
+    Ok((before, doc, snapshot))
+}
+
+pub fn official_preview(home: &Path, state_dir: &Path) -> Result<Value> {
+    let home = path_checked(home)?;
+    let (before, after, _) = official_document(&home, state_dir)?;
+    Ok(
+        json!({"before":redact(&before.parse()?),"after":redact(&after),"connection_mode":"official"}),
+    )
+}
+
+pub fn use_official(home: &Path, state_dir: &Path) -> Result<Value> {
+    let home = path_checked(home)?;
+    // Preparing the document is read-only; a failed preflight creates nothing.
+    let (before, doc, mut snapshot) = official_document(&home, state_dir)?;
+    fs::create_dir_all(&home)?;
+    let home = fs::canonicalize(home)?;
+    snapshot.codex_home = home.clone();
+    let config = home.join("config.toml");
+    if fs::read_to_string(&config).unwrap_or_default() != before {
+        bail!("配置在切换期间发生变化，未覆盖。");
+    }
+    let previous = fs::read(snapshot_path(state_dir)).ok();
+    secure_write(&snapshot_path(state_dir), &serde_json::to_vec(&snapshot)?)?;
+    if fs::read_to_string(&config).unwrap_or_default() != before {
+        rollback_snapshot(state_dir, previous.as_deref());
+        bail!("配置在写入前发生变化，未覆盖。");
+    }
+    if let Err(error) = secure_write(&config, doc.to_string().as_bytes()) {
+        rollback_snapshot(state_dir, previous.as_deref());
+        return Err(error).context("官方连接设置写入失败");
+    }
+    Ok(json!({"connection_mode":"official","attached":true}))
 }
 
 pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<Value> {
@@ -442,6 +611,8 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
             &rules,
         ),
         "config.restore" => restore(home, &state.state_dir),
+        "config.official.preview" => official_preview(home, &state.state_dir),
+        "config.official" => use_official(home, &state.state_dir),
         _ => bail!("未知连接配置操作"),
     }
 }

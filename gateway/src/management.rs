@@ -34,7 +34,7 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             let settings = state.settings.read().await.clone();
             let sources = state.sources.read().await.clone();
             Ok(
-                json!({"running":true,"process_id":std::process::id(),"port":state.port,"base_url":format!("http://127.0.0.1:{}/v1",state.port),"mode":settings.mode,"fixed_source_id":settings.fixed_source_id,"sources":sources,"inflight":state.inflight.load(Ordering::Relaxed)}),
+                json!({"running":true,"process_id":std::process::id(),"port":state.port,"base_url":format!("http://127.0.0.1:{}/v1",state.port),"mode":settings.mode,"fixed_source_id":settings.fixed_source_id,"sources":sources,"inflight":state.inflight.load(Ordering::Relaxed),"connection_mode":config::connection_mode(&state.state_dir).unwrap_or("unknown")}),
             )
         }
         "credentials" => Ok(credentials(state).await),

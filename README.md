@@ -24,6 +24,14 @@ bash scripts/run.sh
 
 退出应用会停止网关，Codex 的本地连接保留。需要恢复原供应商时，先在设置中选择「恢复接管前连接」。已接管期间不能更改端口；恢复后修改端口、重启，再预览和接管。
 
+## 直接官方登录
+
+菜单栏面板、来源页及「设置 → Codex 连接」提供「直接官方登录」。点击后自动检查配置、等待 Codex 正常退出、切换到内置 OpenAI 提供商，并重新打开 Codex。复用 Codex 自己保存的 ChatGPT 登录；尚未登录时，在 Codex 原生界面完成授权。Codexpress 的来源池账号不会被复制进 Codex 的认证文件或钥匙串，两个客户端继续各自管理令牌。
+
+此模式下 Codex 使用正常的系统网络和系统代理，不使用来源里填写的 Clash 端口。Chat、绘图和网页会话等原生功能由 Codex 版本及登录账号提供，本工具不实现这些功能。原生流量不经过本地网关，因此不参与优先级切换，也不计入逐源 Token 统计。需要返回时点击「使用来源池」，同样自动重启 Codex。
+
+切换只局部管理 `model_provider`、`openai_base_url`、`chatgpt_base_url` 和 `forced_login_method`。自定义官方地址覆盖被移入私有快照，登录方式选择 ChatGPT；返回来源池或恢复原连接时局部还原。已有模型压缩规则、来源、工具与历史保留。切换中的退出提示由 Codex 处理，30 秒内未退出则停止操作，不强制结束进程、不写入连接配置。受管字段已被外部修改，或当前配置档案覆盖连接／登录方式时，提示处理冲突后重试。管理员策略及命令行显式覆盖仍可能优先。
+
 ## 供应商模型列表
 
 来源编辑页默认选择「自动获取」。第三方通过 API 基址下的 `GET /models` 获取；基址以 `/responses` 结尾时使用同级 `/models`。支持 OpenAI 的 `data[].id`、Codex 的 `models[].slug` 及模型 ID 数组。官方账号登录后通过官方 Codex 模型目录获取。获取操作使用来源自身的网络策略，代理失败不会改用直连，不转给其他来源，也不计入生成用量。
@@ -50,7 +58,7 @@ bash scripts/run.sh
 
 ## 配置和数据
 
-- 保持一个原有 `CODEX_HOME`。管理根 `model_provider` 和新建的 `model_providers.codexpress` 连接表；设置模型压缩规则时，额外局部管理 `model_catalog_json`、`model_auto_compact_token_limit`、`model_context_window`，恢复时还原。
+- 保持一个原有 `CODEX_HOME`。管理根 `model_provider` 和新建的 `model_providers.codexpress` 连接表；直接官方登录时暂时管理官方地址覆盖及登录方式；设置模型压缩规则时，额外局部管理 `model_catalog_json`、`model_auto_compact_token_limit`、`model_context_window`，恢复时还原。
 - 保留原生认证、MCP、skills、plugins、hooks、权限、项目、模型目录和历史；不改写会话数据库。
 - 恢复采用局部合并。接管期间新增的其他设置会保留；受管字段被外部修改时拒绝覆盖，提示人工检查。
 - 上游密钥和官方凭据存入 Codexpress 专属 macOS Keychain 项。官方刷新后的凭据先写钥匙串再投入使用；钥匙串不可用会明确失败。

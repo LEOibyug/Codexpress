@@ -15,6 +15,19 @@ struct MenuView: View {
                 StatusPill(text: model.running ? "运行中" : "未连接", color: model.running ? .green : .orange)
             }
             Divider()
+            VStack(alignment: .leading, spacing: 7) {
+                DirectOfficialLoginButton().buttonStyle(.bordered).controlSize(.small)
+                if model.connectionMode == "official" {
+                    HStack {
+                        Text("官方连接 · 系统代理").foregroundStyle(.secondary)
+                        Spacer()
+                        Button("使用来源池") { model.switchCodexConnection(.gateway) }.disabled(model.busy || !model.running)
+                    }.font(.system(size: 11))
+                } else {
+                    Text("重启 Codex，使用系统代理").font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            }
+            Divider()
             if model.sources.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("暂无来源").font(.system(size: 13, weight: .medium))
@@ -23,7 +36,7 @@ struct MenuView: View {
                 }.padding(.vertical, 4)
             } else {
                 HStack {
-                    Text("当前路由").foregroundStyle(.secondary)
+                    Text(model.connectionMode == "official" ? "来源池设置" : "当前路由").foregroundStyle(.secondary)
                     Spacer()
                     Text(model.routingMode == "auto" ? "自动切换" : "固定 · \(model.fixedName)").fontWeight(.medium)
                 }.font(.system(size: 11))

@@ -221,3 +221,160 @@ fn restore_refuses_external_edits_to_managed_connection() {
         changed
     );
 }
+
+#[test]
+fn official_gateway_roundtrip_preserves_compaction_tools_auth_and_history() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    let state = root.path().join("app");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let original = "# keep comments\nmodel = \"gpt-6.1-sol\"\nmodel_provider = \"custom\" # selected\nopenai_base_url = \"https://custom.example/v1\"\nchatgpt_base_url = \"https://custom.example/backend\"\nforced_login_method = \"api\"\n[mcp_servers.keep]\ncommand = \"keep-tool\"\n";
+    fs::write(home.join("config.toml"), original).unwrap();
+    fs::write(home.join("auth.json"), "private-native-auth-sentinel").unwrap();
+    fs::write(home.join("history.jsonl"), "history-sentinel").unwrap();
+    let rules = [rule("gpt-6.1-sol", 180000, Some(300000))];
+    config::attach_with_rules(&home, &state, 17863, "local-private-key", &rules).unwrap();
+    assert_eq!(config::connection_mode(&state).unwrap(), "gateway");
+    let catalog = active_catalog(&home);
+    let before = fs::read_to_string(home.join("config.toml")).unwrap();
+    let preview = config::official_preview(&home, &state).unwrap();
+    assert!(!preview.to_string().contains("local-private-key"));
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        before
+    );
+    config::use_official(&home, &state).unwrap();
+    let official = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(official.contains("model_provider = \"openai\" # selected"));
+    assert!(official.contains("forced_login_method = \"chatgpt\""));
+    assert!(!official.contains("openai_base_url"));
+    assert!(!official.contains("chatgpt_base_url"));
+    assert_eq!(active_catalog(&home), catalog);
+    assert_eq!(config::connection_mode(&state).unwrap(), "official");
+    // A second click is idempotent and does not replace the original snapshot.
+    config::use_official(&home, &state).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!("{official}\n[mcp_servers.new]\ncommand = \"new-tool\"\n"),
+    )
+    .unwrap();
+    config::attach_with_rules(&home, &state, 17863, "local-private-key", &rules).unwrap();
+    let gateway = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(gateway.contains("forced_login_method = \"api\""));
+    assert!(gateway.contains("openai_base_url = \"https://custom.example/v1\""));
+    assert!(gateway.contains("model_provider = \"codexpress\""));
+    config::use_official(&home, &state).unwrap();
+    config::restore(&home, &state).unwrap();
+    let restored = fs::read_to_string(home.join("config.toml")).unwrap();
+    for field in [
+        "model_provider = \"custom\" # selected",
+        "forced_login_method = \"api\"",
+        "https://custom.example/backend",
+        "keep-tool",
+        "new-tool",
+    ] {
+        assert!(restored.contains(field));
+    }
+    assert!(!restored.contains("model_catalog_json"));
+    assert!(!restored.contains("model_providers.codexpress"));
+    assert_eq!(
+        fs::read_to_string(home.join("auth.json")).unwrap(),
+        "private-native-auth-sentinel"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("history.jsonl")).unwrap(),
+        "history-sentinel"
+    );
+    assert_eq!(config::connection_mode(&state).unwrap(), "unmanaged");
+}
+
+#[test]
+fn direct_official_without_gateway_preserves_unowned_provider_and_restores() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    let state = root.path().join("app");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let original = "model_provider = \"other\"\n[model_providers.codexpress]\nname = \"unowned\"\nbase_url = \"https://unowned.example/v1\"\n";
+    fs::write(home.join("config.toml"), original).unwrap();
+    config::use_official(&home, &state).unwrap();
+    assert!(config::attach(&home, &state, 17863, "local").is_err());
+    config::restore(&home, &state).unwrap();
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        original
+    );
+    fs::remove_file(home.join("config.toml")).unwrap();
+    config::use_official(&home, &state).unwrap();
+    config::attach(&home, &state, 17863, "local").unwrap();
+    config::use_official(&home, &state).unwrap();
+    config::restore(&home, &state).unwrap();
+    assert!(!home.join("config.toml").exists());
+}
+
+#[test]
+fn native_switch_conflicts_and_profile_overrides_never_modify_files() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    let state = root.path().join("app");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    for original in [
+        "profile = \"work\"\n[profiles.work]\nmodel_provider = \"custom\"\n",
+        "profile = \"../outside\"\n",
+    ] {
+        fs::write(home.join("config.toml"), original).unwrap();
+        assert!(config::use_official(&home, &state).is_err());
+        assert_eq!(
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            original
+        );
+        assert!(!state.join("config-attachment.json").exists());
+    }
+    let original = "profile = \"work\"\n";
+    fs::write(home.join("config.toml"), original).unwrap();
+    fs::write(
+        home.join("work.config.toml"),
+        "forced_login_method = \"api\"\n",
+    )
+    .unwrap();
+    assert!(config::use_official(&home, &state).is_err());
+    fs::remove_file(home.join("work.config.toml")).unwrap();
+    config::use_official(&home, &state).unwrap();
+    let changed = fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .replace("\"chatgpt\"", "\"api\"");
+    fs::write(home.join("config.toml"), &changed).unwrap();
+    assert!(config::use_official(&home, &state).is_err());
+    assert!(config::attach(&home, &state, 17863, "key").is_err());
+    assert!(config::restore(&home, &state).is_err());
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        changed
+    );
+}
+
+#[test]
+fn original_gateway_snapshot_format_remains_compatible() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    let state = root.path().join("app");
+    fs::create_dir_all(&state).unwrap();
+    config::attach(&home, &state, 17863, "key").unwrap();
+    let file = state.join("config-attachment.json");
+    let mut snapshot: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    for key in [
+        "applied_provider",
+        "owns_table",
+        "official_before",
+        "applied_official",
+    ] {
+        snapshot.as_object_mut().unwrap().remove(key);
+    }
+    assert!(snapshot["applied_table"].is_string());
+    fs::write(&file, snapshot.to_string()).unwrap();
+    config::use_official(&home, &state).unwrap();
+    config::restore(&home, &state).unwrap();
+    assert!(!home.join("config.toml").exists());
+}
