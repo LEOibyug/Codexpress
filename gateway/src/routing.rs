@@ -146,6 +146,53 @@ pub async fn reserve(
 ) -> Option<crate::affinity::RouteLease> {
     reserve_for_model(state, source, session, continuation, "").await
 }
+
+/// A planned return is separate from normal affinity: merely considering a
+/// recovered source must not discard the last confirmed route or its context.
+pub async fn reserve_idle_return(
+    state: &Arc<AppState>,
+    model: &str,
+    session: &str,
+) -> Option<(Source, crate::affinity::RouteLease)> {
+    let settings = state.settings.read().await.clone();
+    if settings.mode != "auto" || settings.idle_return_minutes == 0 {
+        return None;
+    }
+    let sources = state.sources.read().await;
+    let all: Vec<_> = sources.iter().map(|r| r.source.clone()).collect();
+    let preferred = state.affinity.preferred(session, &all)?;
+    let from = all.iter().find(|source| source.id == preferred)?;
+    let mut targets: Vec<_> = sources.iter().filter(|runtime| {
+        let source = &runtime.source;
+        source.enabled && source.priority < from.priority
+            && (model.is_empty() || source.models.is_empty() || source.models.iter().any(|m| m == model))
+            && (runtime.health == "ready" || matches!(runtime.health.as_str(), "cooldown" | "proxy_error" | "exhausted")
+                && runtime.cooldown_until.is_some_and(|until| until <= now()))
+            // Unlike first-time routing, reclaiming a working route requires
+            // positive evidence of account recovery, including after restart.
+            && (source.kind != "official" || account_remaining(runtime, &sources).is_some_and(|v| v > 0.0))
+    }).collect();
+    targets.sort_by(|a, b| {
+        a.source
+            .priority
+            .cmp(&b.source.priority)
+            .then(a.source.id.cmp(&b.source.id))
+    });
+    for target in targets {
+        let low = account_remaining(target, &sources)
+            .is_some_and(|v| v <= f64::from(settings.official_low_quota_percent));
+        if let Some(lease) = state.affinity.reserve_idle_return(
+            session,
+            from,
+            &target.source,
+            low,
+            u64::from(settings.idle_return_minutes) * 60,
+        ) {
+            return Some((target.source.clone(), lease));
+        }
+    }
+    None
+}
 pub async fn reserve_for_model(
     state: &Arc<AppState>,
     source: &Source,

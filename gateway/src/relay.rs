@@ -723,6 +723,7 @@ async fn portable_request(
             key: affinity.map(str::to_owned),
             excluded,
             scope,
+            route: None,
         },
     ))
 }
@@ -731,6 +732,7 @@ struct RebuildContext {
     key: Option<String>,
     excluded: HashSet<String>,
     scope: String,
+    route: Option<(Source, crate::affinity::RouteLease)>,
 }
 
 #[derive(Clone)]
@@ -800,9 +802,11 @@ async fn cached_input(
 async fn forward_once(
     state: Arc<AppState>,
     request: Request<Body>,
-    rebuild: Option<RebuildContext>,
+    mut rebuild: Option<RebuildContext>,
 ) -> Response<Body> {
     let degraded = rebuild.is_some();
+    let mut prepared_route = rebuild.as_mut().and_then(|context| context.route.take());
+    let planned_return = prepared_route.is_some();
     let remote_ingress = request.extensions().get::<crate::remote::RemoteIngress>();
     let remote_peer = state.remote.peer(request.headers());
     if remote_ingress.is_some_and(|ingress| remote_peer.as_ref() != Some(&ingress.peer_id)) {
@@ -955,6 +959,65 @@ async fn forward_once(
     let affinity_key = affinity_session
         .as_deref()
         .map(|session| crate::affinity::key(session, model));
+    // Reconsider priority only at an idle Responses turn boundary. Compact and
+    // tool-result continuations keep their current upstream state/cache.
+    let tool_result = parsed["input"]
+        .as_array()
+        .and_then(|items| {
+            items.iter().rev().find(|item| {
+                item["role"] == "user"
+                    || item["role"] == "tool"
+                    || matches!(
+                        item["type"].as_str(),
+                        Some("function_call_output" | "custom_tool_call_output")
+                    )
+            })
+        })
+        .is_some_and(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("function_call_output" | "custom_tool_call_output")
+            ) || item["role"] == "tool"
+        });
+    if !degraded && !discovery && parts.uri.path() == "/v1/responses" && !tool_result {
+        if let Some(key) = affinity_key.as_deref() {
+            let has_state = binding.is_some() || opaque_state;
+            if !has_state || state.settings.read().await.degraded_context_fallback {
+                if let Some(route) = routing::reserve_idle_return(&state, model, key).await {
+                    let prepared = if has_state {
+                        // A missing cache chain must leave the working route in
+                        // place, rather than submit an incomplete conversation.
+                        portable_request(&state, &parts, &parsed, Some(key))
+                            .await
+                            .ok()
+                    } else {
+                        let mut retry = Request::new(Body::from(bytes.clone()));
+                        *retry.method_mut() = parts.method.clone();
+                        *retry.uri_mut() = parts.uri.clone();
+                        *retry.headers_mut() = parts.headers.clone();
+                        if let Some(ingress) =
+                            parts.extensions.get::<crate::remote::RemoteIngress>()
+                        {
+                            retry.extensions_mut().insert(ingress.clone());
+                        }
+                        Some((
+                            retry,
+                            RebuildContext {
+                                key: Some(key.to_owned()),
+                                excluded: HashSet::from(["rebuilt".into()]),
+                                scope: history_scope(&parts, &parsed),
+                                route: None,
+                            },
+                        ))
+                    };
+                    if let Some((retry, mut context)) = prepared {
+                        context.route = Some(route);
+                        return Box::pin(forward_once(state, retry, Some(context))).await;
+                    }
+                }
+            }
+        }
+    }
     let mut hard_keys: Vec<&str> = opaque_keys.iter().map(String::as_str).collect();
     hard_keys.extend(parsed.get("previous_response_id").and_then(Value::as_str));
     hard_keys.extend(
@@ -975,7 +1038,16 @@ async fn forward_once(
     } else {
         None
     };
-    let mut sources = if let Some(origin) = &origin {
+    let mut sources = if let Some((source, _)) = &prepared_route {
+        let mut candidates = vec![source.clone()];
+        candidates.extend(
+            routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
+                .await
+                .into_iter()
+                .filter(|candidate| candidate.id != source.id),
+        );
+        candidates
+    } else if let Some(origin) = &origin {
         // A scoped legacy-provider credential explicitly confirms the original
         // account/key. It can carry old opaque state only to that exact identity.
         let all =
@@ -1104,7 +1176,21 @@ async fn forward_once(
             last_error = Some(error(StatusCode::NOT_IMPLEMENTED, "官方来源尚未验证此端点"));
             continue;
         }
-        let mut route_lease = if discovery {
+        let mut route_lease = if let Some((_, lease)) = prepared_route.take() {
+            // Reconstruction may await disk work. Honor source removal, model
+            // changes, quota updates and fixed-mode changes before submission.
+            if !routing::candidates(&state, model, None)
+                .await
+                .iter()
+                .any(|source| {
+                    source.id == candidate.id && source.identity() == candidate.identity()
+                })
+            {
+                drop(lease);
+                continue;
+            }
+            Some(lease)
+        } else if discovery {
             None
         } else {
             match routing::reserve_for_model(
@@ -1354,7 +1440,7 @@ async fn forward_once(
             }
             let safe_to_fallback = binding.is_none()
                 && !opaque_state
-                && origin.is_none()
+                && (origin.is_none() || planned_return)
                 && matches!(status.as_u16(), 401 | 402 | 403 | 429);
             if safe_to_fallback {
                 attempt.finish("failed", None);

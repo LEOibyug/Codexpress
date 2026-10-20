@@ -187,7 +187,7 @@ async fn unknown_or_other_model_quota_is_not_zero_and_fixed_mode_never_falls_bac
 }
 
 #[tokio::test]
-async fn expired_activity_does_not_expire_affinity_and_failed_migration_never_replaces_it() {
+async fn idle_return_requires_recovered_quota_and_failed_attempt_keeps_confirmed_affinity() {
     let (dir, state, official, api) = state().await;
     let key = affinity::key("long-idle-thread", "m");
     let mut lease = routing::reserve(&state, &api, Some(&key), false)
@@ -213,18 +213,53 @@ async fn expired_activity_does_not_expire_affinity_and_failed_migration_never_re
         routing::candidates_with_session(&restored, "m", None, Some(&key)).await[0].id,
         "api"
     );
-    restored.sources.write().await[1].source.enabled = false;
-    let pending = routing::reserve(&restored, &official, Some(&key), false)
+    // Unknown/zero quota must never reclaim an API conversation.
+    assert!(routing::reserve_idle_return(&restored, "m", &key)
+        .await
+        .is_none());
+    quota(&restored, 100.0).await;
+    assert!(routing::reserve_idle_return(&restored, "m", &key)
+        .await
+        .is_none());
+    quota(&restored, 20.0).await;
+    restored.settings.write().await.mode = "fixed".into();
+    assert!(routing::reserve_idle_return(&restored, "m", &key)
+        .await
+        .is_none());
+    restored.settings.write().await.mode = "auto".into();
+    // Even a confirmed small recovery cannot take quota reserved for active work.
+    quota(&restored, 95.0).await;
+    let active = routing::reserve(&restored, &official, Some("other-active-thread"), false)
         .await
         .unwrap();
+    assert!(routing::reserve_idle_return(&restored, "m", &key)
+        .await
+        .is_none());
+    drop(active);
+    quota(&restored, 20.0).await;
+    let (target, pending) = routing::reserve_idle_return(&restored, "m", &key)
+        .await
+        .unwrap();
+    assert_eq!(target.id, official.id);
     assert!(routing::reserve(&restored, &api, Some(&key), false)
         .await
         .is_none());
     drop(pending);
-    restored.sources.write().await[1].source.enabled = true;
     assert_eq!(
         routing::candidates_with_session(&restored, "m", None, Some(&key)).await[0].id,
         "api"
+    );
+    let (_, mut lease) = routing::reserve_idle_return(&restored, "m", &key)
+        .await
+        .unwrap();
+    lease.commit().unwrap();
+    drop(lease);
+    assert_eq!(
+        restored
+            .affinity
+            .preferred(&key, &[official, api])
+            .as_deref(),
+        Some("official")
     );
 }
 

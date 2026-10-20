@@ -31,6 +31,16 @@ struct Data {
 pub struct AffinityStore {
     data: Mutex<Data>,
 }
+enum Reservation<'a> {
+    Normal {
+        continuation: bool,
+        eligible: Option<&'a [Source]>,
+    },
+    IdleReturn {
+        from: &'a Source,
+        seconds: u64,
+    },
+}
 
 pub fn key(session: &str, model: &str) -> String {
     let encoded = serde_json::to_vec(&(session, model)).expect("string tuple");
@@ -142,19 +152,74 @@ impl AffinityStore {
         low: bool,
         eligible: Option<&[Source]>,
     ) -> Option<RouteLease> {
+        self.reserve_with_policy(
+            key,
+            source,
+            low,
+            Reservation::Normal {
+                continuation,
+                eligible,
+            },
+        )
+    }
+    pub fn reserve_idle_return(
+        self: &Arc<Self>,
+        key: &str,
+        from: &Source,
+        source: &Source,
+        low: bool,
+        seconds: u64,
+    ) -> Option<RouteLease> {
+        self.reserve_with_policy(
+            Some(key),
+            source,
+            low,
+            Reservation::IdleReturn { from, seconds },
+        )
+    }
+    fn reserve_with_policy(
+        self: &Arc<Self>,
+        key: Option<&str>,
+        source: &Source,
+        low: bool,
+        policy: Reservation<'_>,
+    ) -> Option<RouteLease> {
         let mut data = self.data.lock().ok()?;
         let identity = source.identity();
-        if let Some(eligible) = eligible {
-            if let Some(entry) = key.and_then(|key| data.entries.get(key)) {
-                if entry.source_id != source.id
-                    && eligible.iter().any(|candidate| {
-                        candidate.id == entry.source_id && candidate.identity() == entry.identity
-                    })
+        let continuation = match policy {
+            Reservation::Normal {
+                continuation,
+                eligible,
+            } => {
+                if let Some(eligible) = eligible {
+                    if let Some(entry) = key.and_then(|key| data.entries.get(key)) {
+                        if entry.source_id != source.id
+                            && eligible.iter().any(|candidate| {
+                                candidate.id == entry.source_id
+                                    && candidate.identity() == entry.identity
+                            })
+                        {
+                            return None;
+                        }
+                    }
+                }
+                continuation
+            }
+            Reservation::IdleReturn { from, seconds } => {
+                let key = key?;
+                let entry = data.entries.get(key)?;
+                if seconds == 0
+                    || source.priority >= from.priority
+                    || entry.source_id != from.id
+                    || entry.identity != from.identity()
+                    || data.pending.contains_key(key)
+                    || now().saturating_sub(entry.last_seen) < seconds
                 {
                     return None;
                 }
+                false
             }
-        }
+        };
         let known = key
             .and_then(|key| data.entries.get(key))
             .is_some_and(|entry| {
@@ -335,6 +400,57 @@ impl Drop for RouteLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn idle_return_waits_for_stream_end_and_restarts_protection_from_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AffinityStore::open(&directory.path().join("affinity.sqlite")).unwrap();
+        let from: Source = serde_json::from_value(serde_json::json!({"id":"api","name":"api","kind":"api","base_url":"http://127.0.0.1:1","enabled":true,"priority":1,"proxy":{"mode":"direct"},"secret":{"api_key":"fixture"}})).unwrap();
+        let mut target = from.clone();
+        target.id = "preferred".into();
+        target.priority = 0;
+        let key = key("busy-thread", "m");
+        let mut stream = store
+            .reserve(Some(&key), &from, false, false, None)
+            .unwrap();
+        stream.commit().unwrap();
+        store
+            .data
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&key)
+            .unwrap()
+            .last_seen = now() - 3600;
+        assert!(store
+            .reserve_idle_return(&key, &from, &target, false, 1800)
+            .is_none());
+        drop(stream);
+        assert!(store
+            .reserve_idle_return(&key, &from, &target, false, 1800)
+            .is_none());
+        store
+            .data
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&key)
+            .unwrap()
+            .last_seen = now() - 1800;
+        assert!(store
+            .reserve_idle_return(&key, &from, &target, false, 0)
+            .is_none());
+        let returning = store
+            .reserve_idle_return(&key, &from, &target, false, 1800)
+            .unwrap();
+        assert!(store
+            .reserve(Some(&key), &from, false, false, None)
+            .is_none());
+        drop(returning);
+        assert_eq!(
+            store.preferred(&key, &[from, target]).as_deref(),
+            Some("api")
+        );
+    }
     #[test]
     fn releasing_long_lived_stream_touches_only_its_still_current_identity() {
         let directory = tempfile::tempdir().unwrap();

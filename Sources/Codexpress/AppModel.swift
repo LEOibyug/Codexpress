@@ -233,7 +233,7 @@ import ServiceManagement
         }
         if next.sources != settings.sources { try persistSettings(next) }
         do {
-            try await mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true)])))
+            try await mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true), "idle_return_minutes":.number(Double(settings.idleReturnDelay))])))
             historyStatus = try await client.call("history.configure", historyPayload(settings.historyCacheSettings))
             try await updateStatus()
             pendingSync = false
@@ -380,6 +380,13 @@ import ServiceManagement
         perform {
             var next = self.settings; next.degradedContextFallback = enabled
             try self.persistSettings(next); try await self.sync()
+        }
+    }
+    func changeIdleReturnDelay(_ minutes: Int) {
+        perform {
+            guard (0...10080).contains(minutes) else { throw AppError.message("闲置回切时间须为 0–10080 分钟。") }
+            var next = self.settings; next.idleReturnMinutes = minutes
+            try self.persistSettings(next); try await self.sync(); try await self.updateStatus()
         }
     }
     func move(_ offsets: IndexSet, to destination: Int) {

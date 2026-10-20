@@ -155,6 +155,11 @@ pub struct RoutingSettings {
     pub official_low_quota_percent: u8,
     #[serde(default = "default_fallback")]
     pub degraded_context_fallback: bool,
+    #[serde(default = "default_idle_return")]
+    pub idle_return_minutes: u32,
+}
+fn default_idle_return() -> u32 {
+    30
 }
 fn default_fallback() -> bool {
     true
@@ -200,6 +205,7 @@ impl AppState {
                 fixed_source_id: None,
                 official_low_quota_percent: 10,
                 degraded_context_fallback: true,
+                idle_return_minutes: default_idle_return(),
             }),
             bindings: Mutex::new(HashMap::new()),
             usage: Arc::new(usage),

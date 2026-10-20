@@ -1465,7 +1465,7 @@ async fn socks5h_keeps_dns_at_explicit_proxy() {
 }
 
 #[tokio::test]
-async fn portable_history_with_same_session_migrates_once_and_never_returns_on_recovery() {
+async fn portable_history_with_same_session_keeps_new_source_during_idle_protection() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let first_calls = calls.clone();
     let (first, a) = serve(Router::new().route(
@@ -1504,6 +1504,186 @@ async fn portable_history_with_same_session_migrates_once_and_never_returns_on_r
         to_bytes(response.into_body(), 10000).await.unwrap();
     }
     assert_eq!(*calls.lock().await, vec!["a", "b", "b"]);
+    a.abort();
+    b.abort();
+}
+
+fn expire_fixture_affinity(directory: &std::path::Path) {
+    let db = rusqlite::Connection::open(directory.join("affinity.sqlite")).unwrap();
+    db.execute(
+        "UPDATE affinity SET last_seen=?1",
+        [codexpress_gateway::model::now() - 3600],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn idle_return_rebuilds_cached_context_and_failed_return_keeps_working_source() {
+    let preferred_calls = Arc::new(AtomicUsize::new(0));
+    let copy = preferred_calls.clone();
+    let (preferred, preferred_task) = serve(Router::new().route("/responses", post(move |req: Request| {
+        let copy = copy.clone();
+        async move {
+            let body: Value = serde_json::from_slice(&to_bytes(req.into_body(), 10000).await.unwrap()).unwrap();
+            let attempt = copy.fetch_add(1, Ordering::Relaxed);
+            assert!(!body.to_string().contains("old-api-cipher"));
+            if attempt < 2 {
+                assert!(body.get("previous_response_id").is_none());
+                assert!(body["input"].as_array().unwrap().iter().any(|item| item["content"] == "original prompt"));
+                assert!(body["input"].as_array().unwrap().iter().any(|item| item["content"] == "api answer"));
+            } else {
+                assert_eq!(body["previous_response_id"], "preferred-response");
+                assert!(body.to_string().contains("new-preferred-cipher"));
+            }
+            if attempt == 0 {
+                (StatusCode::TOO_MANY_REQUESTS, axum::Json(json!({"error":{"code":"rate_limit_exceeded"}})))
+            } else {
+                (StatusCode::OK, axum::Json(json!({"id":"preferred-response","status":"completed","output":[{"type":"reasoning","encrypted_content":"new-preferred-cipher"}]})))
+            }
+        }
+    }))).await;
+    let api_calls = Arc::new(AtomicUsize::new(0));
+    let copy = api_calls.clone();
+    let (api, api_task) = serve(Router::new().route("/responses", post(move || {
+        let copy = copy.clone();
+        async move {
+            copy.fetch_add(1, Ordering::Relaxed);
+            axum::Json(json!({"id":"api-response","status":"completed","output":[{"role":"assistant","content":"api answer"},{"type":"reasoning","encrypted_content":"old-api-cipher"}]}))
+        }
+    }))).await;
+    let mut first = source("preferred", &preferred, 0);
+    first.enabled = false;
+    let second = source("api", &api, 1);
+    let (directory, initial) = state(vec![first.clone(), second.clone()]).await;
+    initial.history.configure(true, 64_000_000).unwrap();
+    let make = |body: Value| {
+        let mut req = request(&serde_json::to_vec(&body).unwrap());
+        req.headers_mut()
+            .insert("thread-id", "idle-return-thread".parse().unwrap());
+        req
+    };
+    let response = relay::router(initial.clone())
+        .oneshot(make(
+            json!({"model":"m","input":[{"role":"user","content":"original prompt"}]}),
+        ))
+        .await
+        .unwrap();
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    drop(initial);
+    first.enabled = true;
+    let next = json!({"model":"m","previous_response_id":"api-response","input":[{"role":"user","content":"next turn"}]});
+    for attempt in 0..2 {
+        expire_fixture_affinity(directory.path());
+        let restored = AppState::new(directory.path().to_owned(), 0, "local-key".into()).unwrap();
+        *restored.sources.write().await = vec![
+            SourceRuntime::new(first.clone()),
+            SourceRuntime::new(second.clone()),
+        ];
+        let app = relay::router(restored.clone());
+        let response = app.clone().oneshot(make(next.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+        let key = codexpress_gateway::affinity::key("thread:idle-return-thread", "m");
+        assert_eq!(
+            restored
+                .affinity
+                .preferred(&key, &[first.clone(), second.clone()])
+                .as_deref(),
+            Some(if attempt == 0 { "api" } else { "preferred" })
+        );
+        if attempt == 0 {
+            // A failed reclaim and fresh API activity restart the idle window.
+            let response = app.oneshot(make(next.clone())).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), 10000).await.unwrap();
+            assert_eq!(preferred_calls.load(Ordering::Relaxed), 1);
+        } else {
+            // Discard only old-source state; keep new-source ciphertext intact.
+            let followup = json!({"model":"m","previous_response_id":"preferred-response","input":[{"type":"reasoning","encrypted_content":"old-api-cipher"},{"type":"reasoning","encrypted_content":"new-preferred-cipher"},{"role":"user","content":"continue"}]});
+            let response = app.oneshot(make(followup)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), 10000).await.unwrap();
+        }
+    }
+    assert_eq!(preferred_calls.load(Ordering::Relaxed), 3);
+    assert_eq!(api_calls.load(Ordering::Relaxed), 3);
+    preferred_task.abort();
+    api_task.abort();
+}
+
+#[tokio::test]
+async fn idle_return_keeps_current_route_for_tool_results_disabled_rebuild_and_missing_history() {
+    let higher_hits = Arc::new(AtomicUsize::new(0));
+    let copy = higher_hits.clone();
+    let (higher, a) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let copy = copy.clone();
+            async move {
+                copy.fetch_add(1, Ordering::Relaxed);
+                StatusCode::OK
+            }
+        }),
+    ))
+    .await;
+    let (api, b) = serve(Router::new().route(
+        "/responses",
+        post(|| async {
+            axum::Json(json!({"id":"api-response","status":"completed","output":[]}))
+        }),
+    ))
+    .await;
+    let mut first = source("preferred", &higher, 0);
+    first.enabled = false;
+    let second = source("api", &api, 1);
+    let (directory, initial) = state(vec![first.clone(), second.clone()]).await;
+    initial.history.configure(true, 64_000_000).unwrap();
+    let key = codexpress_gateway::affinity::key("thread:protected-thread", "m");
+    let mut lease = routing::reserve(&initial, &second, Some(&key), false)
+        .await
+        .unwrap();
+    lease.commit().unwrap();
+    drop(lease);
+    drop(initial);
+    first.enabled = true;
+    for case in 0..3 {
+        expire_fixture_affinity(directory.path());
+        let restored = AppState::new(directory.path().to_owned(), 0, "local-key".into()).unwrap();
+        *restored.sources.write().await = vec![
+            SourceRuntime::new(first.clone()),
+            SourceRuntime::new(second.clone()),
+        ];
+        restored
+            .bindings
+            .lock()
+            .await
+            .insert("uncached-response".into(), "api".into());
+        restored.settings.write().await.degraded_context_fallback = case != 1;
+        let input = if case == 0 {
+            json!([{"type":"function_call_output","call_id":"call","output":"tool result"}])
+        } else {
+            json!([{"role":"user","content":"next"}])
+        };
+        let mut req = request(
+            &serde_json::to_vec(
+                &json!({"model":"m","previous_response_id":"uncached-response","input":input}),
+            )
+            .unwrap(),
+        );
+        req.headers_mut()
+            .insert("thread-id", "protected-thread".parse().unwrap());
+        let response = relay::router(restored.clone()).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+        assert_eq!(
+            restored
+                .affinity
+                .preferred(&key, &[first.clone(), second.clone()])
+                .as_deref(),
+            Some("api")
+        );
+    }
+    assert_eq!(higher_hits.load(Ordering::Relaxed), 0);
     a.abort();
     b.abort();
 }
