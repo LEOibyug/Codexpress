@@ -187,7 +187,7 @@ import ServiceManagement
         }
         if next.sources != settings.sources { try persistSettings(next) }
         do {
-            try mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null])))
+            try mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent))])))
             try await updateStatus()
             pendingSync = false
         } catch { pendingSync = true; throw error }
@@ -314,6 +314,13 @@ import ServiceManagement
         perform {
             if mode == "fixed", !self.settings.sources.contains(where: { $0.id == fixed && $0.enabled }) { throw AppError.message("请选择已启用的固定来源。") }
             var next = self.settings; next.mode = mode; next.fixed_source_id = fixed
+            try self.persistSettings(next); try await self.sync(); try await self.updateStatus()
+        }
+    }
+    func changeLowQuotaThreshold(_ value: Int) {
+        perform {
+            guard (1...99).contains(value) else { throw AppError.message("余量阈值须为 1–99%。") }
+            var next = self.settings; next.officialLowQuotaPercent = value
             try self.persistSettings(next); try await self.sync(); try await self.updateStatus()
         }
     }

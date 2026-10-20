@@ -399,8 +399,9 @@ async fn fresh_quota_recovers_natural_reset_but_preserves_unknown_and_other_rest
         assert_eq!(sources[0].health, "exhausted");
         assert_eq!(sources[0].cooldown_until, Some(reset + 500));
     }
-    *counters.quota.lock().await =
-        Some(json!({"rate_limit":{"primary_window":{"used_percent":15},"secondary_window":null}}));
+    *counters.quota.lock().await = Some(
+        json!({"rate_limit":{"primary_window":{"used_percent":15},"secondary_window":{"used_percent":20}}}),
+    );
     official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
         .await
         .unwrap();
@@ -531,5 +532,81 @@ async fn consume_requires_the_explicitly_confirmed_account_before_network_dispat
     );
     assert_eq!(counters.posts.load(Ordering::SeqCst), 0);
     assert_eq!(counters.reads.load(Ordering::SeqCst), 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn missing_low_quota_windows_never_reopen_admission_without_known_recovery() {
+    let (proxy, counters, task) = fixture(false).await;
+    let (_dir, state) = setup(&proxy).await;
+    *counters.quota.lock().await = Some(
+        json!({"rate_limit":{"primary_window":{"used_percent":20},"secondary_window":{"used_percent":100,"limit_window_seconds":604800}}}),
+    );
+    official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    // Make the old observation deterministic without waiting for a clock tick.
+    {
+        let mut sources = state.sources.write().await;
+        sources[0].quota["fetched_at"] = json!(100);
+        for window in sources[0].quota["windows"].as_array_mut().unwrap() {
+            window["observed_at"] = json!(100);
+        }
+    }
+    for unknown in [
+        json!({}),
+        json!({"rate_limit":{"primary_window":{"used_percent":20},"secondary_window":{"used_percent":null}}}),
+    ] {
+        *counters.quota.lock().await = Some(unknown);
+        let result =
+            official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+                .await
+                .unwrap();
+        assert_eq!(result["quota"]["stale"], true);
+        let retained = result["quota"]["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|window| window["name"] == "secondary")
+            .unwrap();
+        assert_eq!(retained["observed_at"], 100);
+        assert_eq!(
+            codexpress_gateway::routing::remaining(&state.sources.read().await[0]),
+            Some(0.0)
+        );
+    }
+    {
+        let mut sources = state.sources.write().await;
+        let mut recovered = sources[0].clone();
+        recovered.source.id = "same-account-recovered".into();
+        recovered.quota = json!({"fetched_at":101,"windows":[{"name":"secondary","used_percent":50,"observed_at":101}]});
+        sources.push(recovered);
+        assert_eq!(
+            codexpress_gateway::routing::account_remaining(&sources[0], &sources),
+            Some(50.0)
+        );
+    }
+    *counters.quota.lock().await = Some(json!({}));
+    official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    {
+        let sources = state.sources.read().await;
+        assert_eq!(
+            codexpress_gateway::routing::account_remaining(&sources[0], &sources),
+            Some(50.0)
+        );
+    }
+    *counters.quota.lock().await = Some(
+        json!({"rate_limit":{"primary_window":{"used_percent":20},"secondary_window":{"used_percent":30}}}),
+    );
+    let result = official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    assert_eq!(result["quota"]["stale"], false);
+    assert_eq!(
+        codexpress_gateway::routing::remaining(&state.sources.read().await[0]),
+        Some(70.0)
+    );
     task.abort();
 }

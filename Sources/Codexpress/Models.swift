@@ -85,6 +85,8 @@ struct AppSettings: Codable, Sendable {
     var codexHome = ""
     // Optional for backwards-compatible decoding of existing sources.json files.
     var modelCompaction: [ModelCompactionRule]? = nil
+    var officialLowQuotaPercent: Int? = nil
+    var lowQuotaPercent: Int { officialLowQuotaPercent ?? 10 }
 }
 
 struct ModelCompactionRule: Codable, Equatable, Sendable {

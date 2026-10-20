@@ -980,7 +980,7 @@ async fn socks5h_keeps_dns_at_explicit_proxy() {
 }
 
 #[tokio::test]
-async fn portable_history_with_same_session_can_move_and_restore_priority() {
+async fn portable_history_with_same_session_migrates_once_and_never_returns_on_recovery() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let first_calls = calls.clone();
     let (first, a) = serve(Router::new().route(
@@ -1018,9 +1018,81 @@ async fn portable_history_with_same_session_can_move_and_restore_priority() {
         assert_eq!(response.status(), StatusCode::OK);
         to_bytes(response.into_body(), 10000).await.unwrap();
     }
-    assert_eq!(*calls.lock().await, vec!["a", "b", "a"]);
+    assert_eq!(*calls.lock().await, vec!["a", "b", "b"]);
     a.abort();
     b.abort();
+}
+
+#[tokio::test]
+async fn empty_official_quota_never_contacts_proxy_and_recovery_keeps_api_cache_affinity() {
+    let proxy_hits = Arc::new(AtomicUsize::new(0));
+    let copy = proxy_hits.clone();
+    let (proxy, proxy_task) = serve(Router::new().fallback(move || {
+        let copy = copy.clone();
+        async move {
+            copy.fetch_add(1, Ordering::Relaxed);
+            StatusCode::BAD_GATEWAY
+        }
+    }))
+    .await;
+    let expected=br#"{ "model":"m", "prompt_cache_key":"stable-fixture-cache", "input":[{"role":"user","content":"complete portable history"}],"store":false }"#;
+    let api_hits = Arc::new(AtomicUsize::new(0));
+    let copy = api_hits.clone();
+    let (api,api_task)=serve(Router::new().route("/responses",post(move |request:Request| {
+        let copy=copy.clone();async move {
+            assert_eq!(request.headers()["thread-id"],"long-fixture-thread");
+            assert_eq!(request.headers()["session-id"],"shared-process");
+            assert_eq!(&to_bytes(request.into_body(),10000).await.unwrap()[..],expected);
+            copy.fetch_add(1,Ordering::Relaxed);
+            axum::Json(json!({"id":"api-fixture-response","usage":{"input_tokens":100,"output_tokens":2}}))
+        }
+    }))).await;
+    let mut official = source("official", "https://chatgpt.com/backend-api/codex", 0);
+    official.kind = "official".into();
+    official.account_id = Some("fixture-workspace".into());
+    official.proxy = ProxyPolicy {
+        mode: "explicit".into(),
+        url: Some(proxy),
+    };
+    official.secret = json!({"access_token":"official-fixture","expires_at":4000000000_u64,"account_id":"fixture-workspace"});
+    let (dir, state) = state(vec![official.clone(), source("api", &api, 1)]).await;
+    state.sources.write().await[0].quota =
+        json!({"windows":[{"name":"secondary","used_percent":100}]});
+    let app = relay::router(state.clone());
+    for _ in 0..2 {
+        let mut req = request(expected);
+        req.headers_mut()
+            .insert("thread-id", "long-fixture-thread".parse().unwrap());
+        req.headers_mut()
+            .insert("session-id", "shared-process".parse().unwrap());
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+        state.sources.write().await[0].quota =
+            json!({"windows":[{"name":"secondary","used_percent":0}]});
+    }
+    assert_eq!(proxy_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(api_hits.load(Ordering::Relaxed), 2);
+    // Restart the helper state, preserving only the app-owned affinity DB.
+    drop(app);
+    drop(state);
+    let restored = AppState::new(dir.path().to_owned(), 0, "local-key".into()).unwrap();
+    *restored.sources.write().await = vec![
+        SourceRuntime::new(official),
+        SourceRuntime::new(source("api", &api, 1)),
+    ];
+    let mut req = request(expected);
+    req.headers_mut()
+        .insert("thread-id", "long-fixture-thread".parse().unwrap());
+    req.headers_mut()
+        .insert("session-id", "shared-process".parse().unwrap());
+    let response = relay::router(restored).oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert_eq!(proxy_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(api_hits.load(Ordering::Relaxed), 3);
+    proxy_task.abort();
+    api_task.abort();
 }
 
 #[tokio::test]
@@ -1140,5 +1212,52 @@ async fn old_inflight_response_cannot_rebind_after_source_identity_changes() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
+    task.abort();
+}
+
+#[tokio::test]
+async fn expired_official_auth_preflight_can_migrate_portable_session_without_proxy_submission() {
+    let (api, task) = serve(Router::new().route(
+        "/responses",
+        post(|| async {
+            axum::Json(json!({"id":"migrated","usage":{"input_tokens":10,"output_tokens":2}}))
+        }),
+    ))
+    .await;
+    let mut official = source("official", "https://chatgpt.com/backend-api/codex", 0);
+    official.kind = "official".into();
+    official.account_id = Some("fixture-account".into());
+    official.proxy = ProxyPolicy {
+        mode: "explicit".into(),
+        url: Some("http://127.0.0.1:1".into()),
+    };
+    official.secret =
+        json!({"access_token":"expired-fixture","expires_at":1,"account_id":"fixture-account"});
+    let (_dir, state) = state(vec![official.clone(), source("api", &api, 1)]).await;
+    let key = codexpress_gateway::affinity::key("thread:expired-auth-thread", "m");
+    let mut previous = routing::reserve(&state, &official, Some(&key), false)
+        .await
+        .unwrap();
+    previous.commit().unwrap();
+    drop(previous);
+    let mut req = request(br#"{"model":"m","input":"full portable input"}"#);
+    req.headers_mut()
+        .insert("thread-id", "expired-auth-thread".parse().unwrap());
+    let response = relay::router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert_eq!(
+        state.affinity.preferred(
+            &key,
+            &state
+                .sources
+                .read()
+                .await
+                .iter()
+                .map(|r| r.source.clone())
+                .collect::<Vec<_>>()
+        ),
+        Some("api".into())
+    );
     task.abort();
 }

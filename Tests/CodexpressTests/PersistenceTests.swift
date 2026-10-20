@@ -25,6 +25,8 @@ final class PersistenceTests: XCTestCase {
     func testModelCompactionMigrationAndValidation() throws {
         let legacy = Data(#"{"sources":[],"mode":"auto","port":17863,"codexHome":"/temporary/codex"}"#.utf8)
         var settings = try JSONDecoder().decode(AppSettings.self, from: legacy)
+        XCTAssertEqual(settings.lowQuotaPercent,10)
+        settings.officialLowQuotaPercent=10
         XCTAssertNil(settings.modelCompaction)
         let first = try ModelCompactionRule.parse(model: "model-a", threshold: "180000", window: "300000")
         let second = try ModelCompactionRule.parse(model: "model-b", threshold: "45000", window: "")

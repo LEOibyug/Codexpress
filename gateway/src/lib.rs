@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod backups;
 pub mod compaction;
 pub mod config;

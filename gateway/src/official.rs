@@ -657,6 +657,7 @@ fn quota_snapshot(raw: &Value) -> Result<Value> {
     if !raw.is_object() {
         bail!("官方额度响应格式变化");
     }
+    let fetched_at = now();
     let mut windows = Vec::new();
     let mut append = |prefix: &str, limits: &Value| {
         for (name, key) in [
@@ -665,7 +666,7 @@ fn quota_snapshot(raw: &Value) -> Result<Value> {
         ] {
             if let Some(window) = limits.get(key).filter(|window| !window.is_null()) {
                 let used = number(&window["used_percent"]);
-                windows.push(json!({"name":format!("{prefix}{name}"),"used_percent":used,"reset_at":timestamp(&window["reset_at"]),"window_seconds":number(&window["limit_window_seconds"])}));
+                windows.push(json!({"name":format!("{prefix}{name}"),"used_percent":used,"reset_at":timestamp(&window["reset_at"]),"window_seconds":number(&window["limit_window_seconds"]),"observed_at":fetched_at}));
             }
         }
     };
@@ -695,7 +696,7 @@ fn quota_snapshot(raw: &Value) -> Result<Value> {
         }
     }
     Ok(
-        json!({"plan_type":raw.get("plan_type").and_then(Value::as_str),"windows":windows,"complete":complete,"fetched_at":now(),"stale":false,"error":null}),
+        json!({"plan_type":raw.get("plan_type").and_then(Value::as_str),"windows":windows,"complete":complete,"fetched_at":fetched_at,"stale":false,"error":null}),
     )
 }
 fn credits_snapshot(raw: &Value) -> Result<Value> {
@@ -795,6 +796,7 @@ async fn refresh_selected_snapshots(
     endpoints: Endpoints<'_>,
     include_credits: bool,
 ) -> Result<Value> {
+    let threshold = state.settings.read().await.official_low_quota_percent;
     let quota = get(src, endpoints.usage)
         .await
         .and_then(|v| quota_snapshot(&v));
@@ -813,7 +815,10 @@ async fn refresh_selected_snapshots(
         .find(|r| same_binding(&r.source, src))
         .ok_or_else(|| anyhow!("来源在查询期间发生变化，请刷新"))?;
     runtime.quota = match quota {
-        Ok(v) => v,
+        Ok(mut v) => {
+            preserve_low_windows(&mut v, &runtime.quota, threshold);
+            v
+        }
         Err(e) => stale(runtime.quota.clone(), "quota", &e.to_string()),
     };
     recover_exhaustion(runtime);
@@ -824,6 +829,50 @@ async fn refresh_selected_snapshots(
         };
     }
     Ok(json!({"quota":runtime.quota,"credits":runtime.credits}))
+}
+
+fn preserve_low_windows(fresh: &mut Value, previous: &Value, threshold: u8) {
+    let Some(old) = previous["windows"].as_array() else {
+        return;
+    };
+    let Some(windows) = fresh.get_mut("windows").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut retained = false;
+    for old_window in old.iter().filter(|window| {
+        matches!(window["name"].as_str(), Some("primary" | "secondary"))
+            && window["used_percent"]
+                .as_f64()
+                .is_some_and(|used| used.is_finite() && used >= 100.0 - f64::from(threshold))
+    }) {
+        // Retained observations must not become newer than a confirmed recovery
+        // seen through another source for the same account.
+        let mut retained_window = old_window.clone();
+        retained_window["observed_at"] = json!(old_window["observed_at"]
+            .as_u64()
+            .or_else(|| previous["fetched_at"].as_u64())
+            .unwrap_or(0));
+        if let Some(current) = windows
+            .iter_mut()
+            .find(|window| window["name"] == old_window["name"])
+        {
+            if current["used_percent"]
+                .as_f64()
+                .is_some_and(|used| used.is_finite() && used >= 0.0)
+            {
+                continue;
+            }
+            *current = retained_window;
+        } else {
+            windows.push(retained_window);
+        }
+        retained = true;
+    }
+    if retained {
+        fresh["stale"] = json!(true);
+        fresh["complete"] = json!(false);
+        fresh["error"] = json!("官方未返回完整额度，保留上次已知值");
+    }
 }
 
 #[derive(Serialize, Deserialize)]

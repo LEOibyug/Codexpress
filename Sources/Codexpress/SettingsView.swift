@@ -214,8 +214,19 @@ struct RoutingView: View {
                     }.disabled(model.busy)
                     InfoNote(text: "来源不可用时暂停请求。")
                 } else {
-                    InfoNote(text: "按优先级使用可用来源。")
+                    InfoNote(text: "新对话按优先级分配，连续对话优先沿用原来源。")
                 }
+            }
+            SettingsCard("官方余量保护", symbol: "shield.lefthalf.filled") {
+                HStack {
+                    Text("保留余量阈值").font(.system(size: 12))
+                    Spacer()
+                    Stepper(value: Binding(get: { model.settings.lowQuotaPercent }, set: { model.changeLowQuotaThreshold($0) }), in: 1...99) {
+                        Text("\(model.settings.lowQuotaPercent)%").monospacedDigit().frame(width: 42, alignment: .trailing)
+                    }.fixedSize().disabled(model.busy)
+                }
+                Text("任一短周期或周额度不高于此值时，为已有活跃对话保留余量；额度归零后跳过此来源。")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
             }
             if model.sources.isEmpty {
                 EmptyState("暂无来源", subtitle: "添加来源后可设置优先级。", symbol: "arrow.triangle.branch")
@@ -234,6 +245,10 @@ struct RoutingView: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(source.name).font(.system(size: 13, weight: .medium))
                                     Text(source.policyLabel).font(.system(size: 11)).foregroundStyle(.secondary)
+                                    if let active = model.state(source.id)["admission"]["active_conversations"].number {
+                                        Text("\(Int(active)) 个活跃对话" + (source.official ? " · \(model.state(source.id)["admission"]["routing_note"].string ?? "")" : ""))
+                                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                                    }
                                 }
                                 Spacer()
                                 StatusPill(text: source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用")

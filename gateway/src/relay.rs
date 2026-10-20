@@ -543,7 +543,10 @@ fn turn_binding(token: &str) -> String {
 fn session_binding(parsed: &Value, headers: &HeaderMap) -> Option<String> {
     // Current Codex can share a session-id across threads/subagents. The more
     // specific thread-id must win, and its namespace must remain separate.
-    let (namespace, id) = if let Some(thread) = headers.get("thread-id") {
+    let (namespace, id) = if let Some(thread) = headers
+        .get("thread-id")
+        .or_else(|| headers.get("thread_id"))
+    {
         ("thread", thread.to_str().ok()?)
     } else {
         let id = parsed
@@ -641,7 +644,18 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
     {
         return error(StatusCode::BAD_REQUEST, "previous_response_id 格式无效");
     }
-    let mut sources = routing::candidates(&state, model, binding).await;
+    let affinity_session = session_key.clone().or_else(|| {
+        parsed
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty() && key.len() <= 4096)
+            .map(|key| format!("cache:{key}"))
+    });
+    let affinity_key = affinity_session
+        .as_deref()
+        .map(|session| crate::affinity::key(session, model));
+    let mut sources =
+        routing::candidates_with_session(&state, model, binding, affinity_key.as_deref()).await;
     if opaque_state {
         let bindings = state.bindings.lock().await;
         sources.retain(|source| {
@@ -686,11 +700,34 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
             last_error = Some(error(StatusCode::NOT_IMPLEMENTED, "官方来源尚未验证此端点"));
             continue;
         }
+        let mut route_lease = if discovery {
+            None
+        } else {
+            match routing::reserve_for_model(
+                &state,
+                &candidate,
+                affinity_key.as_deref(),
+                binding.is_some(),
+                model,
+            )
+            .await
+            {
+                Some(lease) => Some(lease),
+                None => {
+                    last_error = Some(error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "来源正为已有对话保留余量，暂无可分配来源",
+                    ));
+                    continue;
+                }
+            }
+        };
         let mut source = if candidate.kind == "official" {
             match crate::official::ensure_access(&state, &candidate.id).await {
                 Ok(source) if source.identity() == candidate.identity() => source,
                 Ok(_) => return error(StatusCode::CONFLICT, "来源身份已经变化，请重新开始请求"),
                 Err(_) => {
+                    routing::mark_auth_preflight_failure(&state, &candidate).await;
                     last_error = Some(error(
                         StatusCode::BAD_GATEWAY,
                         "官方来源认证暂不可用，请检查登录或网络",
@@ -842,6 +879,7 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                 && matches!(status.as_u16(), 401 | 402 | 403 | 429);
             if safe_to_fallback {
                 attempt.finish("failed", None);
+                drop(route_lease.take());
                 // Preserve the final source's native error body when there is no
                 // later candidate; streaming this response must not trigger replay.
                 last_error = Some(
@@ -851,8 +889,8 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                         upstream,
                         prefix,
                         attempt,
-                        discovery,
-                        session_key.clone(),
+                        (discovery, session_key.clone()),
+                        None,
                     )
                     .await,
                 );
@@ -867,8 +905,8 @@ async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> 
                 upstream,
                 prefix,
                 attempt,
-                discovery,
-                session_key.clone(),
+                (discovery, session_key.clone()),
+                route_lease.take(),
             )
             .await;
         }
@@ -911,9 +949,10 @@ async fn stream_response(
     upstream: reqwest::Response,
     prefix: Vec<Bytes>,
     mut attempt: Attempt,
-    discovery: bool,
-    session_key: Option<String>,
+    context: (bool, Option<String>),
+    mut route_lease: Option<crate::affinity::RouteLease>,
 ) -> Response<Body> {
+    let (discovery, session_key) = context;
     let status = upstream.status();
     let headers = clean_headers(upstream.headers(), false);
     let content_length = headers
@@ -956,6 +995,15 @@ async fn stream_response(
         );
     }
     if status.is_success() {
+        if let Some(lease) = &mut route_lease {
+            let sources = state.sources.read().await;
+            if sources.iter().any(|runtime| {
+                runtime.source.id == source.id && runtime.source.identity() == source.identity()
+            }) && lease.commit().is_err()
+            {
+                eprintln!("会话来源保存失败");
+            }
+        }
         if let Some(session_key) = session_key {
             observer.ids.push(session_key);
         }
@@ -970,6 +1018,7 @@ async fn stream_response(
         bind_ids(&state, &source, &mut observer).await;
     }
     let stream = async_stream::stream! {
+        let _route_lease=route_lease;
         let prefix = futures_util::stream::iter(prefix.into_iter().map(Ok));
         let mut upstream = prefix.chain(upstream.bytes_stream());
         let mut received = 0u64;

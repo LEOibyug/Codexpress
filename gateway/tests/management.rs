@@ -17,6 +17,15 @@ async fn management_sync_is_transactional_and_does_not_expose_secrets_in_status(
         .await
         .unwrap();
     assert_eq!(status["sources"][0]["id"], "source-a");
+    assert_eq!(status["official_low_quota_percent"], 10);
+    assert!(management::dispatch(
+        &state,
+        "sync",
+        json!({"sources":[],"official_low_quota_percent":0})
+    )
+    .await
+    .is_err());
+    assert_eq!(state.sources.read().await.len(), 1);
     assert!(!status.to_string().contains("PRIVATE-API-SECRET"));
     let mut invalid = valid;
     invalid["proxy"] = json!({"mode":"explicit","url":"http://user:PRIVATE-PROXY@localhost:1"});

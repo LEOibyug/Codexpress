@@ -33,8 +33,21 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
         "status" => {
             let settings = state.settings.read().await.clone();
             let sources = state.sources.read().await.clone();
+            let sources: Vec<_> = sources
+                .iter()
+                .map(|runtime| {
+                    let mut value = serde_json::to_value(runtime).expect("source status");
+                    value["admission"] = crate::routing::admission(
+                        state,
+                        runtime,
+                        &sources,
+                        settings.official_low_quota_percent,
+                    );
+                    value
+                })
+                .collect();
             Ok(
-                json!({"running":true,"process_id":std::process::id(),"port":state.port,"base_url":format!("http://127.0.0.1:{}/v1",state.port),"mode":settings.mode,"fixed_source_id":settings.fixed_source_id,"sources":sources,"inflight":state.inflight.load(Ordering::Relaxed),"connection_mode":config::connection_mode(&state.state_dir).unwrap_or("unknown")}),
+                json!({"running":true,"process_id":std::process::id(),"port":state.port,"base_url":format!("http://127.0.0.1:{}/v1",state.port),"mode":settings.mode,"fixed_source_id":settings.fixed_source_id,"official_low_quota_percent":settings.official_low_quota_percent,"sources":sources,"inflight":state.inflight.load(Ordering::Relaxed),"connection_mode":config::connection_mode(&state.state_dir).unwrap_or("unknown")}),
             )
         }
         "credentials" => Ok(credentials(state).await),
@@ -51,6 +64,14 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
                 .get("fixed_source_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            let threshold = match payload.get("official_low_quota_percent") {
+                None => 10,
+                Some(value) => value
+                    .as_u64()
+                    .filter(|v| (1..=99).contains(v))
+                    .ok_or_else(|| anyhow::anyhow!("官方余量阈值须为1–99的整数"))?
+                    as u8,
+            };
             if !["auto", "fixed"].contains(&mode) {
                 bail!("未知路由模式");
             }
@@ -110,6 +131,12 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
                 }
                 next.push(SourceRuntime::new(source));
             }
+            state.affinity.retain_identities(
+                &next
+                    .iter()
+                    .map(|runtime| runtime.source.clone())
+                    .collect::<Vec<_>>(),
+            )?;
             *current = next;
             // Keep the source write lock through binding invalidation. Relay
             // readers and binding writers use sources -> bindings consistently.
@@ -122,6 +149,7 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             *state.settings.write().await = RoutingSettings {
                 mode: mode.into(),
                 fixed_source_id: fixed,
+                official_low_quota_percent: threshold,
             };
             Ok(credentials(state).await)
         }
