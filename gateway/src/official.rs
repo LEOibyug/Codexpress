@@ -787,12 +787,26 @@ async fn refresh_snapshots(
     src: &Source,
     endpoints: Endpoints<'_>,
 ) -> Result<Value> {
+    refresh_selected_snapshots(state, src, endpoints, true).await
+}
+async fn refresh_selected_snapshots(
+    state: &Arc<AppState>,
+    src: &Source,
+    endpoints: Endpoints<'_>,
+    include_credits: bool,
+) -> Result<Value> {
     let quota = get(src, endpoints.usage)
         .await
         .and_then(|v| quota_snapshot(&v));
-    let credits = get(src, endpoints.credits)
-        .await
-        .and_then(|v| credits_snapshot(&v));
+    let credits = if include_credits {
+        Some(
+            get(src, endpoints.credits)
+                .await
+                .and_then(|v| credits_snapshot(&v)),
+        )
+    } else {
+        None
+    };
     let mut sources = state.sources.write().await;
     let runtime = sources
         .iter_mut()
@@ -803,10 +817,12 @@ async fn refresh_snapshots(
         Err(e) => stale(runtime.quota.clone(), "quota", &e.to_string()),
     };
     recover_exhaustion(runtime);
-    runtime.credits = match credits {
-        Ok(v) => v,
-        Err(e) => stale(runtime.credits.clone(), "credits", &e.to_string()),
-    };
+    if let Some(credits) = credits {
+        runtime.credits = match credits {
+            Ok(v) => v,
+            Err(e) => stale(runtime.credits.clone(), "credits", &e.to_string()),
+        };
+    }
     Ok(json!({"quota":runtime.quota,"credits":runtime.credits}))
 }
 
@@ -1058,8 +1074,13 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
             )
         }
         "official.refresh" => {
+            let include_credits = match payload.get("include_credits") {
+                None => true,
+                Some(Value::Bool(include)) => *include,
+                _ => bail!("include_credits 需要布尔值"),
+            };
             let src = ensure_access(state, field(&payload, "source_id")?).await?;
-            refresh_snapshots(state, &src, ENDPOINTS).await
+            refresh_selected_snapshots(state, &src, ENDPOINTS, include_credits).await
         }
         "official.credits.consume" => consume(state, &payload, ENDPOINTS).await,
         _ => bail!("未知官方账号操作"),
@@ -1133,8 +1154,16 @@ pub(crate) mod fixture {
         install(state, &source(state, id).await?, secret).await
     }
     pub(crate) async fn snapshots_at(state: &Arc<AppState>, id: &str, base: &str) -> Result<Value> {
+        selected_snapshots_at(state, id, base, true).await
+    }
+    pub(crate) async fn selected_snapshots_at(
+        state: &Arc<AppState>,
+        id: &str,
+        base: &str,
+        include_credits: bool,
+    ) -> Result<Value> {
         let (token, usage, credits, consume) = endpoints(base);
-        refresh_snapshots(
+        refresh_selected_snapshots(
             state,
             &source(state, id).await?,
             Endpoints {
@@ -1143,6 +1172,7 @@ pub(crate) mod fixture {
                 credits: &credits,
                 consume: &consume,
             },
+            include_credits,
         )
         .await
     }

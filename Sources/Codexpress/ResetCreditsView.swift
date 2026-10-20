@@ -18,13 +18,15 @@ struct OfficialAccountView: View {
                 }
                 Spacer(minLength: 0)
                 Button(live["account_id"].string == nil ? "登录…" : "重新登录…") { model.login(source) }.disabled(model.busy || model.loginFlow != nil)
-                Button { model.refresh(source.id) } label: { Label("刷新额度", systemImage: "arrow.clockwise") }.disabled(model.busy)
+                Button { model.refresh(source.id) } label: {
+                    Label(model.refreshingQuotas.contains(source.id) ? "刷新中…" : "刷新额度", systemImage: "arrow.clockwise")
+                }.disabled(model.busy || model.refreshingQuotas.contains(source.id))
             }.controlSize(.small)
-            if quota["windows"].array.isEmpty {
-                Text("暂无额度数据").font(.system(size: 11)).foregroundStyle(.secondary)
+            if live["account_id"].string == nil && quota["windows"].array.isEmpty {
+                Text("登录后查看额度").font(.system(size: 11)).foregroundStyle(.secondary)
             } else {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 12)], spacing: 12) {
-                    ForEach(Array(quota["windows"].array.enumerated()), id: \.offset) { _, window in
+                    ForEach(QuotaOverview(quota).windows) { window in
                         quotaWindow(window)
                     }
                 }
@@ -32,7 +34,7 @@ struct OfficialAccountView: View {
             if quota != .null {
                 HStack(spacing: 5) {
                     Image(systemName: "clock").font(.system(size: 9))
-                    Text("更新于 \(timestampLabel(quota["fetched_at"]))" + (quota["stale"].bool == true ? " · 待刷新" : ""))
+                    Text("更新于 \(timestampLabel(quota["fetched_at"]))" + (quota["stale"].bool == true ? " · 更新失败" : ""))
                 }.font(.system(size: 10)).foregroundStyle(quota["stale"].bool == true ? Color.orange : Color.secondary)
             }
             if let error = quota["error"].string { InfoNote(text: error, color: .orange) }
@@ -60,25 +62,22 @@ struct OfficialAccountView: View {
         }
     }
 
-    private func quotaWindow(_ window: JSONValue) -> some View {
+    private func quotaWindow(_ window: QuotaWindow) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
-                Text(windowName(window["name"].string)).font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(window.title).font(.system(size: 11)).foregroundStyle(.secondary)
                 Spacer()
-                Text(window["used_percent"].number.map { "\(Int(max(0, 100 - $0)))%" } ?? "未知")
+                Text(window.remainingLabel)
                     .font(.system(size: 20, weight: .medium, design: .rounded)).monospacedDigit()
                 Text("剩余").font(.system(size: 10)).foregroundStyle(.secondary)
             }
-            if let used = window["used_percent"].number {
-                ProgressView(value: max(0, min(100, 100 - used)), total: 100).tint(used >= 90 ? .orange : .accentColor).controlSize(.small)
+            if let remaining = window.remaining {
+                ProgressView(value: remaining, total: 100).tint(remaining <= 10 ? .orange : .accentColor).controlSize(.small)
             }
-            Text("重置于 \(timestampLabel(window["reset_at"]))").font(.system(size: 10)).foregroundStyle(.secondary)
+            Text(window.resetLabel).font(.system(size: 10)).foregroundStyle(.secondary)
         }.padding(12).background(AppPalette.well, in: RoundedRectangle(cornerRadius: 9))
     }
 
-    private func windowName(_ name: String?) -> String {
-        switch name { case "primary": return "主要窗口"; case "secondary": return "次要窗口"; default: return name ?? "用量窗口" }
-    }
 }
 struct ResetCreditsView: View {
     @EnvironmentObject var model: AppModel
@@ -102,7 +101,7 @@ struct ResetCreditsView: View {
                     }
                     Spacer()
                     Button(model.consuming.contains(key) ? "提交中…" : "使用…") { prepare(credit) }
-                        .disabled(refreshing || model.busy || model.consuming.contains(key) || model.consuming.contains("all") || credit["expiry_known"].bool != true || model.resetResults[key] != nil || credit["status"].string != "available" || credit["id"].string?.isEmpty != false || credits["stale"].bool == true)
+                        .disabled(refreshing || model.busy || model.refreshingQuotas.contains(source.id) || model.consuming.contains(key) || model.consuming.contains("all") || credit["expiry_known"].bool != true || model.resetResults[key] != nil || credit["status"].string != "available" || credit["id"].string?.isEmpty != false || credits["stale"].bool == true)
                 }
             }
             if let localError { Text(localError).font(.caption).foregroundStyle(.orange) }
@@ -114,7 +113,7 @@ struct ResetCreditsView: View {
                 LabeledContent("卡片", value: item.credit["title"].string ?? "重置卡")
                 LabeledContent("到期时间", value: timestampLabel(item.credit["expires_at"]))
                 Divider()
-                ForEach(Array(item.quota["windows"].array.enumerated()), id: \.offset) { _, window in Text("\(window["name"].string ?? "用量窗口")：已用 \(window["used_percent"].number.map { "\(Int($0))%" } ?? "未知")").font(.callout) }
+                ForEach(QuotaOverview(item.quota).windows) { window in Text("\(window.title)：剩余 \(window.remainingLabel)").font(.callout) }
                 Text("此操作将消耗一张重置卡。若结果待确认，请刷新额度后再操作。").font(.callout).foregroundStyle(.secondary)
                 HStack { Spacer(); Button("取消") { confirmation = nil }.keyboardShortcut(.cancelAction); Button("确认使用") { model.consume(item); confirmation = nil }.buttonStyle(.borderedProminent) }
             }.padding(24).frame(width: 470)

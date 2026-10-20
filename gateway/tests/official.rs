@@ -21,6 +21,7 @@ struct Fixture {
     posts: AtomicUsize,
     tokens: AtomicUsize,
     reads: AtomicUsize,
+    quota_reads: AtomicUsize,
     uncertain: bool,
     headers: Mutex<Vec<String>>,
     quota: Mutex<Option<Value>>,
@@ -37,11 +38,12 @@ async fn fixture(uncertain: bool) -> (String, Arc<Fixture>, tokio::task::JoinHan
         )
     }
     async fn usage(State(s): State<Arc<Fixture>>) -> Json<Value> {
+        s.quota_reads.fetch_add(1, Ordering::SeqCst);
         if let Some(value) = s.quota.lock().await.clone() {
             return Json(value);
         }
         Json(
-            json!({"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":10,"reset_at":2000000000,"limit_window_seconds":18000},"secondary_window":{"used_percent":20}}}),
+            json!({"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":10,"reset_at":2000000000,"limit_window_seconds":18000},"secondary_window":{"used_percent":20,"reset_at":2000500000,"limit_window_seconds":604800}}}),
         )
     }
     async fn consume(
@@ -106,6 +108,67 @@ fn unknown_fields_stay_unknown_and_credit_dates_are_normalized() {
     assert_eq!(credits["credits"][0]["expires_at"], 1792454400u64);
     assert!(credits["credits"][1]["id"].is_null());
     assert_eq!(credits["credits"][1]["status"], "unknown");
+}
+
+#[tokio::test]
+async fn frequent_quota_refresh_retains_weekly_data_and_does_not_poll_credits() {
+    let (proxy, counters, task) = fixture(false).await;
+    let (_dir, state) = setup(&proxy).await;
+    let first = official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    assert_eq!(
+        first["quota"]["windows"][1]["window_seconds"].as_f64(),
+        Some(604800.0)
+    );
+    assert_eq!(
+        first["quota"]["windows"][1]["used_percent"].as_f64(),
+        Some(20.0)
+    );
+    assert_eq!(first["quota"]["windows"][1]["reset_at"], 2000500000);
+    let saved_credits = first["credits"].clone();
+    *counters.quota.lock().await = Some(json!({"rate_limit":{
+        "primary_window":{"used_percent":35,"limit_window_seconds":18000},
+        "secondary_window":{"used_percent":70,"limit_window_seconds":604800,"reset_at":2000600000}
+    }}));
+    let refreshed = official::fixture::selected_snapshots_at(
+        &state,
+        "official-a",
+        "http://fixture.invalid",
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        refreshed["quota"]["windows"][1]["used_percent"].as_f64(),
+        Some(70.0)
+    );
+    assert_eq!(refreshed["quota"]["windows"][1]["reset_at"], 2000600000);
+    assert_eq!(refreshed["credits"], saved_credits);
+    assert_eq!(counters.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.quota_reads.load(Ordering::SeqCst), 2);
+    // A failed quota parse preserves the last weekly snapshot and card state.
+    *counters.quota.lock().await = Some(json!([]));
+    let failed = official::fixture::selected_snapshots_at(
+        &state,
+        "official-a",
+        "http://fixture.invalid",
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(failed["quota"]["stale"], true);
+    assert_eq!(
+        failed["quota"]["windows"][1]["used_percent"].as_f64(),
+        Some(70.0)
+    );
+    assert_eq!(failed["credits"], saved_credits);
+    assert_eq!(counters.reads.load(Ordering::SeqCst), 1);
+    official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    assert_eq!(counters.reads.load(Ordering::SeqCst), 2);
+    task.abort();
 }
 
 #[tokio::test]

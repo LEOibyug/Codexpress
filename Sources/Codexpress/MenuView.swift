@@ -47,10 +47,10 @@ struct MenuView: View {
                                 .frame(width: 5, height: 5).padding(.top, 5)
                             VStack(alignment: .leading, spacing: 5) {
                                 Text(source.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
-                                Text(source.policyLabel + (source.official ? " · \(quotaSummary(model.state(source.id)["quota"]))" : ""))
+                                Text(source.policyLabel)
                                     .font(.system(size: 10)).foregroundStyle(.secondary)
-                            }
-                            Spacer(minLength: 0)
+                                if source.official { compactQuota(model.state(source.id)["quota"]) }
+                            }.frame(maxWidth: .infinity, alignment: .leading)
                             Text(source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用")
                                 .font(.system(size: 10)).foregroundStyle(.secondary)
                         }
@@ -67,12 +67,28 @@ struct MenuView: View {
                 Button("退出") { NSApp.terminate(nil) }.keyboardShortcut("q").foregroundStyle(.secondary)
             }.buttonStyle(.borderless).font(.system(size: 11))
         }.padding(18).frame(width: 340)
+            .task { await model.refreshOfficialIfDue(foreground: true) }
     }
 
     private func showSettings() { AppDelegate.current?.showSettings() }
-}
-
-func quotaSummary(_ quota: JSONValue) -> String {
-    guard let window = quota["windows"].array.first, let used = window["used_percent"].number else { return "额度未知" }
-    return "剩余 \(Int(max(0, 100 - used)))%" + (quota["stale"].bool == true ? " · 陈旧" : "")
+    private func compactQuota(_ quota: JSONValue) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .top, spacing: 12) {
+                ForEach(QuotaOverview(quota).mainWindows) { window in
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 5) {
+                            Text(window.title).foregroundStyle(.secondary)
+                            Text("剩余 \(window.remainingLabel)").fontWeight(.medium).monospacedDigit()
+                        }.font(.system(size: 10))
+                        Text(window.resetLabel).font(.system(size: 9)).foregroundStyle(.secondary)
+                            .lineLimit(1).help(window.resetLabel)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            if quota["stale"].bool == true {
+                Label("更新失败", systemImage: "clock").font(.system(size: 9)).foregroundStyle(.orange)
+                    .help("显示上次获取的额度：\(timestampLabel(quota["fetched_at"]))")
+            }
+        }.padding(.top, 2)
+    }
 }

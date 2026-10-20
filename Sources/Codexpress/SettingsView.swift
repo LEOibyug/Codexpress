@@ -137,6 +137,7 @@ struct SourcesView: View {
                 }
             }
         }.settingsPage()
+            .task { await model.refreshOfficialIfDue(foreground: true) }
             .sheet(item: $editing) { item in SourceEditor(source: item.source, isNew: item.isNew).environmentObject(model) }
             .alert("删除来源？", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
                 Button("取消", role: .cancel) { deleting = nil }

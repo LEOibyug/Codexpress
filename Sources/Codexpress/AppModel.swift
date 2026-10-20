@@ -23,6 +23,7 @@ import ServiceManagement
     @Published private(set) var metadataLoadFailed = false
     @Published private(set) var pendingSync = false
     @Published private(set) var refreshingModels = Set<String>()
+    @Published private(set) var refreshingQuotas = Set<String>()
     @Published private(set) var modelErrors: [String: String] = [:]
     @Published private(set) var codexConnectionPhase: String?
     @Published private(set) var configurationBackups: [JSONValue] = []
@@ -37,7 +38,7 @@ import ServiceManagement
     private var restartCount = 0
     private var shuttingDown = false
     private var operations: [String: ResetOperation] = [:]
-    private var lastQuotaRefresh: [String: Date] = [:]
+    private var officialRefreshSchedule = OfficialRefreshSchedule()
     private var refreshingOfficial = false
     private var startInProgress = false
     private var starting = false
@@ -200,15 +201,13 @@ import ServiceManagement
             scheduleModelRefresh()
         } catch { self.error = error.localizedDescription }
     }
-    private func refreshOfficialIfDue() async {
-        guard !refreshingOfficial else { return }
+    func refreshOfficialIfDue(foreground: Bool = false) async {
+        guard running, !busy, !refreshingOfficial else { return }
         refreshingOfficial = true
         defer { refreshingOfficial = false }
         for source in sources where source.official && source.enabled {
-            guard Date().timeIntervalSince(lastQuotaRefresh[source.id] ?? .distantPast) >= 300, let secret = try? keychain.load(source.id), secret["access_token"].string?.isEmpty == false else { continue }
-            lastQuotaRefresh[source.id] = Date()
-            _ = try? await client.call("official.refresh", .object(["source_id": .string(source.id)]))
-            try? mergeCredentials(try await client.call("credentials"))
+            guard !busy, officialRefreshSchedule.isDue(source.id, foreground: foreground), let secret = try? keychain.load(source.id), secret["access_token"].string?.isEmpty == false else { continue }
+            try? await queryOfficial(source.id, includeCredits: officialRefreshSchedule.needsCredits(source.id))
         }
         try? await updateStatus()
     }
@@ -233,6 +232,7 @@ import ServiceManagement
         if updated.fixed_source_id == source.id && !source.enabled { updated.mode = "auto"; updated.fixed_source_id = nil }
         try persistSettings(updated)
         try await sync(); try await updateStatus()
+        if source.official { officialRefreshSchedule.reset(source.id) }
         modelErrors[source.id] = nil
         lastModelRefresh[source.id] = nil
         scheduleModelRefresh()
@@ -349,19 +349,26 @@ import ServiceManagement
         var next = settings
         if let i = next.sources.firstIndex(where: { $0.id == id }) { next.sources[i].account_id = durable["account_id"].string }
         try persistSettings(next); callbackURL = ""; loginSource = nil; loginFlow = nil; loginMessage = "官方账号已连接。"
-        lastQuotaRefresh[id] = nil
+        officialRefreshSchedule.reset(id)
         lastModelRefresh[id] = nil
         scheduleModelRefresh()
         Task { await refreshOfficialIfDue() }
     }
-    func refresh(_ id: String) { perform { self.lastQuotaRefresh[id] = Date(); _ = try await self.client.call("official.refresh", .object(["source_id": .string(id)])); try self.mergeCredentials(try await self.client.call("credentials")); try await self.updateStatus() } }
+    private func queryOfficial(_ id: String, includeCredits: Bool) async throws {
+        guard !refreshingQuotas.contains(id) else { throw AppError.message("此账号正在刷新，请稍后重试。") }
+        refreshingQuotas.insert(id)
+        defer { refreshingQuotas.remove(id) }
+        officialRefreshSchedule.record(id, includeCredits: includeCredits)
+        _ = try await client.call("official.refresh", .object(["source_id": .string(id), "include_credits": .bool(includeCredits)]))
+        try mergeCredentials(try await client.call("credentials"))
+        try await updateStatus()
+    }
+    func refresh(_ id: String) { perform { try await self.queryOfficial(id, includeCredits: true) } }
     func refreshUsage(days: Int) { perform { self.usage = try await self.client.call("usage", .object(["days": .number(Double(days))])) } }
     func prepareCredit(source: Source, credit: JSONValue) async throws -> CreditConfirmation {
         try requireWritableMetadata()
         guard let before = settings.sources.first(where: { $0.id == source.id }), before == source else { throw AppError.message("来源已删除或发生变化，请重新选择重置卡。") }
-        _ = try await client.call("official.refresh", .object(["source_id": .string(source.id)]))
-        try mergeCredentials(try await client.call("credentials"))
-        try await updateStatus()
+        try await queryOfficial(source.id, includeCredits: true)
         guard let current = settings.sources.first(where: { $0.id == source.id }), current.sameConfiguration(as: before) else { throw AppError.message("来源已删除或网络策略发生变化，请重新选择重置卡。") }
         return try CreditConfirmation.make(source: current, live: state(source.id), creditID: credit["id"].string)
     }
