@@ -22,31 +22,29 @@ struct SSHRemoteView: View {
         .onChange(of: remote.error) { _, error in model.error = error }
         .onChange(of: remote.notice) { _, notice in model.notice = notice }
         .disabled(remote.busy || model.busy || !model.running)
-        .alert(confirmation == "apply" ? "应用远端连接？" : confirmation == "restore" ? "还原接入前设置？" : confirmation == "start" ? "开启远端入口？" : "撤销此机器的 Key？", isPresented: Binding(get:{confirmation != nil},set:{if !$0 {confirmation=nil}})) {
+        .alert(confirmation == "apply" ? "应用远端连接？" : confirmation == "restore" ? "还原接入前设置？" : "撤销此机器的 Key？", isPresented: Binding(get:{confirmation != nil},set:{if !$0 {confirmation=nil}})) {
             Button("取消", role:.cancel){confirmation=nil}
             Button("确认") {
                 switch confirmation {
                 case "apply":remote.apply(model)
                 case "restore":remote.restore(model)
-                case "start":remote.start(model)
                 case "revoke":if let id=revokeID {remote.revoke(id,model:model)}
                 default:break
                 };confirmation=nil
             }
         } message: {
-            Text(confirmation == "start" ? "将监听本机所有 IPv4 网络接口的所选端口。远端使用独立 Key；HTTP 连接仅适合可信局域网或 VPN，请勿直接暴露到公网。" : confirmation == "apply" ? "将先从远端验证网关连通性，再备份配置、文件认证与模型目录，并应用本机已保存的模型压缩规则。请先结束远端 Codex 的运行任务，应用后重启远端 Codex。" : confirmation == "restore" ? "将恢复此 Codex 目录首次接入前的配置、文件认证与模型目录，接入后自行修改的这些设置也会还原。当前状态会另行备份。请先结束远端 Codex 任务，还原后重启。" : "此机器的旧 Key 将无法发起新请求，远端配置和对话记录保留。")
+            Text(confirmation == "apply" ? "将先从远端验证网关连通性，再备份配置、文件认证与模型目录，并应用本机已保存的模型压缩规则。请先结束远端 Codex 的运行任务，应用后重启远端 Codex。" : confirmation == "restore" ? "将恢复此 Codex 目录首次接入前的配置、文件认证与模型目录，接入后自行修改的这些设置也会还原。当前状态会另行备份。请先结束远端 Codex 任务，还原后重启。" : "此机器的旧 Key 将无法发起新请求，远端配置和对话记录保留。")
         }
     }
     private var ingress: some View {
-        SettingsCard("本机远端入口", symbol:"network", accessory:{ StatusPill(text:remote.running ? "运行中" : "已关闭",color:remote.running ? .green : .secondary) }) {
+        SettingsCard("网关连接", symbol:"network", accessory:{ StatusPill(text:model.running ? "运行中" : "未连接",color:model.running ? .green : .secondary) }) {
             HStack(spacing:10) {
-                Text("监听端口").font(.system(size:12))
-                TextField("17864",text:$remote.port).settingsField().frame(width:95)
+                Text("与本机共用端口").font(.system(size:12))
                 Spacer()
-                if remote.running { Button("关闭入口"){remote.stop(model)} }
-                Button(remote.running ? "更新端口…" : "开启入口…"){confirmation="start"}
+                Text(remote.port.isEmpty ? "—" : remote.port).font(.system(size:12, design:.monospaced)).textSelection(.enabled)
             }
-            Text("远端请求使用当前来源池；仅用于可信局域网或 VPN。更改端口后需重新应用各远端配置。").font(.system(size:11)).foregroundStyle(.secondary)
+            Text("随本地网关启动。远端使用独立机器 Key；仅用于可信局域网或 VPN。更改端口后需重新应用远端配置。").font(.system(size:11)).foregroundStyle(.secondary)
+            if let old = remote.status["previous_port"].number { InfoNote(text:"原远端端口为 \(Int(old))，请重新预览并应用连接以使用当前端口。", color:.orange) }
         }
     }
     private var connection: some View {
@@ -109,7 +107,7 @@ struct SSHRemoteView: View {
             Text(remote.summary).font(.system(size:11,design:.monospaced)).textSelection(.enabled)
             if !remote.aliases.isEmpty { Text("接入已有供应商："+remote.aliases.joined(separator:"、")).font(.system(size:11)).foregroundStyle(.secondary) }
             HStack {
-                Text(!remote.canApply(model) ? "设置已变化，请重新预览。" : !remote.running ? "请先开启远端入口，再重新预览。" : "配置、文件认证与模型目录将在远端备份。").font(.system(size:11)).foregroundStyle(.secondary)
+                Text(!remote.canApply(model) ? "设置已变化，请重新预览。" : !remote.running ? "请先启动本地网关。" : "配置、文件认证与模型目录将在远端备份。").font(.system(size:11)).foregroundStyle(.secondary)
                 Spacer();Button("备份并应用…"){confirmation="apply"}.disabled(!remote.canApply(model) || !remote.running).buttonStyle(.borderedProminent)
             }
         }

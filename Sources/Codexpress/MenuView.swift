@@ -17,7 +17,7 @@ struct MenuView: View {
             Divider()
             VStack(alignment: .trailing, spacing: 7) {
                 HStack {
-                    Text(model.connectionMode == "official" ? "官方连接 · 系统代理" : model.connectionMode == "gateway" ? "来源池连接" : "未接管 Codex")
+                    Text(model.connectionMode == "official" ? "官方连接" : model.connectionMode == "gateway" ? "来源池连接" : "未接管 Codex")
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                     Spacer(minLength: 8)
                     if model.connectionMode == "official" {
@@ -54,8 +54,6 @@ struct MenuView: View {
                                     Text(source.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
                                     if source.official && model.refreshingQuotas.contains(source.id) { ProgressView().controlSize(.mini).help("正在更新额度") }
                                 }
-                                Text(source.policyLabel)
-                                    .font(.system(size: 10)).foregroundStyle(.secondary)
                                 if source.official { compactQuota(model.state(source.id)["quota"]) }
                                 else { APIBalanceView(sourceID: source.id, compact: true) }
                             }.frame(maxWidth: .infinity, alignment: .leading)

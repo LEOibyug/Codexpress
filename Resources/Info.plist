@@ -11,9 +11,10 @@
   <key>CFBundleName</key><string>Codexpress</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>CFBundleVersion</key><string>23</string>
+  <key>CFBundleVersion</key><string>24</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>用于让您配置的远端 Codex 通过局域网连接本机网关。</string>
 </dict>
 </plist>

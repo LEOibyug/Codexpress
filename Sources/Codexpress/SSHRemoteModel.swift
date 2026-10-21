@@ -3,7 +3,7 @@ import SwiftUI
 
 @MainActor final class SSHRemoteModel: ObservableObject {
     @Published var profile = SSHRemoteProfile()
-    @Published var port = "17864"
+    var port: String { status["port"].number.map { String(Int($0)) } ?? "" }
     @Published private(set) var status: JSONValue = .null
     @Published private(set) var busy = false
     @Published private(set) var phase = ""
@@ -32,7 +32,7 @@ import SwiftUI
     }
     func refresh(_ model: AppModel) async {
         guard model.running, !busy else { return }
-        do { status = try await model.remoteCall("remote.status"); if let value = status["port"].number { port = String(Int(value)) } }
+        do { status = try await model.remoteCall("remote.status") }
         catch { self.error = error.localizedDescription }
     }
     func select(_ value: SSHRemoteProfile) { profile = value; summary = ""; prepared = .null; candidates = [] }
@@ -71,8 +71,7 @@ import SwiftUI
         perform("正在读取并预览远端配置…") {
             try ModelCompactionRule.validate(rules)
             guard original.codexHome.hasPrefix("/"), !original.gatewayHost.isEmpty else { throw AppError.message("请先填写远端 Codex 目录和本机地址。") }
-            // Preview does not start a network listener. Port configuration is applied separately.
-            guard self.status["port"].number == Double(originalPort) else { throw AppError.message("入口端口尚未生效，请先开启入口或将端口改回当前值。") }
+            guard self.running, self.status["port"].number == model.status["port"].number else { throw AppError.message("网关端口已变化，请重新打开页面后预览。") }
             let result = try await SSHRemoteClient(profile: original).call("read")
             guard let encoded = result["config"].string, let bytes = Data(base64Encoded: encoded), let config = String(data: bytes, encoding: .utf8) else { throw AppError.message("远端配置不是有效 UTF-8。") }
             var base: String?
@@ -104,22 +103,11 @@ import SwiftUI
             try self.remember(original, in: model)
         }
     }
-    func start(_ model: AppModel) {
-        let text = port
-        perform("正在开启远端入口…") {
-            guard let value = Int(text), (1...65535).contains(value), value != model.settings.port else { throw AppError.message("入口端口须为 1–65535，且不能与本机网关端口相同。") }
-            self.status = try await model.remoteCall("remote.start", .object(["port":.number(Double(value))]))
-            self.prepared = .null; self.summary = ""
-        }
-    }
-    func stop(_ model: AppModel) {
-        perform("正在关闭远端入口…") { self.status = try await model.remoteCall("remote.stop") }
-    }
     func apply(_ model: AppModel) {
         guard canApply(model) else { error = "请先重新预览远端配置。"; return }
         let original = profile; let prepared = prepared; let digest = expectedDigest
         perform("正在验证连通性并备份远端配置…") {
-            guard self.running else { throw AppError.message("请先开启远端入口。") }
+            guard self.running else { throw AppError.message("请先启动本地网关。") }
             let fields: [String:JSONValue] = ["base_url":prepared["base_url"],"key":prepared["key"],"expected_digest":.string(digest),"config":.string(Data((prepared["config"].string ?? "").utf8).base64EncodedString()),"catalog_action":prepared["catalog_action"],"catalog":prepared["catalog"],"expected_catalog_digest":.string(self.expectedCatalogDigest),"expected_compaction_state_digest":.string(self.expectedCompactionStateDigest),"expected_files":self.expectedFiles]
             let result = try await SSHRemoteClient(profile: original).call("apply", fields: fields)
             var saved = original; saved.backupID = result["backup_id"].string

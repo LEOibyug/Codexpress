@@ -57,14 +57,20 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             crate::credentials::handle(state, op, payload).await
         }
         "remote.status" => state.remote.status().await,
+        "chatbot.status" => state.chatbot.status().await,
+        "chatbot.key" => state.chatbot.key(),
+        "chatbot.configure" => crate::chatbot::configure(state, payload).await,
         "remote.start" => {
             let port = payload["port"]
                 .as_u64()
                 .filter(|p| (1..=65535).contains(p))
                 .context("远端入口端口无效")? as u16;
-            crate::remote::start(state.clone(), port).await
+            if port != state.port {
+                bail!("远端与本机共用网关端口，请在设置中修改网关端口");
+            }
+            state.remote.status().await
         }
-        "remote.stop" => crate::remote::stop(state).await,
+        "remote.stop" => bail!("远端与本机共用网关，请撤销对应机器的 Key 以停止接入"),
         "remote.revoke" => {
             state
                 .remote

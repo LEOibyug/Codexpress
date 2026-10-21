@@ -4,7 +4,6 @@ use codexpress_gateway::{
     credentials::{KeychainStore, ManagedCredentialStore},
     management,
     model::AppState,
-    relay,
 };
 use std::{
     fs,
@@ -89,17 +88,18 @@ async fn run() -> Result<()> {
         key.trim().into(),
         Some(credential_store),
     )?;
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
         .await
         .context("本地端口被占用，未更改 Codex 连接")?;
-    if codexpress_gateway::remote::resume(state.clone())
-        .await
-        .is_err()
-    {
-        eprintln!("远端入口未能启动，请在应用中检查端口后重试");
-    }
     let management = management::serve(state.clone());
-    let server = axum::serve(listener, relay::router(state));
+    if codexpress_gateway::chatbot::resume(&state).await.is_err() {
+        eprintln!("聊天客户端入口未能启动，请在应用中检查其独立端口");
+    }
+    let server = axum::serve(
+        listener,
+        codexpress_gateway::remote::router(state)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    );
     tokio::select! {
         result=management=>result?,
         result=server=>result?,

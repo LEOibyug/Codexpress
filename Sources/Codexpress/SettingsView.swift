@@ -1,7 +1,7 @@
 import SwiftUI
 
 private enum SettingsPage: String, CaseIterable, Identifiable {
-    case sources = "来源", routing = "路由", usage = "用量", remote = "远端", general = "设置"
+    case sources = "来源", routing = "路由", usage = "用量", remote = "远端", chatbot = "聊天客户端", general = "设置"
     var id: String { rawValue }
     var symbol: String {
         switch self {
@@ -9,6 +9,7 @@ private enum SettingsPage: String, CaseIterable, Identifiable {
         case .routing: return "arrow.triangle.branch"
         case .usage: return "chart.bar.xaxis"
         case .remote: return "desktopcomputer.and.arrow.down"
+        case .chatbot: return "bubble.left.and.bubble.right"
         case .general: return "slider.horizontal.3"
         }
     }
@@ -55,6 +56,7 @@ struct SettingsView: View {
                     case .routing: RoutingView()
                     case .usage: UsageView()
                     case .remote: SSHRemoteView()
+                    case .chatbot: ChatbotSettingsView()
                     case .general: GeneralSettingsView()
                     }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -327,7 +329,7 @@ struct GeneralSettingsView: View {
     }
 
     private var gatewayCard: some View {
-        SettingsCard("本地网关", symbol: "network", accessory: {
+        SettingsCard("Codex／SSH 网关", symbol: "network", accessory: {
             StatusPill(text: model.running ? "运行中" : "未连接", color: model.running ? .green : .orange)
         }) {
             VStack(spacing: 13) {
@@ -348,6 +350,7 @@ struct GeneralSettingsView: View {
                     Text(model.baseURL).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
                     Spacer()
                 }.foregroundStyle(.secondary).padding(.top, 2)
+                Text("SSH 远端共用此端口，使用独立机器 Key；仅用于可信局域网或 VPN。").font(.system(size: 11)).foregroundStyle(.secondary)
             }
         }
     }

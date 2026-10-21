@@ -1,6 +1,7 @@
 pub mod affinity;
 pub mod backups;
 pub mod balance;
+pub mod chatbot;
 pub mod compaction;
 pub mod config;
 pub mod continuity;

@@ -1,8 +1,8 @@
-//! Dedicated remote inference ingress; management remains on the owner-only Unix socket.
+//! Shared local/SSH inference ingress; management stays on the private Unix socket.
 use crate::{config::secure_write, model::AppState};
 use anyhow::{bail, Context, Result};
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -15,7 +15,6 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tokio::sync::Mutex as AsyncMutex;
 use toml_edit::{value, DocumentMut, Item, Table};
 
 pub const CATALOG_FILE: &str = ".codexpress-model-catalog.json";
@@ -113,6 +112,8 @@ struct Peer {
     key: String,
     #[serde(default)]
     accepted_hosts: Vec<String>,
+    #[serde(default)]
+    port: Option<u16>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Settings {
@@ -124,7 +125,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
-            port: 17864,
+            port: 17863,
             peers: vec![],
         }
     }
@@ -133,19 +134,14 @@ impl Default for Settings {
 pub struct RemoteIngress {
     pub peer_id: String,
 }
-struct Listener {
-    port: u16,
-    task: tokio::task::JoinHandle<()>,
-}
 pub struct RemoteAccess {
     settings: Mutex<Settings>,
     path: PathBuf,
-    listener: AsyncMutex<Option<Listener>>,
 }
 impl RemoteAccess {
-    pub fn open(directory: &Path) -> Result<Self> {
+    pub fn open(directory: &Path, port: u16) -> Result<Self> {
         let path = directory.join("remote-access.json");
-        let settings = match std::fs::symlink_metadata(&path) {
+        let mut settings: Settings = match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_file() && meta.len() <= 1024 * 1024 => {
                 serde_json::from_slice(&std::fs::read(&path)?).context("远端接入设置损坏")?
             }
@@ -153,25 +149,15 @@ impl RemoteAccess {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Settings::default(),
             Err(_) => bail!("无法读取远端接入设置"),
         };
+        for peer in &mut settings.peers {
+            peer.port.get_or_insert(settings.port);
+        }
+        settings.enabled = true;
+        settings.port = port;
         Ok(Self {
             settings: Mutex::new(settings),
             path,
-            listener: AsyncMutex::new(None),
         })
-    }
-    fn set_listener(&self, enabled: bool, port: Option<u16>) -> Result<()> {
-        let mut settings = self
-            .settings
-            .lock()
-            .map_err(|_| anyhow::anyhow!("远端入口忙碌"))?;
-        let mut next = settings.clone();
-        next.enabled = enabled;
-        if let Some(port) = port {
-            next.port = port;
-        }
-        secure_write(&self.path, &serde_json::to_vec(&next)?)?;
-        *settings = next;
-        Ok(())
     }
     pub fn peer(&self, headers: &HeaderMap) -> Option<String> {
         let token = headers
@@ -199,14 +185,22 @@ impl RemoteAccess {
             })
             .map(|p| p.id.clone())
     }
+    pub(crate) fn uses_key(&self, key: &str) -> Result<bool> {
+        Ok(self
+            .settings
+            .lock()
+            .map_err(|_| anyhow::anyhow!("远端接入忙碌"))?
+            .peers
+            .iter()
+            .any(|p| p.key == key))
+    }
     pub async fn status(&self) -> Result<Value> {
-        let listener = self.listener.lock().await;
         let settings = self
             .settings
             .lock()
             .map_err(|_| anyhow::anyhow!("远端入口忙碌"))?;
         Ok(
-            json!({"enabled":settings.enabled,"running":listener.as_ref().is_some_and(|l|!l.task.is_finished()),"port":settings.port,"peers":settings.peers.iter().map(|p|json!({"id":p.id,"name":p.name,"host":p.host})).collect::<Vec<_>>()}),
+            json!({"enabled":true,"running":true,"shared":true,"port":settings.port,"previous_port":settings.peers.iter().find_map(|p|p.port.filter(|port|*port!=settings.port)),"peers":settings.peers.iter().map(|p|json!({"id":p.id,"name":p.name,"host":p.host,"port":p.port})).collect::<Vec<_>>()}),
         )
     }
     pub fn prepare(&self, preview: RemotePreview) -> Result<Value> {
@@ -273,6 +267,7 @@ impl RemoteAccess {
             host: host.clone(),
             key: key.clone(),
             accepted_hosts,
+            port: Some(next.port),
         });
         secure_write(&self.path, &serde_json::to_vec(&next)?)?;
         *current = next;
@@ -320,59 +315,18 @@ fn authority(host: &str, port: u16) -> String {
     }
 }
 
-pub async fn start(state: Arc<AppState>, port: u16) -> Result<Value> {
-    if port == 0 || port == state.port {
-        bail!("远端入口端口须与本机入口不同，且为1–65535");
-    }
-    let mut listener = state.remote.listener.lock().await;
-    if listener
-        .as_ref()
-        .is_some_and(|l| l.port == port && !l.task.is_finished())
-    {
-        drop(listener);
-        return state.remote.status().await;
-    }
-    let socket = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
-        .await
-        .context("远端入口端口不可用")?;
-    state.remote.set_listener(true, Some(port))?;
-    let server_state = state.clone();
-    let task = tokio::spawn(async move {
-        let _ = axum::serve(socket, router(server_state)).await;
-    });
-    if let Some(previous) = listener.take() {
-        previous.task.abort();
-    }
-    *listener = Some(Listener { port, task });
-    drop(listener);
-    state.remote.status().await
-}
-pub async fn resume(state: Arc<AppState>) -> Result<()> {
-    let settings = state
-        .remote
-        .settings
-        .lock()
-        .map_err(|_| anyhow::anyhow!("远端入口忙碌"))?
-        .clone();
-    if settings.enabled {
-        start(state, settings.port).await?;
-    }
-    Ok(())
-}
-pub async fn stop(state: &Arc<AppState>) -> Result<Value> {
-    let mut listener = state.remote.listener.lock().await;
-    state.remote.set_listener(false, None)?;
-    if let Some(previous) = listener.take() {
-        previous.task.abort();
-    }
-    drop(listener);
-    state.remote.status().await
-}
 async fn gate(State(state): State<Arc<AppState>>, mut request: Request, next: Next) -> Response {
-    let Some(peer_id) = state.remote.peer(request.headers()) else {
+    if let Some(peer_id) = state.remote.peer(request.headers()) {
+        request.extensions_mut().insert(RemoteIngress { peer_id });
+    } else if !request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .is_some_and(|peer| peer.0.ip().is_loopback())
+    {
+        // A forged localhost Host or X-Forwarded-For must never make a remote
+        // socket eligible to use the local gateway/legacy credentials.
         return (StatusCode::UNAUTHORIZED, "远端网关认证失败").into_response();
-    };
-    request.extensions_mut().insert(RemoteIngress { peer_id });
+    }
     next.run(request).await
 }
 use axum::response::IntoResponse;
@@ -380,7 +334,12 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
     crate::relay::router(state.clone())
         .route(
             "/v1/remote-check",
-            get(|| async { Json(json!({"service":"codexpress","mode":"pool","version":1})) }),
+            get(|request: Request| async move {
+                if request.extensions().get::<RemoteIngress>().is_none() {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                Json(json!({"service":"codexpress","mode":"pool","version":1})).into_response()
+            }),
         )
         .layer(middleware::from_fn_with_state(state, gate))
 }

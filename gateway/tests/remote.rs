@@ -89,7 +89,7 @@ async fn remote_compaction_uses_remote_paths_preserves_metadata_and_can_restore_
 }
 
 #[tokio::test]
-async fn remote_listener_has_separate_credentials_host_restrictions_revoke_and_restart() {
+async fn shared_listener_keeps_remote_credentials_host_restrictions_revoke_and_restart() {
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", upstream.local_addr().unwrap());
     let upstream_task = tokio::spawn(async move {
@@ -100,7 +100,9 @@ async fn remote_listener_has_separate_credentials_host_restrictions_revoke_and_r
     }))).await.unwrap();
     });
     let dir = tempfile::tempdir().unwrap();
-    let state = AppState::new(dir.path().to_owned(), 17863, "fixture-local-key".into()).unwrap();
+    let available = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = available.local_addr().unwrap().port();
+    let state = AppState::new(dir.path().to_owned(), port, "fixture-local-key".into()).unwrap();
     *state.sources.write().await = vec![SourceRuntime::new(Source {
         id: "api".into(),
         name: "API".into(),
@@ -132,10 +134,11 @@ async fn remote_listener_has_separate_credentials_host_restrictions_revoke_and_r
             .status(),
         401
     );
-    let available = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = available.local_addr().unwrap().port();
-    drop(available);
-    remote::start(state.clone(), port).await.unwrap();
+    let router =
+        remote::router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let gateway_task = tokio::spawn(async move {
+        axum::serve(available, router).await.unwrap();
+    });
     let preview = management::dispatch(
         &state,
         "remote.preview",
@@ -238,7 +241,7 @@ async fn remote_listener_has_separate_credentials_host_restrictions_revoke_and_r
         200,
         "previewing another address must not break the old remote connection"
     );
-    let loaded = remote::RemoteAccess::open(dir.path()).unwrap();
+    let loaded = remote::RemoteAccess::open(dir.path(), port).unwrap();
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("host", format!("127.0.0.1:{port}").parse().unwrap());
     headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
@@ -256,9 +259,6 @@ async fn remote_listener_has_separate_credentials_host_restrictions_revoke_and_r
             .status(),
         401
     );
-    remote::stop(&state).await.unwrap();
-    assert!(!state.remote.status().await.unwrap()["running"]
-        .as_bool()
-        .unwrap());
+    gateway_task.abort();
     upstream_task.abort();
 }

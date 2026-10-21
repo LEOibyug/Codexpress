@@ -656,11 +656,23 @@ fn scoped_session(parsed: &Value, parts: &axum::http::request::Parts) -> Option<
                     .map(|s| format!("cache:{s}"))
             })
             .map(|s| format!("remote:{}:{s}", ingress.peer_id)),
-        None => session,
+        None => match parts.extensions.get::<crate::chatbot::ChatbotIngress>() {
+            Some(ingress) => session
+                .or_else(|| {
+                    parsed["prompt_cache_key"]
+                        .as_str()
+                        .map(|s| format!("cache:{s}"))
+                })
+                .map(|s| format!("chatbot:{}:{s}", ingress.namespace)),
+            None => session,
+        },
     }
 }
 
-async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response<Body> {
+pub(crate) async fn forward(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+) -> Response<Body> {
     forward_once(state, request, None, 0).await
 }
 
@@ -741,6 +753,9 @@ async fn portable_request(
     if let Some(ingress) = parts.extensions.get::<crate::remote::RemoteIngress>() {
         retry.extensions_mut().insert(ingress.clone());
     }
+    if let Some(ingress) = parts.extensions.get::<crate::chatbot::ChatbotIngress>() {
+        retry.extensions_mut().insert(ingress.clone());
+    }
     Ok((
         retry,
         RebuildContext {
@@ -779,10 +794,16 @@ fn history_scope(parts: &axum::http::request::Parts, parsed: &Value) -> String {
             .map(|s| format!("cache:{s}"))
     });
     let credential = parts
-        .headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .extensions
+        .get::<crate::chatbot::ChatbotIngress>()
+        .map(|ingress| ingress.namespace.as_str())
+        .unwrap_or_else(|| {
+            parts
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+        });
     crate::continuity::digest(
         "history",
         &serde_json::to_string(&(credential, session)).expect("strings"),
@@ -1260,7 +1281,18 @@ async fn forward_once(
         } else {
             candidate
         };
-        for authentication_attempt in 0..2 {
+        let compatibility = parts
+            .extensions
+            .get::<crate::chatbot::ChatbotIngress>()
+            .is_some();
+        let mut compatibility_body = if compatibility {
+            parsed.clone()
+        } else {
+            Value::Null
+        };
+        let mut compatibility_changes = Vec::new();
+        let mut auth_refreshed = false;
+        for _attempt_number in 0..if compatibility { 5 } else { 2 } {
             let eligible = routing::candidates(&state, model, None)
                 .await
                 .iter()
@@ -1284,6 +1316,31 @@ async fn forward_once(
             if !eligible {
                 break;
             }
+            let (wire_bytes, mut ignored_parameters) = if parts
+                .extensions
+                .get::<crate::chatbot::ChatbotIngress>()
+                .is_some()
+            {
+                match crate::chatbot::upstream_payload(
+                    &compatibility_body,
+                    source.kind == "official",
+                    history_capture.as_ref().map(|h| &h.request["input"]),
+                ) {
+                    Ok((body, ignored)) => (Bytes::from(body), ignored),
+                    Err(problem) => {
+                        return crate::chatbot::error(
+                            StatusCode::BAD_REQUEST,
+                            problem.message,
+                            Some(problem.param),
+                        )
+                    }
+                }
+            } else {
+                (bytes.clone(), Vec::new())
+            };
+            ignored_parameters.extend(compatibility_changes.iter().cloned());
+            ignored_parameters.sort();
+            ignored_parameters.dedup();
             let mut attempt = Attempt::new(state.clone(), &source, &request_id, model, input_units);
             if let Some(record) = &mut attempt.record {
                 record.token_details.service_tier = parsed["service_tier"]
@@ -1327,6 +1384,10 @@ async fn forward_once(
             };
             headers.insert("authorization", value);
             if source.kind == "official" {
+                if compatibility {
+                    headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
+                    headers.insert("version", HeaderValue::from_static("0.162.1"));
+                }
                 if let Some(account) = &source.account_id {
                     let Ok(value) = HeaderValue::from_str(account) else {
                         return error(StatusCode::BAD_GATEWAY, "来源账号标识无效");
@@ -1339,7 +1400,7 @@ async fn forward_once(
                 client
                     .request(parts.method.clone(), url)
                     .headers(headers)
-                    .body(bytes.clone())
+                    .body(wire_bytes)
                     .send(),
             )
             .await;
@@ -1379,10 +1440,8 @@ async fn forward_once(
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
-            if source.kind == "official"
-                && status == StatusCode::UNAUTHORIZED
-                && authentication_attempt == 0
-            {
+            if source.kind == "official" && status == StatusCode::UNAUTHORIZED && !auth_refreshed {
+                auth_refreshed = true;
                 attempt.finish("failed", None);
                 drop(upstream);
                 match crate::official::refresh_access(&state, &source.id).await {
@@ -1425,7 +1484,9 @@ async fn forward_once(
             }
             let mut prefix = Vec::new();
             let mut context_rejected = false;
-            if matches!(status.as_u16(), 400 | 404) && (binding.is_some() || opaque_state) {
+            if matches!(status.as_u16(), 400 | 404)
+                && (binding.is_some() || opaque_state || compatibility)
+            {
                 let mut observed = Vec::new();
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
                 while observed.len() < 65536 {
@@ -1443,6 +1504,18 @@ async fn forward_once(
                     }
                 }
                 if let Ok(value) = serde_json::from_slice::<Value>(&observed) {
+                    if compatibility
+                        && status == StatusCode::BAD_REQUEST
+                        && compatibility_changes.len() < 3
+                    {
+                        if let Some(field) = crate::chatbot::repair(&mut compatibility_body, &value)
+                        {
+                            compatibility_changes.push(field);
+                            attempt.finish("failed", None);
+                            drop(upstream);
+                            continue;
+                        }
+                    }
                     context_rejected = matches!(
                         value.pointer("/error/code").and_then(Value::as_str),
                         Some(
@@ -1539,7 +1612,7 @@ async fn forward_once(
             if status.is_success() {
                 routing::mark_ready(&state, &source.id).await;
             }
-            return stream_response(
+            let mut response = stream_response(
                 state,
                 source.clone(),
                 upstream,
@@ -1555,6 +1628,14 @@ async fn forward_once(
                 route_lease.take(),
             )
             .await;
+            if !ignored_parameters.is_empty() {
+                if let Ok(value) = HeaderValue::from_str(&ignored_parameters.join(", ")) {
+                    response
+                        .headers_mut()
+                        .insert("x-codexpress-adapted-parameters", value);
+                }
+            }
+            return response;
         }
     }
     last_error.unwrap_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "所有来源暂时不可用"))
