@@ -60,22 +60,17 @@ struct SettingsView: View {
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }.background(AppPalette.canvas)
         }.font(.system(size: 13)).frame(minWidth: 860, minHeight: 620)
+            .overlay(alignment: .bottomLeading) { AppFeedbackOverlay() }
     }
 
     @ViewBuilder private var notices: some View {
-        if model.metadataLoadFailed || model.pendingSync || model.error != nil || model.notice != nil {
+        if model.metadataLoadFailed || model.pendingSync {
             VStack(spacing: 8) {
                 if model.metadataLoadFailed {
                     banner("来源文件无法读取，已进入只读保护。请从备份修复 sources.json 后重启。", symbol: "lock.shield", color: .orange)
                 }
                 if model.pendingSync {
                     banner("配置尚未应用到网关，当前路由仍使用上次设置。请重试启动。", symbol: "arrow.triangle.2.circlepath", color: .orange)
-                }
-                if let error = model.error {
-                    banner(error, symbol: "exclamationmark.triangle", color: .orange) { model.error = nil }
-                }
-                if let notice = model.notice {
-                    banner(notice, symbol: "checkmark.circle", color: .accentColor) { model.notice = nil }
                 }
             }.padding(.horizontal, 28).padding(.top, 18).frame(maxWidth: 820)
         }
@@ -139,7 +134,7 @@ struct SourcesView: View {
                 }
             }
         }.settingsPage()
-            .task { await model.refreshOfficialIfDue(foreground: true) }
+            .task(id: "\(model.running):\(model.accountRefreshGeneration)") { await model.refreshAccountInfo() }
             .sheet(item: $editing) { item in SourceEditor(source: item.source, isNew: item.isNew).environmentObject(model) }
             .alert("删除来源？", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
                 Button("取消", role: .cancel) { deleting = nil }
@@ -190,6 +185,7 @@ struct SourcesView: View {
             if let error = model.modelErrors[source.id] { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
             if let reason = model.state(source.id)["last_error"].string { InfoNote(text: reason, symbol: "exclamationmark.triangle", color: .orange) }
             if source.official { Divider(); OfficialAccountView(source: source) }
+            else { APIBalanceView(sourceID: source.id) }
         }.padding(18).cardSurface()
     }
 

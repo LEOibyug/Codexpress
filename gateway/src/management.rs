@@ -105,6 +105,7 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             Ok(json!({"acknowledged":true}))
         }
         "models.list" => crate::discovery::list(state, payload).await,
+        "balance.query" => crate::balance::query(state, payload).await,
         "sync" => {
             let _routing_sync = state.routing_sync.lock().await;
             let sources: Vec<Source> =

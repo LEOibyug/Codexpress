@@ -58,7 +58,7 @@ struct OfficialRefreshSchedule {
     private var creditAttempts: [String: Date] = [:]
 
     func isDue(_ id: String, now: Date = Date(), foreground: Bool = false) -> Bool {
-        now.timeIntervalSince(quotaAttempts[id] ?? .distantPast) >= (foreground ? 15 : 30)
+        now.timeIntervalSince(quotaAttempts[id] ?? .distantPast) >= (foreground ? 15 : 1800)
     }
     func needsCredits(_ id: String, now: Date = Date()) -> Bool {
         now.timeIntervalSince(creditAttempts[id] ?? .distantPast) >= 300

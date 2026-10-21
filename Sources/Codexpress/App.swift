@@ -34,6 +34,7 @@ import AppKit
             settingsWindow = window
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
+        AppModel.shared.accountPageOpened()
         NSApp.activate(ignoringOtherApps: true)
     }
     func applicationDidFinishLaunching(_ notification: Notification) {

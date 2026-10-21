@@ -11,8 +11,6 @@ struct SSHRemoteView: View {
                 PageHeading("远端接入") {
                     if remote.busy { ProgressView().controlSize(.small); Text(remote.phase).font(.system(size: 11)).foregroundStyle(.secondary) }
                 }
-                if let error = remote.error { InfoNote(text: error, color: .orange) }
-                if let notice = remote.notice { InfoNote(text: notice, color: .accentColor) }
                 ingress
                 connection
                 destination
@@ -21,6 +19,8 @@ struct SSHRemoteView: View {
             }.settingsPage()
         }
         .task { await remote.loadSSHConfig(); await remote.refresh(model) }
+        .onChange(of: remote.error) { _, error in model.error = error }
+        .onChange(of: remote.notice) { _, notice in model.notice = notice }
         .disabled(remote.busy || model.busy || !model.running)
         .alert(confirmation == "apply" ? "应用远端连接？" : confirmation == "restore" ? "还原接入前设置？" : confirmation == "start" ? "开启远端入口？" : "撤销此机器的 Key？", isPresented: Binding(get:{confirmation != nil},set:{if !$0 {confirmation=nil}})) {
             Button("取消", role:.cancel){confirmation=nil}

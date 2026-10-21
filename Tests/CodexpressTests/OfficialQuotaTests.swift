@@ -30,7 +30,7 @@ final class OfficialQuotaTests: XCTestCase {
         XCTAssertNil(QuotaWindow(window("secondary", seconds: 1e30, used: nil), index: 0).seconds)
     }
 
-    func testQuotaRefreshesEveryThirtySecondsAndForegroundDoesNotRepeatedlyFetchCredits() {
+    func testQuotaRefreshesEveryThirtyMinutesAndForegroundDoesNotRepeatedlyFetchCredits() {
         let start = Date(timeIntervalSince1970: 2000000000)
         var schedule = OfficialRefreshSchedule()
         XCTAssertTrue(schedule.isDue("source", now: start))
@@ -39,7 +39,9 @@ final class OfficialQuotaTests: XCTestCase {
         XCTAssertFalse(schedule.isDue("source", now: start.addingTimeInterval(14), foreground: true))
         XCTAssertTrue(schedule.isDue("source", now: start.addingTimeInterval(15), foreground: true))
         XCTAssertFalse(schedule.isDue("source", now: start.addingTimeInterval(29)))
-        XCTAssertTrue(schedule.isDue("source", now: start.addingTimeInterval(30)))
+        XCTAssertFalse(schedule.isDue("source", now: start.addingTimeInterval(30)))
+        XCTAssertFalse(schedule.isDue("source", now: start.addingTimeInterval(1799)))
+        XCTAssertTrue(schedule.isDue("source", now: start.addingTimeInterval(1800)))
         schedule.record("source", includeCredits: false, now: start.addingTimeInterval(30))
         XCTAssertFalse(schedule.needsCredits("source", now: start.addingTimeInterval(299)))
         XCTAssertTrue(schedule.needsCredits("source", now: start.addingTimeInterval(300)))

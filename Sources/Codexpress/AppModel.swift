@@ -28,6 +28,9 @@ import ServiceManagement
     @Published private(set) var pendingSync = false
     @Published private(set) var refreshingModels = Set<String>()
     @Published private(set) var refreshingQuotas = Set<String>()
+    @Published private(set) var apiBalances: [String: JSONValue] = [:]
+    @Published private(set) var refreshingBalances = Set<String>()
+    @Published private(set) var accountRefreshGeneration = 0
     @Published private(set) var modelErrors: [String: String] = [:]
     @Published private(set) var codexConnectionPhase: String?
     @Published private(set) var configurationBackups: [JSONValue] = []
@@ -39,12 +42,12 @@ import ServiceManagement
     private var helper: Process?
     private var logPipe: Pipe?
     private var timerTask: Task<Void, Never>?
+    private var accountTimerTask: Task<Void, Never>?
     private var restarting = false
     private var restartCount = 0
     private var shuttingDown = false
     private var operations: [String: ResetOperation] = [:]
     private var officialRefreshSchedule = OfficialRefreshSchedule()
-    private var refreshingOfficial = false
     private var startInProgress = false
     private var starting = false
     private var lastModelRefresh: [String: Date] = [:]
@@ -90,6 +93,13 @@ import ServiceManagement
                 try? await Task.sleep(for: .seconds(5))
                 guard !Task.isCancelled, let self else { break }
                 await self.poll()
+            }
+        }
+        accountTimerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(1800)) } catch { break }
+                guard !Task.isCancelled, let self else { break }
+                await self.refreshAccountInfo(foreground: false)
             }
         }
     }
@@ -153,7 +163,7 @@ import ServiceManagement
         if running { try? await mergeCredentials(try await client.call("credentials")) }
         stop()
     }
-    func stop() { shuttingDown = true; timerTask?.cancel(); modelRefreshTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
+    func stop() { shuttingDown = true; timerTask?.cancel(); accountTimerTask?.cancel(); modelRefreshTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
     func retry() { restartCount = 0; Task { await startHelper() } }
     func requireWritableMetadata() throws {
         guard !metadataLoadFailed else { throw AppError.message("来源文件无法读取，已禁止保存。请先从备份修复 sources.json，再重新启动应用；原文件保持不变。") }
@@ -250,22 +260,49 @@ import ServiceManagement
                 if result["state"].string == "complete" { try await finishLogin(id) }
                 else if result["state"].string == "failed" { loginMessage = result["error"].string ?? "登录失败，请重新发起。"; loginFlow = nil }
             }
-            await refreshOfficialIfDue()
             scheduleModelRefresh()
         } catch { self.error = error.localizedDescription }
     }
-    func refreshOfficialIfDue(foreground: Bool = false) async {
-        guard running, !busy, !refreshingOfficial else { return }
-        refreshingOfficial = true
-        defer { refreshingOfficial = false }
-        for source in sources where source.official && source.enabled {
-            guard !busy, officialRefreshSchedule.isDue(source.id, foreground: foreground), let secret = try? credentialSnapshot.load(source.id), secret["access_token"].string?.isEmpty == false else { continue }
-            try? await queryOfficial(source.id, includeCredits: officialRefreshSchedule.needsCredits(source.id))
+    func accountPageOpened() { accountRefreshGeneration += 1 }
+    func refreshAccountInfo(sourceIDs: [String]? = nil, foreground: Bool = true) async {
+        guard running, !busy, !Task.isCancelled else { return }
+        let selected = sources.filter { $0.enabled && (sourceIDs?.contains($0.id) ?? true) }
+        // Bounded concurrency keeps many configured sources from monopolizing
+        // the management socket; no account request lives in the 5-second poll.
+        await withTaskGroup(of: Void.self) { group in
+            for (index, source) in selected.enumerated() {
+                if index >= 4 { await group.next() }
+                guard !Task.isCancelled else { break }
+                group.addTask { await self.refreshAccount(source.id, foreground: foreground) }
+            }
         }
-        try? await updateStatus()
+    }
+    private func refreshAccount(_ id: String, foreground: Bool) async {
+        guard running, !busy, !Task.isCancelled, let before = settings.sources.first(where: { $0.id == id }), before.enabled else { return }
+        if before.official {
+            guard !refreshingQuotas.contains(id), officialRefreshSchedule.isDue(id, foreground: foreground), let secret = try? credentialSnapshot.load(id), secret["access_token"].string?.isEmpty == false else { return }
+            try? await queryOfficial(id, includeCredits: officialRefreshSchedule.needsCredits(id))
+        } else {
+            guard !refreshingBalances.contains(id) else { return }
+            let credential = try? credentialSnapshot.load(id)
+            refreshingBalances.insert(id)
+            defer { refreshingBalances.remove(id) }
+            do {
+                let balance = try await client.call("balance.query", .object(["source_id": .string(id)]))
+                guard running, let current = settings.sources.first(where: { $0.id == id }), current.base_url == before.base_url, current.proxy == before.proxy,
+                      (try? credentialSnapshot.load(id)) == credential else { return }
+                apiBalances[id] = balance
+            } catch {
+                guard settings.sources.contains(where: { $0.id == id && $0.base_url == before.base_url && $0.proxy == before.proxy }),
+                      (try? credentialSnapshot.load(id)) == credential else { return }
+                if case .object(var cached) = apiBalances[id], cached["amount"]?.number != nil {
+                    cached["stale"] = .bool(true); apiBalances[id] = .object(cached)
+                } else { apiBalances[id] = .object(["status": .string("unavailable")]) }
+            }
+        }
     }
     func perform(_ action: @escaping () async throws -> Void) {
-        guard !busy else { return }; busy = true; error = nil
+        guard !busy else { return }; busy = true; error = nil; notice = nil
         Task { do { try await action() } catch { self.error = error.localizedDescription }; busy = false }
     }
     func saveSource(_ source: Source, apiKey: String) async throws {
@@ -290,8 +327,10 @@ import ServiceManagement
         try await sync(); try await updateStatus()
         if source.official { officialRefreshSchedule.reset(source.id) }
         modelErrors[source.id] = nil
+        apiBalances[source.id] = nil
         lastModelRefresh[source.id] = nil
         scheduleModelRefresh()
+        accountPageOpened()
     }
     func fetchModels(for draft: Source, apiKey: String = "") async throws -> [String] {
         guard running else { throw AppError.message("请先启动网关。") }
@@ -361,6 +400,7 @@ import ServiceManagement
             try await self.loadCredentialSnapshot([id])
             if self.loginSource == id { self.loginSource = nil; self.loginFlow = nil; self.callbackURL = "" }
             try await self.updateStatus()
+            self.apiBalances[id] = nil
         }
     }
     func changeRouting(mode: String, fixed: String?) {
@@ -431,7 +471,7 @@ import ServiceManagement
         officialRefreshSchedule.reset(id)
         lastModelRefresh[id] = nil
         scheduleModelRefresh()
-        Task { await refreshOfficialIfDue() }
+        Task { await refreshAccount(id, foreground: true) }
     }
     private func queryOfficial(_ id: String, includeCredits: Bool) async throws {
         guard !refreshingQuotas.contains(id) else { throw AppError.message("此账号正在刷新，请稍后重试。") }
