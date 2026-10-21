@@ -95,10 +95,12 @@ import ServiceManagement
         defer { starting = false }
         await startHelper()
         timerTask = Task { [weak self] in
+            var tick = 0
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(5))
+                try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled, let self else { break }
-                await self.poll()
+                tick = (tick + 1) % 5
+                await self.poll(refreshCredentials: tick == 0)
             }
         }
         accountTimerTask = Task { [weak self] in
@@ -258,17 +260,19 @@ import ServiceManagement
             pendingSync = false
         } catch { pendingSync = true; throw error }
     }
-    func poll() async {
+    func poll(refreshCredentials: Bool = true) async {
         guard running, !busy else { return }
         do {
             try await updateStatus()
-            try await mergeCredentials(try await client.call("credentials"))
-            if let id = loginSource, let flow = loginFlow {
-                let result = try await client.call("official.login.status", .object(["source_id": .string(id), "flow_id": .string(flow)]))
-                if result["state"].string == "complete" { try await finishLogin(id) }
-                else if result["state"].string == "failed" { loginMessage = result["error"].string ?? "登录失败，请重新发起。"; loginFlow = nil }
+            if refreshCredentials {
+                try await mergeCredentials(try await client.call("credentials"))
+                if let id = loginSource, let flow = loginFlow {
+                    let result = try await client.call("official.login.status", .object(["source_id": .string(id), "flow_id": .string(flow)]))
+                    if result["state"].string == "complete" { try await finishLogin(id) }
+                    else if result["state"].string == "failed" { loginMessage = result["error"].string ?? "登录失败，请重新发起。"; loginFlow = nil }
+                }
+                scheduleModelRefresh()
             }
-            scheduleModelRefresh()
             reportPollingError(nil)
         } catch { reportPollingError(error.localizedDescription) }
     }
@@ -285,7 +289,7 @@ import ServiceManagement
         guard running, !busy, !Task.isCancelled else { return }
         let selected = sources.filter { $0.enabled && (sourceIDs?.contains($0.id) ?? true) }
         // Bounded concurrency keeps many configured sources from monopolizing
-        // the management socket; no account request lives in the 5-second poll.
+        // the management socket; no account request lives in the status poll.
         await withTaskGroup(of: Void.self) { group in
             for (index, source) in selected.enumerated() {
                 if index >= 4 { await group.next() }
@@ -469,6 +473,8 @@ import ServiceManagement
     }
     func toggle(_ source: Source) { var next = source; next.enabled.toggle(); perform { try await self.saveSource(next, apiKey: "") } }
     func state(_ id: String) -> JSONValue { status["sources"].array.first { $0["id"].string == id } ?? .null }
+    var gatewayHasActivity: Bool { running && (status["inflight"].number ?? 0) > 0 }
+    func sourceHasActivity(_ id: String) -> Bool { running && (state(id)["active_requests"].number ?? 0) > 0 }
     func login(_ source: Source) {
         perform {
             try await self.sync()

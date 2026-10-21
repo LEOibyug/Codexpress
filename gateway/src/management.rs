@@ -34,10 +34,13 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             let settings = state.settings.read().await.clone();
             let sources = state.sources.read().await.clone();
             crate::routing::notify_quotas(state, &sources);
+            let active = state.usage.active_by_source();
             let sources: Vec<_> = sources
                 .iter()
                 .map(|runtime| {
                     let mut value = serde_json::to_value(runtime).expect("source status");
+                    value["active_requests"] =
+                        json!(active.get(&runtime.source.id).copied().unwrap_or(0));
                     value["identity_digest"] = json!(runtime.source.identity());
                     value["admission"] = crate::routing::admission(
                         state,

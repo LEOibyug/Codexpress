@@ -115,6 +115,16 @@ impl UsageStore {
             }),
         })
     }
+    /// In-memory counters only: status polling does not query SQLite or expose records.
+    pub fn active_by_source(&self) -> HashMap<String, usize> {
+        let mut counts = HashMap::new();
+        if let Ok(data) = self.data.lock() {
+            for (record, _) in data.active.values() {
+                *counts.entry(record.source_id.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
     pub fn start(&self, record: &UsageRecord) {
         if let Ok(mut data) = self.data.lock() {
             data.active
@@ -536,6 +546,10 @@ mod tests {
             ..base.clone()
         };
         store.start(&b);
+        assert_eq!(store.active_by_source().get("b"), Some(&1));
+        assert!(!store.active_by_source().contains_key("a"));
+        store.start(&b); // Updating the same attempt never double counts.
+        assert_eq!(store.active_by_source().get("b"), Some(&1));
         let active = store
             .summary_filtered(1, Some("b"), Some("gpt-6-astra"))
             .unwrap();
@@ -544,6 +558,7 @@ mod tests {
         assert_eq!(active["rows"][0]["requests"], 205);
         assert_eq!(active["rows"][1]["active_requests"], 1);
         store.record(b).unwrap();
+        assert!(store.active_by_source().is_empty());
         let all = store.summary(1).unwrap();
         assert_eq!(all["recent"].as_array().unwrap().len(), 200);
         assert_eq!(all["rows"][0]["priced_requests"], 205);

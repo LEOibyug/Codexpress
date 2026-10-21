@@ -13,8 +13,15 @@ struct APIBalanceView: View {
             Text("余额").foregroundStyle(.secondary)
             if !compact { Spacer(minLength: 8) }
             if let amount, amount.isFinite, let currency = balance["currency"].string {
-                Text(balanceMoney(amount, currency: currency))
-                    .fontWeight(.medium).monospacedDigit().textSelection(.enabled)
+                let money = BalanceAmount(amount, currency: currency)
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text(money.unit).font(.system(size: compact ? 10 : 12, weight: .medium))
+                    Text(money.number).font(.system(size: compact ? 13 : 18, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                }.foregroundStyle(AccountLevel.balance(amount, threshold: model.sources.first { $0.id == sourceID }?.balanceWarningThreshold).color)
+                    .textSelection(.enabled).lineLimit(1).minimumScaleFactor(0.8)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(balanceMoney(amount, currency: currency))
                 if balance["stale"].bool == true && !model.refreshingBalances.contains(sourceID) {
                     Image(systemName: "clock").foregroundStyle(.orange).help("更新失败，显示上次获取的余额")
                 }
@@ -35,6 +42,6 @@ struct APIBalanceView: View {
 }
 
 func balanceMoney(_ amount: Double, currency: String) -> String {
-    amount.formatted(.currency(code: currency).locale(Locale(identifier: "zh_CN"))
-        .precision(.fractionLength(amount != 0 && abs(amount) < 0.01 ? 4 : 2)))
+    let money = BalanceAmount(amount, currency: currency)
+    return money.unit + " " + money.number
 }

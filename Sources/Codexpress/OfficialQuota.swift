@@ -15,7 +15,7 @@ struct QuotaWindow: Identifiable {
         name = raw["name"].string ?? ""
         id = "\(name):\(index)"
         seconds = raw["window_seconds"].number.flatMap { $0.isFinite && $0 > 0 && $0 <= 31536000 ? $0 : nil }
-        remaining = raw["used_percent"].number.map { max(0, min(100, 100 - $0)) }
+        remaining = raw["used_percent"].number.flatMap { $0.isFinite ? max(0, min(100, 100 - $0)) : nil }
         resetAt = raw["reset_at"].number.flatMap { $0.isFinite && $0 > 0 && $0 <= 253402300799 ? $0 : nil }
         let parts = name.split(separator: ":", omittingEmptySubsequences: false)
         let period: String

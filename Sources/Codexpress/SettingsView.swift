@@ -161,7 +161,7 @@ struct SourcesView: View {
                     Text(source.official ? "官方账号" : "Responses API").font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 8)
-                StatusPill(text: source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用", color: sourceColor(source))
+                StatusPill(text: source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用", color: sourceColor(source), active: model.sourceHasActivity(source.id))
                 Toggle("启用 \(source.name)", isOn: Binding(get: { source.enabled }, set: { _ in model.toggle(source) }))
                     .toggleStyle(.switch).labelsHidden().controlSize(.small).disabled(model.busy)
                 Menu {

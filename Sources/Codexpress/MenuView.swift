@@ -5,7 +5,7 @@ struct MenuView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 15) {
             HStack(spacing: 10) {
                 Image(systemName: "arrow.triangle.branch").font(.system(size: 16, weight: .medium))
                     .foregroundStyle(.white).frame(width: 34, height: 34)
@@ -44,12 +44,12 @@ struct MenuView: View {
                     Spacer()
                     Text(model.routingMode == "auto" ? "自动切换" : "固定 · \(model.fixedName)").fontWeight(.medium)
                 }.font(.system(size: 11))
-                VStack(spacing: 13) {
+                VStack(spacing: 10) {
                     ForEach(Array(model.sources.prefix(4))) { source in
                         HStack(alignment: .top, spacing: 9) {
-                            Circle().fill(source.enabled && model.state(source.id)["health"].string == "ready" ? .green : .secondary)
-                                .frame(width: 5, height: 5).padding(.top, 5)
-                            VStack(alignment: .leading, spacing: 5) {
+                            ActivityDot(color: source.enabled && model.state(source.id)["health"].string == "ready" ? .green : .secondary,
+                                        active: model.sourceHasActivity(source.id)).padding(.top, 5)
+                            VStack(alignment: .leading, spacing: 3) {
                                 HStack(spacing: 6) {
                                     Text(source.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
                                     if source.official && model.refreshingQuotas.contains(source.id) { ProgressView().controlSize(.mini).help("正在更新额度") }
@@ -84,10 +84,12 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .top, spacing: 12) {
                 ForEach(QuotaOverview(quota).mainWindows) { window in
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 5) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(alignment: .firstTextBaseline, spacing: 4) {
                             Text(window.title).foregroundStyle(.secondary)
-                            Text("剩余 \(window.remainingLabel)").fontWeight(.medium).monospacedDigit()
+                            Text(window.remainingLabel).font(.system(size: 14, weight: .semibold, design: .rounded))
+                                .monospacedDigit().foregroundStyle(AccountLevel.quota(window.remaining).color)
+                                .accessibilityLabel("剩余 \(window.remainingLabel)")
                         }.font(.system(size: 10))
                         Text(window.resetLabel).font(.system(size: 9)).foregroundStyle(.secondary)
                             .lineLimit(1).help(window.resetLabel)
@@ -98,7 +100,7 @@ struct MenuView: View {
                 Label("更新失败", systemImage: "clock").font(.system(size: 9)).foregroundStyle(.orange)
                     .help("显示上次获取的额度：\(timestampLabel(quota["fetched_at"]))")
             }
-        }.padding(.top, 2)
+        }
     }
 }
 

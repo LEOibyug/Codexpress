@@ -6,6 +6,9 @@ enum AppPalette {
     static let card = adaptive(light: 0xFFFFFF, dark: 0x27282D)
     static let well = adaptive(light: 0xF4F5F7, dark: 0x202126)
     static let border = Color.primary.opacity(0.075)
+    static let accountHealthy = adaptive(light: 0x228044, dark: 0x65D98A)
+    static let accountCaution = adaptive(light: 0xA86B00, dark: 0xF6C659)
+    static let accountLow = adaptive(light: 0xCE3434, dark: 0xFF7777)
 
     private static func adaptive(light: UInt32, dark: UInt32) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in
@@ -125,10 +128,11 @@ struct SettingRow<Control: View>: View {
 struct StatusPill: View {
     let text: String
     var color: Color = .secondary
+    var active = false
 
     var body: some View {
         HStack(spacing: 5) {
-            Circle().fill(color).frame(width: 5, height: 5)
+            ActivityDot(color: color, active: active)
             Text(text).font(.system(size: 10, weight: .medium))
         }.foregroundStyle(color).padding(.horizontal, 8).padding(.vertical, 5)
             .background(color.opacity(0.09), in: Capsule())

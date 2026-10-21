@@ -68,11 +68,12 @@ struct OfficialAccountView: View {
                 Text(window.title).font(.system(size: 11)).foregroundStyle(.secondary)
                 Spacer()
                 Text(window.remainingLabel)
-                    .font(.system(size: 20, weight: .medium, design: .rounded)).monospacedDigit()
+                    .font(.system(size: 23, weight: .semibold, design: .rounded)).monospacedDigit()
+                    .foregroundStyle(AccountLevel.quota(window.remaining).color)
                 Text("剩余").font(.system(size: 10)).foregroundStyle(.secondary)
             }
             if let remaining = window.remaining {
-                ProgressView(value: remaining, total: 100).tint(remaining <= 10 ? .orange : .accentColor).controlSize(.small)
+                ProgressView(value: remaining, total: 100).tint(AccountLevel.quota(remaining).color).controlSize(.small)
             }
             Text(window.resetLabel).font(.system(size: 10)).foregroundStyle(.secondary)
         }.padding(12).background(AppPalette.well, in: RoundedRectangle(cornerRadius: 9))

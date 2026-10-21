@@ -8,13 +8,46 @@ import AppKit
         MenuBarExtra {
             MenuView().environmentObject(model).task { delegate.model = model; await model.start() }
         } label: {
-            Image(systemName: model.running ? "arrow.triangle.branch" : "exclamationmark.circle")
-                .accessibilityLabel("Codexpress")
+            GatewayMenuIcon(running: model.running, active: model.gatewayHasActivity)
         }
         .menuBarExtraStyle(.window)
 
     }
 }
+
+struct GatewayMenuIcon: View {
+    let running: Bool
+    let active: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Image(nsImage: Self.image(running: running, active: active, dark: colorScheme == .dark))
+            .renderingMode(.original)
+            .accessibilityLabel(active ? "Codexpress · 正在处理请求" : "Codexpress")
+    }
+
+    static func image(running: Bool, active: Bool, dark: Bool) -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            let symbol = NSImage(systemSymbolName: running ? "arrow.triangle.branch" : "exclamationmark.circle", accessibilityDescription: nil)
+            symbol?.draw(in: NSRect(x: 1, y: 1, width: 16, height: 16))
+            (dark ? NSColor.white : NSColor.black).setFill()
+            NSRect(x: 0, y: 0, width: 18, height: 18).fill(using: .sourceAtop)
+            if active {
+                NSGraphicsContext.saveGraphicsState()
+                NSGraphicsContext.current?.compositingOperation = .copy
+                NSColor.clear.setFill()
+                NSBezierPath(ovalIn: NSRect(x: 11, y: 0, width: 7, height: 7)).fill()
+                NSGraphicsContext.restoreGraphicsState()
+                NSColor.systemGreen.setFill()
+                NSBezierPath(ovalIn: NSRect(x: 12, y: 1, width: 5, height: 5)).fill()
+            }
+            return true
+        }
+        image.isTemplate = false
+        return image
+    }
+}
+
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     static weak var current: AppDelegate?
     weak var model: AppModel?
