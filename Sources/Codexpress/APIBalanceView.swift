@@ -16,7 +16,7 @@ struct APIBalanceView: View {
                 let money = BalanceAmount(amount, currency: currency)
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
                     Text(money.unit).font(.system(size: compact ? 10 : 12, weight: .medium))
-                    Text(money.number).font(.system(size: compact ? 13 : 18, weight: .semibold, design: .rounded))
+                    Text(money.number).font(.system(size: compact ? 14 : 18, weight: .semibold, design: .rounded))
                         .monospacedDigit()
                 }.foregroundStyle(AccountLevel.balance(amount, threshold: model.sources.first { $0.id == sourceID }?.balanceWarningThreshold).color)
                     .textSelection(.enabled).lineLimit(1).minimumScaleFactor(0.8)
