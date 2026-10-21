@@ -138,6 +138,8 @@ impl Attempt {
             token_details: TokenDetails {
                 input_estimated: true,
                 output_estimated: true,
+                source_kind: Some(source.kind.clone()),
+                is_subscription: Some(source.is_subscription),
                 ..Default::default()
             },
             complete: false,
@@ -196,6 +198,17 @@ impl Attempt {
                     reasoning_output_tokens: observer.reasoning,
                     reported_total_tokens: observer.total,
                     stream_complete: observer.terminal,
+                    billing_model: observer
+                        .billing_model
+                        .clone()
+                        .or_else(|| record.token_details.billing_model.clone()),
+                    service_tier: observer
+                        .service_tier
+                        .clone()
+                        .or_else(|| record.token_details.service_tier.clone()),
+                    cache_write_retention: record.token_details.cache_write_retention.clone(),
+                    source_kind: record.token_details.source_kind.clone(),
+                    is_subscription: record.token_details.is_subscription,
                 };
                 record.complete =
                     observer.input.is_some() && observer.output.is_some() && observer.terminal;
@@ -249,6 +262,8 @@ struct Observer {
     output: Option<u64>,
     cached: Option<u64>,
     cache_write: Option<u64>,
+    billing_model: Option<String>,
+    service_tier: Option<String>,
     reasoning: Option<u64>,
     total: Option<u64>,
     delta_units: HashMap<String, u64>,
@@ -309,6 +324,15 @@ impl Observer {
             }
         }
         let response = value.get("response").unwrap_or(value);
+        if let Some(model) = response["model"]
+            .as_str()
+            .filter(|v| !v.is_empty() && v.len() <= 256)
+        {
+            self.billing_model = Some(model.into());
+        }
+        if let Some(tier) = response["service_tier"].as_str().filter(|v| v.len() <= 32) {
+            self.service_tier = Some(tier.into());
+        }
         if let Some(id) = response
             .get("id")
             .and_then(Value::as_str)
@@ -1230,6 +1254,16 @@ async fn forward_once(
         };
         for authentication_attempt in 0..2 {
             let mut attempt = Attempt::new(state.clone(), &source, &request_id, model, input_units);
+            if let Some(record) = &mut attempt.record {
+                record.token_details.service_tier = parsed["service_tier"]
+                    .as_str()
+                    .filter(|v| v.len() <= 32)
+                    .map(String::from);
+                record.token_details.cache_write_retention = parsed["prompt_cache_retention"]
+                    .as_str()
+                    .filter(|v| v.len() <= 32)
+                    .map(String::from);
+            }
             let client = match transport::client(&source) {
                 Ok(client) => client,
                 Err(_) => {

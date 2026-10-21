@@ -2,6 +2,23 @@ import XCTest
 @testable import Codexpress
 
 final class UsagePresentationTests: XCTestCase {
+    func testMoneyAndModelComparisonsPreserveUnknownPricesAndSumMatchingModels() {
+        XCTAssertEqual(usageMoney(nil), "—")
+        XCTAssertEqual(usageMoney(0), "≈$0.00")
+        XCTAssertEqual(usageMoney(0.000123), "≈$0.000123")
+        let rows: [JSONValue] = [
+            .object(["model":.string("m"),"source_id":.string("a"),"requests":.number(2),"priced_requests":.number(2),"total_usd":.number(0.5)]),
+            .object(["model":.string("m"),"source_id":.string("b"),"requests":.number(1),"priced_requests":.number(1),"total_usd":.number(1)]),
+            .object(["model":.string("unknown"),"source_id":.string("b"),"requests":.number(1),"unpriced_requests":.number(1)])
+        ]
+        let models = usageComparisons(rows, key: "model", sort: "cost")
+        XCTAssertEqual(models.count, 2)
+        XCTAssertEqual(models.first?.id, "m")
+        XCTAssertEqual(models.first?.totals.cost, 1.5)
+        XCTAssertEqual(models.first?.totals.averageCost, 0.5)
+        XCTAssertNil(models.last?.totals.cost)
+        XCTAssertEqual(UsageTotals(rows: rows).costCoverage, "已计价 3 / 4 次")
+    }
     func testUsageCountsAbbreviateLargeValuesAndPromoteRoundedUnitBoundaries() {
         let cases: [(Double, String)] = [
             (0, "0"), (999, "999"), (1000, "1K"), (1234, "1.23K"),
@@ -18,8 +35,8 @@ final class UsagePresentationTests: XCTestCase {
 
     func testSourceTotalsWeightThroughputAndExcludeInflightRequestsFromSuccessAndLatency() {
         let rows: [JSONValue] = [
-            .object(["requests":.number(4),"active_requests":.number(2),"successes":.number(1),"input_tokens":.number(300),"output_tokens":.number(10),"total_latency_ms":.number(2000),"timed_output_tokens":.number(10),"total_generation_ms":.number(1000),"total_first_token_ms":.number(300),"first_token_samples":.number(1)]),
-            .object(["requests":.number(1),"successes":.number(1),"input_tokens":.number(200),"output_tokens":.number(100),"total_latency_ms":.number(6000),"timed_output_tokens":.number(100),"total_generation_ms":.number(5000),"total_first_token_ms":.number(500),"first_token_samples":.number(1),"estimated_requests":.number(1)])
+            .object(["requests":.number(4),"active_requests":.number(2),"successes":.number(1),"input_tokens":.number(300),"output_tokens":.number(10),"total_latency_ms":.number(2000),"throughput_output_tokens":.number(10),"throughput_latency_ms":.number(1000),"total_first_token_ms":.number(300),"first_token_samples":.number(1)]),
+            .object(["requests":.number(1),"successes":.number(1),"input_tokens":.number(200),"output_tokens":.number(100),"total_latency_ms":.number(6000),"throughput_output_tokens":.number(100),"throughput_latency_ms":.number(5000),"total_first_token_ms":.number(500),"first_token_samples":.number(1),"estimated_requests":.number(1)])
         ]
         let totals = UsageTotals(rows: rows)
         XCTAssertEqual(totals.total,610)

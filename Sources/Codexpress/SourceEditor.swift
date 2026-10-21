@@ -59,6 +59,14 @@ struct SourceEditor: View {
                     }
                     Toggle("启用此来源", isOn: $source.enabled).toggleStyle(.switch).controlSize(.small)
                 }
+                if !source.official {
+                    Section("费用估算") {
+                        Toggle("订阅来源", isOn: Binding(get: { source.is_subscription ?? false }, set: { source.is_subscription = $0 }))
+                            .toggleStyle(.switch).controlSize(.small)
+                        Text("开启后参考费用不计长上下文加价。旧版记录按当前设置补算。")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
                 Section("网络") {
                     Picker("出站策略", selection: $source.proxy.mode) {
                         if !source.official { Text("强制直连").tag("direct") }

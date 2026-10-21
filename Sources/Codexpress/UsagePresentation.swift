@@ -19,8 +19,53 @@ struct UsageTotals {
     var successRate: Double? { finished > 0 ? sum("successes") * 100 / finished : nil }
     var averageLatency: Double? { finished > 0 ? sum("total_latency_ms") / finished : nil }
     var firstToken: Double? { sum("first_token_samples") > 0 ? sum("total_first_token_ms") / sum("first_token_samples") : nil }
-    var tps: Double? { sum("total_generation_ms") > 0 ? sum("timed_output_tokens") * 1000 / sum("total_generation_ms") : nil }
+    var tps: Double? { sum("throughput_latency_ms") > 0 ? sum("throughput_output_tokens") * 1000 / sum("throughput_latency_ms") : nil }
     var cacheRate: Double? { sum("cached_reported_input_tokens") > 0 ? min(100, sum("cached_reported_tokens") * 100 / sum("cached_reported_input_tokens")) : nil }
+    var cost: Double? { sum("priced_requests") > 0 ? sum("total_usd") : nil }
+    var averageCost: Double? { sum("priced_requests") > 0 ? sum("total_usd") / sum("priced_requests") : nil }
+    var savings: Double? { sum("priced_requests") > 0 ? sum("cache_savings_usd") : nil }
+    var costCoverage: String {
+        let priced = Int(sum("priced_requests")), total = Int(sum("requests"))
+        return "已计价 \(priced) / \(total) 次"
+    }
+}
+
+struct UsageComparison: Identifiable {
+    let id: String
+    let name: String
+    let totals: UsageTotals
+}
+func usageComparisons(_ rows: [JSONValue], key: String, sort: String) -> [UsageComparison] {
+    Dictionary(grouping: rows, by: { $0[key].string ?? "" }).map { id, rows in
+        UsageComparison(id: id, name: key == "model" ? (id.isEmpty ? "未知模型" : id) : (rows.first?["source_name"].string ?? "已移除来源"), totals: UsageTotals(rows: rows))
+    }.sorted { a,b in
+        let x = sort == "tokens" ? a.totals.total : sort == "requests" ? a.totals.sum("requests") : a.totals.cost ?? -1
+        let y = sort == "tokens" ? b.totals.total : sort == "requests" ? b.totals.sum("requests") : b.totals.cost ?? -1
+        return x == y ? a.id < b.id : x > y
+    }
+}
+func usageMoney(_ amount: Double?, estimated: Bool = true) -> String {
+    guard let amount, amount.isFinite else { return "—" }
+    let digits = amount != 0 && abs(amount) < 0.01 ? 6 : amount != 0 && abs(amount) < 1 ? 4 : 2
+    return (estimated ? "≈" : "") + "$" + amount.formatted(.number.locale(Locale(identifier: "en_US_POSIX")).precision(.fractionLength(digits)))
+}
+func usageCostStatus(_ cost: JSONValue) -> String {
+    switch cost["status"].string {
+    case "unknown_model": return "未收录价格"
+    case "unknown_tier": return "未收录此计费模式"
+    case "unobserved": return "无可计费计数"
+    case "partial": return "部分计价"
+    case "estimated": return cost["historical"].bool == true ? "历史参考价补算" : "含估算项"
+    case "reported": return "上游计数计价"
+    default: return "待计价"
+    }
+}
+func usageBillingBasis(_ cost: JSONValue) -> String {
+    switch cost["billing_basis"].string {
+    case "official_subscription_reference": return "官方订阅参考折算"
+    case "subscription_reference": return "订阅来源参考折算"
+    default: return cost["source_type_known"].bool == false ? "API 参考折算（历史来源类型未知）" : "API 参考折算"
+    }
 }
 
 func usageCount(_ number: Double, estimated: Bool = false) -> String {

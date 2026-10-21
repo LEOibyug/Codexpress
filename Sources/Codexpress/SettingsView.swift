@@ -301,29 +301,33 @@ struct GeneralSettingsView: View {
     private var canPreview: Bool { !model.busy && model.running && !preferencesChanged && !model.portNeedsRestart && !model.metadataLoadFailed }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                PageHeading("设置") {
-                    HStack(spacing: 10) {
-                        if preferencesChanged { Text("未保存").font(.system(size: 11)).foregroundStyle(.secondary) }
-                        Button("保存设置") { model.savePreferences(port: port, codexHome: home) }
-                            .disabled(model.busy || model.metadataLoadFailed || !preferencesChanged)
+        ScrollViewReader { scroll in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    PageHeading("设置") {
+                        HStack(spacing: 10) {
+                            if preferencesChanged { Text("未保存").font(.system(size: 11)).foregroundStyle(.secondary) }
+                            Button("保存设置") { model.savePreferences(port: port, codexHome: home) }
+                                .disabled(model.busy || model.metadataLoadFailed || !preferencesChanged)
+                        }
                     }
-                }
-                gatewayCard
-                CredentialStorageView()
-                HistoryCacheView()
-                ModelCompactionView()
-                connectionCard
-                backupCard
-                if model.preview != .null { previewCard }
-            }.settingsPage()
-        }.onAppear { port = model.settings.port; home = model.settings.codexHome }
-            .task { await model.refreshConfigurationBackups() }
-            .alert(confirming == "backup.restore" ? "还原所选备份？" : confirming == "config.restore" ? "恢复原连接？" : "应用连接设置？", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
-                Button("取消", role: .cancel) { confirming = nil }
-                Button("确认") { if confirming == "backup.restore" { model.restoreConfigurationBackup(backupID) } else if let op = confirming { model.configAction(op) }; confirming = nil }
-            } message: { Text(confirming == "backup.restore" ? "将还原此备份的 config.toml、配置档案和 auth.json 文件认证，并重启 Codex。当前状态会先备份；钥匙串登录需在 Codex 中确认。" : "配置目录：\(model.settings.codexHome)\n旧配置与文件认证将先备份，再更新连接并重启 Codex。") }
+                    gatewayCard
+                    CredentialStorageView()
+                    HistoryCacheView()
+                    ModelCompactionView()
+                    connectionCard
+                    if model.preview != .null { previewCard.id("connection-preview") }
+                    backupCard
+                }.settingsPage()
+            }.onChange(of: model.preview != .null) { _, visible in
+                if visible { withAnimation(.easeInOut(duration: 0.25)) { scroll.scrollTo("connection-preview", anchor: .center) } }
+            }.onAppear { port = model.settings.port; home = model.settings.codexHome }
+                .task { await model.refreshConfigurationBackups() }
+                .alert(confirming == "backup.restore" ? "还原所选备份？" : confirming == "config.restore" ? "恢复原连接？" : "应用连接设置？", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
+                    Button("取消", role: .cancel) { confirming = nil }
+                    Button("确认") { if confirming == "backup.restore" { model.restoreConfigurationBackup(backupID) } else if let op = confirming { model.configAction(op) }; confirming = nil }
+                } message: { Text(confirming == "backup.restore" ? "将还原此备份的 config.toml、配置档案和 auth.json 文件认证，并重启 Codex。当前状态会先备份；钥匙串登录需在 Codex 中确认。" : "配置目录：\(model.settings.codexHome)\n旧配置与文件认证将先备份，再更新连接并重启 Codex。") }
+        }
     }
 
     private var gatewayCard: some View {

@@ -20,6 +20,8 @@ pub struct Source {
     pub id: String,
     pub name: String,
     pub kind: String,
+    #[serde(default)]
+    pub is_subscription: bool,
     pub base_url: String,
     pub enabled: bool,
     pub priority: i32,

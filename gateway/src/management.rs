@@ -203,6 +203,20 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
                     .map(|runtime| runtime.source.clone())
                     .collect::<Vec<_>>(),
             )?;
+            let pricing_sources = next
+                .iter()
+                .map(|runtime| {
+                    (
+                        runtime.source.id.clone(),
+                        runtime.source.kind.clone(),
+                        runtime.source.is_subscription,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let usage = state.usage.clone();
+            tokio::task::spawn_blocking(move || usage.reprice_historical(&pricing_sources))
+                .await
+                .context("历史费用更新失败")??;
             *current = next;
             // Keep the source write lock through binding invalidation. Relay
             // readers and binding writers use sources -> bindings consistently.
@@ -221,13 +235,14 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             };
             Ok(credentials(state).await)
         }
-        "usage" => state.usage.summary_for(
+        "usage" => state.usage.summary_filtered(
             payload
                 .get("days")
                 .and_then(Value::as_u64)
                 .unwrap_or(30)
                 .clamp(1, 3660) as u32,
             payload.get("source_id").and_then(Value::as_str),
+            payload.get("model").and_then(Value::as_str),
         ),
         op if op.starts_with("config.") => config::handle(state, op, payload).await,
         op if op.starts_with("official.") => crate::official::handle(state, op, payload).await,

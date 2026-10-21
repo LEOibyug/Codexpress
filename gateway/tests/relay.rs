@@ -34,6 +34,7 @@ fn source(id: &str, base: &str, priority: i32) -> Source {
         id: id.into(),
         name: format!("Source {id}"),
         kind: "api".into(),
+        is_subscription: false,
         base_url: base.into(),
         enabled: true,
         priority,
@@ -69,7 +70,7 @@ async fn state(sources: Vec<Source>) -> (tempfile::TempDir, Arc<AppState>) {
 async fn raw_json_headers_query_and_usage_survive_relay() {
     let seen = Arc::new(Mutex::new(None));
     let copy = seen.clone();
-    let response_body = br#"{ "id":"resp-one", "usage":{"input_tokens":100,"output_tokens":9,"total_tokens":109,"input_tokens_details":{"cached_tokens":40},"output_tokens_details":{"reasoning_tokens":5}}, "unknown":true }"#;
+    let response_body = br#"{ "id":"resp-one", "model":"gpt-6.1-sol", "service_tier":"priority", "usage":{"input_tokens":100,"output_tokens":9,"total_tokens":109,"input_tokens_details":{"cached_tokens":40},"output_tokens_details":{"reasoning_tokens":5}}, "unknown":true }"#;
     let (address, task) = serve(Router::new().route(
         "/v1/responses",
         post(move |request: Request| {
@@ -90,7 +91,9 @@ async fn raw_json_headers_query_and_usage_survive_relay() {
         }),
     ))
     .await;
-    let (_directory, state) = state(vec![source("a", &format!("{address}/v1"), 0)]).await;
+    let mut subscription = source("a", &format!("{address}/v1"), 0);
+    subscription.is_subscription = true;
+    let (_directory, state) = state(vec![subscription]).await;
     let body = b"{  \"model\":\"gpt-test\",\"input\":[{\"type\":\"message\",\"content\":\"PRIVATE-PROMPT\"}],\"unknown\":true }";
     let mut req = request(body);
     req.headers_mut()
@@ -129,6 +132,20 @@ async fn raw_json_headers_query_and_usage_survive_relay() {
     assert_eq!(usage["rows"][0]["input_tokens"], 100);
     assert_eq!(usage["rows"][0]["cached_input_tokens"], 40);
     assert_eq!(usage["recent"][0]["complete"], true);
+    assert_eq!(usage["recent"][0]["model"], "gpt-test");
+    assert_eq!(usage["recent"][0]["cost"]["price_model"], "gpt-6.1-sol");
+    assert_eq!(usage["recent"][0]["cost"]["service_tier"], "priority");
+    assert_eq!(
+        usage["recent"][0]["cost"]["billing_basis"],
+        "subscription_reference"
+    );
+    assert_eq!(usage["recent"][0]["token_details"]["is_subscription"], true);
+    state.sources.write().await[0].source.is_subscription = false;
+    assert_eq!(
+        state.usage.summary(1).unwrap()["recent"][0]["cost"],
+        usage["recent"][0]["cost"]
+    );
+    assert!((usage["recent"][0]["cost"]["total_usd"].as_f64().unwrap() - 0.000428).abs() < 1e-12);
     assert_eq!(
         usage["recent"][0]["token_details"]["reasoning_output_tokens"],
         5
@@ -241,7 +258,8 @@ async fn live_usage_estimates_stream_then_replaces_with_reported_tokens_without_
         );
         let duration = recent["generation_ms"].as_f64().unwrap();
         assert!(duration >= 20.0);
-        let expected_tps = recent["output_tokens"].as_f64().unwrap() * 1000.0 / duration;
+        let expected_tps = recent["output_tokens"].as_f64().unwrap() * 1000.0
+            / recent["latency_ms"].as_f64().unwrap();
         assert!((recent["output_tps"].as_f64().unwrap() - expected_tps).abs() < 0.001);
         assert_eq!(
             final_usage["rows"][0]["timed_output_tokens"],
@@ -270,7 +288,7 @@ async fn partial_usage_keeps_reported_zero_and_estimates_only_missing_input() {
     assert_eq!(row["token_details"]["output_estimated"], false);
     assert_eq!(row["token_details"]["reasoning_output_tokens"], 0);
     assert_eq!(row["token_details"]["cached_input_reported"], true);
-    assert!(row["output_tps"].is_null());
+    assert!(row["generation_tps"].is_null());
     task.abort();
 }
 

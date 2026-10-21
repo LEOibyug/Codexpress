@@ -53,6 +53,7 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
     var id = UUID().uuidString
     var name = ""
     var kind = "api"
+    var is_subscription: Bool? = nil
     var base_url = "https://api.openai.com/v1"
     var enabled = true
     var priority = 0

@@ -10,6 +10,7 @@ pub mod management;
 pub mod model;
 pub mod notifications;
 pub mod official;
+pub mod pricing;
 pub mod relay;
 pub mod remote;
 pub mod routing;

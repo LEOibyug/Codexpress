@@ -28,9 +28,12 @@ final class PersistenceTests: XCTestCase {
         // An old manual allowlist must not become an automatically overwritten cache.
         let legacy = try JSONDecoder().decode(Source.self, from: JSONEncoder().encode(source))
         XCTAssertFalse(legacy.discoversModels)
+        XCTAssertNil(legacy.is_subscription)
+        source.is_subscription = true
         source.automaticModelDiscovery = true
         let cached = try JSONDecoder().decode(Source.self, from: JSONEncoder().encode(source))
         XCTAssertTrue(cached.discoversModels)
+        XCTAssertEqual(cached.is_subscription, true)
         XCTAssertEqual(cached.models, ["manual-model"])
     }
     func testModelCompactionMigrationAndValidation() throws {

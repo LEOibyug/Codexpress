@@ -51,6 +51,7 @@ import ServiceManagement
     private var modelRefreshTask: Task<Void, Never>?
     private var usageDays = 30
     private var usageSourceID: String?
+    private var usageModelID: String?
     var sources: [Source] { settings.sources.sorted { $0.priority < $1.priority } }
     var baseURL: String { status["base_url"].string ?? "http://127.0.0.1:\(settings.port)/v1" }
     var routingMode: String { status["mode"].string ?? settings.mode }
@@ -442,19 +443,19 @@ import ServiceManagement
         try await updateStatus()
     }
     func refresh(_ id: String) { perform { try await self.queryOfficial(id, includeCredits: true) } }
-    func refreshUsage(days: Int, sourceID: String? = nil) { Task { await loadUsage(days: days, sourceID: sourceID) } }
-    func loadUsage(days: Int, sourceID: String? = nil) async {
+    func refreshUsage(days: Int, sourceID: String? = nil, modelID: String? = nil) { Task { await loadUsage(days: days, sourceID: sourceID, modelID: modelID) } }
+    func loadUsage(days: Int, sourceID: String? = nil, modelID: String? = nil) async {
         if usageDays != days { usage = .null; usageUpdatedAt = nil }
-        usageDays = days; usageSourceID = sourceID
+        usageDays = days; usageSourceID = sourceID; usageModelID = modelID
         guard running, !usageRefreshing else { return }
         usageRefreshing = true
         defer { usageRefreshing = false }
         do {
-            let snapshot = try await client.call("usage", .object(["days": .number(Double(days)), "source_id": sourceID.map(JSONValue.string) ?? .null]))
-            guard !Task.isCancelled, usageDays == days, usageSourceID == sourceID else { return }
+            let snapshot = try await client.call("usage", .object(["days": .number(Double(days)), "source_id": sourceID.map(JSONValue.string) ?? .null, "model": modelID.map(JSONValue.string) ?? .null]))
+            guard !Task.isCancelled, usageDays == days, usageSourceID == sourceID, usageModelID == modelID else { return }
             usage = snapshot; usageError = nil; usageUpdatedAt = Date()
         } catch {
-            if !Task.isCancelled, usageDays == days, usageSourceID == sourceID { usageError = error.localizedDescription }
+            if !Task.isCancelled, usageDays == days, usageSourceID == sourceID, usageModelID == modelID { usageError = error.localizedDescription }
         }
     }
     func prepareCredit(source: Source, credit: JSONValue) async throws -> CreditConfirmation {

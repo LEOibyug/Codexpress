@@ -105,6 +105,7 @@ async fn remote_listener_has_separate_credentials_host_restrictions_revoke_and_r
         id: "api".into(),
         name: "API".into(),
         kind: "api".into(),
+        is_subscription: false,
         base_url: base,
         enabled: true,
         priority: 0,
