@@ -4,7 +4,11 @@
 
 ## 使用
 
-本机构建产物：`dist/Codexpress.app`。双击打开，或执行：
+从 [Releases](https://github.com/LEOibyug/Codexpress/releases/latest) 下载 DMG，打开后将 Codexpress 拖入「应用程序」。支持 Apple Silicon Mac，要求 macOS 14 或更新版本，无需安装开发工具。
+
+当前版本使用临时签名，尚未经过 Apple 公证。首次打开若被系统拦截，请先尝试打开，再前往「系统设置 → 隐私与安全性」选择「仍要打开」。
+
+从源码构建的应用位于 `dist/Codexpress.app`，可双击打开，或执行：
 
 ```sh
 bash scripts/run.sh

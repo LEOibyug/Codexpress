@@ -8,7 +8,8 @@
   <img src="https://img.shields.io/badge/Apple_Silicon-arm64-3478f6?style=flat-square" alt="Apple Silicon arm64">
 </p>
 <p align="center">
-  <a href="#安装">安装</a> ·
+  <a href="https://github.com/LEOibyug/Codexpress/releases/latest">下载最新版</a> ·
+  <a href="#安装">安装说明</a> ·
   <a href="#开始使用">开始使用</a> ·
   <a href="docs/usage.md">使用指南</a>
 </p>
@@ -54,15 +55,11 @@
 
 ## 安装
 
-支持 Apple Silicon Mac，要求 macOS 14 或更新版本。目前从源码构建，需要安装 Xcode 和 Rust stable。
+支持 Apple Silicon Mac，要求 macOS 14 或更新版本。
 
-```sh
-git clone https://github.com/LEOibyug/Codexpress.git
-cd Codexpress
-bash scripts/build.sh
-```
+从 [Releases 下载最新版](https://github.com/LEOibyug/Codexpress/releases/latest)的 DMG，打开后将 Codexpress 拖入「应用程序」。也提供 ZIP 压缩包，无需安装 Xcode 或 Rust。
 
-将生成的 `dist/Codexpress.app` 拖入「应用程序」后打开。当前构建使用本地签名，尚未经过 Apple 公证。
+当前版本使用临时签名，尚未经过 Apple 公证。首次打开若被 macOS 拦截，请先尝试打开，再前往「系统设置 → 隐私与安全性」选择「仍要打开」。
 
 ## 开始使用
 
@@ -83,11 +80,18 @@ bash scripts/build.sh
 
 界面使用 SwiftUI / AppKit，内置网关使用 Rust。
 
+源码构建需要 Xcode 和 Rust stable：
+
 ```sh
+git clone https://github.com/LEOibyug/Codexpress.git
+cd Codexpress
 bash scripts/check.sh  # Rust 检查与测试
 swift test            # Swift 测试
 bash scripts/build.sh # 构建 macOS 应用
+bash scripts/package.sh # 生成 DMG、ZIP 和校验文件
 ```
+
+应用位于 `dist/Codexpress.app`。更新 `Resources/Info.plist` 中的版本号与构建号后，推送对应的 `v*` 标签即可自动测试、编译并发布；也可在 Actions 中手动运行发布工作流，填写已推送的标签。已发布版本的安装包不会被覆盖。
 
 ## 致谢
 

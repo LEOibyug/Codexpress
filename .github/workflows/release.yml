@@ -1,0 +1,101 @@
+name: 发布 macOS 应用
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已推送的版本标签，例如 v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - name: 获取版本源码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 核对版本与构建环境
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == arm64 ]]
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$RELEASE_TAG" == "v$version" ]]
+          [[ "$(git rev-parse HEAD)" == "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" ]]
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          swift --version
+          xcodebuild -version
+
+      - name: 配置 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target aarch64-apple-darwin
+          rustup default stable
+
+      - name: 测试与检查
+        run: |
+          bash scripts/check.sh
+          swift test
+
+      - name: 编译应用
+        run: bash scripts/build.sh
+
+      - name: 打包安装文件
+        run: bash scripts/package.sh
+
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/codexpress-release-notes.md"
+          cat > "$notes" <<'NOTES'
+          一个管理 Codex 账号、API 和用量的 Mac 菜单栏小工具。
+
+          ### 下载与安装
+          - 支持 Apple Silicon（M1 及更新芯片），要求 macOS 14 或更新版本。
+          - 推荐下载 DMG，打开后将 Codexpress 拖入「应用程序」。也提供 ZIP 压缩包。
+          - 当前版本使用临时签名，尚未经过 Apple 公证。首次打开若被系统拦截，请先尝试打开，再前往「系统设置 → 隐私与安全性」选择「仍要打开」。
+          - 使用方法见仓库中的 README 和使用指南。
+
+          `SHA256SUMS.txt` 提供安装包的 SHA-256 校验值。
+          NOTES
+          assets=("dist/Codexpress-$VERSION-arm64.dmg" "dist/Codexpress-$VERSION-arm64.zip" dist/SHA256SUMS.txt)
+          if gh release view "$RELEASE_TAG" --json isDraft > "$RUNNER_TEMP/codexpress-existing-release.json" 2>/dev/null; then
+            if [[ "$(jq -r .isDraft "$RUNNER_TEMP/codexpress-existing-release.json")" != true ]]; then
+              printf '该版本已发布；请使用新的版本号，已发布的安装包不会被覆盖。\n' >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+            gh release edit "$RELEASE_TAG" --title "Codexpress $RELEASE_TAG" --notes-file "$notes"
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --draft --title "Codexpress $RELEASE_TAG" --notes-file "$notes"
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest
