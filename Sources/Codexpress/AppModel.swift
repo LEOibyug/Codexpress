@@ -171,6 +171,16 @@ import ServiceManagement
         if running { try? await mergeCredentials(try await client.call("credentials")) }
         stop()
     }
+    func activeRequestsBeforeTermination() async throws -> Int {
+        guard let helper, helper.isRunning else { return 0 }
+        let fresh = try await client.call("status")
+        guard fresh["process_id"].number == Double(helper.processIdentifier),
+              let count = fresh["inflight"].number, count.isFinite, count >= 0,
+              count < Double(Int.max), count.rounded(.down) == count else {
+            throw AppError.message("无法确认当前网关的活动状态。")
+        }
+        return Int(count)
+    }
     func stop() { shuttingDown = true; timerTask?.cancel(); accountTimerTask?.cancel(); modelRefreshTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
     func retry() { restartCount = 0; Task { await startHelper() } }
     func requireWritableMetadata() throws {

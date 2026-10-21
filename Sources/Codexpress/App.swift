@@ -52,6 +52,7 @@ struct GatewayMenuIcon: View {
     static weak var current: AppDelegate?
     weak var model: AppModel?
     private var settingsWindow: NSWindow?
+    private let terminationGuard = TerminationGuard()
     func showSettings() {
         if settingsWindow == nil {
             let content = SettingsView().environmentObject(AppModel.shared)
@@ -78,8 +79,37 @@ struct GatewayMenuIcon: View {
         Task { await model?.start() }
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        Task { await model?.shutdown(); NSApp.reply(toApplicationShouldTerminate: true) }
+        let model = model ?? AppModel.shared
+        Task {
+            let approved = await terminationGuard.request(check: {
+                try await model.activeRequestsBeforeTermination()
+            }, confirm: { count in
+                self.confirmTermination(activeRequests: count)
+            }, shutdown: {
+                await model.shutdown()
+            })
+            if let approved { sender.reply(toApplicationShouldTerminate: approved) }
+        }
         return .terminateLater
+    }
+    private func confirmTermination(activeRequests: Int?) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        if let activeRequests {
+            alert.messageText = "仍有对话正在进行"
+            alert.informativeText = "网关正在处理 \(activeRequests) 个请求。退出会停止网关并中断这些请求。"
+        } else {
+            alert.messageText = "无法确认网关是否空闲"
+            alert.informativeText = "暂时无法获取网关状态。退出会停止网关，可能中断正在进行的请求。"
+        }
+        let cancel = alert.addButton(withTitle: "继续运行")
+        cancel.keyEquivalent = "\u{1b}"
+        alert.window.defaultButtonCell = cancel.cell as? NSButtonCell
+        let quit = alert.addButton(withTitle: "仍然退出")
+        quit.keyEquivalent = ""
+        quit.hasDestructiveAction = true
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertSecondButtonReturn
     }
     func applicationWillTerminate(_ notification: Notification) { model?.stop() }
 }
