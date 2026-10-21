@@ -55,6 +55,7 @@ import ServiceManagement
     private var usageDays = 30
     private var usageSourceID: String?
     private var usageModelID: String?
+    private var lastPollingError: String?
     var sources: [Source] { settings.sources.sorted { $0.priority < $1.priority } }
     var baseURL: String { status["base_url"].string ?? "http://127.0.0.1:\(settings.port)/v1" }
     var routingMode: String { status["mode"].string ?? settings.mode }
@@ -261,7 +262,16 @@ import ServiceManagement
                 else if result["state"].string == "failed" { loginMessage = result["error"].string ?? "登录失败，请重新发起。"; loginFlow = nil }
             }
             scheduleModelRefresh()
-        } catch { self.error = error.localizedDescription }
+            reportPollingError(nil)
+        } catch { reportPollingError(error.localizedDescription) }
+    }
+    func reportPollingError(_ message: String?) {
+        defer { lastPollingError = message }
+        guard let message, message != lastPollingError else { return }
+        error = message
+    }
+    func dismissError(_ message: String) {
+        if error == message { error = nil }
     }
     func accountPageOpened() { accountRefreshGeneration += 1 }
     func refreshAccountInfo(sourceIDs: [String]? = nil, foreground: Bool = true) async {

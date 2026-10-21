@@ -8,6 +8,7 @@ struct ChatbotSettingsView: View {
     @State private var newKey = ""
     @State private var working = false
     @State private var confirmReset = false
+    @State private var error: String?
 
     private var canEdit: Bool { model.running && !model.busy && !working }
     private var address: String { status["base_url"].string ?? "—" }
@@ -38,6 +39,7 @@ struct ChatbotSettingsView: View {
                         if working { ProgressView().controlSize(.small) }
                         Button("应用设置") { save() }.buttonStyle(.borderedProminent).disabled(!canEdit || !changed)
                     }.controlSize(.small)
+                    if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
                     if status["enabled"].bool == true && status["running"].bool == false {
                         InfoNote(text: "入口未启动，请更换端口后应用设置。", color: .orange)
                     }
@@ -56,6 +58,8 @@ struct ChatbotSettingsView: View {
                 }
             }.settingsPage()
         }.task(id: model.running) { await load() }
+            .onChange(of: port) { _, _ in error = nil }
+            .onChange(of: newKey) { _, _ in error = nil }
             .alert("重新生成 API Key？", isPresented: $confirmReset) {
                 Button("取消", role: .cancel) {}
                 Button("重新生成") { update(.object(["regenerate_key": .bool(true)]), reset: true) }
@@ -63,35 +67,35 @@ struct ChatbotSettingsView: View {
     }
     private func load() async {
         guard model.running else { return }
-        do { status = try await model.remoteCall("chatbot.status"); port = status["port"].number.map { String(Int($0)) } ?? "" }
-        catch { model.error = error.localizedDescription }
+        do { status = try await model.remoteCall("chatbot.status"); port = status["port"].number.map { String(Int($0)) } ?? ""; error = nil }
+        catch { self.error = error.localizedDescription }
     }
     private func save() {
-        guard let value = Int(port), (1...65535).contains(value) else { model.error = "端口须为 1–65535 的整数。"; return }
+        guard let value = Int(port), (1...65535).contains(value) else { error = "端口须为 1–65535 的整数。"; return }
         var payload: [String: JSONValue] = ["port": .number(Double(value))]
         if !newKey.isEmpty { payload["key"] = .string(newKey) }
         update(.object(payload))
     }
     private func update(_ payload: JSONValue, reset: Bool = false) {
-        guard canEdit else { return }; working = true
+        guard canEdit else { return }; working = true; error = nil
         Task {
             defer { working = false }
             do {
                 status = try await model.remoteCall("chatbot.configure", payload)
                 port = status["port"].number.map { String(Int($0)) } ?? ""; newKey = ""
                 model.notice = reset ? "API Key 已重新生成，请更新客户端密钥。" : "聊天客户端设置已应用。"
-            } catch { model.error = error.localizedDescription }
+            } catch { self.error = error.localizedDescription }
         }
     }
     private func copyKey() {
-        guard canEdit else { return }; working = true
+        guard canEdit else { return }; working = true; error = nil
         Task {
             defer { working = false }
             do {
                 let result = try await model.remoteCall("chatbot.key")
                 guard let key = result["key"].string else { throw AppError.message("无法读取聊天客户端 Key。") }
                 copy(key, message: "API Key 已复制。")
-            } catch { model.error = error.localizedDescription }
+            } catch { self.error = error.localizedDescription }
         }
     }
     private func copy(_ text: String, message: String) {

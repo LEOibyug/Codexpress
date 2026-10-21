@@ -64,7 +64,6 @@ struct MenuView: View {
                 }
             }
             if model.pendingSync { InfoNote(text: "配置尚未应用，当前路由使用上次设置。", symbol: "clock", color: .orange) }
-            if let error = model.error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange).lineLimit(3) }
             Divider()
             HStack {
                 Button { showSettings() } label: { Label("设置", systemImage: "slider.horizontal.3") }
@@ -77,6 +76,7 @@ struct MenuView: View {
                 Task { await model.refreshAccountInfo(sourceIDs: Array(model.sources.prefix(4)).map(\.id)) }
             })
             .task(id: model.running) { await model.refreshAccountInfo(sourceIDs: Array(model.sources.prefix(4)).map(\.id)) }
+            .overlay(alignment: .bottomLeading) { AppFeedbackOverlay() }
     }
 
     private func showSettings() { AppDelegate.current?.showSettings() }

@@ -2,6 +2,40 @@ import XCTest
 @testable import Codexpress
 
 final class ReviewRegressionTests: XCTestCase {
+    func testExpiredFeedbackClearsDisplayedErrorWithoutClearingNewerFailure() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cx-feedback-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await MainActor.run {
+            let model = AppModel(stateDirectory: directory)
+            model.error = "API Key 格式无效"
+            model.dismissError("API Key 格式无效")
+            XCTAssertNil(model.error)
+            model.error = "网关连接失败"
+            model.dismissError("API Key 格式无效")
+            XCTAssertEqual(model.error, "网关连接失败")
+        }
+    }
+    func testPollingFailureStaysDismissedUntilRecoveryOrDifferentFailure() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cx-poll-feedback-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await MainActor.run {
+            let model = AppModel(stateDirectory: directory)
+            model.reportPollingError("网关连接失败")
+            XCTAssertEqual(model.error, "网关连接失败")
+            model.dismissError("网关连接失败")
+            model.reportPollingError("网关连接失败")
+            XCTAssertNil(model.error)
+            model.reportPollingError("读取凭据失败")
+            XCTAssertEqual(model.error, "读取凭据失败")
+            model.dismissError("读取凭据失败")
+            model.reportPollingError(nil)
+            model.reportPollingError("读取凭据失败")
+            XCTAssertEqual(model.error, "读取凭据失败")
+            model.error = "另一次操作失败"
+            model.reportPollingError(nil)
+            XCTAssertEqual(model.error, "另一次操作失败")
+        }
+    }
     private func live(_ source: Source, account: String, stale: Bool = false) throws -> JSONValue {
         guard case .object(var metadata) = try JSONValue.from(source) else { throw AppError.message("invalid fixture") }
         metadata["account_id"] = .string(account)

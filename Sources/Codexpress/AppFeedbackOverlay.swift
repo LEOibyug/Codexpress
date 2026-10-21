@@ -14,8 +14,8 @@ struct AppFeedbackOverlay: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(messages) { message in
-                FeedbackCard(message: message) { dismiss(message, explicit: true) }
-                    onExpire: { dismiss(message, explicit: false) }
+                FeedbackCard(message: message) { dismiss(message) }
+                    onExpire: { dismiss(message) }
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }.frame(maxWidth: 380, alignment: .leading).padding(20)
@@ -29,13 +29,11 @@ struct AppFeedbackOverlay: View {
         guard let text, !text.isEmpty else { return }
         messages.append(FeedbackMessage(text: text, isError: isError))
     }
-    private func dismiss(_ message: FeedbackMessage, explicit: Bool) {
+    private func dismiss(_ message: FeedbackMessage) {
         guard messages.contains(where: { $0.id == message.id }) else { return }
         messages.removeAll { $0.id == message.id }
         if !message.isError, model.notice == message.text { model.notice = nil }
-        // Keep a persistent fault in the model after the toast times out so
-        // identical failures in the local status poll do not repeatedly toast.
-        if message.isError, explicit, model.error == message.text { model.error = nil }
+        if message.isError { model.dismissError(message.text) }
     }
 }
 
