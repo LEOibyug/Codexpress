@@ -370,6 +370,88 @@ async fn fallback_is_ordered_fixed_mode_and_previous_id_never_cross_sources() {
 }
 
 #[tokio::test]
+async fn connection_pool_reuses_transport_without_crossing_source_or_proxy_policy() {
+    use axum::extract::ConnectInfo;
+    let peers = Arc::new(Mutex::new(Vec::new()));
+    let copy = peers.clone();
+    let router = Router::new().fallback(
+        move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>| {
+            let copy = copy.clone();
+            async move {
+                copy.lock().await.push(peer);
+                "direct"
+            }
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let origin_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    let mut target = source("pool-a", &origin, 0);
+    for _ in 0..2 {
+        assert_eq!(
+            transport::client(&target)
+                .unwrap()
+                .get(&origin)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "direct"
+        );
+    }
+    let mut other = target.clone();
+    other.id = "pool-b".into();
+    transport::client(&other)
+        .unwrap()
+        .get(&origin)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    {
+        let peers = peers.lock().await;
+        assert_eq!(peers.len(), 3);
+        assert_eq!(peers[0], peers[1]);
+        assert_ne!(peers[1], peers[2]);
+    }
+    let (proxy, proxy_task) = serve(Router::new().fallback(|| async { "proxied" })).await;
+    target.proxy = ProxyPolicy {
+        mode: "explicit".into(),
+        url: Some(proxy),
+    };
+    assert_eq!(
+        transport::client(&target)
+            .unwrap()
+            .get(&origin)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "proxied"
+    );
+    assert_eq!(peers.lock().await.len(), 3);
+    target.kind = "official".into();
+    target.proxy.mode = "direct".into();
+    target.proxy.url = None;
+    assert!(transport::client(&target).is_err());
+    proxy_task.abort();
+    origin_task.abort();
+}
+
+#[tokio::test]
 async fn explicit_proxy_is_used_and_unavailable_proxy_never_bypasses() {
     let direct_hits = Arc::new(AtomicUsize::new(0));
     let copy = direct_hits.clone();

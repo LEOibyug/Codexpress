@@ -305,7 +305,7 @@ async fn refresh_inner(
     }
     let response = transport::client(&current)?.post(endpoints.token).timeout(REQUEST_TIMEOUT)
         .json(&json!({"client_id":CLIENT_ID,"grant_type":"refresh_token","refresh_token":refresh,"scope":"openid profile email"}))
-        .send().await.map_err(|_| anyhow!("官方令牌刷新连接失败，请检查此来源代理"))?;
+        .send().await.map_err(|e| anyhow!("官方令牌刷新{}",transport::failure_reason(&e)))?;
     let status = response.status().as_u16();
     if matches!(status, 400 | 401) {
         // A malformed request/changed endpoint is not proof that credentials expired.
@@ -439,7 +439,7 @@ async fn complete(
             ])
             .send()
             .await
-            .map_err(|_| anyhow!("登录交换连接失败，请检查此来源代理并重新登录"))?;
+            .map_err(|e| anyhow!("登录交换{}，请重新发起登录", transport::failure_reason(&e)))?;
         let secret = merge_tokens(&json!({}), json_response(response).await?)?;
         if token(&secret, "refresh_token").is_empty() {
             bail!("官方未返回刷新令牌，请重新登录");
@@ -726,7 +726,7 @@ async fn get(source: &Source, url: &str) -> Result<Value> {
         request
             .send()
             .await
-            .map_err(|_| anyhow!("官方查询连接失败，请检查此来源代理"))?,
+            .map_err(|e| anyhow!("官方查询{}", transport::failure_reason(&e)))?,
     )
     .await
 }
@@ -797,6 +797,15 @@ async fn refresh_selected_snapshots(
     include_credits: bool,
 ) -> Result<Value> {
     let threshold = state.settings.read().await.official_low_quota_percent;
+    let recovering_revision = state
+        .sources
+        .read()
+        .await
+        .iter()
+        .find(|r| {
+            same_binding(&r.source, src) && r.health == "proxy_error" && r.cooldown_until.is_some()
+        })
+        .map(|r| r.health_revision);
     let quota = get(src, endpoints.usage)
         .await
         .and_then(|v| quota_snapshot(&v));
@@ -817,6 +826,16 @@ async fn refresh_selected_snapshots(
     runtime.quota = match quota {
         Ok(mut v) => {
             preserve_low_windows(&mut v, &runtime.quota, threshold);
+            // A fresh authenticated query proves this proxy path works. Never
+            // clear a newer failure, HTTP throttling, or an auth/quota block.
+            if runtime.health == "proxy_error"
+                && recovering_revision == Some(runtime.health_revision)
+            {
+                runtime.health = "ready".into();
+                runtime.last_error = None;
+                runtime.cooldown_until = None;
+                runtime.health_revision = runtime.health_revision.wrapping_add(1);
+            }
             v
         }
         Err(e) => stale(runtime.quota.clone(), "quota", &e.to_string()),

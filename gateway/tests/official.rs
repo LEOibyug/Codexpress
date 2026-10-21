@@ -22,6 +22,7 @@ struct Fixture {
     tokens: AtomicUsize,
     reads: AtomicUsize,
     quota_reads: AtomicUsize,
+    quota_delay_ms: AtomicUsize,
     uncertain: bool,
     headers: Mutex<Vec<String>>,
     quota: Mutex<Option<Value>>,
@@ -39,6 +40,10 @@ async fn fixture(uncertain: bool) -> (String, Arc<Fixture>, tokio::task::JoinHan
     }
     async fn usage(State(s): State<Arc<Fixture>>) -> Json<Value> {
         s.quota_reads.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(
+            s.quota_delay_ms.load(Ordering::SeqCst) as u64,
+        ))
+        .await;
         if let Some(value) = s.quota.lock().await.clone() {
             return Json(value);
         }
@@ -168,6 +173,66 @@ async fn frequent_quota_refresh_retains_weekly_data_and_does_not_poll_credits() 
         .await
         .unwrap();
     assert_eq!(counters.reads.load(Ordering::SeqCst), 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn fresh_quota_recovers_only_the_proxy_failure_observed_before_query() {
+    let (proxy, counters, task) = fixture(false).await;
+    let (_dir, state) = setup(&proxy).await;
+    routing::mark_failure(&state, "official-a", 0, None).await;
+    official::fixture::selected_snapshots_at(&state, "official-a", "http://fixture.invalid", false)
+        .await
+        .unwrap();
+    {
+        let sources = state.sources.read().await;
+        assert_eq!(sources[0].health, "ready");
+        assert!(sources[0].last_error.is_none());
+        assert!(sources[0].cooldown_until.is_none());
+    }
+    for status in [401, 429] {
+        routing::mark_failure(&state, "official-a", status, None).await;
+        let before = state.sources.read().await[0].health.clone();
+        official::fixture::selected_snapshots_at(
+            &state,
+            "official-a",
+            "http://fixture.invalid",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.sources.read().await[0].health, before);
+    }
+    routing::mark_failure(&state, "official-a", 0, None).await;
+    *counters.quota.lock().await = Some(json!([]));
+    official::fixture::selected_snapshots_at(&state, "official-a", "http://fixture.invalid", false)
+        .await
+        .unwrap();
+    assert_eq!(state.sources.read().await[0].health, "proxy_error");
+    *counters.quota.lock().await = None;
+    counters.quota_delay_ms.store(80, Ordering::SeqCst);
+    let prior = counters.quota_reads.load(Ordering::SeqCst);
+    let copy = state.clone();
+    let query = tokio::spawn(async move {
+        official::fixture::selected_snapshots_at(
+            &copy,
+            "official-a",
+            "http://fixture.invalid",
+            false,
+        )
+        .await
+        .unwrap()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while counters.quota_reads.load(Ordering::SeqCst) == prior {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    routing::mark_failure(&state, "official-a", 0, None).await;
+    query.await.unwrap();
+    assert_eq!(state.sources.read().await[0].health, "proxy_error");
     task.abort();
 }
 

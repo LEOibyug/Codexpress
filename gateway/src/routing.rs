@@ -292,6 +292,31 @@ pub async fn mark_failure(
     status: u16,
     retry_after: Option<u64>,
 ) {
+    mark_failure_reason(state, source_id, status, retry_after, None).await;
+}
+
+pub async fn mark_transport_failure(
+    state: &Arc<AppState>,
+    source_id: &str,
+    error: &reqwest::Error,
+) {
+    mark_failure_reason(
+        state,
+        source_id,
+        0,
+        None,
+        Some(crate::transport::failure_reason(error)),
+    )
+    .await;
+}
+
+async fn mark_failure_reason(
+    state: &Arc<AppState>,
+    source_id: &str,
+    status: u16,
+    retry_after: Option<u64>,
+    reason: Option<&str>,
+) {
     if let Some(runtime) = state
         .sources
         .write()
@@ -314,7 +339,8 @@ pub async fn mark_failure(
             _ => ("cooldown", "来源暂时不可用", Some(15)),
         };
         runtime.health = health.into();
-        runtime.last_error = Some(message.into());
+        runtime.health_revision = runtime.health_revision.wrapping_add(1);
+        runtime.last_error = Some(reason.unwrap_or(message).into());
         runtime.cooldown_until = delay.map(|seconds| now().saturating_add(seconds));
     }
 }
@@ -330,6 +356,7 @@ pub async fn mark_auth_preflight_failure(state: &Arc<AppState>, source: &Source)
             )
     }) {
         runtime.health = "proxy_error".into();
+        runtime.health_revision = runtime.health_revision.wrapping_add(1);
         runtime.last_error = Some("官方认证查询暂不可用".into());
         runtime.cooldown_until = Some(now() + 15);
     }
@@ -344,6 +371,7 @@ pub async fn mark_ready(state: &Arc<AppState>, source_id: &str) {
         .find(|r| r.source.id == source_id)
     {
         runtime.health = "ready".into();
+        runtime.health_revision = runtime.health_revision.wrapping_add(1);
         runtime.cooldown_until = None;
         runtime.last_error = None;
     }
@@ -383,6 +411,7 @@ pub async fn mark_rejection(
                 "auth_required"
             }
             .into();
+            runtime.health_revision = runtime.health_revision.wrapping_add(1);
             runtime.last_error = Some(
                 if exhausted {
                     "来源额度已耗尽"

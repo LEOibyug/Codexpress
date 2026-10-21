@@ -1328,14 +1328,17 @@ async fn forward_once(
                 Err(err) => {
                     let definitely_unsubmitted = err.is_connect();
                     attempt.finish("failed", None);
-                    routing::mark_failure(&state, &source.id, 0, None).await;
+                    routing::mark_transport_failure(&state, &source.id, &err).await;
                     if !definitely_unsubmitted || opaque_state {
                         return error(
                             StatusCode::BAD_GATEWAY,
                             "来源响应中断，提交结果不明确；未自动重试",
                         );
                     }
-                    last_error = Some(error(StatusCode::BAD_GATEWAY, "无法连接来源或指定代理"));
+                    last_error = Some(error(
+                        StatusCode::BAD_GATEWAY,
+                        transport::failure_reason(&err),
+                    ));
                     break;
                 }
             };

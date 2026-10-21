@@ -88,7 +88,7 @@ async fn fetch(source: &Source) -> Result<Vec<String>> {
     let mut response = request
         .send()
         .await
-        .map_err(|_| anyhow!("无法获取模型列表，请检查来源地址、网络或代理端口"))?;
+        .map_err(|e| anyhow!("获取模型列表{}", transport::failure_reason(&e)))?;
     if !response.status().is_success() {
         bail!(
             "获取模型列表失败（HTTP {}），请检查密钥或供应商接口",

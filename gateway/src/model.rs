@@ -128,6 +128,8 @@ pub struct SourceRuntime {
     pub last_error: Option<String>,
     pub quota: Value,
     pub credits: Value,
+    #[serde(skip)]
+    pub health_revision: u64,
 }
 
 impl SourceRuntime {
@@ -145,6 +147,7 @@ impl SourceRuntime {
             last_error: None,
             quota: Value::Null,
             credits: Value::Null,
+            health_revision: 0,
         }
     }
 }
