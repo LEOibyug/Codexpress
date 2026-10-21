@@ -661,7 +661,7 @@ fn scoped_session(parsed: &Value, parts: &axum::http::request::Parts) -> Option<
 }
 
 async fn forward(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response<Body> {
-    forward_once(state, request, None).await
+    forward_once(state, request, None, 0).await
 }
 
 fn strip_opaque_state(value: &mut Value) {
@@ -827,7 +827,15 @@ async fn forward_once(
     state: Arc<AppState>,
     request: Request<Body>,
     mut rebuild: Option<RebuildContext>,
+    replans: u8,
 ) -> Response<Body> {
+    let selected_revision = state.routing_revision.load(Ordering::Acquire);
+    if selected_revision % 2 != 0 {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "来源设置正在更新，请稍后重试",
+        );
+    }
     let degraded = rebuild.is_some();
     let mut prepared_route = rebuild.as_mut().and_then(|context| context.route.take());
     let planned_return = prepared_route.is_some();
@@ -1036,7 +1044,7 @@ async fn forward_once(
                     };
                     if let Some((retry, mut context)) = prepared {
                         context.route = Some(route);
-                        return Box::pin(forward_once(state, retry, Some(context))).await;
+                        return Box::pin(forward_once(state, retry, Some(context), replans)).await;
                     }
                 }
             }
@@ -1139,7 +1147,7 @@ async fn forward_once(
                     Ok(value) => value,
                     Err(response) => return *response,
                 };
-                return Box::pin(forward_once(state, retry, Some(context))).await;
+                return Box::pin(forward_once(state, retry, Some(context), replans)).await;
             }
         }
         return error(
@@ -1253,6 +1261,29 @@ async fn forward_once(
             candidate
         };
         for authentication_attempt in 0..2 {
+            let eligible = routing::candidates(&state, model, None)
+                .await
+                .iter()
+                .any(|candidate| {
+                    candidate.id == source.id && candidate.identity() == source.identity()
+                });
+            let current_revision = state.routing_revision.load(Ordering::Acquire);
+            if current_revision != selected_revision {
+                // OAuth and history preparation may await while the user edits
+                // sources. No inference has been submitted for this attempt.
+                drop(route_lease.take());
+                if current_revision % 2 != 0 || replans >= 3 {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "来源设置已变化，请稍后重试",
+                    );
+                }
+                let retry = Request::from_parts(parts, Body::from(bytes));
+                return Box::pin(forward_once(state, retry, rebuild, replans + 1)).await;
+            }
+            if !eligible {
+                break;
+            }
             let mut attempt = Attempt::new(state.clone(), &source, &request_id, model, input_units);
             if let Some(record) = &mut attempt.record {
                 record.token_details.service_tier = parsed["service_tier"]
@@ -1381,7 +1412,8 @@ async fn forward_once(
                                 Ok(value) => value,
                                 Err(response) => return *response,
                             };
-                            return Box::pin(forward_once(state, retry, Some(context))).await;
+                            return Box::pin(forward_once(state, retry, Some(context), replans))
+                                .await;
                         }
                         last_error = Some(error(
                             StatusCode::BAD_GATEWAY,
@@ -1473,7 +1505,7 @@ async fn forward_once(
                     Ok(value) => value,
                     Err(response) => return *response,
                 };
-                return Box::pin(forward_once(state, retry, Some(context))).await;
+                return Box::pin(forward_once(state, retry, Some(context), replans)).await;
             }
             let safe_to_fallback = binding.is_none()
                 && !opaque_state

@@ -264,6 +264,86 @@ async fn idle_return_requires_recovered_quota_and_failed_attempt_keeps_confirmed
 }
 
 #[tokio::test]
+async fn idle_return_uses_current_priority_for_both_official_and_api_conversations() {
+    for from_official in [true, false] {
+        let (dir, state, mut official, mut api) = state().await;
+        official.priority = 1;
+        api.priority = 0;
+        let mut low = api.clone();
+        low.id = "low-api".into();
+        low.priority = 2;
+        low.secret = json!({"api_key":"low-fixture"});
+        let from = if from_official {
+            official.clone()
+        } else {
+            low.clone()
+        };
+        *state.sources.write().await = vec![
+            SourceRuntime::new(official.clone()),
+            SourceRuntime::new(api.clone()),
+            SourceRuntime::new(low.clone()),
+        ];
+        let key = affinity::key("idle-priority-only", "m");
+        let mut lease = routing::reserve(&state, &from, Some(&key), false)
+            .await
+            .unwrap();
+        lease.commit().unwrap();
+        drop(lease);
+        drop(state);
+        let db = rusqlite::Connection::open(dir.path().join("affinity.sqlite")).unwrap();
+        db.execute(
+            "UPDATE affinity SET last_seen=?1",
+            [codexpress_gateway::model::now() - 86400],
+        )
+        .unwrap();
+        drop(db);
+        let restored = AppState::new(dir.path().to_owned(), 0, "fixture".into()).unwrap();
+        *restored.sources.write().await = vec![
+            SourceRuntime::new(official.clone()),
+            SourceRuntime::new(api.clone()),
+            SourceRuntime::new(low),
+        ];
+        quota(&restored, 20.0).await;
+        assert_eq!(
+            routing::candidates(&restored, "m", None).await[0].id,
+            api.id
+        );
+        let (target, lease) = routing::reserve_idle_return(&restored, "m", &key)
+            .await
+            .unwrap();
+        assert_eq!(target.id, api.id);
+        assert_eq!(target.kind, "api");
+        drop(lease);
+        restored.sources.write().await[1].source.enabled = false;
+        assert!(routing::candidates(&restored, "m", None)
+            .await
+            .iter()
+            .all(|s| s.id != api.id));
+        let next = routing::reserve_idle_return(&restored, "m", &key).await;
+        if from_official {
+            assert!(next.is_none());
+        } else {
+            assert_eq!(next.as_ref().unwrap().0.id, official.id);
+        }
+        drop(next);
+        restored.sources.write().await[1].source.enabled = true;
+        restored.sources.write().await[1].source.priority = 3;
+        let next = routing::reserve_idle_return(&restored, "m", &key).await;
+        if from_official {
+            assert!(next.is_none());
+        } else {
+            assert_eq!(next.as_ref().unwrap().0.id, official.id);
+        }
+        drop(next);
+        restored.sources.write().await[1].source.priority = 0;
+        restored.settings.write().await.mode = "fixed".into();
+        assert!(routing::reserve_idle_return(&restored, "m", &key)
+            .await
+            .is_none());
+    }
+}
+
+#[tokio::test]
 async fn stale_candidates_cannot_undo_migration_but_model_allowlist_changes_can_migrate() {
     let (_dir, state, official, api) = state().await;
     let key = affinity::key("stale-candidates", "m");

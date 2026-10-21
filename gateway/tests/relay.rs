@@ -1981,6 +1981,111 @@ async fn old_inflight_response_cannot_rebind_after_source_identity_changes() {
 }
 
 #[tokio::test]
+async fn routing_edits_while_auth_waits_replan_before_any_upstream_submission() {
+    for disable in [true, false] {
+        let official_hits = Arc::new(AtomicUsize::new(0));
+        let copy = official_hits.clone();
+        let (proxy, proxy_task) = serve(Router::new().fallback(move || {
+            let copy = copy.clone();
+            async move {
+                copy.fetch_add(1, Ordering::SeqCst);
+                StatusCode::BAD_GATEWAY
+            }
+        }))
+        .await;
+        let api_hits = Arc::new(AtomicUsize::new(0));
+        let copy = api_hits.clone();
+        let (api, api_task) = serve(Router::new().route(
+            "/responses",
+            post(move || {
+                let copy = copy.clone();
+                async move {
+                    copy.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(
+                        json!({"id":"after-edit","usage":{"input_tokens":1,"output_tokens":1}}),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let mut official = source(
+            "official-delayed",
+            "https://chatgpt.com/backend-api/codex",
+            0,
+        );
+        official.kind = "official".into();
+        official.account_id = Some("delayed-account".into());
+        official.proxy = ProxyPolicy {
+            mode: "explicit".into(),
+            url: Some(proxy),
+        };
+        official.secret = json!({"access_token":"fixture-access","account_id":"delayed-account","expires_at":codexpress_gateway::model::now()+3600});
+        let api_source = source("api-after-edit", &api, 1);
+        let (_dir, state) = state(vec![official.clone(), api_source]).await;
+        let token_lock = Arc::new(Mutex::new(()));
+        state
+            .official_locks
+            .lock()
+            .await
+            .insert("token:delayed-account".into(), token_lock.clone());
+        let guard = token_lock.lock().await;
+        let app = relay::router(state.clone());
+        let mut req = request(br#"{"model":"m","input":"portable"}"#);
+        req.headers_mut()
+            .insert("thread-id", "routing-edit-thread".parse().unwrap());
+        let pending = tokio::spawn(async move {
+            let response = app.oneshot(req).await.unwrap();
+            let status = response.status();
+            to_bytes(response.into_body(), 10000).await.unwrap();
+            status
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.affinity.active_count(&official) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut sources = state
+            .sources
+            .read()
+            .await
+            .iter()
+            .map(|r| {
+                let mut value = serde_json::to_value(&r.source).unwrap();
+                value["secret"] = r.source.secret.clone();
+                value
+            })
+            .collect::<Vec<_>>();
+        sources[0]["enabled"] = json!(!disable);
+        sources[0]["priority"] = json!(1);
+        sources[1]["priority"] = json!(0);
+        codexpress_gateway::management::dispatch(
+            &state,
+            "sync",
+            json!({"sources":sources,"mode":"auto"}),
+        )
+        .await
+        .unwrap();
+        drop(guard);
+        assert_eq!(pending.await.unwrap(), StatusCode::OK);
+        assert_eq!(
+            official_hits.load(Ordering::SeqCst),
+            0,
+            "old selection must not submit after disabling or reprioritizing"
+        );
+        assert_eq!(api_hits.load(Ordering::SeqCst), 1);
+        assert!(state.usage.summary(1).unwrap()["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["source_id"] == "api-after-edit"));
+        proxy_task.abort();
+        api_task.abort();
+    }
+}
+
+#[tokio::test]
 async fn expired_official_auth_preflight_can_migrate_portable_session_without_proxy_submission() {
     let (api, task) = serve(Router::new().route(
         "/responses",

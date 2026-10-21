@@ -4,7 +4,10 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize},
+        Arc,
+    },
 };
 use tokio::sync::{Mutex, RwLock};
 
@@ -174,6 +177,8 @@ fn default_low_quota() -> u8 {
 }
 
 pub struct AppState {
+    pub routing_revision: AtomicU64,
+    pub routing_sync: Mutex<()>,
     pub sources: RwLock<Vec<SourceRuntime>>,
     pub settings: RwLock<RoutingSettings>,
     pub bindings: Mutex<HashMap<String, String>>,
@@ -204,6 +209,8 @@ impl AppState {
     ) -> Result<Arc<Self>> {
         let usage = crate::usage::UsageStore::open(&state_dir.join("usage.sqlite"))?;
         Ok(Arc::new(Self {
+            routing_revision: AtomicU64::new(0),
+            routing_sync: Mutex::new(()),
             sources: RwLock::new(Vec::new()),
             settings: RwLock::new(RoutingSettings {
                 mode: "auto".into(),

@@ -241,7 +241,7 @@ struct RoutingView: View {
                         Text("24 小时").tag(1440)
                         Text("不自动回切").tag(0)
                     }.disabled(model.busy || model.routingMode == "fixed")
-                    Text("从上次请求结束计时。闲置到期后，下次请求可回到更高优先级的来源；官方账号需已恢复额度。")
+                    Text("从上次请求结束计时。闲置到期后按当前优先级回到可用来源，官方与 API 使用同一排序。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                     Divider().padding(.vertical, 3)
                     Toggle("无法续接时移除加密块并重建上下文", isOn: Binding(get: { model.settings.degradedContextFallback ?? true }, set: { model.changeContextFallback($0) }))

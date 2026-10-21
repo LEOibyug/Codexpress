@@ -106,6 +106,7 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
         }
         "models.list" => crate::discovery::list(state, payload).await,
         "sync" => {
+            let _routing_sync = state.routing_sync.lock().await;
             let sources: Vec<Source> =
                 serde_json::from_value(payload.get("sources").cloned().context("缺少来源列表")?)
                     .context("来源配置格式错误")?;
@@ -217,6 +218,9 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             tokio::task::spawn_blocking(move || usage.reprice_historical(&pricing_sources))
                 .await
                 .context("历史费用更新失败")??;
+            // Odd revisions describe publication in progress. Readers must not
+            // submit using a mixture of old routing settings and new sources.
+            state.routing_revision.fetch_add(1, Ordering::AcqRel);
             *current = next;
             // Keep the source write lock through binding invalidation. Relay
             // readers and binding writers use sources -> bindings consistently.
@@ -233,6 +237,7 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
                 degraded_context_fallback,
                 idle_return_minutes,
             };
+            state.routing_revision.fetch_add(1, Ordering::Release);
             Ok(credentials(state).await)
         }
         "usage" => state.usage.summary_filtered(
