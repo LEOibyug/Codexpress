@@ -27,7 +27,6 @@ struct UsageView: View {
                 HStack(spacing: 10) {
                     Button("API 价格表") { showingPrices = true }.controlSize(.small)
                     Picker("时间范围", selection: $days) { Text("近 24 小时").tag(1); Text("近 7 天").tag(7); Text("近 30 天").tag(30) }.labelsHidden().frame(width: 112)
-                    Button { refresh() } label: { Image(systemName: "arrow.clockwise") }.disabled(model.usageRefreshing || !model.running).help("刷新用量")
                 }
             }
             filters
@@ -48,7 +47,6 @@ struct UsageView: View {
                 }
             }
     }
-    private func refresh() { model.refreshUsage(days: days, sourceID: sourceID.isEmpty ? nil : sourceID, modelID: modelID.isEmpty ? nil : modelID) }
     private var filters: some View {
         HStack(spacing: 10) {
             Picker("来源", selection: $sourceID) { Text("全部来源").tag(""); ForEach(sources) { Text($0.name).tag($0.id) } }.labelsHidden().frame(maxWidth: 170)
