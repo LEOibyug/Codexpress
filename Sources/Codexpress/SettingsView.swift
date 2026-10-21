@@ -1,7 +1,7 @@
 import SwiftUI
 
 private enum SettingsPage: String, CaseIterable, Identifiable {
-    case sources = "来源", routing = "路由", usage = "用量", remote = "远端", chatbot = "聊天客户端", general = "设置"
+    case sources = "来源", routing = "路由", usage = "用量", remote = "远端", chatbot = "聊天客户端", images = "图片生成", general = "设置"
     var id: String { rawValue }
     var symbol: String {
         switch self {
@@ -10,6 +10,7 @@ private enum SettingsPage: String, CaseIterable, Identifiable {
         case .usage: return "chart.bar.xaxis"
         case .remote: return "desktopcomputer.and.arrow.down"
         case .chatbot: return "bubble.left.and.bubble.right"
+        case .images: return "photo"
         case .general: return "slider.horizontal.3"
         }
     }
@@ -57,6 +58,7 @@ struct SettingsView: View {
                     case .usage: UsageView()
                     case .remote: SSHRemoteView()
                     case .chatbot: ChatbotSettingsView()
+                    case .images: ImageSettingsView()
                     case .general: GeneralSettingsView()
                     }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)

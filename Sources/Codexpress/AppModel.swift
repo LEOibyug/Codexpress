@@ -568,6 +568,8 @@ import ServiceManagement
             if changed, self.running {
                 let chatbot = try await self.client.call("chatbot.status")
                 guard chatbot["port"].number != Double(port) else { throw AppError.message("此端口已用于聊天客户端接入，请选择不同端口。") }
+                let images = try await self.client.call("images.status")
+                guard images["port"].number != Double(port) else { throw AppError.message("此端口已用于图片生成，请选择不同端口。") }
             }
             if changed, FileManager.default.fileExists(atPath: self.directory.appendingPathComponent("config-attachment.json").path) { throw AppError.message("Codex 连接仍由本应用接管。请先预览并恢复接管前连接，再更改本地端口。") }
             var next = self.settings; next.port = port; if next.codexHome != codexHome { next.legacyProviderOrigins = nil }; next.codexHome = codexHome

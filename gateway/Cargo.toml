@@ -7,7 +7,7 @@ rust-version = "1.85"
 [dependencies]
 anyhow = "1"
 async-stream = "0.3"
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
 bytes = "1"
 futures-util = "0.3"

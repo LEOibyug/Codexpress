@@ -95,6 +95,9 @@ async fn run() -> Result<()> {
     if codexpress_gateway::chatbot::resume(&state).await.is_err() {
         eprintln!("聊天客户端入口未能启动，请在应用中检查其独立端口");
     }
+    if codexpress_gateway::images::resume(&state).await.is_err() {
+        eprintln!("图片生成入口未能启动，请在应用中检查其独立端口");
+    }
     let server = axum::serve(
         listener,
         codexpress_gateway::remote::router(state)

@@ -61,6 +61,12 @@ fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 impl ChatbotAccess {
+    pub(crate) fn port(&self) -> Result<u16> {
+        Ok(self.settings()?.port)
+    }
+    pub(crate) fn uses_key(&self, key: &str) -> Result<bool> {
+        Ok(self.settings()?.key == key)
+    }
     pub fn open(directory: &Path, main_port: u16, gateway_key: &str) -> Result<Self> {
         let path = directory.join("chatbot-access.json");
         let settings: Settings = match std::fs::symlink_metadata(&path) {
@@ -125,6 +131,9 @@ pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
     if next.port == state.port {
         bail!("聊天客户端端口不能与 Codex／SSH 网关端口相同");
     }
+    if next.port == state.images.port()? {
+        bail!("此端口已用于图片生成，请选择不同端口");
+    }
     if payload["regenerate_key"] == true {
         next.key = generate_key();
     } else if let Some(value) = payload.get("key") {
@@ -133,6 +142,9 @@ pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
     validate_key(&next.key)?;
     if next.key == state.gateway_key {
         bail!("聊天客户端 Key 不能与 Codex 网关 Key 相同");
+    }
+    if state.images.uses_key(&next.key)? {
+        bail!("聊天客户端与图片生成须使用不同 Key");
     }
     if state.remote.uses_key(&next.key)?
         || state

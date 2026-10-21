@@ -27,6 +27,7 @@
 - 自动获取模型列表，为不同模型设置上下文压缩阈值。
 - 通过 SSH 将远端 Codex 接入本机来源池，支持配置备份与还原。
 - 为聊天客户端提供独立的 OpenAI 兼容接口和模型列表。
+- 使用官方账号套餐额度生图，内置 Skill，复制提示词即可接入 Agent。
 
 <details>
 <summary>更多界面</summary>
@@ -37,6 +38,10 @@
     <td width="50%" align="center"><img src="docs/images/chatbot-settings.png" alt="聊天客户端接入页面"><br><sub>聊天客户端</sub></td>
   </tr>
 </table>
+<p align="center">
+  <img src="docs/images/image-generation.png" width="920" alt="图片生成设置：官方账号、独立接口和复制接入提示词">
+  <br><sub>官方套餐生图与 Agent 接入</sub>
+</p>
 <p align="center">
   <img src="docs/images/model-compaction.png" width="920" alt="按模型设置上下文压缩阈值">
   <br><sub>模型压缩设置</sub>
@@ -69,6 +74,8 @@ bash scripts/build.sh
 来源池模式下需保持 Codexpress 运行。停用前可在设置中恢复原连接；需要使用 Codex 原生官方功能时，可切换到「直接官方登录」。
 
 接入其他聊天软件时，在「聊天客户端」复制地址和 Key，按 OpenAI 兼容供应商填写即可。
+
+需要生图时，打开「图片生成」，复制接入提示词发给 Codex 或其他本机 Agent。Skill 和调用脚本已包含在应用内。
 
 代理设置、旧对话接续、SSH 接入和备份还原等操作见 [使用指南](docs/usage.md)。
 

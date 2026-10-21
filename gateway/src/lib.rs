@@ -8,6 +8,7 @@ pub mod continuity;
 pub mod credentials;
 pub mod discovery;
 pub mod history;
+pub mod images;
 pub mod management;
 pub mod model;
 pub mod notifications;

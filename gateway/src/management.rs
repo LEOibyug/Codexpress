@@ -60,6 +60,9 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
         "chatbot.status" => state.chatbot.status().await,
         "chatbot.key" => state.chatbot.key(),
         "chatbot.configure" => crate::chatbot::configure(state, payload).await,
+        "images.status" => state.images.status().await,
+        "images.key" => state.images.key(),
+        "images.configure" => crate::images::configure(state, payload).await,
         "remote.start" => {
             let port = payload["port"]
                 .as_u64()

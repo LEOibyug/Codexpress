@@ -10,4 +10,5 @@ fi
 cargo test --locked --manifest-path gateway/Cargo.toml
 cargo clippy --locked --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
 swift build
+python3 scripts/check-image-skill.py
 

@@ -17,6 +17,8 @@ cp gateway/target/release/codexpress-gateway "$app/Contents/MacOS/codexpress-gat
 cp Resources/Info.plist "$app/Contents/Info.plist"
 cp gateway/resources/CODEX-LICENSE "$app/Contents/Resources/CODEX-LICENSE"
 cp gateway/resources/CODEX-NOTICE "$app/Contents/Resources/CODEX-NOTICE"
+mkdir -p "$app/Contents/Resources/skills"
+cp -R Resources/skills/codexpress-image "$app/Contents/Resources/skills/"
 swift scripts/make-icon.swift "$project_root/dist/AppIcon.iconset"
 iconutil --convert icns "$project_root/dist/AppIcon.iconset" --output "$app/Contents/Resources/AppIcon.icns"
 codesign --force --sign - "$app/Contents/MacOS/codexpress-gateway"

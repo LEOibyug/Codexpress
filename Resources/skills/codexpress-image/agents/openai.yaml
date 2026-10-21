@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codexpress 图片生成"
+  short_description: "通过本机 Codexpress 官方账号生成或编辑图片，使用套餐额度"
+  default_prompt: "使用 $codexpress-image 按照我的需求生成或编辑图片。"
