@@ -5,7 +5,7 @@ struct MenuView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 15) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
                 Image(systemName: "arrow.triangle.branch").font(.system(size: 16, weight: .medium))
                     .foregroundStyle(.white).frame(width: 34, height: 34)
@@ -44,7 +44,7 @@ struct MenuView: View {
                     Spacer()
                     Text(model.routingMode == "auto" ? "自动切换" : "固定 · \(model.fixedName)").fontWeight(.medium)
                 }.font(.system(size: 11))
-                VStack(spacing: 10) {
+                VStack(spacing: 8) {
                     ForEach(Array(model.sources.prefix(4))) { source in
                         HStack(alignment: .top, spacing: 9) {
                             ActivityDot(color: source.enabled && model.state(source.id)["health"].string == "ready" ? .green : .secondary,
@@ -87,7 +87,7 @@ struct MenuView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(alignment: .firstTextBaseline, spacing: 4) {
                             Text(window.title).foregroundStyle(.secondary)
-                            Text(window.remainingLabel).font(.system(size: 14, weight: .semibold, design: .rounded))
+                            Text(window.remainingLabel).font(AccountTypography.compactValue)
                                 .monospacedDigit().foregroundStyle(AccountLevel.quota(window.remaining).color)
                                 .accessibilityLabel("剩余 \(window.remainingLabel)")
                         }.font(.system(size: 10))

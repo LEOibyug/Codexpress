@@ -13,15 +13,11 @@ struct APIBalanceView: View {
             Text("余额").foregroundStyle(.secondary)
             if !compact { Spacer(minLength: 8) }
             if let amount, amount.isFinite, let currency = balance["currency"].string {
-                let money = BalanceAmount(amount, currency: currency)
-                HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text(money.unit).font(.system(size: compact ? 10 : 12, weight: .medium))
-                    Text(money.number).font(.system(size: compact ? 14 : 18, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
-                }.foregroundStyle(AccountLevel.balance(amount, threshold: model.sources.first { $0.id == sourceID }?.balanceWarningThreshold).color)
-                    .textSelection(.enabled).lineLimit(1).minimumScaleFactor(0.8)
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(balanceMoney(amount, currency: currency))
+                Text(balanceMoney(amount, currency: currency))
+                    .font(compact ? AccountTypography.compactValue : .system(size: 18, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(AccountLevel.balance(amount, threshold: model.sources.first { $0.id == sourceID }?.balanceWarningThreshold).color)
+                    .textSelection(.enabled).lineLimit(1).minimumScaleFactor(1)
                 if balance["stale"].bool == true && !model.refreshingBalances.contains(sourceID) {
                     Image(systemName: "clock").foregroundStyle(.orange).help("更新失败，显示上次获取的余额")
                 }

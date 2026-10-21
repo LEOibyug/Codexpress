@@ -1,5 +1,9 @@
 import SwiftUI
 
+enum AccountTypography {
+    static let compactValue = Font.system(size: 16, weight: .semibold, design: .rounded)
+}
+
 enum AccountLevel {
     case unknown, healthy, caution, low
 
