@@ -14,12 +14,16 @@ struct SourceEditor: View {
     @State private var fetchID = UUID()
     @State private var localError: String?
     @State private var saving = false
+    @State private var balanceWarningEnabled = false
+    @State private var balanceWarningAmount = ""
 
     init(source: Source, isNew: Bool) {
         _source = State(initialValue: source); self.isNew = isNew
         _modelsText = State(initialValue: source.models.joined(separator: ", "))
         _automaticModels = State(initialValue: source.discoversModels)
         _proxyPort = State(initialValue: source.proxy.localPort ?? "")
+        _balanceWarningEnabled = State(initialValue: source.balanceWarningThreshold != nil)
+        _balanceWarningAmount = State(initialValue: source.balanceWarningThreshold.map { String($0) } ?? "")
     }
 
     private var discoveryInput: [String] {
@@ -60,6 +64,15 @@ struct SourceEditor: View {
                     Toggle("启用此来源", isOn: $source.enabled).toggleStyle(.switch).controlSize(.small)
                 }
                 if !source.official {
+                    Section("余额预警") {
+                        Toggle("余额不足时通知", isOn: $balanceWarningEnabled)
+                            .toggleStyle(.switch).controlSize(.small)
+                        if balanceWarningEnabled {
+                            TextField("预警余额", text: $balanceWarningAmount, prompt: Text("例如 10"))
+                            Text("余额不高于此金额时发送系统通知，币种以供应商返回的余额为准。")
+                                .font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                    }
                     Section("费用估算") {
                         Toggle("订阅来源", isOn: Binding(get: { source.is_subscription ?? false }, set: { source.is_subscription = $0 }))
                             .toggleStyle(.switch).controlSize(.small)
@@ -162,6 +175,12 @@ struct SourceEditor: View {
         Task {
             do {
                 var draft = try configuredSource()
+                if !draft.official, balanceWarningEnabled {
+                    guard let threshold = Double(balanceWarningAmount.trimmingCharacters(in: .whitespacesAndNewlines)), threshold.isFinite, threshold >= 0 else {
+                        throw AppError.message("预警余额须为大于或等于 0 的金额。")
+                    }
+                    draft.balanceWarningThreshold = threshold
+                } else { draft.balanceWarningThreshold = nil }
                 draft.automaticModelDiscovery = automaticModels
                 if !automaticModels {
                     draft.models = Array(Set(modelsText.split(whereSeparator: { $0 == "," || $0 == "，" }).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()

@@ -56,6 +56,7 @@ import ServiceManagement
     private var usageSourceID: String?
     private var usageModelID: String?
     private var lastPollingError: String?
+    private var balanceWarnings: BalanceWarnings?
     var sources: [Source] { settings.sources.sorted { $0.priority < $1.priority } }
     var baseURL: String { status["base_url"].string ?? "http://127.0.0.1:\(settings.port)/v1" }
     var routingMode: String { status["mode"].string ?? settings.mode }
@@ -76,6 +77,10 @@ import ServiceManagement
         metadata = MetadataStore(directory: directory)
         client = GatewayClient(socketPath: directory.appendingPathComponent("control.sock").path)
         do { settings = try metadata.load() } catch { metadataLoadFailed = true; self.error = "来源文件无法读取，已进入只读保护。原文件未改动，请从备份修复后重新启动应用。" }
+        do {
+            balanceWarnings = try BalanceWarnings(directory: directory)
+            if !metadataLoadFailed { try balanceWarnings?.retain(sources: settings.sources) }
+        } catch { notice = "无法读取余额预警记录，余额预警暂不可用。"; balanceWarnings = nil }
         // Merely display the path; reading/modifying it requires explicit preview/attach actions.
         if settings.codexHome.isEmpty { settings.codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path }
         do {
@@ -173,6 +178,8 @@ import ServiceManagement
         try requireWritableMetadata()
         try metadata.save(next)
         settings = next
+        do { try balanceWarnings?.retain(sources: next.sources) }
+        catch { notice = "无法更新余额预警记录，请检查应用数据目录的写入权限。" }
     }
     func refreshCredentialStorage() async {
         guard canManageCredentials, !busy else { return }
@@ -302,6 +309,7 @@ import ServiceManagement
                 guard running, let current = settings.sources.first(where: { $0.id == id }), current.base_url == before.base_url, current.proxy == before.proxy,
                       (try? credentialSnapshot.load(id)) == credential else { return }
                 apiBalances[id] = balance
+                await checkBalanceWarning(source: current, balance: balance, credential: credential)
             } catch {
                 guard settings.sources.contains(where: { $0.id == id && $0.base_url == before.base_url && $0.proxy == before.proxy }),
                       (try? credentialSnapshot.load(id)) == credential else { return }
@@ -310,6 +318,15 @@ import ServiceManagement
                 } else { apiBalances[id] = .object(["status": .string("unavailable")]) }
             }
         }
+    }
+    private func checkBalanceWarning(source: Source, balance: JSONValue, credential: JSONValue?) async {
+        guard Bundle.main.bundleIdentifier == "local.codexpress.mac", let key = credential?["api_key"].string, !key.isEmpty else { return }
+        do {
+            guard let event = try balanceWarnings?.evaluate(source: source, balance: balance, apiKey: key) else { return }
+            let result = await LocalNotifications.shared.deliver([event])
+            if let text = result.undelivered { notice = text }
+            try balanceWarnings?.acknowledge(result.ids)
+        } catch { notice = "无法保存余额预警记录，请检查应用数据目录的写入权限。" }
     }
     func perform(_ action: @escaping () async throws -> Void) {
         guard !busy else { return }; busy = true; error = nil; notice = nil

@@ -54,6 +54,7 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
     var name = ""
     var kind = "api"
     var is_subscription: Bool? = nil
+    var balanceWarningThreshold: Double? = nil
     var base_url = "https://api.openai.com/v1"
     var enabled = true
     var priority = 0
@@ -68,6 +69,9 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
         var s = Source(); s.kind = "official"; s.name = "官方账号"; s.base_url = "https://chatgpt.com/backend-api/codex"; s.proxy.mode = "explicit"; return s
     }
     func validate() throws {
+        if let threshold = balanceWarningThreshold, !threshold.isFinite || threshold < 0 {
+            throw AppError.message("预警余额须为大于或等于 0 的金额。")
+        }
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw AppError.message("请填写来源名称。") }
         guard let u = URLComponents(string: base_url), ["http", "https"].contains(u.scheme?.lowercased() ?? ""), u.host != nil, u.user == nil, u.password == nil, u.query == nil, u.fragment == nil else { throw AppError.message("来源地址须为不含账号、密码、查询参数的 HTTP 或 HTTPS 地址。") }
         guard !official || base_url.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == "https://chatgpt.com/backend-api/codex" else { throw AppError.message("官方来源必须使用官方 Codex 地址。") }
