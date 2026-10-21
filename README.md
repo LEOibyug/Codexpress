@@ -34,9 +34,13 @@
 <table>
   <tr>
     <td width="50%" align="center"><img src="docs/images/sources-clean.png" alt="来源管理页面"><br><sub>来源管理</sub></td>
-    <td width="50%" align="center"><img src="docs/images/model-compaction.png" alt="模型压缩设置页面"><br><sub>模型设置</sub></td>
+    <td width="50%" align="center"><img src="docs/images/chatbot-settings.png" alt="聊天客户端接入页面"><br><sub>聊天客户端</sub></td>
   </tr>
 </table>
+<p align="center">
+  <img src="docs/images/model-compaction.png" width="920" alt="按模型设置上下文压缩阈值">
+  <br><sub>模型压缩设置</sub>
+</p>
 <p align="center">
   <img src="docs/images/official-weekly-menu.png" width="300" alt="菜单栏面板显示官方短周期和周额度">
   <br><sub>菜单栏面板</sub>
