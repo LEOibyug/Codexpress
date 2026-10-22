@@ -98,6 +98,39 @@ private struct EditingSource: Identifiable {
     var id: String { source.id }
 }
 
+private struct SourceCapacityLabel: View {
+    let source: Source
+    let admission: JSONValue
+    var showsRoutingNote = false
+
+    private var active: Int? { admission["capacity_active_conversations"].number.map { Int($0) } }
+    private var limit: Int? {
+        active != nil ? admission["max_active_conversations"].number.map { Int($0) } : source.max_active_conversations
+    }
+    private var isFull: Bool { limit != nil && admission["capacity_available"].bool == false }
+    private var label: String? {
+        let capacity: String?
+        if let active {
+            capacity = limit.map { "对话 \(active)/\($0)" + (isFull ? " · 已满" : "") } ?? "活跃 \(active) · 不限"
+        } else { capacity = limit.map { "对话上限 \($0)" } }
+        guard let capacity else { return nil }
+        guard showsRoutingNote, source.official, !isFull,
+              let note = admission["routing_note"].string, !note.isEmpty else { return capacity }
+        return capacity + " · " + note
+    }
+    private var help: String {
+        let seconds = admission["activity_window_seconds"].number.map { Int($0) } ?? source.activeConversationWindowSeconds
+        return "进行中的请求持续占用名额；结束后闲置 \(seconds) 秒释放，同一对话使用同一模型时复用名额。"
+    }
+
+    var body: some View {
+        if let label {
+            Text(label).monospacedDigit().foregroundStyle(isFull ? Color.orange : Color.secondary)
+                .lineLimit(1).help(help)
+        }
+    }
+}
+
 struct SourcesView: View {
     @EnvironmentObject var model: AppModel
     @State private var editing: EditingSource?
@@ -172,8 +205,12 @@ struct SourcesView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text(source.base_url).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
                     .textSelection(.enabled).lineLimit(2)
-                Label(source.policyLabel + (source.proxy.url.map { " · \($0)" } ?? ""), systemImage: source.proxy.mode == "direct" ? "network" : "shield.lefthalf.filled")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Label(source.policyLabel + (source.proxy.url.map { " · \($0)" } ?? ""), systemImage: source.proxy.mode == "direct" ? "network" : "shield.lefthalf.filled")
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    SourceCapacityLabel(source: source, admission: model.state(source.id)["admission"]).fixedSize()
+                }.font(.system(size: 11)).foregroundStyle(.secondary)
                 HStack(spacing: 8) {
                     Label(source.models.isEmpty ? (source.discoversModels ? "尚未获取模型" : "未限定模型") : "\(source.models.count) 个模型", systemImage: "square.stack.3d.up")
                     Spacer()
@@ -266,7 +303,10 @@ struct RoutingView: View {
                                     VStack(alignment: .leading, spacing: 4) {
                                         Text(source.name).font(.system(size: 13, weight: .medium))
                                         Text(source.policyLabel).font(.system(size: 11)).foregroundStyle(.secondary)
-                                        if let active = model.state(source.id)["admission"]["active_conversations"].number {
+                                        if model.state(source.id)["admission"]["capacity_active_conversations"].number != nil || source.max_active_conversations != nil {
+                                            SourceCapacityLabel(source: source, admission: model.state(source.id)["admission"], showsRoutingNote: true)
+                                                .font(.system(size: 10))
+                                        } else if let active = model.state(source.id)["admission"]["active_conversations"].number {
                                             Text("\(Int(active)) 个活跃对话" + (source.official ? " · \(model.state(source.id)["admission"]["routing_note"].string ?? "")" : ""))
                                                 .font(.system(size: 10)).foregroundStyle(.secondary)
                                         }

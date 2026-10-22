@@ -2,7 +2,7 @@ use axum::{
     body::{to_bytes, Body},
     extract::Request,
     http::StatusCode,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::post,
     Router,
 };
@@ -38,6 +38,8 @@ fn source(id: &str, base: &str, priority: i32) -> Source {
         base_url: base.into(),
         enabled: true,
         priority,
+        max_active_conversations: None,
+        active_conversation_window_seconds: 15,
         proxy: ProxyPolicy {
             mode: "direct".into(),
             url: None,
@@ -824,6 +826,500 @@ async fn explicit_invalid_ciphertext_can_rebuild_once_without_replaying_unknown_
 }
 
 #[tokio::test]
+async fn unknown_context_ids_reach_the_upstream_before_missing_local_history_is_rejected() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let copy = seen.clone();
+    let (address, task) = serve(Router::new().route(
+        "/responses",
+        post(move |req: Request| {
+            let copy = copy.clone();
+            async move {
+                let body: Value =
+                    serde_json::from_slice(&to_bytes(req.into_body(), 10000).await.unwrap())
+                        .unwrap();
+                assert!(
+                    body.get("previous_response_id").is_some()
+                        || body.get("conversation").is_some()
+                );
+                copy.lock().await.push(body);
+                axum::Json(json!({"id":"still-valid","status":"completed","output":[]}))
+            }
+        }),
+    ))
+    .await;
+    let (_dir, state) = state(vec![source("a", &address, 0)]).await;
+    state.settings.write().await.degraded_context_fallback = true;
+    state.history.configure(true, 64_000_000).unwrap();
+    for body in [
+        json!({"model":"m","previous_response_id":"unobserved-response","input":"next"}),
+        json!({"model":"m","conversation":{"id":"unobserved-conversation"},"input":"next"}),
+    ] {
+        // A client must not spend its five reconnects on a local mapping miss.
+        let response = relay::router(state.clone())
+            .oneshot(request(&serde_json::to_vec(&body).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+    }
+    assert_eq!(seen.lock().await.len(), 2);
+    assert!(state.notifications.list().is_empty());
+    task.abort();
+}
+
+#[tokio::test]
+async fn anonymous_request_can_use_its_reserved_capacity_without_admitting_another_request() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let entered_copy = entered.clone();
+    let release_copy = release.clone();
+    let (address, task) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let entered = entered_copy.clone();
+            let release = release_copy.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                axum::Json(json!({"id":"anonymous-result","status":"completed","output":[]}))
+            }
+        }),
+    ))
+    .await;
+    let mut limited = source("limited", &address, 0);
+    limited.max_active_conversations = Some(1);
+    let (_dir, state) = state(vec![limited]).await;
+    let app = relay::router(state);
+    let pending_app = app.clone();
+    let pending = tokio::spawn(async move {
+        let response = pending_app
+            .oneshot(request(br#"{"model":"m","input":"anonymous first"}"#))
+            .await
+            .unwrap();
+        let status = response.status();
+        to_bytes(response.into_body(), 10000).await.unwrap();
+        status
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    let response = app
+        .oneshot(request(br#"{"model":"m","input":"anonymous second"}"#))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    release.notify_one();
+    assert_eq!(pending.await.unwrap(), StatusCode::OK);
+    task.abort();
+}
+
+#[tokio::test]
+async fn unknown_response_id_uses_the_known_thread_origin_before_source_priority() {
+    let other_hits = Arc::new(AtomicUsize::new(0));
+    let copy = other_hits.clone();
+    let (other, other_task) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let copy = copy.clone();
+            async move {
+                copy.fetch_add(1, Ordering::Relaxed);
+                StatusCode::IM_A_TEAPOT
+            }
+        }),
+    ))
+    .await;
+    let (origin, origin_task) = serve(Router::new().route(
+        "/responses",
+        post(|req: Request| async move {
+            let body: Value =
+                serde_json::from_slice(&to_bytes(req.into_body(), 10000).await.unwrap()).unwrap();
+            assert_eq!(body["previous_response_id"], "unobserved-response");
+            axum::Json(json!({"id":"accepted","status":"completed","output":[]}))
+        }),
+    ))
+    .await;
+    let (_dir, state) = state(vec![
+        source("other", &other, 0),
+        source("origin", &origin, 1),
+    ])
+    .await;
+    state
+        .bindings
+        .lock()
+        .await
+        .insert("thread:known-thread".into(), "origin".into());
+    let mut req =
+        request(br#"{"model":"m","previous_response_id":"unobserved-response","input":"next"}"#);
+    req.headers_mut()
+        .insert("thread-id", "known-thread".parse().unwrap());
+    let response = relay::router(state).oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert_eq!(other_hits.load(Ordering::Relaxed), 0);
+    other_task.abort();
+    origin_task.abort();
+}
+
+#[tokio::test]
+async fn unknown_response_id_probes_other_candidates_only_after_explicit_not_found() {
+    for known_thread_hint in [false, true] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let copy = seen.clone();
+        let (first, first_task) = serve(Router::new().route(
+            "/responses",
+            post(move |req: Request| {
+                let copy = copy.clone();
+                async move {
+                    let bytes = to_bytes(req.into_body(), 10000).await.unwrap();
+                    copy.lock().await.push(bytes);
+                    (
+                        StatusCode::NOT_FOUND,
+                        axum::Json(json!({"error":{"code":"response_not_found"}})),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let copy = seen.clone();
+        let (second, second_task) = serve(Router::new().route(
+            "/responses",
+            post(move |req: Request| {
+                let copy = copy.clone();
+                async move {
+                    let bytes = to_bytes(req.into_body(), 10000).await.unwrap();
+                    copy.lock().await.push(bytes);
+                    axum::Json(json!({"id":"found-on-second","status":"completed","output":[]}))
+                }
+            }),
+        ))
+        .await;
+        let original = source("first", &first, if known_thread_hint { 1 } else { 0 });
+        let (_dir, state) = state(vec![
+            original.clone(),
+            source("second", &second, if known_thread_hint { 0 } else { 1 }),
+        ])
+        .await;
+        state.history.configure(true, 64_000_000).unwrap();
+        if known_thread_hint {
+            state
+                .bindings
+                .lock()
+                .await
+                .insert("thread:hinted-thread".into(), "first".into());
+            let key = codexpress_gateway::affinity::key("thread:hinted-thread", "m");
+            let mut lease = routing::reserve_for_model(&state, &original, Some(&key), false, "m")
+                .await
+                .unwrap();
+            lease.commit().unwrap();
+        }
+        let wire = br#"{ "model":"m", "previous_response_id":"unknown-valid-id", "input":"next" }"#;
+        let mut req = request(wire);
+        if known_thread_hint {
+            req.headers_mut()
+                .insert("thread-id", "hinted-thread".parse().unwrap());
+        }
+        let response = relay::router(state).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|bytes| bytes.as_ref() == wire));
+        first_task.abort();
+        second_task.abort();
+    }
+}
+
+#[tokio::test]
+async fn unknown_response_id_can_probe_after_sse_rejection_with_rebuild_disabled() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let copy = seen.clone();
+    let (first, first_task) = serve(Router::new().route("/responses", post(move |req: Request| {
+        let copy = copy.clone();
+        async move {
+            copy.lock().await.push(to_bytes(req.into_body(), 10000).await.unwrap());
+            Response::builder().header("content-type", "text/event-stream").body(Body::from(concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"unaccepted\",\"output\":[]}}\n\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"previous_response_not_found\"}}}\n\n"
+            ))).unwrap()
+        }
+    }))).await;
+    let copy = seen.clone();
+    let (second, second_task) = serve(Router::new().route(
+        "/responses",
+        post(move |req: Request| {
+            let copy = copy.clone();
+            async move {
+                copy.lock()
+                    .await
+                    .push(to_bytes(req.into_body(), 10000).await.unwrap());
+                axum::Json(
+                    json!({"id":"found-after-sse-rejection","status":"completed","output":[]}),
+                )
+            }
+        }),
+    ))
+    .await;
+    let (_dir, state) = state(vec![
+        source("first", &first, 0),
+        source("second", &second, 1),
+    ])
+    .await;
+    assert!(!state.settings.read().await.degraded_context_fallback);
+    state.history.configure(true, 64_000_000).unwrap();
+    let wire = br#"{ "model":"m", "stream":true, "previous_response_id":"unknown-valid-id", "input":"next" }"#;
+    let response = relay::router(state.clone())
+        .oneshot(request(wire))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap()).unwrap();
+    assert_eq!(body["id"], "found-after-sse-rejection");
+    let seen = seen.lock().await;
+    assert_eq!(seen.len(), 2);
+    assert!(seen.iter().all(|bytes| bytes.as_ref() == wire));
+    assert!(state.notifications.list().is_empty());
+    first_task.abort();
+    second_task.abort();
+}
+
+#[tokio::test]
+async fn unknown_response_id_probe_budget_stops_after_five_explicit_rejections() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let copy = hits.clone();
+    let (address, task) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let copy = copy.clone();
+            async move {
+                copy.fetch_add(1, Ordering::Relaxed);
+                (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(json!({"error":{"code":"response_not_found"}})),
+                )
+            }
+        }),
+    ))
+    .await;
+    let (_dir, state) = state(
+        (0..7)
+            .map(|index| source(&format!("candidate-{index}"), &address, index))
+            .collect(),
+    )
+    .await;
+    let response = relay::router(state)
+        .oneshot(request(
+            br#"{"model":"m","previous_response_id":"unknown","input":"next"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert_eq!(hits.load(Ordering::Relaxed), 5);
+    task.abort();
+}
+
+#[tokio::test]
+async fn rejected_response_id_rebuilds_cached_history_and_hands_off_in_one_client_request() {
+    for (sse, legacy_origin, body_conversation) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let original_hits = Arc::new(AtomicUsize::new(0));
+        let copy = original_hits.clone();
+        let (origin, origin_task) = serve(Router::new().route("/responses", post(move |req: Request| {
+            let copy = copy.clone();
+            async move {
+                let body: Value = serde_json::from_slice(&to_bytes(req.into_body(), 10000).await.unwrap()).unwrap();
+                copy.fetch_add(1, Ordering::Relaxed);
+                if body.get("previous_response_id").is_none() {
+                    return axum::Json(json!({"id":"lost-parent","status":"completed","output":[{"role":"assistant","content":"prior answer"}]})).into_response();
+                }
+                if sse {
+                    Response::builder().header("content-type", "text/event-stream").body(Body::from(concat!(
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"failed-attempt\",\"output\":[]}}\n\n",
+                        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"output\":[],\"error\":{\"code\":\"previous_response_not_found\"}}}\n\n"
+                    ))).unwrap()
+                } else {
+                    (StatusCode::BAD_REQUEST, axum::Json(json!({"error":{"type":"invalid_request_error","message":"Previous response with id 'lost-parent' not found."}}))).into_response()
+                }
+            }
+        }))).await;
+        let handed_off = Arc::new(AtomicUsize::new(0));
+        let copy = handed_off.clone();
+        let (next, next_task) = serve(Router::new().route(
+            "/responses",
+            post(move |req: Request| {
+                let copy = copy.clone();
+                async move {
+                    if body_conversation {
+                        assert!(!req.headers().contains_key("thread-id"));
+                        assert!(!req.headers().contains_key("session-id"));
+                    }
+                    let body: Value =
+                        serde_json::from_slice(&to_bytes(req.into_body(), 10000).await.unwrap())
+                            .unwrap();
+                    if body.get("previous_response_id").is_some() {
+                        assert!(body_conversation);
+                        assert_eq!(body["previous_response_id"], "continued");
+                        assert_eq!(body["conversation_id"], "body-only-handoff");
+                        assert_eq!(body["input"][0]["content"], "after handoff");
+                        copy.fetch_add(1, Ordering::Relaxed);
+                        return axum::Json(
+                            json!({"id":"next-turn","status":"completed","output":[]}),
+                        );
+                    }
+                    assert!(body.get("previous_response_id").is_none());
+                    assert_eq!(body["input"][0]["content"], "original question");
+                    assert_eq!(body["input"][1]["content"], "prior answer");
+                    assert_eq!(body["input"][2]["content"], "next question");
+                    copy.fetch_add(1, Ordering::Relaxed);
+                    axum::Json(json!({"id":"continued","status":"completed","output":[]}))
+                }
+            }),
+        ))
+        .await;
+        let (_dir, state) =
+            state(vec![source("origin", &origin, 0), source("next", &next, 1)]).await;
+        state.settings.write().await.degraded_context_fallback = true;
+        state.history.configure(true, 64_000_000).unwrap();
+        let credential = if legacy_origin {
+            let home = state.state_dir.join("fixture-home");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::write(home.join("config.toml"), format!("model_provider=\"old\"\n[model_providers.old]\nname=\"Old\"\nbase_url=\"{origin}\"\nwire_api=\"responses\"\n")).unwrap();
+            let original = state.sources.read().await[0].source.clone();
+            codexpress_gateway::config::handle(&state, "config.attach", json!({"codex_home":home,"provider_origins":[{"provider_id":"old","source_id":"origin","source_identity":original.identity(),"confirmed":true}]})).await.unwrap();
+            let doc = std::fs::read_to_string(home.join("config.toml"))
+                .unwrap()
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            doc["model_providers"]["old"]["experimental_bearer_token"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        } else {
+            "local-key".into()
+        };
+        let make_request = |body: &[u8]| {
+            let mut req = if body_conversation {
+                let mut value: Value = serde_json::from_slice(body).unwrap();
+                value["conversation_id"] = json!("body-only-handoff");
+                request(&serde_json::to_vec(&value).unwrap())
+            } else {
+                let mut req = request(body);
+                req.headers_mut()
+                    .insert("thread-id", "live-handoff-thread".parse().unwrap());
+                req
+            };
+            req.headers_mut().insert(
+                "authorization",
+                format!("Bearer {credential}").parse().unwrap(),
+            );
+            req
+        };
+        let response = relay::router(state.clone())
+            .oneshot(make_request(
+                br#"{"model":"m","input":[{"role":"user","content":"original question"}]}"#,
+            ))
+            .await
+            .unwrap();
+        to_bytes(response.into_body(), 10000).await.unwrap();
+        let session = if body_conversation {
+            "session:body-only-handoff"
+        } else {
+            "thread:live-handoff-thread"
+        };
+        let key = codexpress_gateway::affinity::key(session, "m");
+        let all = state
+            .sources
+            .read()
+            .await
+            .iter()
+            .map(|runtime| runtime.source.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state.affinity.preferred(&key, &all).as_deref(),
+            Some("origin")
+        );
+        let response = relay::router(state.clone()).oneshot(make_request(&serde_json::to_vec(&json!({"model":"m","stream":sse,"previous_response_id":"lost-parent","input":[{"role":"user","content":"next question"}]})).unwrap())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap()).unwrap();
+        assert_eq!(body["id"], "continued");
+        assert_eq!(original_hits.load(Ordering::Relaxed), 2);
+        assert_eq!(handed_off.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.affinity.preferred(&key, &all).as_deref(),
+            Some("next")
+        );
+        if body_conversation {
+            assert_eq!(
+                state.bindings.lock().await.get(session).map(String::as_str),
+                Some("next")
+            );
+            let response = relay::router(state.clone()).oneshot(make_request(br#"{"model":"m","previous_response_id":"continued","input":[{"role":"user","content":"after handoff"}]}"#)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["id"], "next-turn");
+            assert_eq!(handed_off.load(Ordering::Relaxed), 2);
+            assert_eq!(original_hits.load(Ordering::Relaxed), 2);
+        }
+        origin_task.abort();
+        next_task.abort();
+    }
+}
+
+#[tokio::test]
+async fn unknown_errors_and_streams_with_output_never_replay_context_requests() {
+    for (status, content_type, wire) in [
+        (StatusCode::BAD_REQUEST, "application/json", r#"{"error":{"code":"invalid_request_error","message":"previous_response_id is not supported for this model"}}"#),
+        (StatusCode::OK, "text/event-stream", "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\"}}}\n\n"),
+        (StatusCode::OK, "text/event-stream", concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"already generated\"}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"previous_response_not_found\"}}}\n\n"
+        )),
+        (StatusCode::OK, "text/event-stream", concat!(
+            "data: {\"type\":\"response.refusal.delta\",\"delta\":\"already refused\"}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"previous_response_not_found\"}}}\n\n"
+        )),
+        (StatusCode::OK, "text/event-stream", concat!(
+            "data: {\"type\":\"response.audio.delta\",\"delta\":\"fixture-audio\"}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"previous_response_not_found\"}}}\n\n"
+        )),
+        (StatusCode::OK, "text/event-stream", concat!(
+            "data: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image_b64\":\"fixture-image\"}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"previous_response_not_found\"}}}\n\n"
+        )),
+    ] {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let copy = hits.clone();
+        let (origin, task) = serve(Router::new().route("/responses", post(move || {
+            let copy = copy.clone();
+            async move {
+                copy.fetch_add(1, Ordering::Relaxed);
+                Response::builder().status(status).header("content-type", content_type).body(Body::from(wire)).unwrap().into_response()
+            }
+        }))).await;
+        let (_dir, state) = state(vec![
+            source("origin", &origin, 0),
+            source("other", &origin, 1),
+        ])
+        .await;
+        state.settings.write().await.degraded_context_fallback = true;
+        state.bindings.lock().await.insert("parent".into(), "origin".into());
+        let response = relay::router(state).oneshot(request(br#"{"model":"m","stream":true,"previous_response_id":"parent","input":"next"}"#)).await.unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(to_bytes(response.into_body(), 10000).await.unwrap().as_ref(), wire.as_bytes());
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        task.abort();
+    }
+}
+
+#[tokio::test]
 async fn scoped_origin_migrates_once_preserves_new_ciphertext_and_survives_recovery_and_restart() {
     let original_hits = Arc::new(AtomicUsize::new(0));
     let copy = original_hits.clone();
@@ -928,9 +1424,17 @@ async fn degraded_fallback_removes_only_wire_state_and_notifies_once_while_offic
         post(move |req: Request| {
             let copy = copy.clone();
             async move {
-                assert!(!req.headers().contains_key("x-codex-turn-state"));
+                let has_turn_state = req.headers().contains_key("x-codex-turn-state");
                 let body = to_bytes(req.into_body(), 10000).await.unwrap();
                 let value: Value = serde_json::from_slice(&body).unwrap();
+                if value.get("previous_response_id").is_some() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(json!({"error":{"code":"previous_response_not_found"}})),
+                    )
+                        .into_response();
+                }
+                assert!(!has_turn_state);
                 assert!(value.get("previous_response_id").is_none());
                 assert!(value.get("conversation").is_none());
                 assert_eq!(value["input"].as_array().unwrap().len(), 2);
@@ -941,6 +1445,7 @@ async fn degraded_fallback_removes_only_wire_state_and_notifies_once_while_offic
                 axum::Json(
                     json!({"id":"fresh-response","usage":{"input_tokens":30,"output_tokens":5}}),
                 )
+                .into_response()
             }
         }),
     ))
@@ -1047,7 +1552,9 @@ async fn confirmed_legacy_origin_bootstraps_old_opaque_context_only_to_matching_
             .await
             .unwrap()
             .status(),
-        StatusCode::CONFLICT
+        // With no local mapping, try the priority candidate unchanged. Its
+        // connection failure must not replay opaque context to another source.
+        StatusCode::BAD_GATEWAY
     );
     for _ in 0..2 {
         state.bindings.lock().await.clear();
@@ -1932,13 +2439,16 @@ async fn old_inflight_response_cannot_rebind_after_source_identity_changes() {
     let release = Arc::new(tokio::sync::Notify::new());
     let upstream_entered = entered.clone();
     let upstream_release = release.clone();
-    let (origin, task) = serve(Router::new().route("/responses", post(move || {
+    let (origin, task) = serve(Router::new().route("/responses", post(move |req: Request| {
         let entered = upstream_entered.clone();
         let release = upstream_release.clone();
         async move {
+            if req.headers()["authorization"] == "Bearer new-account-key" {
+                return (StatusCode::NOT_FOUND, axum::Json(json!({"error":{"code":"previous_response_not_found"}}))).into_response();
+            }
             entered.notify_one();
             release.notified().await;
-            axum::Json(json!({"id":"old-response","output":[{"type":"reasoning","encrypted_content":"old-account-opaque"}],"usage":{"input_tokens":1,"output_tokens":1}}))
+            axum::Json(json!({"id":"old-response","output":[{"type":"reasoning","encrypted_content":"old-account-opaque"}],"usage":{"input_tokens":1,"output_tokens":1}})).into_response()
         }
     }))).await;
     let (_dir, state) = state(vec![source("a", &origin, 0)]).await;
@@ -1976,7 +2486,9 @@ async fn old_inflight_response_cannot_rebind_after_source_identity_changes() {
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert!(state.bindings.lock().await.is_empty());
     task.abort();
 }
 
@@ -2156,12 +2668,15 @@ async fn cached_incremental_history_survives_restart_and_rebuilds_tool_pairs_for
     let copy = received.clone();
     let (b,task_b)=serve(Router::new().route("/responses",post(move |req:Request|{let copy=copy.clone();async move{
         let body:Value=serde_json::from_slice(&to_bytes(req.into_body(),10000).await.unwrap()).unwrap();
+        if body.get("previous_response_id").is_some() {
+            return (StatusCode::BAD_REQUEST, axum::Json(json!({"error":{"code":"previous_response_not_found"}}))).into_response();
+        }
         assert!(body.get("previous_response_id").is_none());
         assert_eq!(body["input"][0]["content"],"remember original prompt");
         assert_eq!(body["input"][1]["call_id"],body["input"][2]["call_id"]);
         assert_eq!(body["input"][2]["output"],"tool result");
         copy.lock().await.push(body);
-        axum::Json(json!({"id":"new-source-response","status":"completed","output":[{"role":"assistant","content":"continued"}]}))
+        axum::Json(json!({"id":"new-source-response","status":"completed","output":[{"role":"assistant","content":"continued"}]})).into_response()
     }}))).await;
     let (dir, state) = state(vec![source("a", &a, 0)]).await;
     state.history.configure(true, 64_000_000).unwrap();

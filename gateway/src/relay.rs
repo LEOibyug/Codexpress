@@ -277,6 +277,8 @@ struct Observer {
     history_items: BTreeMap<u64, Value>,
     history_bytes: usize,
     history_invalid: bool,
+    context_rejected: bool,
+    replay_blocked: bool,
 }
 impl Observer {
     fn output_units(&self) -> u64 {
@@ -352,6 +354,19 @@ impl Observer {
             }
         }
         let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        // Any generated item, including a tool call or private reasoning, makes
+        // replay unsafe even when no text delta has been seen yet.
+        self.replay_blocked |= event_type.starts_with("response.output_")
+            || event_type.starts_with("response.refusal.")
+            || event_type.starts_with("response.audio.")
+            || event_type.starts_with("response.audio_transcript.")
+            || event_type.starts_with("response.image_generation_call.")
+            || event_type.starts_with("response.function_call_")
+            || event_type.starts_with("response.reasoning_")
+            || event_type.starts_with("response.custom_tool_")
+            || response["output"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty());
         if self.history_request.is_some() && event_type == "response.output_item.done" {
             if let (Some(index), Some(item)) = (value["output_index"].as_u64(), value.get("item")) {
                 self.history_bytes = self.history_bytes.saturating_add(item.to_string().len());
@@ -454,8 +469,10 @@ impl Observer {
         }
         if matches!(event_type, "response.failed" | "error")
             || response.get("status").and_then(Value::as_str) == Some("failed")
+            || (!self.sse && response.get("error").is_some_and(|error| !error.is_null()))
         {
             self.failed = true;
+            self.context_rejected |= explicit_context_rejection(value);
             self.failure_code = response
                 .pointer("/error/code")
                 .or_else(|| value.get("code"))
@@ -646,7 +663,15 @@ fn session_binding(parsed: &Value, headers: &HeaderMap) -> Option<String> {
     (!id.is_empty() && id.len() <= 512).then(|| format!("{namespace}:{id}"))
 }
 
+#[derive(Clone)]
+struct PreservedScopedSession(String);
+
 fn scoped_session(parsed: &Value, parts: &axum::http::request::Parts) -> Option<String> {
+    if let Some(session) = parts.extensions.get::<PreservedScopedSession>() {
+        // This value already includes any ingress namespace. Reconstruction
+        // removed wire state, not the identity of the local conversation.
+        return Some(session.0.clone());
+    }
     let session = session_binding(parsed, &parts.headers);
     match parts.extensions.get::<crate::remote::RemoteIngress>() {
         Some(ingress) => session
@@ -674,6 +699,79 @@ pub(crate) async fn forward(
     request: Request<Body>,
 ) -> Response<Body> {
     forward_once(state, request, None, 0).await
+}
+
+fn explicit_context_rejection(value: &Value) -> bool {
+    let problem = value
+        .pointer("/response/error")
+        .or_else(|| value.get("error"))
+        .unwrap_or(value);
+    if matches!(
+        problem
+            .get("code")
+            .or_else(|| problem.get("type"))
+            .and_then(Value::as_str),
+        Some(
+            "invalid_encrypted_content"
+                | "invalid_previous_response_id"
+                | "previous_response_not_found"
+                | "response_not_found"
+                | "conversation_not_found"
+        )
+    ) {
+        return true;
+    }
+    let Some(message) = problem
+        .get("message")
+        .or_else(|| problem.get("detail"))
+        .and_then(Value::as_str)
+        .or_else(|| problem.as_str())
+    else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    let missing = [
+        "not found",
+        "does not exist",
+        "could not be found",
+        "cannot be found",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase));
+    let response_id = message.contains("previous_response_id")
+        || message.contains("previous response")
+        || message.contains("no response found with id");
+    let conversation_id = message.contains("conversation_id")
+        || message.contains("conversation id")
+        || message.contains("conversation with id")
+        || message.contains("conversation not found")
+        || message.contains("no conversation found with id");
+    let encrypted = message.contains("encrypted_content")
+        || message.contains("encrypted content")
+        || message.contains("compaction blob");
+    (missing && (response_id || conversation_id))
+        || message.contains("no response found with id")
+        || message.contains("no conversation found with id")
+        || (encrypted
+            && [
+                "could not be verified",
+                "was not issued to this caller",
+                "could not decrypt",
+                "could not decode",
+                "invalid encrypted",
+                "encrypted_content is invalid",
+            ]
+            .iter()
+            .any(|phrase| message.contains(phrase)))
+}
+
+fn response_is_sse(headers: &HeaderMap, request_is_stream: bool, status: StatusCode) -> bool {
+    let content_type = headers.get("content-type");
+    content_type.and_then(|v| v.to_str().ok()).is_some_and(|v| {
+        v.split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+    }) || (request_is_stream && status.is_success() && content_type.is_none())
 }
 
 fn strip_opaque_state(value: &mut Value) {
@@ -750,6 +848,11 @@ async fn portable_request(
     *retry.method_mut() = parts.method.clone();
     *retry.uri_mut() = parts.uri.clone();
     *retry.headers_mut() = headers;
+    if let Some(session) = scoped_session(parsed, parts) {
+        retry
+            .extensions_mut()
+            .insert(PreservedScopedSession(session));
+    }
     if let Some(ingress) = parts.extensions.get::<crate::remote::RemoteIngress>() {
         retry.extensions_mut().insert(ingress.clone());
     }
@@ -763,6 +866,7 @@ async fn portable_request(
             excluded,
             scope,
             route: None,
+            rejected_source: None,
         },
     ))
 }
@@ -772,6 +876,7 @@ struct RebuildContext {
     excluded: HashSet<String>,
     scope: String,
     route: Option<(Source, crate::affinity::RouteLease)>,
+    rejected_source: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1053,6 +1158,14 @@ async fn forward_once(
                         {
                             retry.extensions_mut().insert(ingress.clone());
                         }
+                        if let Some(ingress) =
+                            parts.extensions.get::<crate::chatbot::ChatbotIngress>()
+                        {
+                            retry.extensions_mut().insert(ingress.clone());
+                        }
+                        if let Some(session) = parts.extensions.get::<PreservedScopedSession>() {
+                            retry.extensions_mut().insert(session.clone());
+                        }
                         Some((
                             retry,
                             RebuildContext {
@@ -1060,6 +1173,7 @@ async fn forward_once(
                                 excluded: HashSet::from(["rebuilt".into()]),
                                 scope: history_scope(&parts, &parsed),
                                 route: None,
+                                rejected_source: None,
                             },
                         ))
                     };
@@ -1082,6 +1196,29 @@ async fn forward_once(
     if opaque_state && session_known {
         hard_keys.extend(session_key.as_deref());
     }
+    let has_upstream_id = parsed["previous_response_id"].is_string()
+        || parsed
+            .get("conversation")
+            .and_then(|v| v.as_str().or_else(|| v.get("id").and_then(Value::as_str)))
+            .is_some();
+    let routing_binding = {
+        let bindings = state.bindings.lock().await;
+        // Missing local metadata is not evidence that an upstream ID expired.
+        // Prefer any confirmed state/thread origin, then affinity/priority.
+        hard_keys
+            .iter()
+            .find(|key| bindings.contains_key(**key))
+            .copied()
+            .or_else(|| {
+                session_key
+                    .as_deref()
+                    .filter(|key| has_upstream_id && bindings.contains_key(*key))
+            })
+            // Opaque-only requests still require a known origin. An external
+            // response/conversation ID can instead be checked by the upstream.
+            .or_else(|| (!has_upstream_id).then_some(binding).flatten())
+            .map(str::to_owned)
+    };
     let migrated_source = if previously_rebuilt {
         let runtimes = state.sources.read().await;
         let all: Vec<_> = runtimes.iter().map(|r| r.source.clone()).collect();
@@ -1091,6 +1228,16 @@ async fn forward_once(
     } else {
         None
     };
+    let probe_unknown_id = !degraded
+        && has_upstream_id
+        && !opaque_state
+        && turn_key.is_none()
+        && origin.is_none()
+        && migrated_source.is_none()
+        && {
+            let bindings = state.bindings.lock().await;
+            hard_keys.iter().all(|key| !bindings.contains_key(*key))
+        };
     let mut sources = if let Some((source, _)) = &prepared_route {
         let mut candidates = vec![source.clone()];
         candidates.extend(
@@ -1132,9 +1279,44 @@ async fn forward_once(
                 })
                 .collect()
         } else {
-            routing::candidates_with_session(&state, model, binding, affinity_key.as_deref()).await
+            routing::candidates_with_session(
+                &state,
+                model,
+                routing_binding.as_deref(),
+                affinity_key.as_deref(),
+            )
+            .await
         }
     };
+    if probe_unknown_id {
+        // A thread or affinity is an origin hint for an unobserved upstream ID,
+        // not proof of ownership. Probe it first, then at most four alternatives
+        // only if each previous candidate explicitly rejects the unchanged ID.
+        let alternatives =
+            routing::candidates_with_session(&state, model, None, affinity_key.as_deref()).await;
+        for alternative in alternatives {
+            if !sources.iter().any(|source| source.id == alternative.id) {
+                sources.push(alternative);
+            }
+        }
+        sources.truncate(5);
+    }
+    {
+        let bindings = state.bindings.lock().await;
+        sources.retain(|source| {
+            hard_keys
+                .iter()
+                .all(|key| bindings.get(*key).is_none_or(|id| id == &source.id))
+        });
+    }
+    if let Some(rejected) = rebuild
+        .as_ref()
+        .and_then(|context| context.rejected_source.as_deref())
+    {
+        // A complete reconstruction can use the original source as a final
+        // option, but another source should handle the handoff first.
+        sources.sort_by_key(|source| source.id == rejected);
+    }
     if opaque_state {
         let bindings = state.bindings.lock().await;
         sources.retain(|source| {
@@ -1155,7 +1337,10 @@ async fn forward_once(
     if sources.is_empty() {
         if !degraded && !discovery && (binding.is_some() || opaque_state) {
             let settings = state.settings.read().await.clone();
-            let eligible = !routing::candidates(&state, model, None).await.is_empty();
+            let eligible =
+                !routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
+                    .await
+                    .is_empty();
             if eligible && settings.degraded_context_fallback {
                 let (retry, context) = match portable_request(
                     &state,
@@ -1222,7 +1407,8 @@ async fn forward_once(
             None
         };
     let mut last_error = None;
-    for candidate in sources {
+    let source_count = sources.len();
+    for (candidate_index, candidate) in sources.into_iter().enumerate() {
         if candidate.kind == "official"
             && !matches!(parts.uri.path(), "/v1/responses" | "/v1/responses/compact")
         {
@@ -1232,13 +1418,7 @@ async fn forward_once(
         let mut route_lease = if let Some((_, lease)) = prepared_route.take() {
             // Reconstruction may await disk work. Honor source removal, model
             // changes, quota updates and fixed-mode changes before submission.
-            if !routing::candidates(&state, model, None)
-                .await
-                .iter()
-                .any(|source| {
-                    source.id == candidate.id && source.identity() == candidate.identity()
-                })
-            {
+            if !routing::source_is_eligible(&state, &candidate, model).await {
                 drop(lease);
                 continue;
             }
@@ -1246,15 +1426,29 @@ async fn forward_once(
         } else if discovery {
             None
         } else {
-            match routing::reserve_for_model(
-                &state,
-                &candidate,
-                affinity_key.as_deref(),
-                binding.is_some() || origin.is_some(),
-                model,
-            )
-            .await
+            let reserved = if rebuild
+                .as_ref()
+                .is_some_and(|context| context.rejected_source.is_some())
+                || (probe_unknown_id && candidate_index > 0)
             {
+                routing::reserve_context_handoff_for_model(
+                    &state,
+                    &candidate,
+                    affinity_key.as_deref(),
+                    model,
+                )
+                .await
+            } else {
+                routing::reserve_for_model(
+                    &state,
+                    &candidate,
+                    affinity_key.as_deref(),
+                    binding.is_some() || origin.is_some(),
+                    model,
+                )
+                .await
+            };
+            match reserved {
                 Some(lease) => Some(lease),
                 None => {
                     last_error = Some(error(
@@ -1293,12 +1487,7 @@ async fn forward_once(
         let mut compatibility_changes = Vec::new();
         let mut auth_refreshed = false;
         for _attempt_number in 0..if compatibility { 5 } else { 2 } {
-            let eligible = routing::candidates(&state, model, None)
-                .await
-                .iter()
-                .any(|candidate| {
-                    candidate.id == source.id && candidate.identity() == source.identity()
-                });
+            let eligible = routing::source_is_eligible(&state, &source, model).await;
             let current_revision = state.routing_revision.load(Ordering::Acquire);
             if current_revision != selected_revision {
                 // OAuth and history preparation may await while the user edits
@@ -1456,7 +1645,14 @@ async fn forward_once(
                         routing::mark_auth_preflight_failure(&state, &source).await;
                         if !degraded
                             && state.settings.read().await.degraded_context_fallback
-                            && !routing::candidates(&state, model, None).await.is_empty()
+                            && !routing::candidates_with_session(
+                                &state,
+                                model,
+                                None,
+                                affinity_key.as_deref(),
+                            )
+                            .await
+                            .is_empty()
                         {
                             drop(route_lease.take());
                             drop(attempt);
@@ -1484,7 +1680,7 @@ async fn forward_once(
             }
             let mut prefix = Vec::new();
             let mut context_rejected = false;
-            if matches!(status.as_u16(), 400 | 404)
+            if matches!(status.as_u16(), 400 | 404 | 409 | 422)
                 && (binding.is_some() || opaque_state || compatibility)
             {
                 let mut observed = Vec::new();
@@ -1516,17 +1712,54 @@ async fn forward_once(
                             continue;
                         }
                     }
-                    context_rejected = matches!(
-                        value.pointer("/error/code").and_then(Value::as_str),
-                        Some(
-                            "invalid_encrypted_content"
-                                | "invalid_previous_response_id"
-                                | "previous_response_not_found"
-                                | "response_not_found"
-                                | "conversation_not_found"
-                        )
-                    );
+                    context_rejected = explicit_context_rejection(&value);
                 }
+            }
+            if !degraded
+                && status.is_success()
+                && (binding.is_some() || opaque_state)
+                && (probe_unknown_id || state.settings.read().await.degraded_context_fallback)
+            {
+                // Hold only an initial bounded prefix. A failed Responses SSE
+                // can use HTTP 200, so headers alone do not prove acceptance.
+                // Once any output is seen (or the probe is inconclusive), its
+                // original bytes are streamed without replay.
+                let mut probe = Observer {
+                    sse: response_is_sse(
+                        upstream.headers(),
+                        parsed["stream"].as_bool() == Some(true),
+                        status,
+                    ),
+                    ..Default::default()
+                };
+                let mut observed = 0usize;
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                while observed < 65536 {
+                    match tokio::time::timeout_at(deadline, upstream.chunk()).await {
+                        Ok(Ok(Some(chunk))) => {
+                            observed = observed.saturating_add(chunk.len());
+                            probe.push(&chunk);
+                            if !probe.sse {
+                                if let Ok(value) = serde_json::from_slice::<Value>(&probe.buffer) {
+                                    probe.value(&value);
+                                }
+                            }
+                            prefix.push(chunk);
+                            if probe.replay_blocked || probe.failed || probe.terminal {
+                                break;
+                            }
+                        }
+                        Ok(Err(_)) => {
+                            attempt.finish("interrupted", Some(&probe));
+                            return error(
+                                StatusCode::BAD_GATEWAY,
+                                "来源响应中断，提交结果不明确；未自动重试",
+                            );
+                        }
+                        _ => break,
+                    }
+                }
+                context_rejected = probe.context_rejected && !probe.replay_blocked;
             }
             if matches!(status.as_u16(), 401 | 402 | 403 | 429 | 500..=599) {
                 routing::mark_failure(&state, &source.id, status.as_u16(), retry_after).await;
@@ -1557,17 +1790,45 @@ async fn forward_once(
                     }
                 }
             }
+            if probe_unknown_id && context_rejected && candidate_index + 1 < source_count {
+                // A missing local mapping can mean a different candidate owns
+                // this ID. Explicit rejection permits a bounded unchanged probe
+                // before requiring local history for a new context.
+                attempt.finish("failed", None);
+                drop(route_lease.take());
+                last_error = Some(
+                    stream_response(
+                        state.clone(),
+                        source.clone(),
+                        upstream,
+                        prefix,
+                        attempt,
+                        ResponseContext {
+                            discovery,
+                            session_key: None,
+                            request_is_stream: parsed["stream"].as_bool() == Some(true),
+                            rebuild: None,
+                            history: None,
+                        },
+                        None,
+                    )
+                    .await,
+                );
+                break;
+            }
             if !degraded
                 && (binding.is_some() || opaque_state || origin.is_some())
                 && (context_rejected || matches!(status.as_u16(), 401 | 402 | 403 | 429))
                 && state.settings.read().await.degraded_context_fallback
-                && !routing::candidates(&state, model, None).await.is_empty()
+                && !routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
+                    .await
+                    .is_empty()
             {
                 attempt.finish("failed", None);
                 drop(upstream);
                 drop(route_lease.take());
                 drop(attempt);
-                let (retry, context) = match portable_request(
+                let (retry, mut context) = match portable_request(
                     &state,
                     &parts,
                     &parsed,
@@ -1578,12 +1839,16 @@ async fn forward_once(
                     Ok(value) => value,
                     Err(response) => return *response,
                 };
+                if context_rejected {
+                    context.rejected_source = Some(source.id.clone());
+                }
                 return Box::pin(forward_once(state, retry, Some(context), replans)).await;
             }
             let safe_to_fallback = binding.is_none()
                 && !opaque_state
                 && (origin.is_none() || planned_return)
-                && matches!(status.as_u16(), 401 | 402 | 403 | 429);
+                && (matches!(status.as_u16(), 401 | 402 | 403 | 429)
+                    || (degraded && context_rejected));
             if safe_to_fallback {
                 attempt.finish("failed", None);
                 drop(route_lease.take());
@@ -1730,13 +1995,8 @@ async fn stream_response(
             }
         }
     }
-    let content_type = headers.get("content-type");
-    let sse = content_type
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream")))
-        // Official Codex can omit Content-Type while still returning SSE.
-        // Preserve explicit JSON/plain responses and all original wire bytes.
-        || (request_is_stream && status.is_success() && content_type.is_none());
+    // Official Codex can omit Content-Type while still returning SSE.
+    let sse = response_is_sse(&headers, request_is_stream, status);
     let mut observer = Observer {
         sse,
         history_request: if status.is_success() { history } else { None },

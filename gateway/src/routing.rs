@@ -32,6 +32,28 @@ pub async fn candidates_with_session(
     binding: Option<&str>,
     session: Option<&str>,
 ) -> Vec<Source> {
+    // An empty model also serves discovery requests, which do not take a
+    // conversation slot. Generation always rechecks capacity during reserve.
+    candidate_sources(state, model, binding, session, !model.is_empty()).await
+}
+
+/// Revalidate a source for a caller that already owns its capacity lease.
+/// Anonymous leases have no reusable session key, so reserving the last slot
+/// must not make this request reject its own source during preflight.
+pub async fn source_is_eligible(state: &Arc<AppState>, source: &Source, model: &str) -> bool {
+    candidate_sources(state, model, None, None, false)
+        .await
+        .iter()
+        .any(|candidate| candidate.id == source.id && candidate.identity() == source.identity())
+}
+
+async fn candidate_sources(
+    state: &Arc<AppState>,
+    model: &str,
+    binding: Option<&str>,
+    session: Option<&str>,
+    check_capacity: bool,
+) -> Vec<Source> {
     let settings = state.settings.read().await.clone();
     // Identity updates clear bindings while holding sources.write. Read both
     // under the same lock order so an old binding cannot select a new identity.
@@ -58,6 +80,7 @@ pub async fn candidates_with_session(
                 && (settings.mode != "fixed"
                     || settings.fixed_source_id.as_ref() == Some(&source.id))
                 && account_remaining(runtime, &runtimes).is_none_or(|percent| percent > 0.0)
+                && (!check_capacity || state.affinity.capacity_available(session, source))
                 && match runtime.health.as_str() {
                     "ready" => true,
                     "cooldown" | "proxy_error" | "exhausted" => runtime
@@ -200,6 +223,29 @@ pub async fn reserve_for_model(
     continuation: bool,
     model: &str,
 ) -> Option<crate::affinity::RouteLease> {
+    reserve_model_with_policy(state, source, session, continuation, model, false).await
+}
+
+/// Used for a reconstructed context or probing an unbound upstream ID after
+/// explicit rejection. The target still admits a new conversation; this authorizes leaving
+/// the prior soft affinity without granting low-quota continuation privileges.
+pub async fn reserve_context_handoff_for_model(
+    state: &Arc<AppState>,
+    source: &Source,
+    session: Option<&str>,
+    model: &str,
+) -> Option<crate::affinity::RouteLease> {
+    reserve_model_with_policy(state, source, session, false, model, true).await
+}
+
+async fn reserve_model_with_policy(
+    state: &Arc<AppState>,
+    source: &Source,
+    session: Option<&str>,
+    continuation: bool,
+    model: &str,
+    allow_handoff: bool,
+) -> Option<crate::affinity::RouteLease> {
     let settings = state.settings.read().await.clone();
     let sources = state.sources.read().await;
     let runtime = sources.iter().find(|runtime| {
@@ -248,10 +294,10 @@ pub async fn reserve_for_model(
         remaining.is_some_and(|value| value <= f64::from(settings.official_low_quota_percent));
     state.affinity.reserve(
         session,
-        source,
+        &runtime.source,
         continuation,
         low,
-        if !continuation && settings.mode == "auto" {
+        if !continuation && !allow_handoff && settings.mode == "auto" {
             Some(&eligible)
         } else {
             None
@@ -267,6 +313,7 @@ pub fn admission(
 ) -> Value {
     let active = state.affinity.active_count(&runtime.source);
     let protected_active = state.affinity.protected_active_count(&runtime.source);
+    let (capacity_active, capacity_available) = state.affinity.capacity_status(&runtime.source);
     let remaining = account_remaining(runtime, sources);
     let note = if !runtime.source.enabled {
         "已停用"
@@ -278,12 +325,14 @@ pub fn admission(
         && !runtime.cooldown_until.is_some_and(|until| until <= now())
     {
         "暂停分配"
+    } else if !capacity_available {
+        "活跃对话已满"
     } else if remaining.is_some_and(|value| value <= f64::from(threshold)) && protected_active > 0 {
         "仅续接已有对话"
     } else {
         "可接新对话"
     };
-    json!({"active_conversations":active,"account_active_conversations":protected_active,"remaining_percent":remaining,"accepting_new_conversations":note=="可接新对话","routing_note":note})
+    json!({"active_conversations":active,"account_active_conversations":protected_active,"capacity_active_conversations":capacity_active,"max_active_conversations":runtime.source.max_active_conversations,"activity_window_seconds":runtime.source.active_conversation_window_seconds,"capacity_available":capacity_available,"remaining_percent":remaining,"accepting_new_conversations":note=="可接新对话","routing_note":note})
 }
 
 pub async fn mark_failure(

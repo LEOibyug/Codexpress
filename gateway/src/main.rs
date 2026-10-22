@@ -39,7 +39,7 @@ async fn run() -> Result<()> {
                     .context("端口格式错误")?
             }
             "--version" => {
-                println!("codexpress-gateway 0.1.0");
+                println!("codexpress-gateway {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             _ => bail!("未知启动参数"),

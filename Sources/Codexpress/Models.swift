@@ -62,13 +62,22 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
     var models: [String] = []
     var automaticModelDiscovery: Bool? = nil
     var account_id: String? = nil
+    var max_active_conversations: Int? = nil
+    var active_conversation_window_seconds: Int? = nil
     var official: Bool { kind == "official" }
     var discoversModels: Bool { automaticModelDiscovery ?? models.isEmpty }
     var policyLabel: String { proxy.mode == "direct" ? "强制直连" : "指定代理" }
+    var activeConversationWindowSeconds: Int { active_conversation_window_seconds ?? 15 }
     static func newOfficial() -> Source {
         var s = Source(); s.kind = "official"; s.name = "官方账号"; s.base_url = "https://chatgpt.com/backend-api/codex"; s.proxy.mode = "explicit"; return s
     }
     func validate() throws {
+        if let limit = max_active_conversations, !(1...1024).contains(limit) {
+            throw AppError.message("活跃对话上限须为 1–1024 的整数。")
+        }
+        if !(1...300).contains(activeConversationWindowSeconds) {
+            throw AppError.message("空闲释放时间须为 1–300 秒的整数。")
+        }
         if let threshold = balanceWarningThreshold, !threshold.isFinite || threshold < 0 {
             throw AppError.message("预警余额须为大于或等于 0 的金额。")
         }
@@ -80,6 +89,23 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
         if proxy.mode == "explicit" {
             guard let raw = proxy.url, let p = URLComponents(string: raw), ["http", "https", "socks5", "socks5h"].contains(p.scheme?.lowercased() ?? ""), p.host != nil, let port = p.port, (1...65535).contains(port), p.user == nil, p.password == nil, p.query == nil, p.fragment == nil, p.path.isEmpty || p.path == "/" else { throw AppError.message("请填写有效的代理端口（1–65535）。") }
         }
+    }
+    func withConversationCapacity(enabled: Bool, limit: String, windowSeconds: String) throws -> Self {
+        var source = self
+        guard enabled else { source.max_active_conversations = nil; return source }
+        let rawLimit = limit.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawLimit.isEmpty, rawLimit.allSatisfy(\.isASCII), rawLimit.allSatisfy(\.isNumber),
+              let parsedLimit = Int(rawLimit), (1...1024).contains(parsedLimit) else {
+            throw AppError.message("活跃对话上限须为 1–1024 的整数。")
+        }
+        let rawWindow = windowSeconds.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawWindow.isEmpty, rawWindow.allSatisfy(\.isASCII), rawWindow.allSatisfy(\.isNumber),
+              let parsedWindow = Int(rawWindow), (1...300).contains(parsedWindow) else {
+            throw AppError.message("空闲释放时间须为 1–300 秒的整数。")
+        }
+        source.max_active_conversations = parsedLimit
+        source.active_conversation_window_seconds = parsedWindow
+        return source
     }
 }
 struct AppSettings: Codable, Sendable {

@@ -428,3 +428,269 @@ async fn account_quota_uses_latest_known_windows_and_auth_failures_keep_auth_req
         Some("persistence blocked")
     );
 }
+
+#[tokio::test]
+async fn source_capacity_atomically_limits_official_and_api_conversations() {
+    for kind in ["official", "api"] {
+        let (_dir, state, official, api) = state().await;
+        let mut source = if kind == "official" { official } else { api };
+        source.max_active_conversations = Some(3);
+        source.active_conversation_window_seconds = 15;
+        *state.sources.write().await = vec![SourceRuntime::new(source.clone())];
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = Vec::new();
+        for index in 0..16 {
+            let state = state.clone();
+            let source = source.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                routing::reserve(
+                    &state,
+                    &source,
+                    Some(&affinity::key(&format!("capacity-{index}"), "m")),
+                    false,
+                )
+                .await
+            }));
+        }
+        let mut leases = Vec::new();
+        for task in tasks {
+            if let Some(lease) = task.await.unwrap() {
+                leases.push(lease);
+            }
+        }
+        assert_eq!(leases.len(), 3, "{kind}");
+        let status = management::dispatch(&state, "status", json!({}))
+            .await
+            .unwrap();
+        let admission = &status["sources"][0]["admission"];
+        assert_eq!(admission["capacity_active_conversations"], 3);
+        assert_eq!(admission["max_active_conversations"], 3);
+        assert_eq!(admission["activity_window_seconds"], 15);
+        assert_eq!(admission["capacity_available"], false);
+        assert_eq!(admission["accepting_new_conversations"], false);
+        assert_eq!(admission["routing_note"], "活跃对话已满");
+        assert!(routing::candidates(&state, "m", None).await.is_empty());
+        drop(leases);
+        assert_eq!(state.affinity.capacity_status(&source), (0, true));
+    }
+}
+
+#[tokio::test]
+async fn parallel_requests_for_one_conversation_share_one_capacity_slot() {
+    let (_dir, state, _, mut api) = state().await;
+    api.max_active_conversations = Some(1);
+    *state.sources.write().await = vec![SourceRuntime::new(api.clone())];
+    let key = affinity::key("one-conversation", "m");
+    let barrier = Arc::new(tokio::sync::Barrier::new(12));
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        let state = state.clone();
+        let source = api.clone();
+        let key = key.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            routing::reserve(&state, &source, Some(&key), true).await
+        }));
+    }
+    let mut leases = Vec::new();
+    for task in tasks {
+        leases.push(task.await.unwrap().expect("same conversation may continue"));
+    }
+    assert_eq!(state.affinity.capacity_status(&api), (1, false));
+    assert_eq!(
+        routing::candidates_with_session(&state, "m", None, Some(&key))
+            .await
+            .len(),
+        1
+    );
+    let last = leases.pop().unwrap();
+    drop(leases);
+    assert!(routing::reserve(&state, &api, Some("different"), false)
+        .await
+        .is_none());
+    drop(last);
+    assert_eq!(state.affinity.capacity_status(&api), (0, true));
+}
+
+#[tokio::test]
+async fn anonymous_requests_and_bound_continuations_cannot_bypass_current_limit() {
+    let (_dir, state, _, old_snapshot) = state().await;
+    let mut api = old_snapshot.clone();
+    api.max_active_conversations = Some(1);
+    *state.sources.write().await = vec![SourceRuntime::new(api.clone())];
+    let anonymous = routing::reserve(&state, &old_snapshot, None, false)
+        .await
+        .unwrap();
+    assert!(routing::source_is_eligible(&state, &old_snapshot, "m").await);
+    assert_eq!(routing::candidates(&state, "", None).await.len(), 1);
+    assert!(routing::candidates(&state, "m", None).await.is_empty());
+    state.sources.write().await[0].source.enabled = false;
+    assert!(!routing::source_is_eligible(&state, &old_snapshot, "m").await);
+    state.sources.write().await[0].source.enabled = true;
+    state.sources.write().await[0].source.models = vec!["other".into()];
+    assert!(!routing::source_is_eligible(&state, &old_snapshot, "m").await);
+    state.sources.write().await[0].source.models.clear();
+    assert!(routing::reserve(&state, &old_snapshot, None, false)
+        .await
+        .is_none());
+    assert!(
+        routing::reserve(&state, &old_snapshot, Some("bound-thread"), true)
+            .await
+            .is_none()
+    );
+    state
+        .bindings
+        .lock()
+        .await
+        .insert("bound-response".into(), api.id.clone());
+    assert!(routing::candidates_with_session(
+        &state,
+        "m",
+        Some("bound-response"),
+        Some("bound-thread")
+    )
+    .await
+    .is_empty());
+    drop(anonymous);
+    let bound = routing::reserve(&state, &api, Some("bound-thread"), true)
+        .await
+        .unwrap();
+    // Increasing the limit immediately permits another conversation; lowering
+    // it does not evict ongoing work or authorize any additional conversation.
+    state.sources.write().await[0]
+        .source
+        .max_active_conversations = Some(2);
+    let other = routing::reserve(&state, &api, Some("other-thread"), false)
+        .await
+        .unwrap();
+    state.sources.write().await[0]
+        .source
+        .max_active_conversations = Some(1);
+    assert_eq!(state.affinity.capacity_status(&api), (2, false));
+    assert!(routing::reserve(&state, &api, Some("third-thread"), true)
+        .await
+        .is_none());
+    assert!(routing::reserve(&state, &api, Some("bound-thread"), true)
+        .await
+        .is_some());
+    drop((bound, other));
+}
+
+#[tokio::test]
+async fn expired_affinity_does_not_bypass_capacity_and_full_source_does_not_block_fallback() {
+    let (dir, state, official, mut api) = state().await;
+    api.max_active_conversations = Some(1);
+    let key = affinity::key("old-bound-thread", "m");
+    let mut previous = routing::reserve(&state, &api, Some(&key), false)
+        .await
+        .unwrap();
+    previous.commit().unwrap();
+    drop(previous);
+    // Restart retains routing affinity but has no surviving active requests.
+    drop(state);
+    let restored = AppState::new(dir.path().to_owned(), 0, "fixture".into()).unwrap();
+    *restored.sources.write().await = vec![
+        SourceRuntime::new(official.clone()),
+        SourceRuntime::new(api.clone()),
+    ];
+    let occupied = routing::reserve(&restored, &api, Some("different-thread"), false)
+        .await
+        .unwrap();
+    assert!(routing::reserve(&restored, &api, Some(&key), true)
+        .await
+        .is_none());
+    assert_eq!(
+        routing::candidates_with_session(&restored, "m", None, Some(&key))
+            .await
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["official"]
+    );
+    let mut fallback = routing::reserve(&restored, &official, Some(&key), false)
+        .await
+        .expect("full old affinity must allow another eligible source");
+    fallback.commit().unwrap();
+    drop((occupied, fallback));
+}
+
+#[test]
+fn capacity_configuration_defaults_to_unlimited_and_validates_both_source_kinds() {
+    for kind in ["api", "official"] {
+        let mut source = source("capacity-settings", kind);
+        assert_eq!(source.max_active_conversations, None);
+        assert_eq!(source.active_conversation_window_seconds, 15);
+        source.validate().unwrap();
+        for limit in [0, 1025] {
+            source.max_active_conversations = Some(limit);
+            assert!(source.validate().is_err());
+        }
+        source.max_active_conversations = Some(1024);
+        for seconds in [0, 301] {
+            source.active_conversation_window_seconds = seconds;
+            assert!(source.validate().is_err());
+        }
+        source.active_conversation_window_seconds = 300;
+        source.validate().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn authorized_context_handoff_skips_old_affinity_without_bypassing_admission() {
+    let (_dir, state, mut official, api) = state().await;
+    official.max_active_conversations = Some(1);
+    state.sources.write().await[0].source = official.clone();
+    let key = affinity::key("rejected-context", "m");
+    let mut old = routing::reserve(&state, &api, Some(&key), false)
+        .await
+        .unwrap();
+    old.commit().unwrap();
+    drop(old);
+    assert!(
+        routing::reserve_for_model(&state, &official, Some(&key), false, "m")
+            .await
+            .is_none()
+    );
+    let handoff = routing::reserve_context_handoff_for_model(&state, &official, Some(&key), "m")
+        .await
+        .expect("complete rejected context may leave the old sticky route");
+    assert!(
+        routing::reserve_context_handoff_for_model(&state, &official, Some("new"), "m")
+            .await
+            .is_none()
+    );
+    drop(handoff);
+    quota(&state, 95.0).await;
+    state.sources.write().await[0]
+        .source
+        .max_active_conversations = None;
+    let protected = routing::reserve(&state, &official, Some("protected"), false)
+        .await
+        .unwrap();
+    assert!(
+        routing::reserve_context_handoff_for_model(&state, &official, Some(&key), "m")
+            .await
+            .is_none()
+    );
+    drop(protected);
+    state.sources.write().await[0].source.enabled = false;
+    assert!(
+        routing::reserve_context_handoff_for_model(&state, &official, Some(&key), "m")
+            .await
+            .is_none()
+    );
+    state.sources.write().await[0].source.enabled = true;
+    {
+        let mut settings = state.settings.write().await;
+        settings.mode = "fixed".into();
+        settings.fixed_source_id = Some(api.id);
+    }
+    assert!(
+        routing::reserve_context_handoff_for_model(&state, &official, Some(&key), "m")
+            .await
+            .is_none()
+    );
+}

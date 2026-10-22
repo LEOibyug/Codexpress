@@ -28,6 +28,10 @@ pub struct Source {
     pub base_url: String,
     pub enabled: bool,
     pub priority: i32,
+    #[serde(default)]
+    pub max_active_conversations: Option<u32>,
+    #[serde(default = "default_active_conversation_window_seconds")]
+    pub active_conversation_window_seconds: u64,
     pub proxy: ProxyPolicy,
     #[serde(default)]
     pub models: Vec<String>,
@@ -35,6 +39,10 @@ pub struct Source {
     pub account_id: Option<String>,
     #[serde(default, skip_serializing)]
     pub secret: Value,
+}
+
+fn default_active_conversation_window_seconds() -> u64 {
+    15
 }
 
 impl Source {
@@ -72,6 +80,15 @@ impl Source {
         }
         if !["api", "official"].contains(&self.kind.as_str()) {
             bail!("未知来源类型");
+        }
+        if self
+            .max_active_conversations
+            .is_some_and(|limit| !(1..=1024).contains(&limit))
+        {
+            bail!("最大活跃对话数须为 1 至 1024，或不设限制");
+        }
+        if !(1..=300).contains(&self.active_conversation_window_seconds) {
+            bail!("对话活跃窗口须为 1 至 300 秒");
         }
         let base =
             url::Url::parse(&self.base_url).map_err(|_| anyhow::anyhow!("来源地址格式错误"))?;

@@ -16,6 +16,9 @@ struct SourceEditor: View {
     @State private var saving = false
     @State private var balanceWarningEnabled = false
     @State private var balanceWarningAmount = ""
+    @State private var capacityLimitEnabled = false
+    @State private var maxActiveConversations = "3"
+    @State private var activityWindowSeconds = "15"
 
     init(source: Source, isNew: Bool) {
         _source = State(initialValue: source); self.isNew = isNew
@@ -24,6 +27,9 @@ struct SourceEditor: View {
         _proxyPort = State(initialValue: source.proxy.localPort ?? "")
         _balanceWarningEnabled = State(initialValue: source.balanceWarningThreshold != nil)
         _balanceWarningAmount = State(initialValue: source.balanceWarningThreshold.map { String($0) } ?? "")
+        _capacityLimitEnabled = State(initialValue: source.max_active_conversations != nil)
+        _maxActiveConversations = State(initialValue: source.max_active_conversations.map(String.init) ?? "3")
+        _activityWindowSeconds = State(initialValue: String(source.activeConversationWindowSeconds))
     }
 
     private var discoveryInput: [String] {
@@ -63,6 +69,7 @@ struct SourceEditor: View {
                     }
                     Toggle("启用此来源", isOn: $source.enabled).toggleStyle(.switch).controlSize(.small)
                 }
+                conversationCapacitySection
                 if !source.official {
                     Section("余额预警") {
                         Toggle("余额不足时通知", isOn: $balanceWarningEnabled)
@@ -145,6 +152,19 @@ struct SourceEditor: View {
             .onDisappear { fetchID = UUID() }
     }
 
+    private var conversationCapacitySection: some View {
+        Section("活跃对话") {
+            Toggle("限制活跃对话数", isOn: $capacityLimitEnabled)
+                .toggleStyle(.switch).controlSize(.small)
+            if capacityLimitEnabled {
+                TextField("对话上限", text: $maxActiveConversations, prompt: Text("1–1024，建议 3"))
+                TextField("空闲释放时间（秒）", text: $activityWindowSeconds, prompt: Text("1–300，默认 15"))
+                Text("进行中的请求持续占用名额，结束后按此时间保留。同一对话使用同一模型时复用名额；自动模式会跳过满额来源。")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private func configuredSource() throws -> Source {
         var draft = source
         if draft.proxy.mode == "direct" { draft.proxy.url = nil }
@@ -175,6 +195,7 @@ struct SourceEditor: View {
         Task {
             do {
                 var draft = try configuredSource()
+                draft = try draft.withConversationCapacity(enabled: capacityLimitEnabled, limit: maxActiveConversations, windowSeconds: activityWindowSeconds)
                 if !draft.official, balanceWarningEnabled {
                     guard let threshold = Double(balanceWarningAmount.trimmingCharacters(in: .whitespacesAndNewlines)), threshold.isFinite, threshold >= 0 else {
                         throw AppError.message("预警余额须为大于或等于 0 的金额。")

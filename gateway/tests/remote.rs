@@ -111,6 +111,8 @@ async fn shared_listener_keeps_remote_credentials_host_restrictions_revoke_and_r
         base_url: base,
         enabled: true,
         priority: 0,
+        max_active_conversations: None,
+        active_conversation_window_seconds: 15,
         proxy: ProxyPolicy {
             mode: "direct".into(),
             url: None,

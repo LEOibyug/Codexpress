@@ -96,7 +96,7 @@ async fn setup(proxy: &str) -> (tempfile::TempDir, Arc<AppState>) {
     let directory = tempfile::tempdir().unwrap();
     let state = AppState::new(directory.path().to_path_buf(), 0, "local-fixture".into()).unwrap();
     for (id, account) in [("official-a", "account-a"), ("official-b", "account-b")] {
-        state.sources.write().await.push(SourceRuntime::new(Source {id:id.into(),name:id.into(),kind:"official".into(),is_subscription:false,base_url:"https://chatgpt.com/backend-api/codex".into(),enabled:true,priority:0,proxy:ProxyPolicy {mode:"explicit".into(),url:Some(proxy.into())},models:vec![],account_id:Some(account.into()),secret:json!({"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_at":model::now()+3600,"account_id":account})}));
+        state.sources.write().await.push(SourceRuntime::new(Source {id:id.into(),name:id.into(),kind:"official".into(),is_subscription:false,base_url:"https://chatgpt.com/backend-api/codex".into(),enabled:true,priority:0,max_active_conversations:None,active_conversation_window_seconds:15,proxy:ProxyPolicy {mode:"explicit".into(),url:Some(proxy.into())},models:vec![],account_id:Some(account.into()),secret:json!({"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_at":model::now()+3600,"account_id":account})}));
     }
     (directory, state)
 }
