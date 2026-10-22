@@ -1,15 +1,97 @@
-references/
+# Local tools, reference checkouts and working state
+/references/
 .tools/
+.runtime/
+.superpowers/
+/tmp/
+/.tmp/
+
+# Swift, Rust and macOS build output
 .build/
 .swiftpm/
 target/
 dist/
-.runtime/
-.superpowers/
+build/
+DerivedData/
+*.app/
+*.dSYM/
+*.xcresult/
+*.profraw
+*.profdata
+Codexpress-*.dmg
+Codexpress-*.zip
+/SHA256SUMS.txt
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Runtime data and credentials, also when using a custom state directory
+.codex/
+.codexpress/
+gateway-key
+gateway.lock
+*.sock
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+credentials.json
+credential-storage.json
+image-client.json
+chatbot-access.json
+image-access.json
+remote-access.json
+sources.json
+reset-operations.json
+balance-warnings.json
+config-attachment.json
+configuration-backups/
+model-catalogs/
+.metadata-*
+.reset-operations-*
+.image-client-*
+.gateway-log-*
+auth.json
+auth.json.*
+/config.toml
+/*.config.toml
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Signing keys and private keychains
+*.p12
+*.pfx
+*.p8
+*.key
+*.pem
+*.keychain
+*.keychain-db
+*.mobileprovision
+
+# Finder, editor and temporary files
 .DS_Store
+._*
+__MACOSX/
 *.xcuserstate
 xcuserdata/
+*.swp
+*.swo
+*~
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+*.rej
 *.log
+
+# Keep dependency lockfiles and shared project configuration tracked.
 
 # Local agent instructions
 AGENTS.md
