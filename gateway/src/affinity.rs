@@ -177,6 +177,20 @@ impl AffinityStore {
                 .is_none_or(|limit| active < limit as usize),
         )
     }
+    pub fn order_by_load(&self, sources: &mut [Source]) {
+        let Ok(data) = self.data.lock() else { return };
+        let timestamp = Instant::now();
+        let counts: HashMap<_, _> = sources
+            .iter()
+            .map(|source| (source.id.clone(), capacity_count(&data, source, timestamp)))
+            .collect();
+        sources.sort_by(|a, b| {
+            counts[&a.id]
+                .cmp(&counts[&b.id])
+                .then(a.priority.cmp(&b.priority))
+                .then(a.id.cmp(&b.id))
+        });
+    }
     /// Candidate filtering is advisory; reserve repeats this check and takes
     /// the slot while holding the same mutex as every competing reservation.
     pub fn capacity_available(&self, key: Option<&str>, source: &Source) -> bool {

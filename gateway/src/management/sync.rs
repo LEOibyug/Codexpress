@@ -38,6 +38,11 @@ impl SyncRequest {
             .map(|v| v.as_bool().context("上下文兜底须为布尔值"))
             .transpose()?
             .unwrap_or(true);
+        let load_balance = payload
+            .get("load_balance")
+            .map(|v| v.as_bool().context("负载均衡须为布尔值"))
+            .transpose()?
+            .unwrap_or(false);
         let idle_return_minutes = match payload.get("idle_return_minutes") {
             None => 30,
             Some(value) => value
@@ -71,6 +76,7 @@ impl SyncRequest {
             settings: RoutingSettings {
                 mode: mode.into(),
                 fixed_source_id: fixed,
+                load_balance,
                 official_low_quota_percent: threshold,
                 degraded_context_fallback,
                 idle_return_minutes,

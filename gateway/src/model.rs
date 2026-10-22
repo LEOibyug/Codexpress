@@ -176,6 +176,8 @@ impl SourceRuntime {
 pub struct RoutingSettings {
     pub mode: String,
     pub fixed_source_id: Option<String>,
+    #[serde(default)]
+    pub load_balance: bool,
     #[serde(default = "default_low_quota")]
     pub official_low_quota_percent: u8,
     #[serde(default = "default_fallback")]
@@ -237,6 +239,7 @@ impl AppState {
             settings: RwLock::new(RoutingSettings {
                 mode: "auto".into(),
                 fixed_source_id: None,
+                load_balance: false,
                 official_low_quota_percent: 10,
                 degraded_context_fallback: true,
                 idle_return_minutes: default_idle_return(),

@@ -18,7 +18,10 @@ struct RoutingView: View {
                         }.disabled(model.busy)
                         InfoNote(text: "来源不可用时暂停请求。")
                     } else {
-                        InfoNote(text: "新对话按优先级分配，连续对话优先沿用原来源。")
+                        Toggle("负载均衡", isOn: Binding(get: { model.settings.loadBalanceEnabled }, set: { model.changeLoadBalance($0) }))
+                            .disabled(model.busy)
+                        Text("关闭时按优先级分配新对话；开启时按活跃对话数分配。已有对话保留来源。")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                 }
                 SettingsCard("官方余量保护", symbol: "shield.lefthalf.filled") {
@@ -41,8 +44,8 @@ struct RoutingView: View {
                         Text("6 小时").tag(360)
                         Text("24 小时").tag(1440)
                         Text("不自动回切").tag(0)
-                    }.disabled(model.busy || model.routingMode == "fixed")
-                    Text("从上次请求结束计时。闲置到期后按当前优先级回到可用来源，官方与 API 使用同一排序。")
+                    }.disabled(model.busy || model.routingMode == "fixed" || model.settings.loadBalanceEnabled)
+                    Text(model.settings.loadBalanceEnabled ? "开启负载均衡时，已有对话保留来源，不按优先级自动回切。" : "从上次请求结束计时。闲置到期后按当前优先级回到可用来源，官方与 API 使用同一排序。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                     Divider().padding(.vertical, 3)
                     Toggle("无法续接时移除加密块并重建上下文", isOn: Binding(get: { model.settings.degradedContextFallback ?? true }, set: { model.changeContextFallback($0) }))

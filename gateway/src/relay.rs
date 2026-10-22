@@ -21,6 +21,7 @@ use std::{
 };
 
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
+const RECOVERY_WAIT_SECONDS: u64 = 20;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -38,6 +39,18 @@ fn error(status: StatusCode, message: &str) -> Response<Body> {
             json!({"error":{"message":message,"type":"gateway_error"}}).to_string(),
         ))
         .unwrap()
+}
+
+fn recovery_timeout(retry_after: u64) -> Response<Body> {
+    let mut response = error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "来源仍在冷却或等待空闲名额，已等待恢复；请稍后重试。",
+    );
+    response.headers_mut().insert(
+        "retry-after",
+        HeaderValue::from_str(&retry_after.max(1).to_string()).expect("seconds"),
+    );
+    response
 }
 
 fn sensitive(name: &str) -> bool {
@@ -173,6 +186,12 @@ fn session_binding(parsed: &Value, headers: &HeaderMap) -> Option<String> {
 #[derive(Clone)]
 struct PreservedScopedSession(String);
 
+#[derive(Clone)]
+struct RecoveryWindow {
+    deadline: tokio::time::Instant,
+    attempted: bool,
+}
+
 fn scoped_session(parsed: &Value, parts: &axum::http::request::Parts) -> Option<String> {
     if let Some(session) = parts.extensions.get::<PreservedScopedSession>() {
         // This value already includes any ingress namespace. Reconstruction
@@ -203,8 +222,13 @@ fn scoped_session(parsed: &Value, parts: &axum::http::request::Parts) -> Option<
 
 pub(crate) async fn forward(
     State(state): State<Arc<AppState>>,
-    request: Request<Body>,
+    mut request: Request<Body>,
 ) -> Response<Body> {
+    request.extensions_mut().insert(RecoveryWindow {
+        deadline: tokio::time::Instant::now()
+            + std::time::Duration::from_secs(RECOVERY_WAIT_SECONDS),
+        attempted: false,
+    });
     forward_once(state, request, None, 0).await
 }
 
@@ -337,11 +361,6 @@ async fn portable_request(
         );
     }
     headers.insert("content-type", HeaderValue::from_static("application/json"));
-    state.notifications.fallback(
-        &affinity
-            .map(str::to_owned)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-    );
     let mut retry = Request::new(Body::from(serde_json::to_vec(&portable).expect("JSON")));
     *retry.method_mut() = parts.method.clone();
     *retry.uri_mut() = parts.uri.clone();
@@ -356,6 +375,9 @@ async fn portable_request(
     }
     if let Some(ingress) = parts.extensions.get::<crate::chatbot::ChatbotIngress>() {
         retry.extensions_mut().insert(ingress.clone());
+    }
+    if let Some(window) = parts.extensions.get::<RecoveryWindow>() {
+        retry.extensions_mut().insert(window.clone());
     }
     Ok((
         retry,
@@ -664,6 +686,9 @@ async fn forward_once(
                         if let Some(session) = parts.extensions.get::<PreservedScopedSession>() {
                             retry.extensions_mut().insert(session.clone());
                         }
+                        if let Some(window) = parts.extensions.get::<RecoveryWindow>() {
+                            retry.extensions_mut().insert(window.clone());
+                        }
                         Some((
                             retry,
                             RebuildContext {
@@ -848,32 +873,84 @@ async fn forward_once(
             state.history.enabled(),
             diagnostics
         );
+        let mut restore_error = None;
         if !degraded && !discovery && (binding.is_some() || opaque_state) {
             let eligible =
                 !routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
                     .await
                     .is_empty();
             if eligible && settings.degraded_context_fallback {
-                let (retry, context) = match portable_request(
-                    &state,
-                    &parts,
-                    &parsed,
-                    affinity_key.as_deref(),
-                )
-                .await
-                {
-                    Ok(value) => value,
+                match portable_request(&state, &parts, &parsed, affinity_key.as_deref()).await {
+                    Ok((retry, context)) => {
+                        return Box::pin(forward_once(state, retry, Some(context), replans)).await;
+                    }
                     Err(response) => {
                         eprintln!(
                             "context_restore_failed unix={} status={}",
                             crate::model::now(),
                             response.status().as_u16()
                         );
-                        return *response;
+                        restore_error = Some(response);
                     }
-                };
-                return Box::pin(forward_once(state, retry, Some(context), replans)).await;
+                }
             }
+        }
+        // A transient admission failure must not burn the client's retry budget
+        // before the upstream has a chance to recover. Preserve the original
+        // wire context when rebuilding was unavailable, and share this single
+        // bounded window across every internal replan and reconstruction.
+        if !discovery {
+            if let Some(mut window) = parts
+                .extensions
+                .get::<RecoveryWindow>()
+                .cloned()
+                .filter(|w| !w.attempted)
+            {
+                window.attempted = true;
+                parts.extensions.insert(window.clone());
+                drop(prepared_route.take());
+                eprintln!("routing_recovery_wait unix={}", crate::model::now());
+                let recovery_origin = migrated_source
+                    .as_deref()
+                    .map(|source_id| routing::RecoveryOrigin {
+                        source_id,
+                        identity: None,
+                    })
+                    .or_else(|| {
+                        origin.as_ref().map(|origin| routing::RecoveryOrigin {
+                            source_id: &origin.source_id,
+                            identity: Some(&origin.source_identity),
+                        })
+                    });
+                match routing::wait_for_recovery(
+                    &state,
+                    model,
+                    routing_binding.as_deref(),
+                    affinity_key.as_deref(),
+                    recovery_origin,
+                    window.deadline,
+                )
+                .await
+                {
+                    routing::RecoveryWait::Ready => {
+                        eprintln!("routing_recovery_ready unix={}", crate::model::now());
+                        let retry = Request::from_parts(parts, Body::from(bytes));
+                        return Box::pin(forward_once(state, retry, rebuild, replans)).await;
+                    }
+                    routing::RecoveryWait::TimedOut { retry_after } => {
+                        eprintln!(
+                            "routing_recovery_timeout unix={} retry_after={}",
+                            crate::model::now(),
+                            retry_after
+                        );
+                        return recovery_timeout(retry_after);
+                    }
+                    routing::RecoveryWait::Unavailable => {}
+                }
+            }
+        }
+        if let Some(response) = restore_error {
+            return *response;
         }
         return error(
             if binding.is_some() {
@@ -925,6 +1002,9 @@ async fn forward_once(
         } else {
             None
         };
+    let previous_preference = affinity_key
+        .as_deref()
+        .and_then(|key| state.affinity.preferred(key, &sources));
     let mut last_error = None;
     let source_count = sources.len();
     for (candidate_index, candidate) in sources.into_iter().enumerate() {
@@ -1102,6 +1182,46 @@ async fn forward_once(
                     };
                     headers.insert(HeaderName::from_static("chatgpt-account-id"), value);
                 }
+            }
+            let settings = state.settings.read().await.clone();
+            let source_index = state.sources.read().await.iter().position(|runtime| {
+                runtime.source.id == source.id && runtime.source.identity() == source.identity()
+            });
+            let selection = if degraded {
+                "context_handoff"
+            } else if origin.is_some() {
+                "legacy_origin"
+            } else if migrated_source.is_some() {
+                "prior_handoff"
+            } else if routing_binding.is_some() {
+                "bound_context"
+            } else if previous_preference.as_deref() == Some(&source.id) {
+                "conversation_affinity"
+            } else if settings.mode == "fixed" {
+                "fixed"
+            } else if settings.load_balance {
+                "load_balance"
+            } else {
+                "priority"
+            };
+            eprintln!(
+                "routing_attempt unix={} source_index={} selection={} rebuilt={} bound={} opaque={}",
+                crate::model::now(),
+                source_index.map_or(-1, |index| index as i64),
+                selection,
+                degraded,
+                binding.is_some(),
+                opaque_state
+            );
+            // Preparation can be abandoned during OAuth or route revalidation.
+            // Notify only when the reconstructed request is actually submitted.
+            if let Some(context) = rebuild
+                .as_ref()
+                .filter(|context| context.excluded.iter().any(|key| key != "rebuilt"))
+            {
+                state
+                    .notifications
+                    .fallback(context.key.as_deref().unwrap_or(&request_id));
             }
             let upstream = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
@@ -1425,4 +1545,57 @@ async fn forward_once(
         }
     }
     last_error.unwrap_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "所有来源暂时不可用"))
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cooldown_deadline_returns_503_with_retry_after_without_contacting_another_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned(), 0, "fixture".into()).unwrap();
+        let source: Source = serde_json::from_value(json!({
+            "id":"only","name":"Fixture","kind":"api","base_url":"http://127.0.0.1:1",
+            "enabled":true,"priority":0,"proxy":{"mode":"direct"},"secret":{"api_key":"fixture"}
+        }))
+        .unwrap();
+        let mut runtime = crate::model::SourceRuntime::new(source);
+        runtime.health = "cooldown".into();
+        runtime.cooldown_until = Some(crate::model::now() + 60);
+        *state.sources.write().await = vec![runtime];
+        {
+            let mut settings = state.settings.write().await;
+            settings.mode = "fixed".into();
+            settings.fixed_source_id = Some("only".into());
+        }
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("host", "127.0.0.1:0")
+            .header("authorization", "Bearer fixture")
+            .body(Body::from(r#"{"model":"m","input":"next"}"#))
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        request.extensions_mut().insert(RecoveryWindow {
+            deadline: started + std::time::Duration::from_millis(60),
+            attempted: false,
+        });
+        let response = forward_once(state.clone(), request, None, 0).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response.headers()["retry-after"]
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                > 0
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(state.usage.summary(1).unwrap()["recent"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
 }

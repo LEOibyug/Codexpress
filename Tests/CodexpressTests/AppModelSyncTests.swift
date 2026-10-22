@@ -26,6 +26,11 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertTrue(model.running, model.error ?? "Fixture helper did not start")
         guard model.running else { return }
         let requests = directory.appendingPathComponent("requests")
+        let syncPayload = directory.appendingPathComponent("last-sync.json")
+        func syncedLoadBalance() throws -> JSONValue {
+            try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: syncPayload))["load_balance"]
+        }
+        XCTAssertEqual(try syncedLoadBalance(), .bool(false))
 
         func expectOneRefresh(_ action: () -> Void) async throws {
             try Data().write(to: requests)
@@ -45,6 +50,12 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertEqual(model.settings.fixed_source_id, first.id)
         try await expectOneRefresh { model.changeLowQuotaThreshold(20) }
         try await expectOneRefresh { model.changeContextFallback(false) }
+        try await expectOneRefresh { model.changeLoadBalance(true) }
+        XCTAssertEqual(try syncedLoadBalance(), .bool(true))
+        XCTAssertTrue(try MetadataStore(directory: directory).load().loadBalanceEnabled)
+        try await expectOneRefresh { model.changeLoadBalance(false) }
+        XCTAssertEqual(try syncedLoadBalance(), .bool(false))
+        XCTAssertFalse(try MetadataStore(directory: directory).load().loadBalanceEnabled)
         try await expectOneRefresh { model.changeIdleReturnDelay(60) }
         try await expectOneRefresh { model.move(IndexSet(integer: 0), to: 2) }
         XCTAssertEqual(model.sources.first?.id, second.id)
@@ -75,6 +86,8 @@ final class AppModelSyncTests: XCTestCase {
             operation = request['op']
             with (directory / 'requests').open('a') as record:
                 record.write(operation + '\n')
+            if operation == 'sync':
+                (directory / 'last-sync.json').write_text(json.dumps(request['payload']))
             if operation == 'status':
                 data = dict(process_id=os.getpid(), port=17863, sources=[])
             elif operation == 'credentials.storage.status':

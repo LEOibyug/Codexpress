@@ -264,7 +264,7 @@ import ServiceManagement
         }
         if next.sources != settings.sources { try persistSettings(next) }
         do {
-            try await mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true), "idle_return_minutes":.number(Double(settings.idleReturnDelay))])))
+            try await mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true), "load_balance":.bool(settings.loadBalanceEnabled), "idle_return_minutes":.number(Double(settings.idleReturnDelay))])))
             historyStatus = try await client.call("history.configure", historyPayload(settings.historyCacheSettings))
             try await updateStatus()
             pendingSync = false
@@ -461,6 +461,12 @@ import ServiceManagement
     func changeContextFallback(_ enabled: Bool) {
         perform {
             var next = self.settings; next.degradedContextFallback = enabled
+            try self.persistSettings(next); try await self.sync()
+        }
+    }
+    func changeLoadBalance(_ enabled: Bool) {
+        perform {
+            var next = self.settings; next.loadBalance = enabled
             try self.persistSettings(next); try await self.sync()
         }
     }

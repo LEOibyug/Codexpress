@@ -323,6 +323,9 @@ async fn fallback_is_ordered_fixed_mode_and_previous_id_never_cross_sources() {
         summary["recent"][1]["request_id"]
     );
     assert_eq!(state.sources.read().await[0].health, "cooldown");
+    // Use a terminal block to check strict source isolation without waiting
+    // through a transient cooldown; recovery waits have separate coverage.
+    state.sources.write().await[0].health = "auth_required".into();
     state
         .bindings
         .lock()
@@ -1256,6 +1259,279 @@ async fn rejected_response_id_rebuilds_cached_history_and_hands_off_in_one_clien
         origin_task.abort();
         next_task.abort();
     }
+}
+
+#[tokio::test]
+async fn cooling_bound_source_waits_and_resumes_raw_context_even_when_rebuild_is_unavailable() {
+    for cache_enabled in [false, true] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let copy = seen.clone();
+        let (origin, origin_task) = serve(Router::new().route(
+            "/responses",
+            post(move |req: Request| {
+                let copy = copy.clone();
+                async move {
+                    assert_eq!(req.headers()["x-codex-turn-state"], "waiting-turn");
+                    copy.lock()
+                        .await
+                        .push(to_bytes(req.into_body(), 10000).await.unwrap());
+                    axum::Json(json!({"id":"resumed-on-origin","status":"completed","output":[]}))
+                }
+            }),
+        ))
+        .await;
+        let other_hits = Arc::new(AtomicUsize::new(0));
+        let copy = other_hits.clone();
+        let (other, other_task) = serve(Router::new().route(
+            "/responses",
+            post(move || {
+                let copy = copy.clone();
+                async move {
+                    copy.fetch_add(1, Ordering::Relaxed);
+                    axum::Json(json!({"id":"wrong-target","output":[]}))
+                }
+            }),
+        ))
+        .await;
+        let (_dir, state) = state(vec![
+            source("origin", &origin, 0),
+            source("other", &other, 1),
+        ])
+        .await;
+        state.settings.write().await.degraded_context_fallback = cache_enabled;
+        state.history.configure(cache_enabled, 64_000_000).unwrap();
+        {
+            let mut sources = state.sources.write().await;
+            sources[0].health = "proxy_error".into();
+            sources[0].cooldown_until = Some(codexpress_gateway::model::now() + 15);
+        }
+        {
+            let mut bindings = state.bindings.lock().await;
+            for key in [
+                "existing-response".to_string(),
+                "thread:waiting-thread".to_string(),
+                codexpress_gateway::continuity::digest("encrypted", "waiting-cipher"),
+                codexpress_gateway::continuity::digest("turn", "waiting-turn"),
+            ] {
+                bindings.insert(key, "origin".into());
+            }
+        }
+        let wire = br#"{ "model":"m", "previous_response_id":"existing-response", "input":[{"type":"reasoning","encrypted_content":"waiting-cipher"},{"role":"user","content":"next"}] }"#;
+        let mut req = request(wire);
+        req.headers_mut()
+            .insert("thread-id", "waiting-thread".parse().unwrap());
+        req.headers_mut()
+            .insert("x-codex-turn-state", "waiting-turn".parse().unwrap());
+        let app = relay::router(state.clone());
+        let pending = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert!(
+            !pending.is_finished(),
+            "transient cooldown must not immediately consume a client retry"
+        );
+        {
+            let mut sources = state.sources.write().await;
+            sources[0].health = "ready".into();
+            sources[0].cooldown_until = None;
+        }
+        let response = tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].as_ref(), wire);
+        assert_eq!(other_hits.load(Ordering::Relaxed), 0);
+        origin_task.abort();
+        other_task.abort();
+    }
+}
+
+#[tokio::test]
+async fn cooling_unbound_legacy_origin_preserves_context_when_cached_history_is_missing() {
+    cooling_unbound_origin_waits_and_resumes_raw_context("legacy", true).await;
+}
+
+#[tokio::test]
+async fn cooling_unbound_legacy_origin_accepts_its_unknown_opaque_binding() {
+    cooling_unbound_origin_waits_and_resumes_raw_context("legacy", false).await;
+}
+
+#[tokio::test]
+async fn cooling_unbound_migrated_origin_preserves_context_when_cached_history_is_missing() {
+    cooling_unbound_origin_waits_and_resumes_raw_context("migrated", true).await;
+}
+
+async fn cooling_unbound_origin_waits_and_resumes_raw_context(mode: &str, previous_id: bool) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let copy = seen.clone();
+    let (origin, origin_task) = serve(Router::new().route(
+        "/responses",
+        post(move |req: Request| {
+            let copy = copy.clone();
+            async move {
+                copy.lock()
+                    .await
+                    .push(to_bytes(req.into_body(), 10000).await.unwrap());
+                axum::Json(
+                    json!({"id":"resumed-on-confirmed-origin","status":"completed","output":[]}),
+                )
+            }
+        }),
+    ))
+    .await;
+    let other_hits = Arc::new(AtomicUsize::new(0));
+    let copy = other_hits.clone();
+    let (other, other_task) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let copy = copy.clone();
+            async move {
+                copy.fetch_add(1, Ordering::Relaxed);
+                axum::Json(json!({"id":"unrelated-ready-source","output":[]}))
+            }
+        }),
+    ))
+    .await;
+    let original = source("origin", &origin, 0);
+    let (directory, state) = state(vec![original.clone(), source("other", &other, 1)]).await;
+    state.history.configure(true, 64_000_000).unwrap();
+    // With an upstream ID, missing history prevents rebuilding. Opaque-only
+    // strict mode requires the confirmed original source without local hashes.
+    state.settings.write().await.degraded_context_fallback = previous_id;
+    let credential = if mode == "legacy" {
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            format!("[model_providers.old]\nname=\"Old\"\nbase_url=\"{origin}\"\nwire_api=\"responses\"\n"),
+        )
+        .unwrap();
+        codexpress_gateway::config::handle(
+            &state,
+            "config.attach",
+            json!({"codex_home":home,"provider_origins":[{"provider_id":"old","source_id":"origin","source_identity":original.identity(),"confirmed":true}]}),
+        )
+        .await
+        .unwrap();
+        let doc = std::fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        doc["model_providers"]["old"]["experimental_bearer_token"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    } else {
+        let key = codexpress_gateway::affinity::key("thread:unbound-origin-thread", "m");
+        let mut lease = routing::reserve_for_model(&state, &original, Some(&key), false, "m")
+            .await
+            .unwrap();
+        lease.commit().unwrap();
+        drop(lease);
+        state
+            .affinity
+            .confirm_exclusions(&key, &std::collections::HashSet::from(["rebuilt".into()]))
+            .unwrap();
+        "local-key".to_owned()
+    };
+    assert!(state.bindings.lock().await.is_empty());
+    {
+        let mut sources = state.sources.write().await;
+        sources[0].health = "proxy_error".into();
+        sources[0].cooldown_until = Some(codexpress_gateway::model::now() + 15);
+    }
+    let wire: &[u8] = if previous_id {
+        br#"{ "model":"m", "previous_response_id":"uncached-existing-response", "input":[{"type":"reasoning","encrypted_content":"unbound-original-cipher"},{"role":"user","content":"next"}] }"#
+    } else {
+        br#"{ "model":"m", "input":[{"type":"reasoning","encrypted_content":"unbound-original-cipher"},{"role":"user","content":"next"}] }"#
+    };
+    let mut req = request(wire);
+    req.headers_mut().insert(
+        "authorization",
+        format!("Bearer {credential}").parse().unwrap(),
+    );
+    req.headers_mut()
+        .insert("thread-id", "unbound-origin-thread".parse().unwrap());
+    let app = relay::router(state.clone());
+    let pending = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert!(
+        !pending.is_finished(),
+        "{mode} origin must wait for its own recovery despite an unrelated ready source"
+    );
+    {
+        let mut sources = state.sources.write().await;
+        sources[0].health = "ready".into();
+        sources[0].cooldown_until = None;
+    }
+    let response = tokio::time::timeout(Duration::from_secs(3), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    let seen = seen.lock().await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].as_ref(), wire);
+    assert_eq!(other_hits.load(Ordering::Relaxed), 0);
+    origin_task.abort();
+    other_task.abort();
+}
+
+#[tokio::test]
+async fn concurrent_requests_wait_for_a_cooling_pool_without_blocking_recovery() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let copy = hits.clone();
+    let (upstream, task) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let copy = copy.clone();
+            async move {
+                copy.fetch_add(1, Ordering::Relaxed);
+                axum::Json(json!({"id":"pool-recovered","status":"completed","output":[]}))
+            }
+        }),
+    ))
+    .await;
+    let (_dir, state) = state(vec![source("only", &upstream, 0)]).await;
+    state.settings.write().await.degraded_context_fallback = true;
+    {
+        let mut sources = state.sources.write().await;
+        sources[0].health = "cooldown".into();
+        sources[0].cooldown_until = Some(codexpress_gateway::model::now() + 15);
+    }
+    let app = relay::router(state.clone());
+    let mut pending = Vec::new();
+    for _ in 0..2 {
+        let app = app.clone();
+        pending.push(tokio::spawn(async move {
+            app.oneshot(request(br#"{"model":"m","input":"next"}"#))
+                .await
+                .unwrap()
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert!(pending.iter().all(|task| !task.is_finished()));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut sources = state.sources.write().await;
+        sources[0].health = "ready".into();
+        sources[0].cooldown_until = None;
+    })
+    .await
+    .unwrap();
+    for pending in pending {
+        let response = tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+    task.abort();
 }
 
 #[tokio::test]
@@ -2195,6 +2471,67 @@ async fn tool_continuation_keeps_long_http_and_stream_metadata_turn_state() {
 }
 
 #[tokio::test]
+async fn child_agent_with_known_inherited_context_keeps_origin_without_recovery_notice() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let copy = hits.clone();
+    let (primary, primary_task) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let copy = copy.clone();
+            async move {
+                copy.fetch_add(1, Ordering::Relaxed);
+                axum::Json(json!({"id":"parent-result","status":"completed","output":[{"type":"reasoning","encrypted_content":"inherited-parent-cipher"}]}))
+            }
+        }),
+    )).await;
+    let other_hits = Arc::new(AtomicUsize::new(0));
+    let copy = other_hits.clone();
+    let (secondary, secondary_task) = serve(Router::new().route(
+        "/responses",
+        post(move || {
+            let copy = copy.clone();
+            async move {
+                copy.fetch_add(1, Ordering::Relaxed);
+                StatusCode::IM_A_TEAPOT
+            }
+        }),
+    ))
+    .await;
+    let (_dir, state) = state(vec![
+        source("primary", &primary, 0),
+        source("secondary", &secondary, 1),
+    ])
+    .await;
+    state.settings.write().await.degraded_context_fallback = true;
+    let app = relay::router(state.clone());
+    let mut parent = request(br#"{"model":"m","input":"parent"}"#);
+    parent
+        .headers_mut()
+        .insert("thread-id", "parent-thread".parse().unwrap());
+    parent
+        .headers_mut()
+        .insert("session-id", "shared-process".parse().unwrap());
+    let response = app.clone().oneshot(parent).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    let mut child = request(br#"{"model":"m","input":[{"type":"reasoning","encrypted_content":"inherited-parent-cipher"},{"role":"user","content":"child"}]}"#);
+    child
+        .headers_mut()
+        .insert("thread-id", "child-thread".parse().unwrap());
+    child
+        .headers_mut()
+        .insert("session-id", "shared-process".parse().unwrap());
+    let response = app.oneshot(child).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+    assert_eq!(other_hits.load(Ordering::Relaxed), 0);
+    assert!(state.notifications.list().is_empty());
+    primary_task.abort();
+    secondary_task.abort();
+}
+
+#[tokio::test]
 async fn codex_thread_headers_bind_opaque_tool_continuations_without_crossing_threads() {
     let hits = Arc::new(AtomicUsize::new(0));
     let copy = hits.clone();
@@ -2388,7 +2725,7 @@ async fn portable_history_with_same_session_keeps_new_source_during_idle_protect
         }),
     ))
     .await;
-    let (_dir, state) = state(vec![source("a", &first, 0), source("b", &second, 1)]).await;
+    let (directory, state) = state(vec![source("a", &first, 0), source("b", &second, 1)]).await;
     let app = relay::router(state.clone());
     for enabled in [true, false, true] {
         state.sources.write().await[0].source.enabled = enabled;
@@ -2401,6 +2738,28 @@ async fn portable_history_with_same_session_keeps_new_source_during_idle_protect
         to_bytes(response.into_body(), 10000).await.unwrap();
     }
     assert_eq!(*calls.lock().await, vec!["a", "b", "b"]);
+    assert!(state.notifications.list().is_empty());
+    let sources = state.sources.read().await.clone();
+    drop(app);
+    drop(state);
+    expire_fixture_affinity(directory.path());
+    let restored = AppState::new(directory.path().to_owned(), 0, "local-key".into()).unwrap();
+    *restored.sources.write().await = sources;
+    let mut portable = request(br#"{"model":"m","input":"complete portable history"}"#);
+    portable
+        .headers_mut()
+        .insert("x-session-id", "same-local-session".parse().unwrap());
+    let response = relay::router(restored.clone())
+        .oneshot(portable)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert_eq!(*calls.lock().await, vec!["a", "b", "b", "a"]);
+    assert!(
+        restored.notifications.list().is_empty(),
+        "a portable idle return must not report context removal"
+    );
     a.abort();
     b.abort();
 }

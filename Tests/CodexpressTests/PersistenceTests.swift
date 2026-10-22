@@ -2,6 +2,21 @@ import XCTest
 @testable import Codexpress
 
 final class PersistenceTests: XCTestCase {
+    func testLoadBalancingDefaultsToPriorityAndPersistsOptIn() throws {
+        let legacy = Data(#"{"sources":[],"mode":"auto","port":17863,"codexHome":"/temporary/codex"}"#.utf8)
+        var settings = try JSONDecoder().decode(AppSettings.self, from: legacy)
+        XCTAssertFalse(settings.loadBalanceEnabled)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cx-load-balance-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MetadataStore(directory: directory)
+        settings.loadBalance = true
+        try store.save(settings)
+        XCTAssertTrue(try store.load().loadBalanceEnabled)
+        settings.loadBalance = false
+        try store.save(settings)
+        XCTAssertFalse(try store.load().loadBalanceEnabled)
+    }
+
     func testHistoryCacheCapacityMigrationAndValidation() throws {
         let old = Data(#"{"sources":[],"mode":"auto","port":17863,"codexHome":"/temporary/codex"}"#.utf8)
         var settings = try JSONDecoder().decode(AppSettings.self, from: old)

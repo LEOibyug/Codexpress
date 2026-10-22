@@ -25,6 +25,71 @@ async fn quota(state: &Arc<AppState>, used: f64) {
 }
 
 #[tokio::test]
+async fn priority_is_strict_by_default_and_balancing_only_changes_new_unbound_sessions() {
+    let (_dir, state, first, second) = state().await;
+    let parent = affinity::key("parent", "m");
+    let mut lease = routing::reserve(&state, &first, Some(&parent), false)
+        .await
+        .unwrap();
+    lease.commit().unwrap();
+    // An active first source is not a reason to distribute new subagents.
+    for index in 0..10 {
+        let child = affinity::key(&format!("child-{index}"), "m");
+        assert_eq!(
+            routing::candidates_with_session(&state, "m", None, Some(&child)).await[0].id,
+            first.id
+        );
+    }
+    state.settings.write().await.load_balance = true;
+    let child = affinity::key("balanced-child", "m");
+    assert_eq!(
+        routing::candidates_with_session(&state, "m", None, Some(&child)).await[0].id,
+        second.id
+    );
+    assert_eq!(
+        routing::candidates_with_session(&state, "m", None, Some(&parent)).await[0].id,
+        first.id
+    );
+    state
+        .bindings
+        .lock()
+        .await
+        .insert("parent-response".into(), first.id.clone());
+    assert_eq!(
+        routing::candidates_with_session(&state, "m", Some("parent-response"), Some(&child)).await
+            [0]
+        .id,
+        first.id
+    );
+    {
+        let mut settings = state.settings.write().await;
+        settings.mode = "fixed".into();
+        settings.fixed_source_id = Some(first.id.clone());
+    }
+    let candidates = routing::candidates_with_session(&state, "m", None, Some(&child)).await;
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].id, first.id);
+    {
+        let mut settings = state.settings.write().await;
+        settings.mode = "auto".into();
+        settings.load_balance = false;
+    }
+    assert_eq!(
+        routing::candidates_with_session(&state, "m", None, Some(&child)).await[0].id,
+        first.id
+    );
+    // Strict priority still falls back when the preferred source cannot admit.
+    state.sources.write().await[0]
+        .source
+        .max_active_conversations = Some(1);
+    assert_eq!(
+        routing::candidates_with_session(&state, "m", None, Some(&child)).await[0].id,
+        second.id
+    );
+    drop(lease);
+}
+
+#[tokio::test]
 async fn low_quota_keeps_existing_conversation_and_reserves_only_one_new_conversation_atomically() {
     let (_dir, state, official, api) = state().await;
     quota(&state, 90.0).await;

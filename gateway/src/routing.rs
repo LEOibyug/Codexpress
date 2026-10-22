@@ -37,6 +37,113 @@ pub async fn candidates_with_session(
     candidate_sources(state, model, binding, session, !model.is_empty()).await
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryWait {
+    Ready,
+    TimedOut { retry_after: u64 },
+    Unavailable,
+}
+
+enum RecoveryReadiness {
+    Ready,
+    Waiting(u64),
+    Blocked,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RecoveryOrigin<'a> {
+    pub source_id: &'a str,
+    pub identity: Option<&'a str>,
+}
+
+/// Wait only for transient admission failures. No inference or health mutation
+/// happens here, and no state lock is retained across a timer wait.
+pub(crate) async fn wait_for_recovery(
+    state: &Arc<AppState>,
+    model: &str,
+    binding: Option<&str>,
+    session: Option<&str>,
+    origin: Option<RecoveryOrigin<'_>>,
+    deadline: tokio::time::Instant,
+) -> RecoveryWait {
+    loop {
+        let snapshot = tokio::time::timeout_at(
+            deadline,
+            recovery_readiness(state, model, binding, session, origin),
+        )
+        .await;
+        let retry_after = match snapshot {
+            Ok(RecoveryReadiness::Ready) => return RecoveryWait::Ready,
+            Ok(RecoveryReadiness::Blocked) => return RecoveryWait::Unavailable,
+            Ok(RecoveryReadiness::Waiting(seconds)) => seconds,
+            Err(_) => return RecoveryWait::TimedOut { retry_after: 1 },
+        };
+        let timestamp = tokio::time::Instant::now();
+        if timestamp >= deadline {
+            return RecoveryWait::TimedOut { retry_after };
+        }
+        tokio::time::sleep_until((timestamp + std::time::Duration::from_millis(250)).min(deadline))
+            .await;
+    }
+}
+
+async fn recovery_readiness(
+    state: &Arc<AppState>,
+    model: &str,
+    binding: Option<&str>,
+    session: Option<&str>,
+    origin: Option<RecoveryOrigin<'_>>,
+) -> RecoveryReadiness {
+    let settings = state.settings.read().await.clone();
+    let runtimes = state.sources.read().await;
+    let bound_id = if let Some(binding) = binding {
+        match state.bindings.lock().await.get(binding).cloned() {
+            Some(id) => Some(id),
+            // A confirmed legacy credential can establish the origin of opaque
+            // state that has never been observed by this gateway.
+            None if origin.is_some() => None,
+            None => return RecoveryReadiness::Blocked,
+        }
+    } else {
+        None
+    };
+    let timestamp = now();
+    let mut retry_after: Option<u64> = None;
+    for runtime in runtimes.iter() {
+        let source = &runtime.source;
+        if !source.enabled
+            || !(model.is_empty()
+                || source.models.is_empty()
+                || source.models.iter().any(|m| m == model))
+            || bound_id.as_ref().is_some_and(|id| id != &source.id)
+            || origin.is_some_and(|origin| {
+                origin.source_id != source.id
+                    || origin
+                        .identity
+                        .is_some_and(|identity| identity != source.identity())
+            })
+            || (settings.mode == "fixed" && settings.fixed_source_id.as_ref() != Some(&source.id))
+            || account_remaining(runtime, &runtimes).is_some_and(|remaining| remaining <= 0.0)
+        {
+            continue;
+        }
+        let cooling = match runtime.health.as_str() {
+            "ready" => 0,
+            "cooldown" | "proxy_error" => match runtime.cooldown_until {
+                Some(until) => until.saturating_sub(timestamp),
+                None => continue,
+            },
+            _ => continue,
+        };
+        if cooling == 0 && state.affinity.capacity_available(session, source) {
+            return RecoveryReadiness::Ready;
+        }
+        let seconds = cooling.max(1);
+        retry_after = Some(retry_after.map_or(seconds, |previous| previous.min(seconds)));
+    }
+    retry_after.map_or(RecoveryReadiness::Blocked, RecoveryReadiness::Waiting)
+}
+
 /// Revalidate a source for a caller that already owns its capacity lease.
 /// Anonymous leases have no reusable session key, so reserving the last slot
 /// must not make this request reject its own source during preflight.
@@ -135,6 +242,9 @@ async fn candidate_sources(
         .map(|r| r.source.clone())
         .collect();
     sources.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.id.cmp(&b.id)));
+    if settings.load_balance && settings.mode == "auto" && binding.is_none() {
+        state.affinity.order_by_load(&mut sources);
+    }
     if binding.is_none() {
         if let Some(preferred) = session.and_then(|key| state.affinity.preferred(key, &sources)) {
             sources.sort_by_key(|source| source.id != preferred);
@@ -221,7 +331,7 @@ pub async fn reserve_idle_return(
     session: &str,
 ) -> Option<(Source, crate::affinity::RouteLease)> {
     let settings = state.settings.read().await.clone();
-    if settings.mode != "auto" || settings.idle_return_minutes == 0 {
+    if settings.mode != "auto" || settings.load_balance || settings.idle_return_minutes == 0 {
         return None;
     }
     let sources = state.sources.read().await;
@@ -530,6 +640,131 @@ pub async fn mark_rejection(
 mod tests {
     use super::*;
     use crate::model::SourceRuntime;
+
+    fn recovery_source() -> Source {
+        serde_json::from_value(json!({
+            "id":"recovery","name":"Fixture","kind":"api",
+            "base_url":"http://127.0.0.1:1/v1","enabled":true,"priority":0,
+            "proxy":{"mode":"direct"},"secret":{"api_key":"fixture"}
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recovery_wait_rechecks_capacity_without_holding_state_locks() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned(), 0, "fixture".into()).unwrap();
+        let mut source = recovery_source();
+        source.max_active_conversations = Some(1);
+        let lease = state
+            .affinity
+            .reserve(Some("occupied"), &source, false, false, None)
+            .unwrap();
+        *state.sources.write().await = vec![SourceRuntime::new(source)];
+        let copy = state.clone();
+        let update = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let _sources = copy.sources.write().await;
+            drop(lease);
+        });
+        assert_eq!(
+            wait_for_recovery(
+                &state,
+                "m",
+                None,
+                Some("new"),
+                None,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1)
+            )
+            .await,
+            RecoveryWait::Ready
+        );
+        update.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_wait_respects_terminal_policy_and_bounds_cooldown_and_lock_waits() {
+        for case in [
+            "disabled",
+            "model",
+            "fixed",
+            "auth",
+            "quota",
+            "exhausted",
+            "binding",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = AppState::new(directory.path().to_owned(), 0, "fixture".into()).unwrap();
+            let mut runtime = SourceRuntime::new(recovery_source());
+            runtime.health = "cooldown".into();
+            runtime.cooldown_until = Some(now() + 60);
+            match case {
+                "disabled" => runtime.source.enabled = false,
+                "model" => runtime.source.models = vec!["different".into()],
+                "fixed" => {
+                    let mut settings = state.settings.write().await;
+                    settings.mode = "fixed".into();
+                    settings.fixed_source_id = Some("another".into());
+                }
+                "auth" => runtime.health = "auth_required".into(),
+                "quota" => {
+                    runtime.source.kind = "official".into();
+                    runtime.quota = json!({"windows":[{"name":"primary","used_percent":100}]});
+                }
+                "exhausted" => runtime.health = "exhausted".into(),
+                _ => {}
+            }
+            *state.sources.write().await = vec![runtime];
+            assert_eq!(
+                wait_for_recovery(
+                    &state,
+                    "m",
+                    (case == "binding").then_some("unknown"),
+                    None,
+                    None,
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(60)
+                )
+                .await,
+                RecoveryWait::Unavailable,
+                "{case} must not be bypassed by recovery"
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned(), 0, "fixture".into()).unwrap();
+        let mut runtime = SourceRuntime::new(recovery_source());
+        runtime.health = "proxy_error".into();
+        runtime.cooldown_until = Some(now() + 60);
+        *state.sources.write().await = vec![runtime];
+        for duration in [0, 50] {
+            assert!(matches!(
+                wait_for_recovery(
+                    &state,
+                    "m",
+                    None,
+                    None,
+                    None,
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(duration)
+                )
+                .await,
+                RecoveryWait::TimedOut { retry_after: 1.. }
+            ));
+        }
+        let _locked = state.sources.write().await;
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            wait_for_recovery(
+                &state,
+                "m",
+                None,
+                None,
+                None,
+                started + std::time::Duration::from_millis(50)
+            )
+            .await,
+            RecoveryWait::TimedOut { retry_after: 1 }
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     #[tokio::test]
     async fn rejection_diagnostics_exposes_reasons_without_private_source_data() {
