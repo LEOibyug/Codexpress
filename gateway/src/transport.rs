@@ -102,3 +102,28 @@ pub fn failure_reason(error: &reqwest::Error) -> &'static str {
         _ => "数据传输中断，提交结果可能不明确",
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BodyReadError {
+    TooLarge,
+    ReadFailed,
+}
+
+/// Read raw chunks only; status, length hints and timeouts remain caller policy.
+pub async fn read_limited(
+    response: &mut reqwest::Response,
+    limit: usize,
+) -> std::result::Result<Vec<u8>, BodyReadError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| BodyReadError::ReadFailed)?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(BodyReadError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}

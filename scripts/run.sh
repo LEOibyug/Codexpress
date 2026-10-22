@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-project_root="$(cd "$(dirname "$0")/.." && pwd)"
+source "$(dirname "$0")/common.sh"
 if [ ! -d "$project_root/dist/Codexpress.app" ]; then
   bash "$project_root/scripts/build.sh"
 fi

@@ -256,17 +256,12 @@ async fn json_response(response: reqwest::Response) -> Result<Value> {
         bail!("官方响应过大");
     }
     let mut response = response;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
+    let bytes = transport::read_limited(&mut response, 2 * 1024 * 1024)
         .await
-        .map_err(|_| anyhow!("官方响应读取失败"))?
-    {
-        if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-            bail!("官方响应过大");
-        }
-        bytes.extend_from_slice(&chunk);
-    }
+        .map_err(|error| match error {
+            transport::BodyReadError::TooLarge => anyhow!("官方响应过大"),
+            transport::BodyReadError::ReadFailed => anyhow!("官方响应读取失败"),
+        })?;
     serde_json::from_slice(&bytes).map_err(|_| anyhow!("官方接口响应格式变化"))
 }
 async fn refresh_inner(
@@ -313,17 +308,12 @@ async fn refresh_inner(
             true
         } else {
             let mut response = response;
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
+            let bytes = transport::read_limited(&mut response, 65536)
                 .await
-                .map_err(|_| anyhow!("官方令牌响应读取失败"))?
-            {
-                if bytes.len() + chunk.len() > 65536 {
-                    bail!("官方令牌接口返回 HTTP 400");
-                }
-                bytes.extend_from_slice(&chunk);
-            }
+                .map_err(|error| match error {
+                    transport::BodyReadError::TooLarge => anyhow!("官方令牌接口返回 HTTP 400"),
+                    transport::BodyReadError::ReadFailed => anyhow!("官方令牌响应读取失败"),
+                })?;
             let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
             let code = body
                 .pointer("/error/code")

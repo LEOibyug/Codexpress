@@ -86,8 +86,7 @@
 ```sh
 git clone https://github.com/LEOibyug/Codexpress.git
 cd Codexpress
-bash scripts/check.sh  # Rust 检查与测试
-swift test            # Swift 测试
+bash scripts/check.sh # 测试与静态检查
 bash scripts/build.sh # 构建 macOS 应用
 bash scripts/package.sh # 生成 DMG、ZIP 和校验文件
 ```

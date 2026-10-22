@@ -2757,3 +2757,118 @@ async fn sse_capture_keeps_completed_output_and_usage_never_returns_bodies() {
     }
     task.abort();
 }
+
+#[tokio::test]
+async fn unknown_chunked_errors_keep_all_bytes_and_never_replay() {
+    use bytes::Bytes;
+
+    for status in [StatusCode::BAD_REQUEST, StatusCode::PAYMENT_REQUIRED] {
+        for padding in [0, 70_000] {
+            let wire = format!(
+                "{{\"error\":{{\"code\":\"unknown_rejection\",\"message\":\"{}\"}}}}",
+                "x".repeat(padding)
+            );
+            let chunks: Vec<_> = wire
+                .as_bytes()
+                .chunks(if padding == 0 { 7 } else { 4093 })
+                .map(Bytes::copy_from_slice)
+                .collect();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let copy = calls.clone();
+            let (origin, origin_task) = serve(Router::new().route(
+                "/responses",
+                post(move || {
+                    let chunks = chunks.clone();
+                    let copy = copy.clone();
+                    async move {
+                        copy.fetch_add(1, Ordering::SeqCst);
+                        let stream = async_stream::stream! {
+                            for chunk in chunks {
+                                yield Ok::<_, std::io::Error>(chunk);
+                                tokio::task::yield_now().await;
+                            }
+                        };
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(Body::from_stream(stream))
+                            .unwrap()
+                    }
+                }),
+            ))
+            .await;
+            let fallback_calls = Arc::new(AtomicUsize::new(0));
+            let copy = fallback_calls.clone();
+            let (fallback, fallback_task) = serve(Router::new().route(
+                "/responses",
+                post(move || {
+                    copy.fetch_add(1, Ordering::SeqCst);
+                    async { "must not replay" }
+                }),
+            ))
+            .await;
+            let (_dir, state) =
+                state(vec![source("a", &origin, 0), source("b", &fallback, 1)]).await;
+            state
+                .bindings
+                .lock()
+                .await
+                .insert("known-response".into(), "a".into());
+            state.settings.write().await.degraded_context_fallback =
+                status == StatusCode::BAD_REQUEST;
+            let response = relay::router(state)
+                .oneshot(request(
+                    br#"{"model":"m","previous_response_id":"known-response","input":"hi"}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let body = to_bytes(response.into_body(), 100_000).await.unwrap();
+            assert_eq!(body.as_ref(), wire.as_bytes());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+            origin_task.abort();
+            fallback_task.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn bounded_body_reader_rejects_chunked_overflow_and_incomplete_transport() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for (wire, expected) in [
+        (
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\n1234\r\n4\r\n5678\r\n0\r\n\r\n",
+            transport::BodyReadError::TooLarge,
+        ),
+        (
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\n1234\r\n4\r\n56",
+            transport::BodyReadError::ReadFailed,
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            socket.write_all(wire.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let mut response = transport::client(&source("reader", &address, 0))
+            .unwrap()
+            .get(&address)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.content_length(), None);
+        assert_eq!(transport::read_limited(&mut response, 7).await, Err(expected));
+        task.await.unwrap();
+    }
+}

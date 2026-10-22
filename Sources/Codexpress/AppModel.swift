@@ -365,7 +365,7 @@ import ServiceManagement
         else { var item = source; item.priority = updated.sources.count; updated.sources.append(item) }
         if updated.fixed_source_id == source.id && !source.enabled { updated.mode = "auto"; updated.fixed_source_id = nil }
         try persistSettings(updated)
-        try await sync(); try await updateStatus()
+        try await sync()
         if source.official { officialRefreshSchedule.reset(source.id) }
         modelErrors[source.id] = nil
         apiBalances[source.id] = nil
@@ -448,14 +448,14 @@ import ServiceManagement
         perform {
             if mode == "fixed", !self.settings.sources.contains(where: { $0.id == fixed && $0.enabled }) { throw AppError.message("请选择已启用的固定来源。") }
             var next = self.settings; next.mode = mode; next.fixed_source_id = fixed
-            try self.persistSettings(next); try await self.sync(); try await self.updateStatus()
+            try self.persistSettings(next); try await self.sync()
         }
     }
     func changeLowQuotaThreshold(_ value: Int) {
         perform {
             guard (1...99).contains(value) else { throw AppError.message("余量阈值须为 1–99%。") }
             var next = self.settings; next.officialLowQuotaPercent = value
-            try self.persistSettings(next); try await self.sync(); try await self.updateStatus()
+            try self.persistSettings(next); try await self.sync()
         }
     }
     func changeContextFallback(_ enabled: Bool) {
@@ -468,7 +468,7 @@ import ServiceManagement
         perform {
             guard (0...10080).contains(minutes) else { throw AppError.message("闲置回切时间须为 0–10080 分钟。") }
             var next = self.settings; next.idleReturnMinutes = minutes
-            try self.persistSettings(next); try await self.sync(); try await self.updateStatus()
+            try self.persistSettings(next); try await self.sync()
         }
     }
     func move(_ offsets: IndexSet, to destination: Int) {
@@ -478,7 +478,7 @@ import ServiceManagement
             guard next.count == self.settings.sources.count else { throw AppError.message("来源已变化，请重新排序。") }
             for i in next.indices { next[i].priority = i }
             var settings = self.settings; settings.sources = next
-            try self.persistSettings(settings); try await self.sync(); try await self.updateStatus()
+            try self.persistSettings(settings); try await self.sync()
         }
     }
     func toggle(_ source: Source) { var next = source; next.enabled.toggle(); perform { try await self.saveSource(next, apiKey: "") } }
@@ -526,7 +526,6 @@ import ServiceManagement
         try await updateStatus()
     }
     func refresh(_ id: String) { perform { try await self.queryOfficial(id, includeCredits: true) } }
-    func refreshUsage(days: Int, sourceID: String? = nil, modelID: String? = nil) { Task { await loadUsage(days: days, sourceID: sourceID, modelID: modelID) } }
     func loadUsage(days: Int, sourceID: String? = nil, modelID: String? = nil) async {
         if usageDays != days { usage = .null; usageUpdatedAt = nil }
         usageDays = days; usageSourceID = sourceID; usageModelID = modelID
@@ -650,6 +649,18 @@ import ServiceManagement
             self.preview = try await self.client.call("config.preview", self.configPayload())
         }
     }
+    private func transitionCodexConnection(target: CodexConnectionTarget, payload: JSONValue, preflight: String, operation: String) async throws -> JSONValue {
+        var result: JSONValue = .null
+        try await CodexConnectionTransition.run(controller: NativeCodexApplication(), codexHome: settings.codexHome, target: target, preflight: {
+            _ = try await self.client.call(preflight, payload)
+        }, apply: {
+            result = try await self.client.call(operation, payload)
+        }, phase: { self.codexConnectionPhase = $0 })
+        preview = .null
+        try await updateStatus()
+        await refreshConfigurationBackups()
+        return result
+    }
     func configAction(_ operation: String) {
         perform {
             try self.requireWritableMetadata()
@@ -657,15 +668,7 @@ import ServiceManagement
             let payload = try self.configPayload()
             self.codexConnectionPhase = "检查连接设置…"
             defer { self.codexConnectionPhase = nil }
-            var result: JSONValue = .null
-            try await CodexConnectionTransition.run(controller: NativeCodexApplication(), codexHome: self.settings.codexHome, target: operation == "config.restore" ? .restored : .gateway, preflight: {
-                _ = try await self.client.call(operation == "config.restore" ? "config.restore.preview" : "config.preview",payload)
-            }, apply: {
-                result = try await self.client.call(operation,payload)
-            }, phase: { self.codexConnectionPhase = $0 })
-            self.preview = .null
-            try await self.updateStatus()
-            await self.refreshConfigurationBackups()
+            let result = try await self.transitionCodexConnection(target: operation == "config.restore" ? .restored : .gateway, payload: payload, preflight: operation == "config.restore" ? "config.restore.preview" : "config.preview", operation: operation)
             self.notice = operation == "config.restore" ? "已恢复原连接并重启 Codex。" : "旧配置与文件认证已备份，连接设置已应用并重启 Codex。"
             if let warning = result["warning"].string { self.notice = warning }
         }
@@ -683,14 +686,7 @@ import ServiceManagement
             let payload: JSONValue = .object(["codex_home":.string(self.settings.codexHome),"backup_id":.string(id)])
             self.codexConnectionPhase = "检查备份…"
             defer { self.codexConnectionPhase = nil }
-            try await CodexConnectionTransition.run(controller: NativeCodexApplication(), codexHome: self.settings.codexHome, target: .restored, preflight: {
-                _ = try await self.client.call("config.backup.preview",payload)
-            }, apply: {
-                _ = try await self.client.call("config.backup.restore",payload)
-            }, phase: { self.codexConnectionPhase = $0 })
-            self.preview = .null
-            try await self.updateStatus()
-            await self.refreshConfigurationBackups()
+            _ = try await self.transitionCodexConnection(target: .restored, payload: payload, preflight: "config.backup.preview", operation: "config.backup.restore")
             self.notice = "配置与文件认证已还原，Codex 已重启；还原前状态也已备份。"
         }
     }
@@ -704,19 +700,10 @@ import ServiceManagement
                 try await self.sync()
             }
             let payload = try self.configPayload()
-            let home = self.settings.codexHome
             self.codexConnectionPhase = "检查连接设置…"
             defer { self.codexConnectionPhase = nil }
             do {
-                var result: JSONValue = .null
-                try await CodexConnectionTransition.run(controller: NativeCodexApplication(), codexHome: home, target: target, preflight: {
-                    _ = try await self.client.call(target == .official ? "config.official.preview" : "config.preview", payload)
-                }, apply: {
-                    result = try await self.client.call(target == .official ? "config.official" : "config.attach", payload)
-                }, phase: { self.codexConnectionPhase = $0 })
-                self.preview = .null
-                try await self.updateStatus()
-                await self.refreshConfigurationBackups()
+                let result = try await self.transitionCodexConnection(target: target, payload: payload, preflight: target == .official ? "config.official.preview" : "config.preview", operation: target == .official ? "config.official" : "config.attach")
                 self.notice = target == .official ? "Codex 已重启并切换为官方连接；如未登录，请在 Codex 中完成登录。" : "Codex 已重启并切换为来源池。"
                 if let warning = result["warning"].string { self.notice = warning }
             } catch {

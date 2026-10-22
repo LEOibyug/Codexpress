@@ -57,9 +57,7 @@ jobs:
           rustup default stable
 
       - name: 测试与检查
-        run: |
-          bash scripts/check.sh
-          swift test
+        run: bash scripts/check.sh
 
       - name: 编译应用
         run: bash scripts/build.sh

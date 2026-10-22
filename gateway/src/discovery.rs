@@ -101,17 +101,12 @@ async fn fetch(source: &Source) -> Result<Vec<String>> {
     {
         bail!("供应商模型列表超过 4 MiB 限制");
     }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
+    let body = transport::read_limited(&mut response, BODY_LIMIT)
         .await
-        .map_err(|_| anyhow!("读取模型列表失败，请重试"))?
-    {
-        if body.len() + chunk.len() > BODY_LIMIT {
-            bail!("供应商模型列表超过 4 MiB 限制");
-        }
-        body.extend_from_slice(&chunk);
-    }
+        .map_err(|error| match error {
+            transport::BodyReadError::TooLarge => anyhow!("供应商模型列表超过 4 MiB 限制"),
+            transport::BodyReadError::ReadFailed => anyhow!("读取模型列表失败，请重试"),
+        })?;
     parse_models(&body)
 }
 

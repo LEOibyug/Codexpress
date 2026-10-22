@@ -303,13 +303,9 @@ impl<'a> Probe<'a> {
         } else {
             None
         };
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.ok()? {
-            if bytes.len() + chunk.len() > BODY_LIMIT {
-                return None;
-            }
-            bytes.extend_from_slice(&chunk);
-        }
+        let bytes = transport::read_limited(&mut response, BODY_LIMIT)
+            .await
+            .ok()?;
         Some(Reply {
             status,
             json: serde_json::from_slice(&bytes).ok()?,

@@ -507,22 +507,16 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             );
         }
         let _ = lease.commit();
-        let mut raw = Vec::new();
-        loop {
-            match upstream.chunk().await {
-                Ok(Some(chunk)) if raw.len() + chunk.len() <= RESPONSE_LIMIT => {
-                    raw.extend_from_slice(&chunk)
-                }
-                Ok(None) => break,
-                _ => {
-                    attempt.finish("failed");
-                    return error(
-                        StatusCode::BAD_GATEWAY,
-                        "图片响应过大或传输中断，未自动重试",
-                    );
-                }
+        let raw = match transport::read_limited(&mut upstream, RESPONSE_LIMIT).await {
+            Ok(raw) => raw,
+            Err(_) => {
+                attempt.finish("failed");
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    "图片响应过大或传输中断，未自动重试",
+                );
             }
-        }
+        };
         let result: Value = match serde_json::from_slice(&raw) {
             Ok(v) => v,
             Err(_) => {
