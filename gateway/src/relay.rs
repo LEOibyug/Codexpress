@@ -717,7 +717,9 @@ async fn forward_once(
             .or_else(|| (!has_upstream_id).then_some(binding).flatten())
             .map(str::to_owned)
     };
-    let migrated_source = if previously_rebuilt {
+    // Prior migrations constrain unchanged upstream state. Once this request
+    // has safely rebuilt its context, that old target must not lock it there.
+    let migrated_source = if previously_rebuilt && !degraded {
         let runtimes = state.sources.read().await;
         let all: Vec<_> = runtimes.iter().map(|r| r.source.clone()).collect();
         stored_key
@@ -833,8 +835,20 @@ async fn forward_once(
         });
     }
     if sources.is_empty() {
+        let settings = state.settings.read().await.clone();
+        let diagnostics =
+            routing::rejection_diagnostics(&state, model, affinity_key.as_deref()).await;
+        eprintln!(
+            "routing_candidates_empty unix={} rebuilt={} bound={} opaque={} fallback={} cache={} sources={}",
+            crate::model::now(),
+            degraded,
+            binding.is_some(),
+            opaque_state,
+            settings.degraded_context_fallback,
+            state.history.enabled(),
+            diagnostics
+        );
         if !degraded && !discovery && (binding.is_some() || opaque_state) {
-            let settings = state.settings.read().await.clone();
             let eligible =
                 !routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
                     .await
@@ -849,7 +863,14 @@ async fn forward_once(
                 .await
                 {
                     Ok(value) => value,
-                    Err(response) => return *response,
+                    Err(response) => {
+                        eprintln!(
+                            "context_restore_failed unix={} status={}",
+                            crate::model::now(),
+                            response.status().as_u16()
+                        );
+                        return *response;
+                    }
                 };
                 return Box::pin(forward_once(state, retry, Some(context), replans)).await;
             }
@@ -1106,8 +1127,49 @@ async fn forward_once(
                 Ok(response) => response,
                 Err(err) => {
                     let definitely_unsubmitted = err.is_connect();
+                    eprintln!(
+                        "upstream_transport_failure unix={} kind={} connect={} timeout={} uncertain={}",
+                        crate::model::now(),
+                        if source.kind == "official" { "official" } else { "api" },
+                        definitely_unsubmitted,
+                        err.is_timeout(),
+                        !definitely_unsubmitted
+                    );
                     attempt.finish("failed", None);
                     routing::mark_transport_failure(&state, &source.id, &err).await;
+                    if definitely_unsubmitted
+                        && !degraded
+                        && !probe_unknown_id
+                        && (binding.is_some() || opaque_state || origin.is_some())
+                        && state.settings.read().await.degraded_context_fallback
+                        && !routing::candidates_with_session(
+                            &state,
+                            model,
+                            None,
+                            affinity_key.as_deref(),
+                        )
+                        .await
+                        .is_empty()
+                    {
+                        // A connect failure did not submit inference. Rebuild
+                        // before changing sources instead of returning the old
+                        // opaque state to the client's limited retry loop.
+                        drop(route_lease.take());
+                        drop(attempt);
+                        let (retry, mut context) = match portable_request(
+                            &state,
+                            &parts,
+                            &parsed,
+                            affinity_key.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(value) => value,
+                            Err(response) => return *response,
+                        };
+                        context.rejected_source = Some(source.id.clone());
+                        return Box::pin(forward_once(state, retry, Some(context), replans)).await;
+                    }
                     if !definitely_unsubmitted || opaque_state {
                         return error(
                             StatusCode::BAD_GATEWAY,
@@ -1122,6 +1184,18 @@ async fn forward_once(
                 }
             };
             let status = upstream.status();
+            if !status.is_success() {
+                eprintln!(
+                    "upstream_http_failure unix={} kind={} status={}",
+                    crate::model::now(),
+                    if source.kind == "official" {
+                        "official"
+                    } else {
+                        "api"
+                    },
+                    status.as_u16()
+                );
+            }
             let retry_after = upstream
                 .headers()
                 .get("retry-after")

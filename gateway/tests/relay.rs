@@ -1259,6 +1259,311 @@ async fn rejected_response_id_rebuilds_cached_history_and_hands_off_in_one_clien
 }
 
 #[tokio::test]
+async fn unknown_id_keeps_raw_context_after_a_candidate_connect_failure() {
+    let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let missing = format!("http://{}", unavailable.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let copy = seen.clone();
+    let (available, task) = serve(Router::new().route(
+        "/responses",
+        post(move |req: Request| {
+            let copy = copy.clone();
+            async move {
+                copy.lock()
+                    .await
+                    .push(to_bytes(req.into_body(), 10000).await.unwrap());
+                axum::Json(
+                    json!({"id":"accepted-existing-context","status":"completed","output":[]}),
+                )
+            }
+        }),
+    ))
+    .await;
+    drop(unavailable);
+    let (_dir, state) = state(vec![
+        source("missing", &missing, 0),
+        source("available", &available, 1),
+    ])
+    .await;
+    state.settings.write().await.degraded_context_fallback = true;
+    state.history.configure(true, 64_000_000).unwrap();
+    let wire = br#"{ "model":"m", "previous_response_id":"external-existing-id", "input":"next question" }"#;
+    let response = relay::router(state.clone())
+        .oneshot(request(wire))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap()).unwrap();
+    assert_eq!(body["id"], "accepted-existing-context");
+    let seen = seen.lock().await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].as_ref(), wire);
+    assert!(state.notifications.list().is_empty());
+    task.abort();
+}
+
+#[tokio::test]
+async fn connect_refusal_rebuilds_bound_opaque_context_and_hands_off_in_the_same_request() {
+    let (origin, origin_task) = serve(Router::new().route(
+        "/responses",
+        post(|| async {
+            Response::builder()
+                .header("content-type", "application/json")
+                .header("connection", "close")
+                .header("x-codex-turn-state", "before-disconnect-turn")
+                .body(Body::from(
+                    json!({
+                        "id":"before-disconnect", "status":"completed",
+                        "output":[
+                            {"type":"reasoning","encrypted_content":"before-disconnect-private"},
+                            {"role":"assistant","content":"answer before disconnect"}
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }),
+    ))
+    .await;
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let copy = received.clone();
+    let (next, next_task) = serve(Router::new().route(
+        "/responses",
+        post(move |req: Request| {
+            let copy = copy.clone();
+            async move {
+                assert!(!req.headers().contains_key("x-codex-turn-state"));
+                let body: Value =
+                    serde_json::from_slice(&to_bytes(req.into_body(), 10000).await.unwrap())
+                        .unwrap();
+                copy.lock().await.push(body);
+                axum::Json(json!({
+                    "id":"continued-after-connect-refusal", "status":"completed", "output":[]
+                }))
+            }
+        }),
+    ))
+    .await;
+    let (_dir, state) = state(vec![source("origin", &origin, 0), source("next", &next, 1)]).await;
+    state.settings.write().await.degraded_context_fallback = true;
+    state.history.configure(true, 64_000_000).unwrap();
+    let make_request = |body: Value| {
+        let mut req = request(&serde_json::to_vec(&body).unwrap());
+        req.headers_mut()
+            .insert("thread-id", "connect-refusal-thread".parse().unwrap());
+        req
+    };
+    let app = relay::router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(make_request(json!({
+            "model":"m", "input":[{"role":"user","content":"original question"}]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    origin_task.abort();
+    let _ = origin_task.await;
+    // The first response closes its connection, so the next attempt cannot
+    // reuse a pooled socket after the listener is gone.
+    assert!(
+        tokio::net::TcpStream::connect(origin.strip_prefix("http://").unwrap())
+            .await
+            .is_err()
+    );
+    let mut continuation = make_request(json!({
+        "model":"m", "previous_response_id":"before-disconnect",
+        "input":[
+            {"type":"reasoning","encrypted_content":"before-disconnect-private"},
+            {"role":"user","content":"continue after disconnect"}
+        ]
+    }));
+    continuation.headers_mut().insert(
+        "x-codex-turn-state",
+        "before-disconnect-turn".parse().unwrap(),
+    );
+    let response = app.oneshot(continuation).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap()).unwrap();
+    assert_eq!(body["id"], "continued-after-connect-refusal");
+    let received = received.lock().await;
+    assert_eq!(received.len(), 1);
+    assert!(received[0].get("previous_response_id").is_none());
+    assert_eq!(
+        received[0]["input"],
+        json!([
+            {"role":"user","content":"original question"},
+            {"role":"assistant","content":"answer before disconnect"},
+            {"role":"user","content":"continue after disconnect"}
+        ])
+    );
+    assert_eq!(state.sources.read().await[0].health, "cooldown");
+    let key = codexpress_gateway::affinity::key("thread:connect-refusal-thread", "m");
+    let sources = state.sources.read().await;
+    let all = sources
+        .iter()
+        .map(|runtime| runtime.source.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        state.affinity.preferred(&key, &all).as_deref(),
+        Some("next")
+    );
+    next_task.abort();
+}
+
+#[tokio::test]
+async fn previously_migrated_context_can_handoff_again_when_its_source_is_cooling_down() {
+    let origin_requests = Arc::new(Mutex::new(Vec::new()));
+    let copy = origin_requests.clone();
+    let (origin, origin_task) = serve(Router::new().route(
+        "/responses",
+        post(move |req: Request| {
+            let copy = copy.clone();
+            async move {
+                let has_turn_state = req.headers().contains_key("x-codex-turn-state");
+                let body: Value =
+                    serde_json::from_slice(&to_bytes(req.into_body(), 10000).await.unwrap())
+                        .unwrap();
+                let mut requests = copy.lock().await;
+                requests.push((has_turn_state, body));
+                match requests.len() {
+                    1 => axum::Json(json!({
+                        "id":"origin-parent", "status":"completed",
+                        "output":[{"role":"assistant","content":"original answer"}]
+                    }))
+                    .into_response(),
+                    2 => (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        axum::Json(json!({"error":{"code":"rate_limit_exceeded"}})),
+                    )
+                        .into_response(),
+                    _ => axum::Json(json!({
+                        "id":"returned-to-origin", "status":"completed", "output":[]
+                    }))
+                    .into_response(),
+                }
+            }
+        }),
+    ))
+    .await;
+    let next_hits = Arc::new(AtomicUsize::new(0));
+    let copy = next_hits.clone();
+    let (next, next_task) = serve(Router::new().route(
+        "/responses",
+        post(move |req: Request| {
+            let copy = copy.clone();
+            async move {
+                let body: Value =
+                    serde_json::from_slice(&to_bytes(req.into_body(), 10000).await.unwrap())
+                        .unwrap();
+                assert!(body.get("previous_response_id").is_none());
+                assert_eq!(body["input"][0]["content"], "original question");
+                assert_eq!(body["input"][1]["content"], "original answer");
+                assert_eq!(body["input"][2]["content"], "second question");
+                copy.fetch_add(1, Ordering::Relaxed);
+                Response::builder()
+                    .header("content-type", "application/json")
+                    .header("x-codex-turn-state", "next-turn-state")
+                    .body(Body::from(
+                        json!({
+                            "id":"next-parent", "status":"completed",
+                            "output":[
+                                {"type":"reasoning","encrypted_content":"next-private-state"},
+                                {"role":"assistant","content":"second answer"}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap()
+            }
+        }),
+    ))
+    .await;
+    let (_dir, state) = state(vec![source("origin", &origin, 0), source("next", &next, 1)]).await;
+    state.settings.write().await.degraded_context_fallback = true;
+    state.history.configure(true, 64_000_000).unwrap();
+    let make_request = |body: Value| {
+        let mut req = request(&serde_json::to_vec(&body).unwrap());
+        req.headers_mut()
+            .insert("thread-id", "repeat-handoff-thread".parse().unwrap());
+        req
+    };
+    let app = relay::router(state.clone());
+    for body in [
+        json!({"model":"m","input":[{"role":"user","content":"original question"}]}),
+        json!({"model":"m","previous_response_id":"origin-parent","input":[{"role":"user","content":"second question"}]}),
+    ] {
+        let response = app.clone().oneshot(make_request(body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+    }
+    let key = codexpress_gateway::affinity::key("thread:repeat-handoff-thread", "m");
+    let all = state
+        .sources
+        .read()
+        .await
+        .iter()
+        .map(|runtime| runtime.source.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        state.affinity.preferred(&key, &all).as_deref(),
+        Some("next")
+    );
+    assert!(!state.affinity.exclusions(&key).is_empty());
+    assert_eq!(next_hits.load(Ordering::Relaxed), 1);
+    // The last migration target becomes temporarily unavailable while the
+    // original source recovers. Its durable migration marker must not prevent
+    // a second handoff after the complete cached context has been rebuilt.
+    {
+        let mut sources = state.sources.write().await;
+        sources[0].health = "ready".into();
+        sources[0].cooldown_until = None;
+        sources[1].health = "cooldown".into();
+        sources[1].cooldown_until = Some(codexpress_gateway::model::now() + 60);
+    }
+    let mut continuation = make_request(json!({
+        "model":"m", "previous_response_id":"next-parent",
+        "input":[
+            {"type":"reasoning","encrypted_content":"next-private-state"},
+            {"role":"user","content":"third question"}
+        ]
+    }));
+    continuation
+        .headers_mut()
+        .insert("x-codex-turn-state", "next-turn-state".parse().unwrap());
+    let response = app.oneshot(continuation).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap()).unwrap();
+    assert_eq!(body["id"], "returned-to-origin");
+    let requests = origin_requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    let (has_turn_state, body) = &requests[2];
+    assert!(!has_turn_state);
+    assert!(body.get("previous_response_id").is_none());
+    assert_eq!(
+        body["input"],
+        json!([
+            {"role":"user","content":"original question"},
+            {"role":"assistant","content":"original answer"},
+            {"role":"user","content":"second question"},
+            {"role":"assistant","content":"second answer"},
+            {"role":"user","content":"third question"}
+        ])
+    );
+    assert_eq!(next_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        state.affinity.preferred(&key, &all).as_deref(),
+        Some("origin")
+    );
+    origin_task.abort();
+    next_task.abort();
+}
+
+#[tokio::test]
 async fn unknown_errors_and_streams_with_output_never_replay_context_requests() {
     for (status, content_type, wire) in [
         (StatusCode::BAD_REQUEST, "application/json", r#"{"error":{"code":"invalid_request_error","message":"previous_response_id is not supported for this model"}}"#),

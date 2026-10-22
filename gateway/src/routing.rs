@@ -47,6 +47,49 @@ pub async fn source_is_eligible(state: &Arc<AppState>, source: &Source, model: &
         .any(|candidate| candidate.id == source.id && candidate.identity() == source.identity())
 }
 
+/// Safe metadata for a rejected route, indexed by the current source order.
+/// Keep values on this explicit allowlist: source and request strings are private.
+pub(crate) async fn rejection_diagnostics(
+    state: &Arc<AppState>,
+    model: &str,
+    session: Option<&str>,
+) -> Value {
+    let settings = state.settings.read().await.clone();
+    let runtimes = state.sources.read().await;
+    let timestamp = now();
+    Value::Array(
+        runtimes
+            .iter()
+            .enumerate()
+            .map(|(index, runtime)| {
+                let source = &runtime.source;
+                let health = match runtime.health.as_str() {
+                    "ready" => "ready",
+                    "cooldown" => "cooldown",
+                    "proxy_error" => "proxy_error",
+                    "exhausted" => "exhausted",
+                    "auth_required" => "auth_required",
+                    _ => "unknown",
+                };
+                json!({
+                    "index":index,
+                    "enabled":source.enabled,
+                    "model_supported":model.is_empty() || source.models.is_empty()
+                        || source.models.iter().any(|candidate| candidate == model),
+                    "fixed_selected":settings.mode != "fixed"
+                        || settings.fixed_source_id.as_ref() == Some(&source.id),
+                    "quota_available":account_remaining(runtime, &runtimes)
+                        .is_none_or(|remaining| remaining > 0.0),
+                    "capacity_available":state.affinity.capacity_available(session, source),
+                    "health":health,
+                    "remaining_cooldown_seconds":runtime.cooldown_until
+                        .map_or(0, |until| until.saturating_sub(timestamp))
+                })
+            })
+            .collect(),
+    )
+}
+
 async fn candidate_sources(
     state: &Arc<AppState>,
     model: &str,
@@ -479,6 +522,122 @@ pub async fn mark_rejection(
                     .notifications
                     .quota(&runtime.source.identity(), &runtime.source.name, true);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::SourceRuntime;
+
+    #[tokio::test]
+    async fn rejection_diagnostics_exposes_reasons_without_private_source_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            directory.path().to_owned(),
+            0,
+            "private-gateway-key-marker".into(),
+        )
+        .unwrap();
+        let source = |index: usize| -> Source {
+            serde_json::from_value(json!({
+                "id":format!("private-source-marker-{index}"),
+                "name":format!("private-name-marker-{index}"),
+                "kind":"api",
+                "base_url":format!("https://private-url-marker-{index}.invalid/v1"),
+                "enabled":true,
+                "priority":index,
+                "proxy":{"mode":"direct"},
+                "secret":{"api_key":"private-api-key-marker"}
+            }))
+            .unwrap()
+        };
+        let mut blocked = SourceRuntime::new(source(0));
+        blocked.source.enabled = false;
+        blocked.source.models = vec!["private-model-marker".into()];
+        blocked.source.max_active_conversations = Some(1);
+        blocked.health = "cooldown".into();
+        blocked.cooldown_until = Some(now() + 300);
+        blocked.last_error = Some("private-error-marker".into());
+        let _lease = state
+            .affinity
+            .reserve(
+                Some("private-occupied-session-marker"),
+                &blocked.source,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        let mut exhausted = SourceRuntime::new(source(1));
+        exhausted.source.kind = "official".into();
+        exhausted.source.base_url = "https://chatgpt.com/backend-api/codex".into();
+        exhausted.source.secret = json!({"access_token":"private-access-token-marker"});
+        exhausted.health = "exhausted".into();
+        exhausted.quota = json!({"windows":[{"name":"primary","used_percent":100}]});
+        let mut unknown = SourceRuntime::new(source(2));
+        unknown.health = "private-health-marker".into();
+        unknown.cooldown_until = Some(now().saturating_sub(1));
+        let identities = [
+            blocked.source.identity(),
+            exhausted.source.identity(),
+            unknown.source.identity(),
+        ];
+        {
+            let mut settings = state.settings.write().await;
+            settings.mode = "fixed".into();
+            settings.fixed_source_id = Some(exhausted.source.id.clone());
+        }
+        *state.sources.write().await = vec![blocked, exhausted, unknown];
+
+        // Diagnosis must not depend on a binding lookup, even if one is busy.
+        let _bindings = state.bindings.lock().await;
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rejection_diagnostics(
+                &state,
+                "private-request-model-marker",
+                Some("private-request-session-marker"),
+            ),
+        )
+        .await
+        .unwrap();
+        let rows = snapshot.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["index"], 0);
+        assert_eq!(rows[0]["enabled"], false);
+        assert_eq!(rows[0]["model_supported"], false);
+        assert_eq!(rows[0]["fixed_selected"], false);
+        assert_eq!(rows[0]["quota_available"], true);
+        assert_eq!(rows[0]["capacity_available"], false);
+        assert_eq!(rows[0]["health"], "cooldown");
+        assert!((1..=300).contains(&rows[0]["remaining_cooldown_seconds"].as_u64().unwrap()));
+        assert_eq!(
+            rows[1],
+            json!({
+                "index":1,"enabled":true,"model_supported":true,"fixed_selected":true,
+                "quota_available":false,"capacity_available":true,"health":"exhausted",
+                "remaining_cooldown_seconds":0
+            })
+        );
+        assert_eq!(rows[2]["health"], "unknown");
+        assert_eq!(rows[2]["remaining_cooldown_seconds"], 0);
+        let serialized = snapshot.to_string();
+        for marker in [
+            "private-",
+            "https://",
+            "api_key",
+            "access_token",
+            "account_id",
+        ] {
+            assert!(!serialized.contains(marker), "diagnostic leaked {marker}");
+        }
+        for identity in identities {
+            assert!(!serialized.contains(&identity));
+        }
+        for row in rows {
+            assert_eq!(row.as_object().unwrap().len(), 8);
         }
     }
 }
