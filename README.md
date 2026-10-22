@@ -79,19 +79,7 @@
 
 ## 开发
 
-界面使用 SwiftUI / AppKit，内置网关使用 Rust。
-
-源码构建需要 Xcode 和 Rust stable：
-
-```sh
-git clone https://github.com/LEOibyug/Codexpress.git
-cd Codexpress
-bash scripts/check.sh # 测试与静态检查
-bash scripts/build.sh # 构建 macOS 应用
-bash scripts/package.sh # 生成 DMG、ZIP 和校验文件
-```
-
-应用位于 `dist/Codexpress.app`。更新 `Resources/Info.plist` 中的版本号与构建号后，推送对应的 `v*` 标签即可自动测试、编译并发布；也可在 Actions 中手动运行发布工作流，填写已推送的标签。已发布版本的安装包不会被覆盖。
+源码构建见 [开发说明](CONTRIBUTING.md)。
 
 ## 致谢
 
