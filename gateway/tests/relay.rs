@@ -1,3 +1,8 @@
+#[path = "common/server.rs"]
+mod server;
+#[path = "common/source.rs"]
+mod source_fixture;
+
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
@@ -11,6 +16,8 @@ use codexpress_gateway::{
     relay, routing, transport,
 };
 use serde_json::{json, Value};
+use server::serve;
+use source_fixture::api_source;
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -21,32 +28,10 @@ use std::{
 use tokio::{net::TcpListener, sync::Mutex};
 use tower::ServiceExt;
 
-async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = format!("http://{}", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    (address, task)
-}
 fn source(id: &str, base: &str, priority: i32) -> Source {
     Source {
-        id: id.into(),
-        name: format!("Source {id}"),
-        kind: "api".into(),
-        is_subscription: false,
-        base_url: base.into(),
-        enabled: true,
         priority,
-        max_active_conversations: None,
-        active_conversation_window_seconds: 15,
-        proxy: ProxyPolicy {
-            mode: "direct".into(),
-            url: None,
-        },
-        models: vec![],
-        account_id: None,
-        secret: json!({"api_key":format!("upstream-{id}")}),
+        ..api_source(id, &format!("Source {id}"), base, &format!("upstream-{id}"))
     }
 }
 fn request(body: &[u8]) -> Request {

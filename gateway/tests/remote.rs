@@ -1,3 +1,8 @@
+#[path = "common/server.rs"]
+mod server;
+#[path = "common/source.rs"]
+mod source_fixture;
+
 use axum::{
     body::{to_bytes, Body},
     http::Request,
@@ -6,10 +11,12 @@ use axum::{
 };
 use codexpress_gateway::{
     management,
-    model::{AppState, ProxyPolicy, Source, SourceRuntime},
+    model::{AppState, SourceRuntime},
     relay, remote,
 };
 use serde_json::json;
+use server::serve;
+use source_fixture::api_source;
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -90,37 +97,31 @@ async fn remote_compaction_uses_remote_paths_preserves_metadata_and_can_restore_
 
 #[tokio::test]
 async fn shared_listener_keeps_remote_credentials_host_restrictions_revoke_and_restart() {
-    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", upstream.local_addr().unwrap());
-    let upstream_task = tokio::spawn(async move {
-        axum::serve(upstream,Router::new().route("/responses",post(|request:Request<Body>|async move{
-        assert_eq!(request.headers()["authorization"],"Bearer fixture-upstream");
-        assert_eq!(&to_bytes(request.into_body(),1024).await.unwrap()[..],br#"{ "model":"m", "input":"keep bytes" }"#);
-        axum::Json(json!({"id":"remote-response","usage":{"input_tokens":2,"output_tokens":1}}))
-    }))).await.unwrap();
-    });
+    let (base, upstream_task) = serve(Router::new().route(
+        "/responses",
+        post(|request: Request<Body>| async move {
+            assert_eq!(
+                request.headers()["authorization"],
+                "Bearer fixture-upstream"
+            );
+            assert_eq!(
+                &to_bytes(request.into_body(), 1024).await.unwrap()[..],
+                br#"{ "model":"m", "input":"keep bytes" }"#
+            );
+            axum::Json(json!({"id":"remote-response","usage":{"input_tokens":2,"output_tokens":1}}))
+        }),
+    ))
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let available = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = available.local_addr().unwrap().port();
     let state = AppState::new(dir.path().to_owned(), port, "fixture-local-key".into()).unwrap();
-    *state.sources.write().await = vec![SourceRuntime::new(Source {
-        id: "api".into(),
-        name: "API".into(),
-        kind: "api".into(),
-        is_subscription: false,
-        base_url: base,
-        enabled: true,
-        priority: 0,
-        max_active_conversations: None,
-        active_conversation_window_seconds: 15,
-        proxy: ProxyPolicy {
-            mode: "direct".into(),
-            url: None,
-        },
-        models: vec![],
-        account_id: None,
-        secret: json!({"api_key":"fixture-upstream"}),
-    })];
+    *state.sources.write().await = vec![SourceRuntime::new(api_source(
+        "api",
+        "API",
+        &base,
+        "fixture-upstream",
+    ))];
     assert_eq!(
         remote::router(state.clone())
             .oneshot(

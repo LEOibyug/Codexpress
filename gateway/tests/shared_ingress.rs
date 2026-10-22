@@ -1,3 +1,8 @@
+#[path = "common/server.rs"]
+mod server;
+#[path = "common/source.rs"]
+mod source_fixture;
+
 use axum::{
     body::{to_bytes, Body},
     extract::{ConnectInfo, Request},
@@ -11,33 +16,33 @@ use codexpress_gateway::{
     remote,
 };
 use serde_json::json;
+use server::serve;
+use source_fixture::api_source;
 use std::net::SocketAddr;
 use tower::ServiceExt;
 
 #[tokio::test]
 async fn local_and_remote_share_one_port_without_activation_and_keep_credentials_separate() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/responses",
-                post(|request: Request| async {
-                    assert_eq!(
-                        &to_bytes(request.into_body(), 1024).await.unwrap()[..],
-                        br#"{ "model":"m", "input":"native bytes" }"#
-                    );
-                    axum::Json(json!({"id":"r","output":[]}))
-                }),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let (base, task) = serve(Router::new().route(
+        "/responses",
+        post(|request: Request| async {
+            assert_eq!(
+                &to_bytes(request.into_body(), 1024).await.unwrap()[..],
+                br#"{ "model":"m", "input":"native bytes" }"#
+            );
+            axum::Json(json!({"id":"r","output":[]}))
+        }),
+    ))
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::new(dir.path().into(), 17863, "local-only".into()).unwrap();
-    state.sources.write().await.push(SourceRuntime::new(serde_json::from_value(json!({"id":"api","name":"API","kind":"api","base_url":base,"enabled":true,"priority":0,"proxy":{"mode":"direct"},"secret":{"api_key":"fixture"}})).unwrap()));
+    state
+        .sources
+        .write()
+        .await
+        .push(SourceRuntime::new(api_source(
+            "api", "API", &base, "fixture",
+        )));
     let preview = management::dispatch(
         &state,
         "remote.preview",

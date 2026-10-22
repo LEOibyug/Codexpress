@@ -1,3 +1,8 @@
+#[path = "common/server.rs"]
+mod server;
+#[path = "common/source.rs"]
+mod source_fixture;
+
 use axum::{
     extract::Request,
     http::StatusCode,
@@ -10,28 +15,26 @@ use codexpress_gateway::{
     model::{AppState, SourceRuntime},
 };
 use serde_json::{json, Value};
+use server::serve;
+use source_fixture::api_source;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 
-async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = format!("http://{}", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    (address, task)
-}
 async fn state(base: &str) -> (tempfile::TempDir, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::new(dir.path().into(), 0, "local".into()).unwrap();
-    state.sources.write().await.push(SourceRuntime::new(
-        serde_json::from_value(json!({
-            "id":"balance-api", "name":"API", "kind":"api", "base_url":base,
-            "enabled":true, "priority":0, "proxy":{"mode":"direct"},
-            "secret":{"api_key":"PRIVATE-TEST-KEY"}
-        }))
-        .unwrap(),
-    ));
+    state
+        .sources
+        .write()
+        .await
+        .push(SourceRuntime::new(api_source(
+            "balance-api",
+            "API",
+            base,
+            "PRIVATE-TEST-KEY",
+        )));
     (dir, state)
 }
 async fn query(state: &Arc<AppState>) -> Value {

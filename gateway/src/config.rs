@@ -1,11 +1,22 @@
-use crate::{
-    compaction::{self, ModelCompactionRule},
-    model::AppState,
-};
+mod compaction_patch;
+mod official_patch;
+mod provider_aliases;
+
+pub use official_patch::{OFFICIAL_RESPONSES_URL, OFFICIAL_SERVICE_URL};
+pub use provider_aliases::{confirmed_origin, normalized_base, ProviderOrigin};
+
+use crate::{compaction::ModelCompactionRule, model::AppState};
 use anyhow::{bail, Context, Result};
+use compaction_patch::{compaction_text, prepare_compaction, restore_compaction};
+use official_patch::{
+    official_fields, official_fields_version, restore_official_fields, OFFICIAL_KEYS,
+};
+use provider_aliases::{
+    alias_tables, prepare_gateway_aliases, provider_table, restore_gateway_aliases,
+    verify_gateway_aliases, ProviderAliases,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -45,58 +56,6 @@ struct Snapshot {
     gateway_aliases: Option<ProviderAliases>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct ProviderAliases {
-    before: String,
-    applied: String,
-    #[serde(default)]
-    origins: Vec<ProviderOrigin>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ProviderOrigin {
-    pub provider_id: String,
-    pub source_id: String,
-    pub source_identity: String,
-    pub base_url: String,
-    #[serde(default)]
-    credential_digest: String,
-}
-
-pub fn normalized_base(raw: &str) -> String {
-    raw.trim_end_matches('/')
-        .strip_suffix("/responses")
-        .unwrap_or(raw.trim_end_matches('/'))
-        .to_owned()
-}
-
-pub fn confirmed_origin(state_dir: &Path, credential: &str) -> Result<Option<ProviderOrigin>> {
-    let digest = format!("{:x}", Sha256::digest(credential.as_bytes()));
-    Ok(snapshot_load(state_dir)?
-        .filter(|s| s.applied_provider == "codexpress")
-        .and_then(|s| s.gateway_aliases)
-        .and_then(|a| {
-            a.origins
-                .into_iter()
-                .find(|origin| origin.credential_digest == digest)
-        }))
-}
-
-fn origin_credential(key: &str, origin: &ProviderOrigin) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(
-            serde_json::to_vec(&(
-                key,
-                &origin.provider_id,
-                &origin.source_id,
-                &origin.source_identity
-            ))
-            .expect("strings")
-        )
-    )
-}
-
 fn local_provider() -> String {
     "codexpress".into()
 }
@@ -106,182 +65,12 @@ fn yes() -> bool {
 fn first_schema() -> u32 {
     1
 }
-const OFFICIAL_KEYS: [&str; 4] = [
-    "openai_base_url",
-    "chatgpt_base_url",
-    "forced_login_method",
-    "respect_system_proxy",
-];
-pub const OFFICIAL_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex";
-pub const OFFICIAL_SERVICE_URL: &str = "https://chatgpt.com/backend-api/";
-
 pub fn connection_mode(state_dir: &Path) -> Result<&'static str> {
     Ok(match snapshot_load(state_dir)? {
         Some(snapshot) if snapshot.applied_provider == "openai" => "official",
         Some(_) => "gateway",
         None => "unmanaged",
     })
-}
-
-fn official_fields_version(doc: &DocumentMut, schema: u32) -> String {
-    let mut fields = DocumentMut::new();
-    for key in OFFICIAL_KEYS {
-        if schema < 2 && key == "respect_system_proxy" {
-            continue;
-        }
-        if let Some(item) = doc.get(key) {
-            fields[key] = item.clone();
-        }
-    }
-    if schema >= 3 {
-        if let Some(item) = doc.get("model_providers") {
-            fields["model_providers"] = item.clone();
-        }
-    } else if schema >= 2 {
-        if let Some(item) = doc.get("model_providers").and_then(|p| p.get("openai")) {
-            fields["model_providers"] = Item::Table(Table::new());
-            fields["model_providers"]["openai"] = item.clone();
-        }
-    }
-    fields.to_string()
-}
-
-fn official_fields(doc: &DocumentMut) -> String {
-    official_fields_version(doc, 3)
-}
-
-fn restore_official_fields(doc: &mut DocumentMut, snapshot: &Snapshot) -> Result<()> {
-    if let Some(before) = &snapshot.official_before {
-        let original = before.parse::<DocumentMut>()?;
-        for key in OFFICIAL_KEYS {
-            if snapshot.official_schema < 2 && key == "respect_system_proxy" {
-                continue;
-            }
-            match original.get(key) {
-                Some(item) => {
-                    doc[key] = item.clone();
-                }
-                None => {
-                    doc.remove(key);
-                }
-            }
-        }
-        if snapshot.official_schema >= 3 {
-            if let Some(item) = original.get("model_providers") {
-                doc["model_providers"] = item.clone();
-            } else {
-                doc.remove("model_providers");
-            }
-        } else if snapshot.official_schema >= 2 {
-            if let Some(item) = original
-                .get("model_providers")
-                .and_then(|p| p.get("openai"))
-            {
-                if doc.get("model_providers").is_none() {
-                    let mut providers = Table::new();
-                    providers.set_implicit(true);
-                    doc["model_providers"] = Item::Table(providers);
-                }
-                doc["model_providers"]["openai"] = item.clone();
-            } else if let Some(table) = doc
-                .get_mut("model_providers")
-                .and_then(Item::as_table_like_mut)
-            {
-                table.remove("openai");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn alias_tables(doc: &DocumentMut) -> Option<&dyn toml_edit::TableLike> {
-    doc.get("model_providers").and_then(Item::as_table_like)
-}
-
-fn verify_gateway_aliases(doc: &DocumentMut, snapshot: &Snapshot) -> Result<()> {
-    if let Some(aliases) = &snapshot.gateway_aliases {
-        let applied = aliases.applied.parse::<DocumentMut>()?;
-        if let Some(providers) = alias_tables(&applied) {
-            for (id, expected) in providers.iter() {
-                if alias_tables(doc)
-                    .and_then(|p| p.get(id))
-                    .map(ToString::to_string)
-                    != Some(expected.to_string())
-                {
-                    bail!("已有对话的供应商连接已被其他程序修改，未覆盖；请先检查供应商配置。");
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn restore_gateway_aliases(doc: &mut DocumentMut, snapshot: &Snapshot) -> Result<()> {
-    if let Some(aliases) = &snapshot.gateway_aliases {
-        let before = aliases.before.parse::<DocumentMut>()?;
-        if let Some(providers) = alias_tables(&before) {
-            for (id, item) in providers.iter() {
-                doc["model_providers"][id] = item.clone();
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Resume can retain a custom provider ID. Redirect its current definition,
-/// keeping the conversation itself untouched and the original table restorable.
-fn prepare_gateway_aliases(
-    doc: &mut DocumentMut,
-    port: u16,
-    key: &str,
-    origins: &[ProviderOrigin],
-) -> Result<Option<ProviderAliases>> {
-    let Some(providers) = doc
-        .get_mut("model_providers")
-        .and_then(Item::as_table_like_mut)
-    else {
-        return Ok(None);
-    };
-    let mut before = DocumentMut::new();
-    let mut applied = DocumentMut::new();
-    before["model_providers"] = Item::Table(Table::new());
-    applied["model_providers"] = Item::Table(Table::new());
-    let mut confirmed = Vec::new();
-    for (id, item) in providers.iter_mut() {
-        let id = id.get();
-        if matches!(id, "codexpress" | "openai" | "ollama" | "lmstudio") {
-            continue;
-        }
-        let Some(origin) = origins.iter().find(|origin| origin.provider_id == id) else {
-            continue;
-        };
-        if item
-            .get("base_url")
-            .and_then(Item::as_str)
-            .map(normalized_base)
-            .as_deref()
-            != Some(origin.base_url.as_str())
-        {
-            bail!("已有供应商与所选来源的地址不一致，未接入；请重新确认原来源。");
-        }
-        let credential = origin_credential(key, origin);
-        before["model_providers"][id] = item.clone();
-        *item = Item::Table(provider_table(port, &credential));
-        applied["model_providers"][id] = item.clone();
-        let mut origin = origin.clone();
-        origin.credential_digest = format!("{:x}", Sha256::digest(credential.as_bytes()));
-        confirmed.push(origin);
-    }
-    if confirmed.len() != origins.len() {
-        bail!("原供应商不存在或不支持接入，请重新选择已有对话来源");
-    }
-    Ok(alias_tables(&before)
-        .filter(|p| !p.is_empty())
-        .map(|_| ProviderAliases {
-            before: before.to_string(),
-            applied: applied.to_string(),
-            origins: confirmed,
-        }))
 }
 
 pub fn secure_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -335,17 +124,6 @@ fn read_document(path: &Path) -> Result<(String, DocumentMut)> {
     Ok((content, doc))
 }
 
-fn provider_table(port: u16, key: &str) -> Table {
-    let mut table = Table::new();
-    table["name"] = value("Codexpress");
-    table["base_url"] = value(format!("http://127.0.0.1:{port}/v1"));
-    table["wire_api"] = value("responses");
-    table["requires_openai_auth"] = value(false);
-    table["experimental_bearer_token"] = value(key);
-    table["supports_websockets"] = value(false);
-    table
-}
-
 fn select_local(doc: &mut DocumentMut) {
     let mut selected = value("codexpress");
     if let Some(old) = doc.get("model_provider").and_then(Item::as_value) {
@@ -396,61 +174,6 @@ fn verify_attachment(doc: &DocumentMut, snapshot: &Snapshot) -> Result<()> {
         bail!("模型目录或全局上下文设置已被其他程序修改；未覆盖，请先检查模型压缩配置。");
     }
     verify_gateway_aliases(doc, snapshot)
-}
-
-fn compaction_text(doc: &DocumentMut) -> String {
-    let mut fields = DocumentMut::new();
-    for key in compaction::MANAGED_KEYS {
-        if let Some(item) = doc.get(key) {
-            fields[key] = item.clone();
-        }
-    }
-    fields.to_string()
-}
-
-fn restore_compaction(doc: &mut DocumentMut, original: &DocumentMut) {
-    for key in compaction::MANAGED_KEYS {
-        match original.get(key) {
-            Some(item) => {
-                doc[key] = item.clone();
-            }
-            None => {
-                doc.remove(key);
-            }
-        }
-    }
-}
-
-fn prepare_compaction(
-    doc: &mut DocumentMut,
-    home: &Path,
-    state_dir: &Path,
-    snapshot: Option<&Snapshot>,
-    rules: &[ModelCompactionRule],
-) -> Result<Option<(PathBuf, Vec<u8>)>> {
-    compaction::validate(rules)?;
-    let original = match snapshot.filter(|s| s.applied_compaction.is_some()) {
-        Some(snapshot) => snapshot
-            .compaction_before
-            .as_ref()
-            .unwrap_or(&snapshot.before)
-            .parse::<DocumentMut>()?,
-        None => doc.clone(),
-    };
-    if rules.is_empty() {
-        if snapshot.is_some_and(|s| s.applied_compaction.is_some()) {
-            restore_compaction(doc, &original);
-        }
-        return Ok(None);
-    }
-    let bytes = serde_json::to_vec_pretty(&compaction::catalog(home, &original, rules)?)?;
-    let path = state_dir
-        .join("model-catalogs")
-        .join(format!("{:x}.json", Sha256::digest(&bytes)));
-    doc["model_catalog_json"] = value(path.to_str().context("模型目录路径无效")?);
-    doc.remove("model_auto_compact_token_limit");
-    doc.remove("model_context_window");
-    Ok(Some((path, bytes)))
 }
 
 fn redact(doc: &DocumentMut) -> String {

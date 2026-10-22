@@ -1,22 +1,18 @@
+#[path = "common/server.rs"]
+mod server;
+
 use axum::{body::Body, extract::Request, http::StatusCode, response::Response, Router};
 use codexpress_gateway::{
     management,
     model::{now, AppState, SourceRuntime},
 };
 use serde_json::{json, Value};
+use server::serve;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 
-async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = format!("http://{}", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    (address, task)
-}
 fn source(base: &str) -> Value {
     json!({"id":"api-a","name":"API","kind":"api","base_url":base,"enabled":true,"priority":0,"proxy":{"mode":"direct"},"secret":{"api_key":"PRIVATE-TEST-KEY"}})
 }
