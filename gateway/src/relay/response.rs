@@ -6,7 +6,10 @@ use super::{
 use crate::{
     model::{now, AppState, Source},
     routing,
-    usage::{content_units, estimated_tokens, text_units, TokenDetails, UsageRecord},
+    usage::{
+        content_units, diagnostics::Capture, estimated_tokens, text_units, TokenDetails,
+        UsageRecord,
+    },
 };
 use axum::{
     body::Body,
@@ -22,6 +25,8 @@ use std::{
 };
 
 const OBSERVATION_LIMIT: usize = 1024 * 1024;
+// Failure feedback uses the diagnostic budget; history snapshots retain their smaller limit.
+const EVENT_LIMIT: usize = crate::usage::diagnostics::BODY_LIMIT;
 
 /// Inspect a bounded JSON prefix while preserving full chunks for forwarding.
 pub(super) async fn read_error_prefix(
@@ -74,11 +79,17 @@ pub(super) async fn probe_context_rejection(
                 }
             }
             Ok(Err(_)) => {
+                attempt
+                    .diagnostic
+                    .transport("body_transport", "上游响应传输中断");
                 attempt.finish("interrupted", Some(&probe));
                 return Err(());
             }
             _ => break,
         }
+    }
+    if let Some(value) = &probe.failure_event {
+        attempt.diagnostic.failed_event(value);
     }
     Ok(probe.context_rejected && !probe.replay_blocked)
 }
@@ -98,6 +109,10 @@ pub(super) struct Attempt {
     started: Instant,
     published: Instant,
     first_output: Option<Instant>,
+    pub(super) diagnostic: Capture,
+    captured_prefix: usize,
+    captured_transport_error: bool,
+    saved_failure: Option<Value>,
 }
 impl Attempt {
     pub(super) fn new(
@@ -132,15 +147,87 @@ impl Attempt {
             generation_ms: None,
         };
         state.usage.start(&record);
+        let diagnostic = Capture::new(
+            &record.attempt_id,
+            record.started_at,
+            source,
+            &state.gateway_key,
+        );
         Self {
             state,
             started: Instant::now(),
             published: Instant::now(),
             record: Some(record),
             first_output: None,
+            diagnostic,
+            captured_prefix: 0,
+            captured_transport_error: false,
+            saved_failure: None,
         }
     }
+    pub(super) fn save_diagnostic(&self, body: bool) {
+        if self.state.usage.diagnostic(&self.diagnostic, body).is_err() {
+            eprintln!("请求诊断写入失败");
+        }
+    }
+    /// Preserve error bytes for forwarding and for attempts discarded during retry.
+    pub(super) async fn collect_error(
+        &mut self,
+        upstream: &mut reqwest::Response,
+        prefix: &mut Vec<Bytes>,
+    ) {
+        if !upstream.status().is_client_error() && !upstream.status().is_server_error() {
+            return;
+        }
+        for chunk in prefix.iter().skip(self.captured_prefix) {
+            self.diagnostic.chunk(chunk);
+        }
+        self.captured_prefix = prefix.len();
+        let mut received: u64 = prefix.iter().map(|chunk| chunk.len() as u64).sum();
+        let length = upstream.content_length();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if length == Some(received) {
+                self.diagnostic.complete();
+                break;
+            }
+            if self.diagnostic.full() {
+                break;
+            }
+            match tokio::time::timeout_at(deadline, upstream.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
+                    received = received.saturating_add(chunk.len() as u64);
+                    self.diagnostic.chunk(&chunk);
+                    prefix.push(chunk);
+                    self.captured_prefix += 1;
+                }
+                Ok(Ok(None)) => {
+                    self.diagnostic.complete();
+                    break;
+                }
+                Ok(Err(_)) => {
+                    self.captured_transport_error = true;
+                    self.diagnostic
+                        .transport("body_transport", "上游错误响应传输中断");
+                    break;
+                }
+                Err(_) => {
+                    self.diagnostic
+                        .transport("body_timeout", "上游错误响应尚未完整返回");
+                    break;
+                }
+            }
+        }
+        self.save_diagnostic(true);
+    }
     pub(super) fn finish(&mut self, status: &str, observer: Option<&Observer>) {
+        if let Some(value) = observer.and_then(|observer| observer.failure_event.as_ref()) {
+            if self.saved_failure.as_ref() != Some(value) {
+                self.diagnostic.failed_event(value);
+                self.save_diagnostic(true);
+                self.saved_failure = Some(value.clone());
+            }
+        }
         if let Some(record) = &mut self.record {
             let mut changed = record.status != status;
             record.status = status.into();
@@ -218,6 +305,7 @@ impl Drop for Attempt {
                 record.generation_ms =
                     Some(first.elapsed().as_millis().min(u64::MAX as u128) as u64);
             }
+            self.save_diagnostic(true);
             // Persistence failures cannot justify replaying a billable request.
             // No upstream data or database error is logged here.
             if self.state.usage.record(record).is_err() {
@@ -245,6 +333,7 @@ pub(super) struct Observer {
     terminal: bool,
     failed: bool,
     failure_code: Option<String>,
+    failure_event: Option<Value>,
     input: Option<u64>,
     output: Option<u64>,
     cached: Option<u64>,
@@ -467,6 +556,7 @@ impl Observer {
             || (!self.sse && response.get("error").is_some_and(|error| !error.is_null()))
         {
             self.failed = true;
+            self.failure_event = Some(value.clone());
             self.context_rejected |= explicit_context_rejection(value);
             self.failure_code = super::retries::permanent_code(response)
                 .or_else(|| super::retries::permanent_code(value))
@@ -518,8 +608,7 @@ impl Observer {
     }
     fn push(&mut self, bytes: &[u8]) {
         if !self.sse {
-            if !self.oversized && self.buffer.len().saturating_add(bytes.len()) <= OBSERVATION_LIMIT
-            {
+            if !self.oversized && self.buffer.len().saturating_add(bytes.len()) <= EVENT_LIMIT {
                 self.buffer.extend_from_slice(bytes);
             } else {
                 self.oversized = true;
@@ -539,7 +628,7 @@ impl Observer {
                         self.event();
                     } else if let Some(raw) = self.line.strip_prefix(b"data:") {
                         let raw = raw.strip_prefix(b" ").unwrap_or(raw);
-                        if self.data.len().saturating_add(raw.len() + 1) <= OBSERVATION_LIMIT {
+                        if self.data.len().saturating_add(raw.len() + 1) <= EVENT_LIMIT {
                             if !self.data.is_empty() {
                                 self.data.push(b'\n');
                             }
@@ -553,7 +642,7 @@ impl Observer {
                 self.line.clear();
                 self.discarding_line = false;
             } else if !self.discarding_line {
-                if self.line.len() < OBSERVATION_LIMIT {
+                if self.line.len() < EVENT_LIMIT {
                     self.line.push(byte);
                 } else {
                     self.line.clear();
@@ -738,6 +827,7 @@ pub(super) async fn stream_response(
     // A zero-length body may never be polled by Hyper either. Usage stays
     // unknown, but receiving an empty successful response is not cancellation.
     if content_length == Some(0) {
+        attempt.diagnostic.complete();
         attempt.finish(
             if status.is_success() && !rejected_attempt {
                 "success"
@@ -801,18 +891,23 @@ pub(super) async fn stream_response(
     }
     let stream = async_stream::stream! {
         let mut route_lease=route_lease;
+        let captured_prefix = attempt.captured_prefix;
         let prefix = futures_util::stream::iter(prefix.into_iter().map(Ok));
         let mut upstream = prefix.chain(upstream.bytes_stream());
         let mut received = 0u64;
         let mut finalized = content_length == Some(0);
+        let mut chunk_index = 0usize;
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(chunk) => {
+                    if chunk_index >= captured_prefix { attempt.diagnostic.chunk(&chunk); }
+                    chunk_index += 1;
                     observer.push(&chunk);
                     persist_history(&state, &mut observer).await;
                     bind_ids(&state, &source, &mut observer).await;
                     received = received.saturating_add(chunk.len() as u64);
                     let complete_body = content_length == Some(received);
+                    if complete_body { attempt.diagnostic.complete(); }
                     // A client may stop polling as soon as it sees a terminal
                     // SSE event, just as Hyper can stop at Content-Length.
                     // Record the outcome before yielding those bytes. Continue
@@ -828,12 +923,19 @@ pub(super) async fn stream_response(
                     if complete_body { return; }
                 },
                 Err(_) => {
+                    attempt.diagnostic.transport("body_transport", "上游响应传输中断");
                     if !finalized { attempt.finish("interrupted", Some(&observer)); }
                     yield Err(std::io::Error::other("来源流已中断"));
                     return;
                 }
             }
         }
+        if attempt.captured_transport_error {
+            if !finalized { attempt.finish("failed", Some(&observer)); }
+            yield Err(std::io::Error::other("来源流已中断"));
+            return;
+        }
+        attempt.diagnostic.complete();
         if !finalized { finalize_response(&state, &source, status, discovery, &mut observer, &mut attempt).await; }
         confirm_manual_acceptance(&state, &source, &mut observer, &mut accepted_state, &mut route_lease, &mut session_key, status.is_success() && !rejected_attempt).await;
     };

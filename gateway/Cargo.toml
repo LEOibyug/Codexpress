@@ -1,6 +1,6 @@
 [package]
 name = "codexpress-gateway"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 
@@ -11,6 +11,7 @@ axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
 bytes = "1"
 futures-util = "0.3"
+flate2 = "1"
 http = "1"
 http-body-util = "0.1"
 libc = "0.2"

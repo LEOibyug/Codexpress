@@ -1333,6 +1333,9 @@ async fn forward_once(
             let client = match transport::client(&source) {
                 Ok(client) => client,
                 Err(_) => {
+                    attempt
+                        .diagnostic
+                        .transport("configuration", "来源网络策略无法建立连接");
                     attempt.finish("failed", None);
                     if manual_candidate {
                         drop(route_lease.take());
@@ -1347,6 +1350,29 @@ async fn forward_once(
                 Ok(url) => url,
                 Err(_) => return error(StatusCode::BAD_GATEWAY, "来源地址无效"),
             };
+            let ingress = if parts
+                .extensions
+                .get::<crate::chatbot::ChatbotIngress>()
+                .is_some()
+            {
+                "chatbot"
+            } else if parts
+                .extensions
+                .get::<crate::remote::RemoteIngress>()
+                .is_some()
+            {
+                "ssh"
+            } else {
+                "native"
+            };
+            attempt.diagnostic.request(
+                ingress,
+                parts.method.as_str(),
+                parts.uri.path(),
+                url.as_str(),
+                &ignored_parameters,
+            );
+            attempt.save_diagnostic(false);
             let mut headers = clean_headers(&parts.headers, true);
             if role_repaired {
                 headers.remove("content-length");
@@ -1440,6 +1466,9 @@ async fn forward_once(
             let upstream = match upstream {
                 Ok(result) => result,
                 Err(_) => {
+                    attempt
+                        .diagnostic
+                        .transport("timeout", "来源提交结果超时且不明确；未自动重试");
                     attempt.finish("failed", None);
                     return error(
                         StatusCode::GATEWAY_TIMEOUT,
@@ -1459,9 +1488,20 @@ async fn forward_once(
                         err.is_timeout(),
                         !definitely_unsubmitted
                     );
+                    attempt.diagnostic.transport(
+                        if err.is_connect() {
+                            "connect"
+                        } else if err.is_timeout() {
+                            "timeout"
+                        } else {
+                            "transport"
+                        },
+                        transport::failure_reason(&err),
+                    );
                     attempt.finish("failed", None);
                     if definitely_unsubmitted {
                         if let Some(delay) = retries.failed(false) {
+                            drop(attempt);
                             tokio::time::sleep(delay).await;
                             continue;
                         }
@@ -1525,6 +1565,10 @@ async fn forward_once(
                     break;
                 }
             };
+            attempt
+                .diagnostic
+                .response(upstream.status().as_u16(), upstream.headers());
+            attempt.save_diagnostic(false);
             let status = upstream.status();
             if !status.is_success() {
                 eprintln!(
@@ -1558,7 +1602,9 @@ async fn forward_once(
                 if let Some(delay) = retries.failed(true) {
                     attempt.finish("failed", None);
                     // Keep the capacity lease, but release the failed transport.
+                    attempt.collect_error(&mut upstream, &mut prefix).await;
                     drop(upstream);
+                    drop(attempt);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -1566,6 +1612,7 @@ async fn forward_once(
             if source.kind == "official" && status == StatusCode::UNAUTHORIZED && !auth_refreshed {
                 auth_refreshed = true;
                 attempt.finish("failed", None);
+                attempt.collect_error(&mut upstream, &mut prefix).await;
                 drop(upstream);
                 match crate::official::refresh_access(&state, &source.id).await {
                     Ok(fresh) if fresh.identity() == source.identity() => {
@@ -1646,6 +1693,7 @@ async fn forward_once(
                             }
                             role_repaired = true;
                             attempt.finish("failed", None);
+                            attempt.collect_error(&mut upstream, &mut prefix).await;
                             drop(upstream);
                             continue;
                         }
@@ -1658,6 +1706,7 @@ async fn forward_once(
                         {
                             compatibility_changes.push(field);
                             attempt.finish("failed", None);
+                            attempt.collect_error(&mut upstream, &mut prefix).await;
                             drop(upstream);
                             continue;
                         }
@@ -1729,6 +1778,7 @@ async fn forward_once(
             {
                 attempt.finish("failed", None);
                 drop(route_lease.take());
+                attempt.collect_error(&mut upstream, &mut prefix).await;
                 drop(upstream);
                 drop(attempt);
                 return after_manual_failure(state, parts, bytes, rebuild, replans).await;
@@ -1744,6 +1794,7 @@ async fn forward_once(
                 // this ID. Explicit rejection permits a bounded unchanged probe
                 // before requiring local history for a new context.
                 attempt.finish("failed", None);
+                attempt.collect_error(&mut upstream, &mut prefix).await;
                 drop(route_lease.take());
                 last_error = Some(
                     stream_response(
@@ -1785,6 +1836,7 @@ async fn forward_once(
                 }
             {
                 attempt.finish("failed", None);
+                attempt.collect_error(&mut upstream, &mut prefix).await;
                 drop(upstream);
                 drop(route_lease.take());
                 drop(attempt);
@@ -1815,6 +1867,9 @@ async fn forward_once(
                 drop(route_lease.take());
                 // Preserve the final source's native error body when there is no
                 // later candidate; streaming this response must not trigger replay.
+                if candidate_index + 1 < source_count {
+                    attempt.collect_error(&mut upstream, &mut prefix).await;
+                }
                 last_error = Some(
                     stream_response(
                         state.clone(),

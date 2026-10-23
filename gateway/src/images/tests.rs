@@ -360,3 +360,41 @@ async fn official_priority_selection_rate_limit_fallback_and_low_quota_reservati
     task.abort();
 }
 use axum::response::IntoResponse;
+
+#[tokio::test]
+async fn image_error_feedback_is_saved_without_oauth_or_request_content() {
+    let (_dir,state,key,port,task)=setup(Router::new().route("/codex/images/generations",post(||async {
+        (StatusCode::BAD_REQUEST,Json(json!({"error":{"message":"invalid request","code":"invalid_image","details":{"reason":"unsupported size","access_token":"PRIVATE-OAUTH"}}})))
+    }))).await;
+    let response = images::router(state.clone())
+        .oneshot(request(
+            port,
+            &key,
+            "/v1/images/generations",
+            Some(json!({"prompt":"PRIVATE-IMAGE-PROMPT"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let record = &state.usage.summary(1).unwrap()["recent"][0];
+    let detail = state
+        .usage
+        .detail(&json!({"attempt_id":record["attempt_id"]}))
+        .unwrap();
+    assert_eq!(detail["diagnostic"]["ingress"], "image");
+    assert_eq!(detail["diagnostic"]["http_status"], 400);
+    assert_eq!(detail["diagnostic"]["body_complete"], true);
+    assert!(detail["diagnostic"]["body_text"]
+        .as_str()
+        .unwrap()
+        .contains("unsupported size"));
+    for private in [
+        "PRIVATE-OAUTH",
+        "PRIVATE-NATIVE-KEY",
+        "PRIVATE-IMAGE-PROMPT",
+        &key,
+    ] {
+        assert!(!detail.to_string().contains(private));
+    }
+    task.abort();
+}

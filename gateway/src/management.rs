@@ -123,6 +123,17 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
         "models.list" => crate::discovery::list(state, payload).await,
         "balance.query" => crate::balance::query(state, payload).await,
         "sync" => sync::handle(state, payload).await,
+        "usage.analytics" | "usage.requests" | "usage.detail" => {
+            let usage = state.usage.clone();
+            let operation = op.to_owned();
+            tokio::task::spawn_blocking(move || match operation.as_str() {
+                "usage.analytics" => usage.analytics(&payload),
+                "usage.requests" => usage.requests(&payload),
+                _ => usage.detail(&payload),
+            })
+            .await
+            .context("用量查询失败")?
+        }
         "usage" => state.usage.summary_filtered(
             payload
                 .get("days")

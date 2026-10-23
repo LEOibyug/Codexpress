@@ -7,7 +7,7 @@ use crate::{
     config::secure_write,
     model::{now, AppState, Source},
     routing, transport,
-    usage::{TokenDetails, UsageRecord},
+    usage::{diagnostics::Capture, TokenDetails, UsageRecord},
 };
 use anyhow::{bail, Context, Result};
 use axum::{
@@ -310,6 +310,7 @@ struct Attempt {
     state: Arc<AppState>,
     record: Option<UsageRecord>,
     started: Instant,
+    diagnostic: Capture,
 }
 impl Attempt {
     fn new(state: Arc<AppState>, source: &Source, request_id: &str) -> Self {
@@ -335,11 +336,55 @@ impl Attempt {
         };
         state.inflight.fetch_add(1, Ordering::Relaxed);
         state.usage.start(&record);
+        let diagnostic = Capture::new(
+            &record.attempt_id,
+            record.started_at,
+            source,
+            &state.gateway_key,
+        );
         Self {
             state,
             record: Some(record),
             started: Instant::now(),
+            diagnostic,
         }
+    }
+    async fn collect_error(&mut self, upstream: &mut reqwest::Response) -> Vec<u8> {
+        let mut prefix = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut received = 0u64;
+        loop {
+            if upstream.content_length() == Some(received) {
+                self.diagnostic.complete();
+                break;
+            }
+            if self.diagnostic.full() {
+                break;
+            }
+            match tokio::time::timeout_at(deadline, upstream.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
+                    received = received.saturating_add(chunk.len() as u64);
+                    self.diagnostic.chunk(&chunk);
+                    let take = chunk.len().min(65536usize.saturating_sub(prefix.len()));
+                    prefix.extend_from_slice(&chunk[..take]);
+                }
+                Ok(Ok(None)) => {
+                    self.diagnostic.complete();
+                    break;
+                }
+                Ok(Err(_)) => {
+                    self.diagnostic
+                        .transport("body_transport", "上游错误响应传输中断");
+                    break;
+                }
+                Err(_) => {
+                    self.diagnostic
+                        .transport("body_timeout", "上游错误响应尚未完整返回");
+                    break;
+                }
+            }
+        }
+        prefix
     }
     fn finish(&mut self, status: &str) {
         if let Some(mut record) = self.record.take() {
@@ -347,6 +392,9 @@ impl Attempt {
             record.complete = status == "success";
             record.token_details.stream_complete = record.complete;
             record.latency_ms = self.started.elapsed().as_millis() as u64;
+            if self.state.usage.diagnostic(&self.diagnostic, true).is_err() {
+                eprintln!("图片请求诊断写入失败");
+            }
             let _ = self.state.usage.record(record);
             self.state.inflight.fetch_sub(1, Ordering::Relaxed);
         }
@@ -471,6 +519,18 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             headers.insert("chatgpt-account-id", value);
         }
         let mut attempt = Attempt::new(state.clone(), &source, &request_id);
+        attempt.diagnostic.request(
+            "image",
+            "POST",
+            if edit {
+                "/v1/images/edits"
+            } else {
+                "/v1/images/generations"
+            },
+            &endpoint,
+            &[],
+        );
+        let _ = state.usage.diagnostic(&attempt.diagnostic, false);
         let response = client
             .post(endpoint)
             .headers(headers)
@@ -481,6 +541,9 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
         let mut upstream = match response {
             Ok(r) => r,
             Err(_) => {
+                attempt
+                    .diagnostic
+                    .transport("transport", "官方生图连接中断或超时，结果未知");
                 attempt.finish("failed");
                 return error(
                     StatusCode::BAD_GATEWAY,
@@ -489,27 +552,26 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             }
         };
         let status = upstream.status();
+        attempt
+            .diagnostic
+            .response(status.as_u16(), upstream.headers());
+        let _ = state.usage.diagnostic(&attempt.diagnostic, false);
         if status.as_u16() == 429 {
+            let bytes = attempt.collect_error(&mut upstream).await;
             attempt.finish("failed");
-            if let Ok(Ok(bytes)) = tokio::time::timeout(
-                Duration::from_secs(5),
-                transport::read_limited(&mut upstream, 65536),
-            )
-            .await
-            {
-                if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-                    routing::mark_rejection(
-                        &state,
-                        &source.id,
-                        crate::relay::permanent_code(&value),
-                        None,
-                    )
-                    .await;
-                }
+            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                routing::mark_rejection(
+                    &state,
+                    &source.id,
+                    crate::relay::permanent_code(&value),
+                    None,
+                )
+                .await;
             }
             continue;
         }
         if !status.is_success() {
+            attempt.collect_error(&mut upstream).await;
             attempt.finish("failed");
             return error(
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -525,6 +587,9 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
         let raw = match transport::read_limited(&mut upstream, RESPONSE_LIMIT).await {
             Ok(raw) => raw,
             Err(_) => {
+                attempt
+                    .diagnostic
+                    .transport("body_transport", "图片响应过大或传输中断，未自动重试");
                 attempt.finish("failed");
                 return error(
                     StatusCode::BAD_GATEWAY,
@@ -532,17 +597,27 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
                 );
             }
         };
+        attempt.diagnostic.complete();
         let result: Value = match serde_json::from_slice(&raw) {
             Ok(v) => v,
             Err(_) => {
+                attempt
+                    .diagnostic
+                    .transport("invalid_response", "官方返回了无法识别的图片响应");
                 attempt.finish("failed");
                 return error(StatusCode::BAD_GATEWAY, "官方返回了无法识别的图片响应");
             }
         };
+        if result.get("error").is_some_and(|error| !error.is_null()) {
+            attempt.diagnostic.failed_event(&result);
+        }
         let Some(data) = result["data"]
             .as_array()
             .filter(|v| !v.is_empty() && v.len() <= 10)
         else {
+            attempt
+                .diagnostic
+                .transport("invalid_response", "官方未返回图片数据");
             attempt.finish("failed");
             return error(StatusCode::BAD_GATEWAY, "官方未返回图片数据");
         };
@@ -550,6 +625,9 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             .iter()
             .all(|v| v["b64_json"].as_str().is_some_and(|s| !s.is_empty()))
         {
+            attempt
+                .diagnostic
+                .transport("invalid_response", "官方未返回可保存的图片内容");
             attempt.finish("failed");
             return error(StatusCode::BAD_GATEWAY, "官方未返回可保存的图片内容");
         }

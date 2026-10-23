@@ -1,3 +1,6 @@
+mod analytics;
+pub mod diagnostics;
+mod requests;
 mod summary;
 
 use anyhow::{Context, Result};
@@ -75,6 +78,7 @@ impl UsageStore {
                 [],
             )?;
         }
+        diagnostics::initialize(&connection)?;
         // Backfill once with today's reference list, retaining an explicit
         // historical marker. Subsequent price updates never rewrite snapshots.
         loop {
@@ -215,6 +219,34 @@ impl UsageStore {
     }
     pub fn summary_for(&self, days: u32, source_id: Option<&str>) -> Result<Value> {
         self.summary_filtered(days, source_id, None)
+    }
+    pub fn analytics(&self, payload: &Value) -> Result<Value> {
+        let data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("用量数据库不可用"))?;
+        analytics::build(&data, payload)
+    }
+    pub fn requests(&self, payload: &Value) -> Result<Value> {
+        let data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("用量数据库不可用"))?;
+        requests::build(&data, payload)
+    }
+    pub fn detail(&self, payload: &Value) -> Result<Value> {
+        let data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("用量数据库不可用"))?;
+        diagnostics::detail(&data, payload)
+    }
+    pub fn diagnostic(&self, capture: &diagnostics::Capture, include_body: bool) -> Result<()> {
+        let data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("用量数据库不可用"))?;
+        diagnostics::save(&data.connection, capture, include_body)
     }
     pub fn summary_filtered(
         &self,

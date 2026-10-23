@@ -581,6 +581,20 @@ import ServiceManagement
             if !Task.isCancelled, usageDays == days, usageSourceID == sourceID, usageModelID == modelID { usageError = error.localizedDescription }
         }
     }
+    func usageAnalytics(_ query: UsageQuery) async throws -> JSONValue {
+        try await client.call("usage.analytics", .object(query.payload))
+    }
+    func usageRequests(_ query: UsageQuery, status: String = "", search: String = "", before: Double? = nil) async throws -> JSONValue {
+        var payload = query.payload
+        payload["limit"] = .number(50)
+        if !status.isEmpty { payload["status"] = .string(status) }
+        if !search.isEmpty { payload["search"] = .string(search) }
+        if let before { payload["before"] = .number(before) }
+        return try await client.call("usage.requests", .object(payload))
+    }
+    func usageDetail(attemptID: String, bodyOffset: Double = 0) async throws -> JSONValue {
+        try await client.call("usage.detail", .object(["attempt_id": .string(attemptID), "body_offset": .number(bodyOffset), "body_limit": .number(65_536)]))
+    }
     func prepareCredit(source: Source, credit: JSONValue) async throws -> CreditConfirmation {
         try requireWritableMetadata()
         guard let before = settings.sources.first(where: { $0.id == source.id }), before == source else { throw AppError.message("来源已删除或发生变化，请重新选择重置卡。") }

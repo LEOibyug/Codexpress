@@ -106,6 +106,7 @@ AGENTS.md
 /docs/images/*
 !/docs/images/app-icon.png
 !/docs/images/usage-live-overview.png
+!/docs/images/usage-breakdown.png
 !/docs/images/sources-clean.png
 !/docs/images/model-compaction.png
 !/docs/images/official-weekly-menu.png

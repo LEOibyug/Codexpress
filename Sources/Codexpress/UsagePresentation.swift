@@ -94,3 +94,145 @@ private func compactUsageNumber(_ number: Double, minimumFractionDigits: Int = 0
     return scaled.formatted(.number.locale(Locale(identifier: "en_US_POSIX")).grouping(.never).precision(precision)) + units[unit]
 }
 func usageSeconds(_ milliseconds: Double?) -> String { milliseconds.map { String(format: "%.2f 秒", $0 / 1000) } ?? "—" }
+
+/// An inclusive selection of local calendar dates, sent as half-open day boundaries.
+struct UsageQuery: Equatable, Sendable {
+    let from: Double
+    let to: Double
+    let dayStarts: [Double]
+    var sourceID = ""
+    var modelID = ""
+    var ingress = ""
+
+    init(start: Date, end: Date, calendar: Calendar = .current, sourceID: String = "", modelID: String = "", ingress: String = "") throws {
+        let first = calendar.startOfDay(for: start), last = calendar.startOfDay(for: end)
+        let count = (calendar.dateComponents([.day], from: first, to: last).day ?? -1) + 1
+        guard (1...366).contains(count) else { throw AppError.message("请选择不超过 366 天的日期范围，结束日期须晚于或等于开始日期。") }
+        let dates = (0...count).compactMap { calendar.date(byAdding: .day, value: $0, to: first)?.timeIntervalSince1970 }
+        guard dates.count == count + 1, let from = dates.first, let to = dates.last, from >= 0 else { throw AppError.message("无法读取所选日期，请重新选择。") }
+        self.from = from; self.to = to; dayStarts = dates
+        self.sourceID = sourceID; self.modelID = modelID; self.ingress = ingress
+    }
+    static func last(days: Int, now: Date = Date(), calendar: Calendar = .current, sourceID: String = "", modelID: String = "") -> UsageQuery {
+        let count = min(366, max(1, days))
+        let today = calendar.startOfDay(for: now)
+        let start = calendar.date(byAdding: .day, value: 1 - count, to: today) ?? today
+        // Calendar arithmetic on supported macOS calendars always yields a valid interval.
+        return try! UsageQuery(start: start, end: today, calendar: calendar, sourceID: sourceID, modelID: modelID)
+    }
+    var payload: [String: JSONValue] {
+        var values: [String: JSONValue] = ["from": .number(from), "to": .number(to), "day_starts": .array(dayStarts.map(JSONValue.number))]
+        if !sourceID.isEmpty { values["source_id"] = .string(sourceID) }
+        if !modelID.isEmpty { values["model"] = .string(modelID) }
+        if !ingress.isEmpty { values["ingress"] = .string(ingress) }
+        return values
+    }
+    var label: String {
+        let first = Date(timeIntervalSince1970: from).formatted(.dateTime.month().day())
+        let last = Date(timeIntervalSince1970: dayStarts.dropLast().last ?? from).formatted(.dateTime.month().day())
+        return "\(first) – \(last)"
+    }
+}
+
+struct UsageDaily: Identifiable {
+    let date: Date
+    let input: Double
+    let output: Double
+    let cached: Double
+    let total: Double
+    let cost: Double?
+    let requests: Double
+    let estimated: Bool
+    var id: Date { date }
+    init(_ value: JSONValue) {
+        date = Date(timeIntervalSince1970: value["start_at"].number ?? 0)
+        input = value["input_tokens"].number ?? 0; output = value["output_tokens"].number ?? 0
+        cached = value["cached_input_tokens"].number ?? 0
+        total = value["total_tokens"].number ?? (input + output)
+        cost = value["total_usd"].number
+        requests = value["requests"].number ?? 0
+        estimated = (value["estimated_requests"].number ?? 0) > 0
+    }
+}
+
+func usageActivityLevel(_ value: Double, maximum: Double) -> Int {
+    guard value > 0, maximum > 0 else { return 0 }
+    return min(4, max(1, Int(ceil(value / maximum * 4))))
+}
+
+func usageRequestStatus(_ item: JSONValue) -> String {
+    switch item["status"].string {
+    case "connecting": return "连接中"
+    case "streaming": return "接收中"
+    case "success": return "完成"
+    case "failed": return "失败"
+    case "interrupted": return "已中断"
+    default: return item["active"].bool == true ? "进行中" : "未知"
+    }
+}
+
+func usageIngressName(_ value: String?) -> String {
+    switch value {
+    case "native": return "Codex"
+    case "ssh": return "SSH"
+    case "chatbot": return "聊天客户端"
+    case "image": return "图片"
+    default: return "未知入口"
+    }
+}
+
+func usagePrettyJSON(_ value: JSONValue) -> String {
+    guard value != .null else { return "—" }
+    let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+    guard let data = try? encoder.encode(value), let text = String(data: data, encoding: .utf8) else { return "—" }
+    return text
+}
+
+struct UsageFirstPage {
+    let records: [UsageItem]
+    let nextCursor: Double?
+    let preservedHistory: Bool
+}
+
+/// Keep older pages only when a completed row proves the refreshed page overlaps them.
+func usageMergeFirstPage(previous: [UsageItem], incoming: [UsageItem], previousCursor: Double?, incomingCursor: Double?, preserving: Bool, capacity: Int = 50) -> UsageFirstPage {
+    let currentIDs = Set(incoming.filter { $0.value["active"].bool != true }.map(\.id))
+    let overlaps = previous.contains { $0.value["active"].bool != true && currentIDs.contains($0.id) }
+    guard preserving, overlaps, let minimum = incoming.filter({ $0.value["active"].bool != true }).compactMap({ $0.value["sequence"].number }).min() else {
+        return UsageFirstPage(records: incoming, nextCursor: incomingCursor, preservedHistory: false)
+    }
+    let ids = Set(incoming.map(\.id))
+    let tail = previous.filter { $0.value["active"].bool != true && ($0.value["sequence"].number ?? .infinity) < minimum && !ids.contains($0.id) }
+    let merged = incoming + tail
+    let kept = Array(merged.prefix(max(incoming.count, capacity)))
+    let cursor = kept.count < merged.count ? kept.last(where: { $0.value["active"].bool != true })?.value["sequence"].number : tail.isEmpty ? incomingCursor : previousCursor
+    return UsageFirstPage(records: kept, nextCursor: cursor, preservedHistory: !tail.isEmpty)
+}
+
+struct UsageSourceSlice: Identifiable {
+    let id: String
+    let name: String
+    let value: Double
+}
+
+func usageSourceSlices(_ groups: [JSONValue], mode: String) -> [UsageSourceSlice] {
+    let ranked = usageComparisons(groups, key: "source_id", sort: mode).compactMap { row -> UsageSourceSlice? in
+        let value = mode == "cost" ? row.totals.cost : row.totals.total
+        guard let value, value.isFinite, value > 0 else { return nil }
+        return UsageSourceSlice(id: row.id, name: row.name, value: value)
+    }
+    var slices = Array(ranked.prefix(3))
+    if ranked.count > 3 { slices.append(UsageSourceSlice(id: "usage-other-sources", name: "其他", value: ranked.dropFirst(3).reduce(0) { $0 + $1.value })) }
+    return slices
+}
+
+struct UsageActivityLayout {
+    let weeks: Int
+    let cell: Double
+    let height: Double
+    init(width: Double, days: Int, leading: Int) {
+        weeks = max(1, Int(ceil(Double(days + leading) / 7)))
+        cell = min(24, max(4, (width - 21) / Double(weeks) - 3))
+        height = cell * 7 + 18
+    }
+}

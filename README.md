@@ -27,7 +27,7 @@
 - 对话默认保持 5 分钟来源粘性，也可手动插入来源或立即恢复冷却。
 - 为每个来源选择直连或本地代理，官方登录与来源池模式一键切换。
 - 在菜单栏查看官方额度、周限量和供应商余额，设置余额不足提醒。
-- 按来源、模型查看 Token 用量、参考费用、输出速度和请求记录。
+- 查看 Token 趋势、每日活跃图和来源费用占比，按模型筛选；连接日志可查看错误详情。
 - 自动获取模型列表，为不同模型设置上下文压缩阈值。
 - 通过 SSH 将远端 Codex 接入本机来源池，支持配置备份与还原。
 - 为聊天客户端提供独立的 OpenAI 兼容接口和模型列表。
@@ -36,6 +36,10 @@
 <details>
 <summary>更多界面</summary>
 <br>
+<p align="center">
+  <img src="docs/images/usage-breakdown.png" width="920" alt="来源费用占比与可按来源筛选的性能指标">
+  <br><sub>来源占比与性能指标，图中为演示数据</sub>
+</p>
 <table>
   <tr>
     <td width="50%" align="center"><img src="docs/images/sources-clean.png" alt="来源管理页面"><br><sub>来源管理</sub></td>
