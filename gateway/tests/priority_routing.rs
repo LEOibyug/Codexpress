@@ -49,7 +49,8 @@ async fn configure(state: &Arc<AppState>, sources: &[Source]) {
             value
         })
         .collect();
-    management::dispatch(state, "sync", json!({"sources":values,"mode":"auto"}))
+    // These fixtures isolate priority/handoff; retries have dedicated coverage.
+    management::dispatch(state, "sync", json!({"sources":values,"mode":"auto","upstream_attempts":1,"upstream_retry_delay_seconds":0}))
         .await
         .unwrap();
     assert!(state.settings.read().await.strict_priority);

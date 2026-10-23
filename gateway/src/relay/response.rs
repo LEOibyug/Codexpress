@@ -468,10 +468,10 @@ impl Observer {
         {
             self.failed = true;
             self.context_rejected |= explicit_context_rejection(value);
-            self.failure_code = response
-                .pointer("/error/code")
-                .or_else(|| value.get("code"))
-                .and_then(Value::as_str)
+            self.failure_code = super::retries::permanent_code(response)
+                .or_else(|| super::retries::permanent_code(value))
+                .or_else(|| response.pointer("/error/code").and_then(Value::as_str))
+                .or_else(|| value.get("code").and_then(Value::as_str))
                 .filter(|code| code.len() <= 128)
                 .map(String::from);
         }

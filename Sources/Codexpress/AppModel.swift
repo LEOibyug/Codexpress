@@ -264,7 +264,7 @@ import ServiceManagement
         }
         if next.sources != settings.sources { try persistSettings(next) }
         do {
-            try await mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true), "load_balance":.bool(settings.loadBalanceEnabled), "idle_return_minutes":.number(Double(settings.idleReturnDelay))])))
+            try await mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true), "load_balance":.bool(settings.loadBalanceEnabled), "idle_return_minutes":.number(Double(settings.idleReturnDelay)), "upstream_attempts":.number(Double(settings.upstreamAttemptLimit)), "upstream_retry_delay_seconds":.number(Double(settings.upstreamRetryDelay))])))
             historyStatus = try await client.call("history.configure", historyPayload(settings.historyCacheSettings))
             try await updateStatus()
             pendingSync = false
@@ -498,6 +498,17 @@ import ServiceManagement
         perform {
             guard (0...10080).contains(minutes) else { throw AppError.message("闲置回切时间须为 0–10080 分钟。") }
             var next = self.settings; next.conversationStickyMinutes = minutes
+            try self.persistSettings(next); try await self.sync()
+        }
+    }
+    func changeUpstreamRetry(attempts: Int, delaySeconds: Int) {
+        perform {
+            guard (1...10).contains(attempts), (0...300).contains(delaySeconds) else {
+                throw AppError.message("尝试次数须为 1–10，等待时间须为 0–300 秒。")
+            }
+            var next = self.settings
+            next.upstreamAttempts = attempts
+            next.upstreamRetryDelaySeconds = delaySeconds
             try self.persistSettings(next); try await self.sync()
         }
     }

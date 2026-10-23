@@ -50,6 +50,20 @@ impl SyncRequest {
                 .filter(|v| *v <= 10080)
                 .context("闲置回切时间须为 0–10080 分钟的整数")? as u32,
         };
+        let upstream_attempts = match payload.get("upstream_attempts") {
+            None => 3,
+            Some(value) => value
+                .as_u64()
+                .filter(|v| (1..=10).contains(v))
+                .context("单个来源尝试次数须为 1–10 的整数")? as u8,
+        };
+        let upstream_retry_delay_seconds = match payload.get("upstream_retry_delay_seconds") {
+            None => 3,
+            Some(value) => value
+                .as_u64()
+                .filter(|v| *v <= 300)
+                .context("重试等待时间须为 0–300 秒的整数")?,
+        };
         if !["auto", "fixed"].contains(&mode) {
             bail!("未知路由模式");
         }
@@ -81,6 +95,8 @@ impl SyncRequest {
                 official_low_quota_percent: threshold,
                 degraded_context_fallback,
                 idle_return_minutes,
+                upstream_attempts,
+                upstream_retry_delay_seconds,
             },
         })
     }

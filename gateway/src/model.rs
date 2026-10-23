@@ -191,6 +191,16 @@ pub struct RoutingSettings {
     pub degraded_context_fallback: bool,
     #[serde(default = "default_idle_return")]
     pub idle_return_minutes: u32,
+    #[serde(default = "default_upstream_attempts")]
+    pub upstream_attempts: u8,
+    #[serde(default = "default_retry_delay")]
+    pub upstream_retry_delay_seconds: u64,
+}
+fn default_upstream_attempts() -> u8 {
+    3
+}
+fn default_retry_delay() -> u64 {
+    3
 }
 fn default_idle_return() -> u32 {
     5
@@ -255,6 +265,8 @@ impl AppState {
                 official_low_quota_percent: 10,
                 degraded_context_fallback: true,
                 idle_return_minutes: default_idle_return(),
+                upstream_attempts: default_upstream_attempts(),
+                upstream_retry_delay_seconds: default_retry_delay(),
             }),
             bindings: Mutex::new(HashMap::new()),
             usage: Arc::new(usage),

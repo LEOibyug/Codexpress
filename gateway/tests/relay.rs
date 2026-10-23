@@ -48,6 +48,9 @@ async fn state(sources: Vec<Source>) -> (tempfile::TempDir, Arc<AppState>) {
     let directory = tempfile::tempdir().unwrap();
     let state = AppState::new(directory.path().to_owned(), 0, "local-key".into()).unwrap();
     state.settings.write().await.strict_priority = false;
+    // Keep handoff/stream fixtures independent of the configurable retry policy.
+    state.settings.write().await.upstream_attempts = 1;
+    state.settings.write().await.upstream_retry_delay_seconds = 0;
     *state.sources.write().await = sources.into_iter().map(SourceRuntime::new).collect();
     // Strict-mode safety fixtures; degraded rebuilding is exercised separately.
     state.settings.write().await.degraded_context_fallback = false;
@@ -674,7 +677,7 @@ async fn transport_error_after_terminal_event_does_not_replace_success_or_failur
 }
 
 #[tokio::test]
-async fn server_failure_is_not_replayed_and_model_filter_is_strict() {
+async fn transient_server_errors_fall_back_after_budget_and_model_filter_is_strict() {
     let hits = Arc::new(AtomicUsize::new(0));
     let copy = hits.clone();
     let (first, a) = serve(Router::new().route(
@@ -688,7 +691,7 @@ async fn server_failure_is_not_replayed_and_model_filter_is_strict() {
             let copy = copy.clone();
             async move {
                 copy.fetch_add(1, Ordering::Relaxed);
-                "wrong"
+                axum::Json(json!({"status":"completed","output":[]}))
             }
         }),
     ))
@@ -698,9 +701,9 @@ async fn server_failure_is_not_replayed_and_model_filter_is_strict() {
         .oneshot(request(br#"{"model":"m"}"#))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::OK);
     to_bytes(response.into_body(), 10000).await.unwrap();
-    assert_eq!(hits.load(Ordering::Relaxed), 0);
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
     state.sources.write().await[1].source.models = vec!["other".into()];
     assert!(routing::candidates(&state, "m", None).await.is_empty());
     a.abort();

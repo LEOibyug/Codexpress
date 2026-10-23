@@ -122,11 +122,15 @@ struct AppSettings: Codable, Sendable {
     var loadBalance: Bool? = nil
     var idleReturnMinutes: Int? = nil
     var conversationStickyMinutes: Int? = nil
+    var upstreamAttempts: Int? = nil
+    var upstreamRetryDelaySeconds: Int? = nil
     var historyCache: HistoryCacheSettings? = nil
     var sshRemoteProfiles: [SSHRemoteProfile]? = nil
     var lowQuotaPercent: Int { officialLowQuotaPercent ?? 10 }
     var loadBalanceEnabled: Bool { loadBalance ?? false }
     var idleReturnDelay: Int { conversationStickyMinutes ?? 5 }
+    var upstreamAttemptLimit: Int { min(max(upstreamAttempts ?? 3, 1), 10) }
+    var upstreamRetryDelay: Int { min(max(upstreamRetryDelaySeconds ?? 3, 0), 300) }
     var historyCacheSettings: HistoryCacheSettings { historyCache ?? HistoryCacheSettings() }
 }
 

@@ -43,6 +43,9 @@ async fn state(sources: Vec<Source>) -> (tempfile::TempDir, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::new(dir.path().to_owned(), 0, "fixture".into()).unwrap();
     state.settings.write().await.strict_priority = false;
+    // These fixtures isolate manual handoff; transient retries have their own suite.
+    state.settings.write().await.upstream_attempts = 1;
+    state.settings.write().await.upstream_retry_delay_seconds = 0;
     *state.sources.write().await = sources.into_iter().map(SourceRuntime::new).collect();
     state.settings.write().await.degraded_context_fallback = false;
     (dir, state)
@@ -512,7 +515,7 @@ async fn manual_selection_survives_configuration_replanning_before_submission() 
             value
         })
         .collect();
-    management::dispatch(&state, "sync", json!({"sources":sources,"mode":"auto"}))
+    management::dispatch(&state, "sync", json!({"sources":sources,"mode":"auto","upstream_attempts":1,"upstream_retry_delay_seconds":0}))
         .await
         .unwrap();
     drop(guard);

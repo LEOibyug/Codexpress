@@ -31,6 +31,9 @@ final class AppModelSyncTests: XCTestCase {
             try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: syncPayload))["load_balance"]
         }
         XCTAssertEqual(try syncedLoadBalance(), .bool(false))
+        var retryPayload = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: syncPayload))
+        XCTAssertEqual(retryPayload["upstream_attempts"], .number(3))
+        XCTAssertEqual(retryPayload["upstream_retry_delay_seconds"], .number(3))
 
         func expectOneRefresh(_ action: () -> Void) async throws {
             try Data().write(to: requests)
@@ -57,6 +60,13 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertEqual(try syncedLoadBalance(), .bool(false))
         XCTAssertFalse(try MetadataStore(directory: directory).load().loadBalanceEnabled)
         try await expectOneRefresh { model.changeIdleReturnDelay(60) }
+        try await expectOneRefresh { model.changeUpstreamRetry(attempts: 5, delaySeconds: 7) }
+        retryPayload = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: syncPayload))
+        XCTAssertEqual(retryPayload["upstream_attempts"], .number(5))
+        XCTAssertEqual(retryPayload["upstream_retry_delay_seconds"], .number(7))
+        let persisted = try MetadataStore(directory: directory).load()
+        XCTAssertEqual(persisted.upstreamAttemptLimit, 5)
+        XCTAssertEqual(persisted.upstreamRetryDelay, 7)
         try await expectOneRefresh { model.move(IndexSet(integer: 0), to: 2) }
         XCTAssertEqual(model.sources.first?.id, second.id)
 

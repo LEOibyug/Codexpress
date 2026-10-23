@@ -2,6 +2,67 @@ use codexpress_gateway::{management, model::AppState};
 use serde_json::json;
 
 #[tokio::test]
+async fn upstream_retry_settings_default_and_invalid_edits_are_transactional() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(dir.path().into(), 0, "fixture".into()).unwrap();
+    management::dispatch(&state, "sync", json!({"sources":[]}))
+        .await
+        .unwrap();
+    let status = management::dispatch(&state, "status", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(status["upstream_attempts"], 3);
+    assert_eq!(status["upstream_retry_delay_seconds"], 3);
+    management::dispatch(
+        &state,
+        "sync",
+        json!({"sources":[],"upstream_attempts":1,"upstream_retry_delay_seconds":0}),
+    )
+    .await
+    .unwrap();
+    for (key, values) in [
+        (
+            "upstream_attempts",
+            vec![
+                json!(0),
+                json!(11),
+                json!(-1),
+                json!(1.5),
+                json!("3"),
+                json!(null),
+            ],
+        ),
+        (
+            "upstream_retry_delay_seconds",
+            vec![json!(-1), json!(301), json!(0.5), json!("3"), json!(null)],
+        ),
+    ] {
+        for value in values {
+            let mut payload = json!({"sources":[]});
+            payload[key] = value;
+            assert!(management::dispatch(&state, "sync", payload).await.is_err());
+            let status = management::dispatch(&state, "status", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(status["upstream_attempts"], 1);
+            assert_eq!(status["upstream_retry_delay_seconds"], 0);
+        }
+    }
+    management::dispatch(
+        &state,
+        "sync",
+        json!({"sources":[],"upstream_attempts":10,"upstream_retry_delay_seconds":300}),
+    )
+    .await
+    .unwrap();
+    let status = management::dispatch(&state, "status", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(status["upstream_attempts"], 10);
+    assert_eq!(status["upstream_retry_delay_seconds"], 300);
+}
+
+#[tokio::test]
 async fn management_sync_is_transactional_and_does_not_expose_secrets_in_status() {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::new(dir.path().to_owned(), 17863, "local-test-key".into()).unwrap();

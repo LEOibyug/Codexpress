@@ -37,6 +37,24 @@ struct RoutingView: View {
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 }
+                SettingsCard("上游重试", symbol: "arrow.clockwise") {
+                    HStack {
+                        Text("单个来源最多尝试").font(.system(size: 12))
+                        Spacer()
+                        Stepper(value: Binding(get: { model.settings.upstreamAttemptLimit }, set: { model.changeUpstreamRetry(attempts: $0, delaySeconds: model.settings.upstreamRetryDelay) }), in: 1...10) {
+                            Text("\(model.settings.upstreamAttemptLimit) 次").monospacedDigit().frame(width: 54, alignment: .trailing)
+                        }.fixedSize()
+                    }
+                    HStack {
+                        Text("失败后等待").font(.system(size: 12))
+                        Spacer()
+                        Stepper(value: Binding(get: { model.settings.upstreamRetryDelay }, set: { model.changeUpstreamRetry(attempts: model.settings.upstreamAttemptLimit, delaySeconds: $0) }), in: 0...300) {
+                            Text("\(model.settings.upstreamRetryDelay) 秒").monospacedDigit().frame(width: 54, alignment: .trailing)
+                        }.fixedSize()
+                    }
+                    Text("次数包含首次请求。连接失败或暂时服务错误时先重试，仍失败后再按路由规则切换来源。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }.disabled(model.busy)
                 SettingsCard("对话接续", symbol: "arrow.triangle.2.circlepath") {
                     Picker("粘性保持时间", selection: Binding(get: { model.settings.idleReturnDelay }, set: { model.changeIdleReturnDelay($0) })) {
                         Text("5 分钟").tag(5)

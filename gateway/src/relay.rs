@@ -1,4 +1,5 @@
 mod response;
+mod retries;
 mod roles;
 
 use self::response::{probe_context_rejection, read_error_prefix, stream_response, Attempt};
@@ -414,6 +415,9 @@ async fn portable_request(
     if let Some(manual) = parts.extensions.get::<ManualRequest>() {
         retry.extensions_mut().insert(manual.clone());
     }
+    if let Some(retries) = parts.extensions.get::<retries::RequestRetries>() {
+        retry.extensions_mut().insert(retries.clone());
+    }
     Ok((
         retry,
         RebuildContext {
@@ -586,6 +590,12 @@ async fn forward_once(
         return error(StatusCode::FORBIDDEN, "网关不接受浏览器跨站请求");
     }
     let (mut parts, body) = request.into_parts();
+    let request_retries = parts
+        .extensions
+        .get::<retries::RequestRetries>()
+        .cloned()
+        .unwrap_or_default();
+    parts.extensions.insert(request_retries.clone());
     let mut bytes = match crate::request_body::read(body, "codex").await {
         Ok(body) => body,
         Err(problem) => return error(problem.status, problem.message),
@@ -790,6 +800,7 @@ async fn forward_once(
                         if let Some(manual) = parts.extensions.get::<ManualRequest>() {
                             retry.extensions_mut().insert(manual.clone());
                         }
+                        retry.extensions_mut().insert(request_retries.clone());
                         Some((
                             retry,
                             RebuildContext {
@@ -970,6 +981,15 @@ async fn forward_once(
         // Explicit local action: let the selected upstream validate unchanged
         // state before rebuilding. Normal alternatives keep all origin checks.
         sources = vec![target.clone()];
+    }
+    let retry_limit = state.settings.read().await.upstream_attempts;
+    let had_candidates = !sources.is_empty();
+    sources.retain(|source| !request_retries.exhausted(source, retry_limit));
+    if had_candidates && sources.is_empty() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "本次请求已用完来源尝试次数，请稍后重试",
+        );
     }
     if sources.is_empty() {
         let settings = state.settings.read().await.clone();
@@ -1222,7 +1242,10 @@ async fn forward_once(
         let mut role_repaired = false;
         let has_system = roles::has_system(&parsed);
         let mut auth_refreshed = false;
-        for _attempt_number in 0..if compatibility { 6 } else { 3 } {
+        let retries =
+            retries::UpstreamRetries::new(&request_retries, &source, &*state.settings.read().await);
+        let attempt_limit = (if compatibility { 6 } else { 3 }) + retries.extra_attempts();
+        for _attempt_number in 0..attempt_limit {
             let eligible = if manual_candidate {
                 match &manual.trial {
                     Some(trial) => routing::manual::source_for_trial(&state, trial, model)
@@ -1425,6 +1448,12 @@ async fn forward_once(
                         !definitely_unsubmitted
                     );
                     attempt.finish("failed", None);
+                    if definitely_unsubmitted {
+                        if let Some(delay) = retries.failed() {
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                    }
                     routing::mark_transport_failure(&state, &source.id, &err).await;
                     if manual_candidate && definitely_unsubmitted {
                         drop(route_lease.take());
@@ -1503,6 +1532,26 @@ async fn forward_once(
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
+            let mut prefix = Vec::new();
+            let mut transient_error = if retries::transient_status(status.as_u16()) {
+                read_error_prefix(&mut upstream, &mut prefix).await
+            } else {
+                None
+            };
+            let permanent_rejection = transient_error
+                .as_ref()
+                .is_some_and(|value| retries::permanent_code(value).is_some());
+            if permanent_rejection {
+                request_retries.block(&source);
+            } else if retries::transient_status(status.as_u16()) {
+                if let Some(delay) = retries.failed() {
+                    attempt.finish("failed", None);
+                    // Keep the capacity lease, but release the failed transport.
+                    drop(upstream);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
             if source.kind == "official" && status == StatusCode::UNAUTHORIZED && !auth_refreshed {
                 auth_refreshed = true;
                 attempt.finish("failed", None);
@@ -1565,7 +1614,6 @@ async fn forward_once(
                     }
                 }
             }
-            let mut prefix = Vec::new();
             let mut context_rejected = false;
             if matches!(status.as_u16(), 400 | 404 | 409 | 422)
                 && (binding.is_some() || opaque_state || compatibility || has_system)
@@ -1636,14 +1684,21 @@ async fn forward_once(
             }
             if matches!(status.as_u16(), 401 | 402 | 403 | 429 | 500..=599) {
                 routing::mark_failure(&state, &source.id, status.as_u16(), retry_after).await;
-                if matches!(status.as_u16(), 402 | 403 | 429) {
+                if matches!(status.as_u16(), 402 | 403 | 429) || permanent_rejection {
                     // Read only a bounded error prefix, retaining the original
                     // chunks for exact forwarding if this is the final source.
-                    if let Some(value) = read_error_prefix(&mut upstream, &mut prefix).await {
-                        let code = value
-                            .pointer("/error/code")
-                            .or_else(|| value.pointer("/error/type"))
-                            .and_then(Value::as_str);
+                    let value = if transient_error.is_some() {
+                        transient_error.take()
+                    } else {
+                        read_error_prefix(&mut upstream, &mut prefix).await
+                    };
+                    if let Some(value) = value {
+                        let code = retries::permanent_code(&value).or_else(|| {
+                            value
+                                .pointer("/error/code")
+                                .and_then(Value::as_str)
+                                .or_else(|| value.pointer("/error/type").and_then(Value::as_str))
+                        });
                         routing::mark_rejection(&state, &source.id, code, retry_after).await;
                     }
                 }
@@ -1694,16 +1749,20 @@ async fn forward_once(
             }
             if !degraded
                 && (binding.is_some() || opaque_state || origin.is_some())
-                && (context_rejected || matches!(status.as_u16(), 401 | 402 | 403 | 429))
+                && (context_rejected
+                    || matches!(status.as_u16(), 401 | 402 | 403 | 429)
+                    || retries::transient_status(status.as_u16()))
                 && state.settings.read().await.degraded_context_fallback
                 && if priority_probe {
                     !routing::priority::candidates(&state, model, affinity_key.as_deref())
                         .await
-                        .is_empty()
+                        .iter()
+                        .all(|s| request_retries.exhausted(s, retry_limit))
                 } else {
                     !routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
                         .await
-                        .is_empty()
+                        .iter()
+                        .all(|s| request_retries.exhausted(s, retry_limit))
                 }
             {
                 attempt.finish("failed", None);
@@ -1721,7 +1780,7 @@ async fn forward_once(
                     Ok(value) => value,
                     Err(response) => return *response,
                 };
-                if context_rejected {
+                if context_rejected || retries::transient_status(status.as_u16()) {
                     context.rejected_source = Some(source.id.clone());
                 }
                 return Box::pin(forward_once(state, retry, Some(context), replans)).await;
@@ -1730,6 +1789,7 @@ async fn forward_once(
                 && !opaque_state
                 && (origin.is_none() || planned_return)
                 && (matches!(status.as_u16(), 401 | 402 | 403 | 429)
+                    || retries::transient_status(status.as_u16())
                     || (degraded && context_rejected));
             if safe_to_fallback {
                 attempt.finish("failed", None);
