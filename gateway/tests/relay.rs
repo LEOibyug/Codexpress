@@ -326,7 +326,7 @@ async fn fallback_is_ordered_fixed_mode_and_previous_id_never_cross_sources() {
         summary["recent"][0]["request_id"],
         summary["recent"][1]["request_id"]
     );
-    assert_eq!(state.sources.read().await[0].health, "cooldown");
+    assert_eq!(state.sources.read().await[0].health, "ready");
     // Use a terminal block to check strict source isolation without waiting
     // through a transient cooldown; recovery waits have separate coverage.
     state.sources.write().await[0].health = "auth_required".into();
@@ -705,7 +705,14 @@ async fn transient_server_errors_fall_back_after_budget_and_model_filter_is_stri
     to_bytes(response.into_body(), 10000).await.unwrap();
     assert_eq!(hits.load(Ordering::Relaxed), 1);
     state.sources.write().await[1].source.models = vec!["other".into()];
-    assert!(routing::candidates(&state, "m", None).await.is_empty());
+    assert_eq!(
+        routing::candidates(&state, "m", None)
+            .await
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a"]
+    );
     a.abort();
     b.abort();
 }
@@ -1681,7 +1688,7 @@ async fn connect_refusal_rebuilds_bound_opaque_context_and_hands_off_in_the_same
             {"role":"user","content":"continue after disconnect"}
         ])
     );
-    assert_eq!(state.sources.read().await[0].health, "cooldown");
+    assert_eq!(state.sources.read().await[0].health, "ready");
     let key = codexpress_gateway::affinity::key("thread:connect-refusal-thread", "m");
     let sources = state.sources.read().await;
     let all = sources
@@ -2839,6 +2846,8 @@ async fn idle_return_rebuilds_cached_context_and_failed_return_keeps_working_sou
         expire_fixture_affinity(directory.path());
         let restored = AppState::new(directory.path().to_owned(), 0, "local-key".into()).unwrap();
         restored.settings.write().await.strict_priority = false;
+        restored.settings.write().await.upstream_attempts = 1;
+        restored.settings.write().await.upstream_retry_delay_seconds = 0;
         *restored.sources.write().await = vec![
             SourceRuntime::new(first.clone()),
             SourceRuntime::new(second.clone()),

@@ -44,6 +44,8 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
                     value["active_requests"] =
                         json!(active.get(&runtime.source.id).copied().unwrap_or(0));
                     value["identity_digest"] = json!(runtime.source.identity());
+                    value["system_role_as_developer"] =
+                        json!(state.role_capabilities.requires_developer(&runtime.source));
                     value["admission"] = crate::routing::admission_with_settings(
                         state, runtime, &sources, &settings,
                     );

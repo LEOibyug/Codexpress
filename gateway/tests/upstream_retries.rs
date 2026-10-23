@@ -242,7 +242,7 @@ async fn permanent_errors_and_already_started_streams_are_not_replayed() {
         let response = relay::router(state).oneshot(request(BODY)).await.unwrap();
         assert_eq!(response.status().as_u16(), status);
         to_bytes(response.into_body(), 10000).await.unwrap();
-        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(*calls.lock().unwrap(), if status == 429 { 3 } else { 1 });
         task.abort();
     }
 }
@@ -395,7 +395,7 @@ async fn explicit_permanent_rejections_inside_transient_http_statuses_are_not_re
             "exhausted",
         ),
         (json!({"code":"invalid_api_key"}), "auth_required"),
-        (json!({"code":"unsupported_parameter"}), "cooldown"),
+        (json!({"code":"unsupported_parameter"}), "ready"),
     ] {
         let calls = Arc::new(Mutex::new(0));
         let copy = calls.clone();
@@ -425,4 +425,54 @@ async fn explicit_permanent_rejections_inside_transient_http_statuses_are_not_re
         assert_eq!(state.sources.read().await[0].health, health);
         task.abort();
     }
+}
+
+#[tokio::test]
+async fn only_three_confirmed_upstream_errors_in_one_request_allow_cooldown() {
+    for attempts in [1, 2, 3] {
+        for status in [429, 503] {
+            let calls = Arc::new(Mutex::new(0));
+            let copy = calls.clone();
+            let (base, task) = server::serve(Router::new().route(
+                "/responses",
+                post(move || {
+                    let copy = copy.clone();
+                    async move {
+                        *copy.lock().unwrap() += 1;
+                    if status==429 {
+                        (StatusCode::TOO_MANY_REQUESTS,axum::Json(json!({"error":{"code":"rate_limit_exceeded","type":"invalid_request_error"}}))).into_response()
+                    } else {StatusCode::from_u16(status).unwrap().into_response()}
+                    }
+                }),
+            ))
+            .await;
+            let (_directory, state) = state(&[base], attempts, 0).await;
+            let response = relay::router(state.clone())
+                .oneshot(request(BODY))
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            to_bytes(response.into_body(), 10000).await.unwrap();
+            assert_eq!(*calls.lock().unwrap(), usize::from(attempts));
+            let runtime = state.sources.read().await;
+            assert_eq!(
+                runtime[0].health,
+                if attempts >= 3 { "cooldown" } else { "ready" }
+            );
+            assert_eq!(runtime[0].cooldown_until.is_some(), attempts >= 3);
+            task.abort();
+        }
+    }
+    // Repeated connect failures provide no HTTP error evidence for a cooldown.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let (_directory, state) = state(&[format!("http://{address}")], 3, 0).await;
+    let response = relay::router(state.clone())
+        .oneshot(request(BODY))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert_eq!(state.sources.read().await[0].health, "ready");
 }

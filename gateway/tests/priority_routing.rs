@@ -233,6 +233,9 @@ async fn new_and_expired_conversations_start_at_priority_one_even_when_it_is_coo
     assert_eq!(send(state.clone(), "long").await, StatusCode::OK);
     assert_eq!(first_calls.load(Ordering::SeqCst), 1);
     assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.sources.read().await[0].health, "ready");
+    // Seed a pre-existing cooldown; a single refusal no longer creates one.
+    routing::mark_failure(&state, "a", 429, None).await;
     assert_eq!(state.sources.read().await[0].health, "cooldown");
     let status = management::dispatch(&state, "status", json!({}))
         .await

@@ -1,6 +1,8 @@
 mod response;
 mod retries;
 mod roles;
+pub(crate) use retries::permanent_code;
+pub(crate) use roles::RoleCapabilities;
 
 use self::response::{probe_context_rejection, read_error_prefix, stream_response, Attempt};
 use crate::{
@@ -1175,9 +1177,10 @@ async fn forward_once(
         } else if discovery {
             None
         } else {
-            let reserved = if rebuild
-                .as_ref()
-                .is_some_and(|context| context.rejected_source.is_some())
+            let reserved = if last_error.is_some()
+                || rebuild
+                    .as_ref()
+                    .is_some_and(|context| context.rejected_source.is_some())
                 || (probe_unknown_id && candidate_index > 0)
             {
                 routing::reserve_context_handoff_for_model(
@@ -1214,6 +1217,7 @@ async fn forward_once(
                 Ok(_) => return error(StatusCode::CONFLICT, "来源身份已经变化，请重新开始请求"),
                 Err(_) => {
                     routing::mark_auth_preflight_failure(&state, &candidate).await;
+                    request_retries.block(&candidate);
                     if manual_candidate {
                         drop(route_lease.take());
                         return after_manual_failure(state, parts, bytes, rebuild, replans).await;
@@ -1241,6 +1245,16 @@ async fn forward_once(
         let mut role_bytes: Option<Bytes> = None;
         let mut role_repaired = false;
         let has_system = roles::has_system(&parsed);
+        if state.role_capabilities.requires_developer(&source) {
+            if let Some(repaired) = roles::convert(&parsed) {
+                if compatibility {
+                    compatibility_body = repaired;
+                } else {
+                    role_bytes = Some(Bytes::from(serde_json::to_vec(&repaired).expect("JSON")));
+                }
+                role_repaired = true;
+            }
+        }
         let mut auth_refreshed = false;
         let retries =
             retries::UpstreamRetries::new(&request_retries, &source, &*state.settings.read().await);
@@ -1320,7 +1334,6 @@ async fn forward_once(
                 Ok(client) => client,
                 Err(_) => {
                     attempt.finish("failed", None);
-                    routing::mark_failure(&state, &source.id, 0, None).await;
                     if manual_candidate {
                         drop(route_lease.take());
                         drop(attempt);
@@ -1428,7 +1441,6 @@ async fn forward_once(
                 Ok(result) => result,
                 Err(_) => {
                     attempt.finish("failed", None);
-                    routing::mark_failure(&state, &source.id, 504, None).await;
                     return error(
                         StatusCode::GATEWAY_TIMEOUT,
                         "来源提交结果超时且不明确；未自动重试",
@@ -1449,12 +1461,11 @@ async fn forward_once(
                     );
                     attempt.finish("failed", None);
                     if definitely_unsubmitted {
-                        if let Some(delay) = retries.failed() {
+                        if let Some(delay) = retries.failed(false) {
                             tokio::time::sleep(delay).await;
                             continue;
                         }
                     }
-                    routing::mark_transport_failure(&state, &source.id, &err).await;
                     if manual_candidate && definitely_unsubmitted {
                         drop(route_lease.take());
                         drop(attempt);
@@ -1544,7 +1555,7 @@ async fn forward_once(
             if permanent_rejection {
                 request_retries.block(&source);
             } else if retries::transient_status(status.as_u16()) {
-                if let Some(delay) = retries.failed() {
+                if let Some(delay) = retries.failed(true) {
                     attempt.finish("failed", None);
                     // Keep the capacity lease, but release the failed transport.
                     drop(upstream);
@@ -1626,6 +1637,7 @@ async fn forward_once(
                             &parsed
                         };
                         if let Some(repaired) = roles::adapt(body, &value) {
+                            state.role_capabilities.remember(&source);
                             if compatibility {
                                 compatibility_body = repaired;
                             } else {
@@ -1683,7 +1695,14 @@ async fn forward_once(
                 };
             }
             if matches!(status.as_u16(), 401 | 402 | 403 | 429 | 500..=599) {
-                routing::mark_failure(&state, &source.id, status.as_u16(), retry_after).await;
+                routing::mark_upstream_failure(
+                    &state,
+                    &source,
+                    status.as_u16(),
+                    retry_after,
+                    retries.confirmed_errors(),
+                )
+                .await;
                 if matches!(status.as_u16(), 402 | 403 | 429) || permanent_rejection {
                     // Read only a bounded error prefix, retaining the original
                     // chunks for exact forwarding if this is the final source.

@@ -585,19 +585,23 @@ pub async fn mark_failure(
     mark_failure_reason(state, source_id, status, retry_after, None).await;
 }
 
-pub async fn mark_transport_failure(
+pub(crate) async fn mark_upstream_failure(
     state: &Arc<AppState>,
-    source_id: &str,
-    error: &reqwest::Error,
+    source: &Source,
+    status: u16,
+    retry_after: Option<u64>,
+    upstream_errors: u8,
 ) {
-    mark_failure_reason(
-        state,
-        source_id,
-        0,
-        None,
-        Some(crate::transport::failure_reason(error)),
-    )
-    .await;
+    if status == 401 || upstream_errors >= 3 {
+        mark_failure_reason(
+            state,
+            &source.id,
+            status,
+            retry_after,
+            Some(&source.identity()),
+        )
+        .await;
+    }
 }
 
 async fn mark_failure_reason(
@@ -605,15 +609,11 @@ async fn mark_failure_reason(
     source_id: &str,
     status: u16,
     retry_after: Option<u64>,
-    reason: Option<&str>,
+    identity: Option<&str>,
 ) {
-    if let Some(runtime) = state
-        .sources
-        .write()
-        .await
-        .iter_mut()
-        .find(|r| r.source.id == source_id)
-    {
+    if let Some(runtime) = state.sources.write().await.iter_mut().find(|r| {
+        r.source.id == source_id && identity.is_none_or(|identity| r.source.identity() == identity)
+    }) {
         let (health, message, delay) = match status {
             401 => ("auth_required", "来源认证已失效", None),
             402 => ("cooldown", "来源拒绝计费请求，原因待核实", Some(30)),
@@ -633,7 +633,7 @@ async fn mark_failure_reason(
         }
         runtime.health = health.into();
         runtime.health_revision = runtime.health_revision.wrapping_add(1);
-        runtime.last_error = Some(reason.unwrap_or(message).into());
+        runtime.last_error = Some(message.into());
         runtime.cooldown_until = delay.map(|seconds| now().saturating_add(seconds));
     }
 }
@@ -651,10 +651,8 @@ pub async fn mark_auth_preflight_failure(state: &Arc<AppState>, source: &Source)
         if runtime.health == "exhausted" {
             runtime.quota_exhausted = true;
         }
-        runtime.health = "proxy_error".into();
         runtime.health_revision = runtime.health_revision.wrapping_add(1);
         runtime.last_error = Some("官方认证查询暂不可用".into());
-        runtime.cooldown_until = Some(now() + 15);
     }
 }
 

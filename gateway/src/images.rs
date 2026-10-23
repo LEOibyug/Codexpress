@@ -491,7 +491,22 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
         let status = upstream.status();
         if status.as_u16() == 429 {
             attempt.finish("failed");
-            routing::mark_failure(&state, &source.id, 429, None).await;
+            if let Ok(Ok(bytes)) = tokio::time::timeout(
+                Duration::from_secs(5),
+                transport::read_limited(&mut upstream, 65536),
+            )
+            .await
+            {
+                if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                    routing::mark_rejection(
+                        &state,
+                        &source.id,
+                        crate::relay::permanent_code(&value),
+                        None,
+                    )
+                    .await;
+                }
+            }
             continue;
         }
         if !status.is_success() {

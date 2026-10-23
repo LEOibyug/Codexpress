@@ -220,6 +220,7 @@ pub struct AppState {
     pub routing_sync: Mutex<()>,
     pub sources: RwLock<Vec<SourceRuntime>>,
     pub settings: RwLock<RoutingSettings>,
+    pub(crate) role_capabilities: crate::relay::RoleCapabilities,
     pub bindings: Mutex<HashMap<String, String>>,
     pub usage: Arc<crate::usage::UsageStore>,
     pub affinity: Arc<crate::affinity::AffinityStore>,
@@ -268,6 +269,9 @@ impl AppState {
                 upstream_attempts: default_upstream_attempts(),
                 upstream_retry_delay_seconds: default_retry_delay(),
             }),
+            role_capabilities: crate::relay::RoleCapabilities::open(
+                state_dir.join("source-compatibility.json"),
+            ),
             bindings: Mutex::new(HashMap::new()),
             usage: Arc::new(usage),
             affinity: crate::affinity::AffinityStore::open(&state_dir.join("affinity.sqlite"))?,
