@@ -517,7 +517,8 @@ async fn new_exhaustion_outlives_old_failures_and_older_quota_queries() {
     });
     duplicate.health = "exhausted".into();
     state.sources.write().await.push(duplicate);
-    routing::mark_rejection(&state, "official-a", Some("usage_limit_reached"), Some(1)).await;
+    let original = state.sources.read().await[0].source.clone();
+    routing::mark_rejection(&state, &original, Some("usage_limit_reached"), Some(1)).await;
     let gate = Arc::new(tokio::sync::Notify::new());
     *counters.credit_gate.lock().await = Some(gate.clone());
     let copy = state.clone();
@@ -534,11 +535,20 @@ async fn new_exhaustion_outlives_old_failures_and_older_quota_queries() {
     .unwrap();
     // Quota was already read as positive; a newer rejection must win, even if
     // old network/auth completions subsequently change the health label.
-    routing::mark_rejection(&state, "duplicate", Some("usage_limit_reached"), Some(1)).await;
+    let duplicate = state
+        .sources
+        .read()
+        .await
+        .iter()
+        .find(|r| r.source.id == "duplicate")
+        .unwrap()
+        .source
+        .clone();
+    routing::mark_rejection(&state, &duplicate, Some("usage_limit_reached"), Some(1)).await;
     routing::mark_failure(&state, "official-a", 500, None).await;
     let source = state.sources.read().await[0].source.clone();
     routing::mark_auth_preflight_failure(&state, &source).await;
-    routing::mark_ready(&state, "official-a").await;
+    routing::mark_ready(&state, &source).await;
     gate.notify_one();
     query.await.unwrap();
     {

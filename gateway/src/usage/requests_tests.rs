@@ -156,3 +156,41 @@ fn first_page_active_limit_legacy_fallback_and_validation_preserve_state() {
     assert_eq!(snapshot, data.connection.total_changes());
     assert_eq!(data.active.len(), 1);
 }
+
+#[test]
+fn upstream_and_unsuccessful_filter_include_failures_and_interruptions_only() {
+    let (_dir, mut data) = fixture();
+    for (id, source, outcome) in [
+        ("ok", "a", "success"),
+        ("bad", "a", "failed"),
+        ("cut", "a", "interrupted"),
+        ("other", "b", "failed"),
+    ] {
+        let mut item = record(id, 105);
+        item.source_id = source.into();
+        item.status = outcome.into();
+        persist(&data, &item, Some("native"));
+    }
+    let mut active = record("live", 105);
+    active.source_id = "a".into();
+    active.status = "streaming".into();
+    data.active
+        .insert(active.attempt_id.clone(), (active, Instant::now()));
+    let query = json!({"from":100,"to":200,"source_id":"a","status":"unsuccessful","limit":1});
+    let page = build(&data, &query).unwrap();
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["active_count"], 0);
+    assert_eq!(page["records"][0]["attempt_id"], "cut");
+    let mut next = query;
+    next["before"] = page["next_cursor"].clone();
+    let page = build(&data, &next).unwrap();
+    assert_eq!(page["records"][0]["attempt_id"], "bad");
+    assert!(page["next_cursor"].is_null());
+    let success = build(
+        &data,
+        &json!({"from":100,"to":200,"source_id":"a","status":"success"}),
+    )
+    .unwrap();
+    assert_eq!(success["total"], 1);
+    assert_eq!(success["records"][0]["attempt_id"], "ok");
+}

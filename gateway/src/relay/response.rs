@@ -718,7 +718,7 @@ async fn finalize_response(
         state.history.record_skip();
     }
     if observer.failed {
-        routing::mark_rejection(state, &source.id, observer.failure_code.as_deref(), None).await;
+        routing::mark_rejection(state, source, observer.failure_code.as_deref(), None).await;
     }
     bind_ids(state, source, observer).await;
     let outcome = if !status.is_success() || observer.failed {

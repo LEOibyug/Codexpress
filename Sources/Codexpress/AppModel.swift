@@ -168,7 +168,7 @@ import ServiceManagement
         await startHelper(); restarting = false
     }
     func shutdown() async {
-        if running { try? await mergeCredentials(try await client.call("credentials")) }
+        if running { _ = try? await refreshCredentials() }
         stop()
     }
     func activeRequestsBeforeTermination() async throws -> Int {
@@ -192,6 +192,12 @@ import ServiceManagement
         settings = next
         do { try balanceWarnings?.retain(sources: next.sources) }
         catch { notice = "无法更新余额预警记录，请检查应用数据目录的写入权限。" }
+    }
+    private func updateSettingsAndSync(_ update: (inout AppSettings) -> Void) async throws {
+        var next = settings
+        update(&next)
+        try persistSettings(next)
+        try await sync()
     }
     func refreshCredentialStorage() async {
         guard canManageCredentials, !busy else { return }
@@ -227,6 +233,11 @@ import ServiceManagement
         next.sources = try OfficialCredentialMirror.mergedSources(settings.sources, response: data, loadDurable: credentialSnapshot.load)
         if next.sources != settings.sources { try persistSettings(next) }
     }
+    @discardableResult private func refreshCredentials() async throws -> JSONValue {
+        let notification = try await client.call("credentials")
+        try await mergeCredentials(notification)
+        return notification
+    }
     private func updateStatus() async throws {
         let fresh = try await client.call("status")
         guard let child = helper, child.isRunning, fresh["process_id"].number == Double(child.processIdentifier) else { running = false; throw AppError.message("网关实例已改变，停止发送管理请求。") }
@@ -248,8 +259,7 @@ import ServiceManagement
         try requireWritableMetadata()
         pendingSync = true
         // Always retrieve helper-authoritative rotated tokens before building a source snapshot.
-        let notification = try await client.call("credentials")
-        try await mergeCredentials(notification)
+        let notification = try await refreshCredentials()
         let helperOwnedIDs = Set(notification["updated_secrets"].array.compactMap { $0["source_id"].string })
         var values: [JSONValue] = []
         var next = settings
@@ -275,7 +285,7 @@ import ServiceManagement
         do {
             try await updateStatus()
             if refreshCredentials {
-                try await mergeCredentials(try await client.call("credentials"))
+                try await self.refreshCredentials()
                 if let id = loginSource, let flow = loginFlow {
                     let result = try await client.call("official.login.status", .object(["source_id": .string(id), "flow_id": .string(flow)]))
                     if result["state"].string == "complete" { try await finishLogin(id) }
@@ -352,7 +362,7 @@ import ServiceManagement
         if let current = settings.sources.first(where: { $0.id == source.id }), current.kind != source.kind { throw AppError.message("不能更改已有来源的类型，请新建来源。") }
         guard settings.sources.contains(where: { $0.id == source.id }) || settings.sources.count < 200 else { throw AppError.message("最多支持 200 个来源。") }
         if !source.official, apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, try credentialSnapshot.load(source.id) == nil { throw AppError.message("请输入 API 密钥。") }
-        try await mergeCredentials(try await client.call("credentials"))
+        try await refreshCredentials()
         try await updateStatus()
         var source = source
         if source.official { source = source.preservingOfficialIdentity(current: settings.sources.first { $0.id == source.id }, live: state(source.id)) }
@@ -360,12 +370,11 @@ import ServiceManagement
             _ = try await client.call("credentials.save_api", .object(["source_id": .string(source.id), "api_key": .string(apiKey.trimmingCharacters(in: .whitespacesAndNewlines))]))
             try await loadCredentialSnapshot([source.id])
         }
-        var updated = settings
-        if let i = updated.sources.firstIndex(where: { $0.id == source.id }) { updated.sources[i] = source }
-        else { var item = source; item.priority = updated.sources.count; updated.sources.append(item) }
-        if updated.fixed_source_id == source.id && !source.enabled { updated.mode = "auto"; updated.fixed_source_id = nil }
-        try persistSettings(updated)
-        try await sync()
+        try await updateSettingsAndSync { next in
+            if let i = next.sources.firstIndex(where: { $0.id == source.id }) { next.sources[i] = source }
+            else { var item = source; item.priority = next.sources.count; next.sources.append(item) }
+            if next.fixed_source_id == source.id && !source.enabled { next.mode = "auto"; next.fixed_source_id = nil }
+        }
         if source.official { officialRefreshSchedule.reset(source.id) }
         modelErrors[source.id] = nil
         apiBalances[source.id] = nil
@@ -420,11 +429,10 @@ import ServiceManagement
             // Discard a response if the editor, login or deletion changed its source.
             guard !Task.isCancelled, running, !busy, let index = settings.sources.firstIndex(where: { $0.id == id }), settings.sources[index] == before else { lastModelRefresh[id] = nil; return }
             guard before.models != models || before.automaticModelDiscovery != true else { return }
-            var next = settings
-            next.sources[index].automaticModelDiscovery = true
-            next.sources[index].models = models
-            try persistSettings(next)
-            try await sync()
+            try await updateSettingsAndSync { next in
+                next.sources[index].automaticModelDiscovery = true
+                next.sources[index].models = models
+            }
         } catch {
             if settings.sources.contains(where: { $0 == before }) { modelErrors[id] = error.localizedDescription }
         }
@@ -432,11 +440,11 @@ import ServiceManagement
     func removeSource(_ id: String) {
         perform {
             try self.requireWritableMetadata()
-            try await self.mergeCredentials(try await self.client.call("credentials"))
-            var next = self.settings; next.sources.removeAll { $0.id == id }
-            if next.fixed_source_id == id { next.fixed_source_id = nil; next.mode = "auto" }
-            try self.persistSettings(next)
-            try await self.sync()
+            try await self.refreshCredentials()
+            try await self.updateSettingsAndSync { next in
+                next.sources.removeAll { $0.id == id }
+                if next.fixed_source_id == id { next.fixed_source_id = nil; next.mode = "auto" }
+            }
             _ = try await self.client.call("credentials.delete", .object(["source_id": .string(id)]))
             try await self.loadCredentialSnapshot([id])
             if self.loginSource == id { self.loginSource = nil; self.loginFlow = nil; self.callbackURL = "" }
@@ -447,24 +455,21 @@ import ServiceManagement
     func changeRouting(mode: String, fixed: String?) {
         perform {
             if mode == "fixed", !self.settings.sources.contains(where: { $0.id == fixed && $0.enabled }) { throw AppError.message("请选择已启用的固定来源。") }
-            var next = self.settings; next.mode = mode; next.fixed_source_id = fixed
-            try self.persistSettings(next); try await self.sync()
+            try await self.updateSettingsAndSync { next in next.mode = mode; next.fixed_source_id = fixed }
         }
     }
     func recoverSource(_ id: String) {
-        perform {
-            guard self.running else { throw AppError.message("请先启动网关。") }
-            _ = try await self.client.call("routing.recover", .object(["source_id": .string(id)]))
-            try await self.updateStatus()
-            self.notice = "已解除临时冷却。"
-        }
+        performSourceRouting("routing.recover", sourceID: id, notice: "已解除临时冷却。")
     }
     func trySourceOnce(_ id: String) {
+        performSourceRouting("routing.try", sourceID: id, notice: "下一条对话请求将优先尝试此来源。")
+    }
+    private func performSourceRouting(_ operation: String, sourceID: String, notice: String) {
         perform {
             guard self.running else { throw AppError.message("请先启动网关。") }
-            _ = try await self.client.call("routing.try", .object(["source_id": .string(id)]))
+            _ = try await self.client.call(operation, .object(["source_id": .string(sourceID)]))
             try await self.updateStatus()
-            self.notice = "下一条对话请求将优先尝试此来源。"
+            self.notice = notice
         }
     }
     func cancelSourceTrial() {
@@ -478,27 +483,23 @@ import ServiceManagement
     func changeLowQuotaThreshold(_ value: Int) {
         perform {
             guard (1...99).contains(value) else { throw AppError.message("余量阈值须为 1–99%。") }
-            var next = self.settings; next.officialLowQuotaPercent = value
-            try self.persistSettings(next); try await self.sync()
+            try await self.updateSettingsAndSync { $0.officialLowQuotaPercent = value }
         }
     }
     func changeContextFallback(_ enabled: Bool) {
         perform {
-            var next = self.settings; next.degradedContextFallback = enabled
-            try self.persistSettings(next); try await self.sync()
+            try await self.updateSettingsAndSync { $0.degradedContextFallback = enabled }
         }
     }
     func changeLoadBalance(_ enabled: Bool) {
         perform {
-            var next = self.settings; next.loadBalance = enabled
-            try self.persistSettings(next); try await self.sync()
+            try await self.updateSettingsAndSync { $0.loadBalance = enabled }
         }
     }
     func changeIdleReturnDelay(_ minutes: Int) {
         perform {
             guard (0...10080).contains(minutes) else { throw AppError.message("闲置回切时间须为 0–10080 分钟。") }
-            var next = self.settings; next.conversationStickyMinutes = minutes
-            try self.persistSettings(next); try await self.sync()
+            try await self.updateSettingsAndSync { $0.conversationStickyMinutes = minutes }
         }
     }
     func changeUpstreamRetry(attempts: Int, delaySeconds: Int) {
@@ -506,10 +507,10 @@ import ServiceManagement
             guard (1...10).contains(attempts), (0...300).contains(delaySeconds) else {
                 throw AppError.message("尝试次数须为 1–10，等待时间须为 0–300 秒。")
             }
-            var next = self.settings
-            next.upstreamAttempts = attempts
-            next.upstreamRetryDelaySeconds = delaySeconds
-            try self.persistSettings(next); try await self.sync()
+            try await self.updateSettingsAndSync { next in
+                next.upstreamAttempts = attempts
+                next.upstreamRetryDelaySeconds = delaySeconds
+            }
         }
     }
     func move(_ offsets: IndexSet, to destination: Int) {
@@ -518,8 +519,7 @@ import ServiceManagement
             var next = order.compactMap { id in self.settings.sources.first { $0.id == id } }
             guard next.count == self.settings.sources.count else { throw AppError.message("来源已变化，请重新排序。") }
             for i in next.indices { next[i].priority = i }
-            var settings = self.settings; settings.sources = next
-            try self.persistSettings(settings); try await self.sync()
+            try await self.updateSettingsAndSync { $0.sources = next }
         }
     }
     func toggle(_ source: Source) { var next = source; next.enabled.toggle(); perform { try await self.saveSource(next, apiKey: "") } }
@@ -563,7 +563,7 @@ import ServiceManagement
         defer { refreshingQuotas.remove(id) }
         officialRefreshSchedule.record(id, includeCredits: includeCredits)
         _ = try await client.call("official.refresh", .object(["source_id": .string(id), "include_credits": .bool(includeCredits)]))
-        try await mergeCredentials(try await client.call("credentials"))
+        try await refreshCredentials()
         try await updateStatus()
     }
     func refresh(_ id: String) { perform { try await self.queryOfficial(id, includeCredits: true) } }

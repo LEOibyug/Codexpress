@@ -16,6 +16,7 @@ struct UsageView: View {
     @EnvironmentObject var model: AppModel
     @State private var selection = UsageSelection()
     @State private var snapshot: JSONValue = .null
+    @State private var snapshotQuery: UsageQuery?
     @State private var loadError: String?
     @State private var updatedAt: Date?
     @State private var showingLogs = false
@@ -42,15 +43,9 @@ struct UsageView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     summary
+                    breakdown
+                    UsageActivityCard(selection: selection, snapshot: snapshot, overviewQuery: snapshotQuery)
                     UsageTrendChart(days: daily)
-                    UsageActivityChart(days: daily)
-                    HStack(alignment: .top, spacing: 0) {
-                        UsageDistributionChart(groups: snapshot["groups"].array)
-                            .frame(maxWidth: .infinity)
-                        Divider().padding(.vertical, 16)
-                        UsagePerformanceCard(selection: selection, snapshot: snapshot)
-                            .frame(maxWidth: .infinity)
-                    }.frame(height: 342).cardSurface()
                     HStack {
                         Button("API 价格表") { showingPrices = true }.buttonStyle(.link)
                         Spacer()
@@ -66,7 +61,7 @@ struct UsageView: View {
                 do {
                     let next = try await model.usageAnalytics(query)
                     guard !Task.isCancelled else { break }
-                    snapshot = next; loadError = nil; updatedAt = Date()
+                    snapshot = next; snapshotQuery = query; loadError = nil; updatedAt = Date()
                 } catch {
                     guard !Task.isCancelled else { break }
                     loadError = error.localizedDescription
@@ -75,9 +70,16 @@ struct UsageView: View {
             }
         }
     }
+    private var breakdown: some View {
+        HStack(alignment: .top, spacing: 0) {
+            UsageDistributionChart(groups: snapshot["groups"].array).frame(maxWidth: .infinity)
+            Divider().padding(.vertical, 16)
+            UsagePerformanceCard(selection: selection, snapshot: snapshot).frame(maxWidth: .infinity)
+        }.frame(height: 342).cardSurface()
+    }
     private var summary: some View {
         HStack(alignment: .top, spacing: 0) {
-            summaryMetric("参考费用 · USD", value: usageMoney(totals.cost), detail: totals.costCoverage, prominent: true)
+            summaryMetric("参考费用 · USD", value: usageMoney(totals.cost), detail: "API 参考价估算", prominent: true)
             Divider().padding(.vertical, 3).padding(.horizontal, 14)
             summaryMetric("总 Token", value: usageCount(totals.total, estimated: totals.estimated), detail: "输入 + 输出")
             summaryMetric("请求", value: usageCount(totals.sum("requests")), detail: "失败 \(usageCount(totals.sum("failures")))")
@@ -97,6 +99,7 @@ struct UsageView: View {
 struct UsageFilters: View {
     @Binding var selection: UsageSelection
     let options: JSONValue
+    var sourceTitle = "全部来源"
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 9) {
@@ -104,7 +107,7 @@ struct UsageFilters: View {
                     Text("近 7 天").tag(7); Text("近 30 天").tag(30); Text("近 90 天").tag(90); Text("近 365 天").tag(365); Text("自定义").tag(0)
                 }.labelsHidden().frame(width: 108)
                 Picker("来源", selection: $selection.sourceID) {
-                    Text("全部来源").tag("")
+                    Text(sourceTitle).tag("")
                     if !selection.sourceID.isEmpty && !options["sources"].array.contains(where: { $0["id"].string == selection.sourceID }) { Text("已选来源").tag(selection.sourceID) }
                     ForEach(Array(options["sources"].array.enumerated()), id: \.offset) { _, item in Text(item["name"].string ?? "已移除来源").tag(item["id"].string ?? "") }
                 }.labelsHidden().frame(maxWidth: 180)

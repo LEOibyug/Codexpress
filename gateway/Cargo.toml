@@ -1,6 +1,6 @@
 [package]
 name = "codexpress-gateway"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.85"
 
@@ -33,6 +33,10 @@ security-framework = "3"
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+
+[profile.dev]
+debug = 0
+incremental = false
 
 [profile.release]
 lto = "thin"

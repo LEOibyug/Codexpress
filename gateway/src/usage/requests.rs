@@ -20,7 +20,7 @@ pub(super) const ATTEMPTS: &str = r#"WITH attempts AS (
 
 pub(super) const FILTERS: &str =
     "(?3 IS NULL OR source_id=?3) AND (?4 IS NULL OR model=?4) AND (?5 IS NULL OR ingress=?5)";
-const LOG_FILTERS: &str = r#"AND (?6 IS NULL OR status=?6)
+const LOG_FILTERS: &str = r#"AND (?6 IS NULL OR status=?6 OR (?6='unsuccessful' AND status IN ('failed','interrupted')))
     AND (?7 IS NULL OR instr(lower(request_id||char(10)||attempt_id_key||char(10)||source_id||char(10)||source_name||char(10)||model||char(10)||status||char(10)||ingress||char(10)||COALESCE(http_status,'')||char(10)||COALESCE(error_code,'')||char(10)||COALESCE(error_kind,'')||char(10)||COALESCE(error_message,'')||char(10)||COALESCE(error_param,'')),lower(?7))>0)"#;
 const RECORD_COLUMNS: &str = "attempt,request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata";
 const MAX_INTERVAL: u64 = 366 * 26 * 3600;
@@ -107,7 +107,7 @@ impl Query {
         ensure!(
             status.as_deref().is_none_or(|value| matches!(
                 value,
-                "success" | "failed" | "interrupted" | "active"
+                "success" | "failed" | "interrupted" | "active" | "unsuccessful"
             )),
             "状态筛选无效"
         );

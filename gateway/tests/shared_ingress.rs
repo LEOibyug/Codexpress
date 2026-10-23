@@ -89,3 +89,39 @@ async fn local_and_remote_share_one_port_without_activation_and_keep_credentials
     assert_eq!(response.status(), StatusCode::OK);
     task.abort();
 }
+
+#[tokio::test]
+async fn concurrent_client_configuration_preserves_distinct_keys_and_ports() {
+    use codexpress_gateway::{chatbot, images};
+    use futures_util::poll;
+    use std::task::Poll;
+
+    for conflict in ["key", "port"] {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().into(), 17863, "native-fixture".into()).unwrap();
+        let fields = if conflict == "key" {
+            json!({"enabled":false,"key":"shared-fixture-key"})
+        } else {
+            json!({"enabled":false,"port":17999})
+        };
+        // Both old implementations pass their conflict checks, then wait here
+        // before either can publish. No listener or real upstream is needed.
+        let sources = state.sources.write().await;
+        let mut chatbot = Box::pin(chatbot::configure(&state, fields.clone()));
+        let mut images = Box::pin(images::configure(&state, fields));
+        assert!(matches!(poll!(&mut chatbot), Poll::Pending));
+        assert!(matches!(poll!(&mut images), Poll::Pending));
+        drop(sources);
+        let (chatbot, images) = tokio::join!(chatbot, images);
+        assert_ne!(
+            chatbot.is_ok(),
+            images.is_ok(),
+            "conflicting {conflict} must have one winner"
+        );
+        assert_ne!(state.chatbot.key().unwrap(), state.images.key().unwrap());
+        assert_ne!(
+            state.chatbot.status().await.unwrap()["port"],
+            state.images.status().await.unwrap()["port"]
+        );
+    }
+}

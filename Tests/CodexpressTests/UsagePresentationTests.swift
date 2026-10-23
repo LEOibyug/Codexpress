@@ -17,7 +17,6 @@ final class UsagePresentationTests: XCTestCase {
         XCTAssertEqual(models.first?.totals.cost, 1.5)
         XCTAssertEqual(models.first?.totals.averageCost, 0.5)
         XCTAssertNil(models.last?.totals.cost)
-        XCTAssertEqual(UsageTotals(rows: rows).costCoverage, "已计价 3 / 4 次")
     }
     func testUsageCountsAbbreviateLargeValuesAndPromoteRoundedUnitBoundaries() {
         let cases: [(Double, String)] = [
@@ -33,7 +32,7 @@ final class UsagePresentationTests: XCTestCase {
         XCTAssertEqual(usageRate(nil), "—")
     }
 
-    func testSourceTotalsWeightThroughputAndExcludeInflightRequestsFromSuccessAndLatency() {
+    func testSourceTotalsWeightThroughputAndExcludeInflightRequestsFromSuccess() {
         let rows: [JSONValue] = [
             .object(["requests":.number(4),"active_requests":.number(2),"successes":.number(1),"input_tokens":.number(300),"output_tokens":.number(10),"total_latency_ms":.number(2000),"throughput_output_tokens":.number(10),"throughput_latency_ms":.number(1000),"total_first_token_ms":.number(300),"first_token_samples":.number(1)]),
             .object(["requests":.number(1),"successes":.number(1),"input_tokens":.number(200),"output_tokens":.number(100),"total_latency_ms":.number(6000),"throughput_output_tokens":.number(100),"throughput_latency_ms":.number(5000),"total_first_token_ms":.number(500),"first_token_samples":.number(1),"estimated_requests":.number(1)])
@@ -43,8 +42,6 @@ final class UsagePresentationTests: XCTestCase {
         XCTAssertEqual(totals.finished,3)
         XCTAssertEqual(totals.successRate ?? 0,200.0/3,accuracy:0.001)
         XCTAssertEqual(totals.tps ?? 0,110000.0/6000,accuracy:0.001)
-        XCTAssertEqual(totals.averageLatency ?? 0,8000.0/3,accuracy:0.001)
-        XCTAssertEqual(totals.firstToken,400)
         XCTAssertTrue(totals.estimated)
         XCTAssertNil(UsageTotals(rows: []).tps)
         XCTAssertNil(UsageTotals(rows: []).successRate)
@@ -128,15 +125,15 @@ final class UsagePresentationTests: XCTestCase {
             let fields: [String: JSONValue] = ["source_id": .string("source-\(index)"), "source_name": .string("来源 \(index)"), "input_tokens": .number(Double(index * 100)), "output_tokens": .number(10), "priced_requests": .number(index == 6 ? 0 : 1), "total_usd": price]
             return .object(fields)
         }
-        let cost = usageSourceSlices(groups, mode: "cost")
+        let cost = usageDistributionSlices(groups, groupBy: "source_id")
         XCTAssertEqual(cost.map(\.id), ["source-5", "source-4", "source-3", "usage-other-sources"])
         XCTAssertEqual(cost.last?.value, 3)
+        XCTAssertEqual(cost.last?.cost, 3)
+        XCTAssertEqual(cost.last?.tokenTotal, 320)
         XCTAssertEqual(cost.reduce(0) { $0 + $1.value }, 15)
-        let tokens = usageSourceSlices(groups, mode: "tokens")
-        XCTAssertEqual(tokens.count, 4)
-        XCTAssertEqual(tokens.first?.id, "source-6")
-        XCTAssertEqual(tokens.reduce(0) { $0 + $1.value }, 2160)
-        XCTAssertTrue(usageSourceSlices([.object(["source_id": .string("zero"), "priced_requests": .number(1), "total_usd": .number(0)])], mode: "cost").isEmpty)
+        XCTAssertEqual(cost.reduce(0) { $0 + ($1.cost ?? 0) }, 15)
+        XCTAssertEqual(cost.reduce(0) { $0 + $1.tokenTotal }, 1550)
+        XCTAssertTrue(usageDistributionSlices([.object(["source_id": .string("zero"), "priced_requests": .number(1), "total_usd": .number(0)])], groupBy: "source_id").isEmpty)
     }
 
     func testActivityHeightUsesTheSameCellSizeAsTheRenderedGrid() {
@@ -145,6 +142,64 @@ final class UsagePresentationTests: XCTestCase {
             XCTAssertEqual(layout.height, layout.cell * 7 + 18)
             XCTAssertLessThanOrEqual(Double(layout.weeks) * (layout.cell + 3) + 21, 511)
         }
+    }
+
+    func testRingHitTestingStartsAtTwelveClockwiseAndRejectsHoleAndOutside() {
+        let slices = [
+            UsageSourceSlice(id: "first", name: "第一", value: 1, tokenTotal: 100, cost: 1, estimated: false),
+            UsageSourceSlice(id: "second", name: "第二", value: 1, tokenTotal: 200, cost: 1, estimated: false),
+            UsageSourceSlice(id: "third", name: "第三", value: 1, tokenTotal: 300, cost: 1, estimated: false),
+            UsageSourceSlice(id: "usage-other-sources", name: "其他", value: 1, tokenTotal: 400, cost: 1, estimated: true)
+        ]
+        XCTAssertEqual(usageRingHit(x: 0, y: -9, outerRadius: 10, innerRatio: 0.78, slices: slices), "first")
+        XCTAssertEqual(usageRingHit(x: 7, y: -7, outerRadius: 10, innerRatio: 0.78, slices: slices), "first")
+        XCTAssertEqual(usageRingHit(x: 7, y: 7, outerRadius: 10, innerRatio: 0.78, slices: slices), "second")
+        XCTAssertEqual(usageRingHit(x: -7, y: 7, outerRadius: 10, innerRatio: 0.78, slices: slices), "third")
+        XCTAssertEqual(usageRingHit(x: -7, y: -7, outerRadius: 10, innerRatio: 0.78, slices: slices), "usage-other-sources")
+        XCTAssertNil(usageRingHit(x: 0, y: 0, outerRadius: 10, innerRatio: 0.78, slices: slices))
+        XCTAssertNil(usageRingHit(x: 0, y: 11, outerRadius: 10, innerRatio: 0.78, slices: slices))
+        XCTAssertNil(usageRingHit(x: 0, y: -9, outerRadius: 10, innerRatio: 0.78, slices: []))
+        let estimated: [JSONValue] = [.object(["source_id": .string("estimated"), "input_tokens": .number(10), "estimated_requests": .number(1), "priced_requests": .number(1), "total_usd": .number(1)])]
+        XCTAssertTrue(usageDistributionSlices(estimated, groupBy: "source_id").first?.estimated == true)
+    }
+
+    func testModelDistributionCombinesMatchingModelsAndConservesAllTokens() {
+        let groups: [JSONValue] = [
+            .object(["source_id": .string("a"), "source_name": .string("供应商 A"), "model": .string("shared-model"), "input_tokens": .number(100), "output_tokens": .number(20), "priced_requests": .number(1), "total_usd": .number(3)]),
+            .object(["source_id": .string("b"), "source_name": .string("供应商 B"), "model": .string("shared-model"), "input_tokens": .number(200), "output_tokens": .number(30), "priced_requests": .number(1), "total_usd": .number(2), "estimated_requests": .number(1)]),
+            .object(["source_id": .string("c"), "source_name": .string("供应商 C"), "model": .string("another-model"), "input_tokens": .number(300), "priced_requests": .number(1), "total_usd": .number(1)]),
+            .object(["source_id": .string("d"), "source_name": .string("供应商 D"), "model": .string("unpriced"), "input_tokens": .number(999), "unpriced_requests": .number(1)])
+        ]
+        let models = usageDistributionSlices(groups, groupBy: "model")
+        XCTAssertEqual(models.map(\.name), ["shared-model", "another-model", "其他"])
+        XCTAssertEqual(models.first?.cost, 5)
+        XCTAssertEqual(models.first?.tokenTotal, 350)
+        XCTAssertTrue(models.first?.estimated == true)
+        XCTAssertEqual(models.reduce(0) { $0 + ($1.cost ?? 0) }, 6)
+        XCTAssertEqual(models.reduce(0) { $0 + $1.tokenTotal }, 1649)
+        let sources = usageDistributionSlices(groups, groupBy: "source_id")
+        XCTAssertEqual(sources.first?.name, "供应商 A")
+        XCTAssertEqual(sources.reduce(0) { $0 + ($1.cost ?? 0) }, 6)
+        XCTAssertEqual(sources.reduce(0) { $0 + $1.tokenTotal }, 650)
+    }
+
+    func testModelTokenOrderingAlwaysCombinesUnknownModelsIntoOther() {
+        func row(_ model: String, _ tokens: Double, priced: Bool = true) -> JSONValue {
+            .object(["model": .string(model), "input_tokens": .number(tokens), "priced_requests": .number(priced ? 1 : 0), "unpriced_requests": .number(priced ? 0 : 1), "total_usd": priced ? .number(1) : .null])
+        }
+        let knownAndUnknown = usageDistributionSlices([row("known", 10), row("unlisted-model", 200, priced: false)], groupBy: "model")
+        XCTAssertEqual(knownAndUnknown.map(\.name), ["known", "其他"])
+        XCTAssertEqual(knownAndUnknown.last?.tokenTotal, 200)
+        XCTAssertNil(knownAndUnknown.last?.cost)
+        let unknownOnly = usageDistributionSlices([row("", 10), row("unknown", 20), row("unknown_model", 30), row("未知模型", 40)], groupBy: "model")
+        XCTAssertEqual(unknownOnly.count, 1)
+        XCTAssertEqual(unknownOnly.first?.name, "其他")
+        XCTAssertEqual(unknownOnly.first?.tokenTotal, 100)
+        let many = usageDistributionSlices([row("model-a", 10), row("model-b", 40), row("model-c", 30), row("model-d", 20), row("unlisted-model", 500, priced: false)], groupBy: "model")
+        XCTAssertEqual(many.map(\.name), ["model-b", "model-c", "model-d", "其他"])
+        XCTAssertEqual(many.last?.tokenTotal, 510)
+        XCTAssertEqual(many.reduce(0) { $0 + $1.tokenTotal }, 600)
+        XCTAssertEqual(many.reduce(0) { $0 + ($1.cost ?? 0) }, 4)
     }
 
 }

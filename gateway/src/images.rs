@@ -127,6 +127,7 @@ impl ImageAccess {
     }
 }
 pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
+    let _configuration = state.config_lock.lock().await;
     let mut listener = state.images.listener.lock().await;
     let mut next = state.images.settings()?;
     if let Some(v) = payload.get("enabled") {
@@ -562,7 +563,7 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
                 routing::mark_rejection(
                     &state,
-                    &source.id,
+                    &source,
                     crate::relay::permanent_code(&value),
                     None,
                 )

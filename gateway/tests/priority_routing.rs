@@ -155,7 +155,7 @@ async fn exhausted_official_accounts_are_skipped_until_confirmed_recovery() {
     assert_eq!(proxy_hits.load(Ordering::SeqCst), 0);
     configure(&state, &[official.clone(), duplicate, api_source.clone()]).await;
     // A successful older inflight response must not turn known zero into ready.
-    routing::mark_ready(&state, "official").await;
+    routing::mark_ready(&state, &official).await;
     let status = management::dispatch(&state, "status", json!({}))
         .await
         .unwrap();

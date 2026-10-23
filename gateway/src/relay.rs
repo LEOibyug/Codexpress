@@ -1,10 +1,14 @@
+mod request;
 mod response;
 mod retries;
 mod roles;
 pub(crate) use retries::permanent_code;
 pub(crate) use roles::RoleCapabilities;
 
-use self::response::{probe_context_rejection, read_error_prefix, stream_response, Attempt};
+use self::{
+    request::{clear_body_headers, retry_request, Payload},
+    response::{probe_context_rejection, read_error_prefix, stream_response, Attempt},
+};
 use crate::{
     model::{AppState, Source},
     routing, transport,
@@ -380,11 +384,13 @@ async fn portable_request(
     for field in ["previous_response_id", "conversation", "conversation_id"] {
         portable.as_object_mut().expect("object").remove(field);
     }
-    let mut headers = parts.headers.clone();
+    let mut retry = retry_request(
+        parts,
+        Bytes::from(serde_json::to_vec(&portable).expect("JSON")),
+    );
+    let headers = retry.headers_mut();
     headers.remove("x-codex-turn-state");
-    headers.remove("content-length");
-    headers.remove("content-md5");
-    headers.remove("digest");
+    clear_body_headers(headers);
     if parts
         .extensions
         .get::<crate::remote::RemoteIngress>()
@@ -396,29 +402,10 @@ async fn portable_request(
         );
     }
     headers.insert("content-type", HeaderValue::from_static("application/json"));
-    let mut retry = Request::new(Body::from(serde_json::to_vec(&portable).expect("JSON")));
-    *retry.method_mut() = parts.method.clone();
-    *retry.uri_mut() = parts.uri.clone();
-    *retry.headers_mut() = headers;
     if let Some(session) = scoped_session(parsed, parts) {
         retry
             .extensions_mut()
             .insert(PreservedScopedSession(session));
-    }
-    if let Some(ingress) = parts.extensions.get::<crate::remote::RemoteIngress>() {
-        retry.extensions_mut().insert(ingress.clone());
-    }
-    if let Some(ingress) = parts.extensions.get::<crate::chatbot::ChatbotIngress>() {
-        retry.extensions_mut().insert(ingress.clone());
-    }
-    if let Some(window) = parts.extensions.get::<RecoveryWindow>() {
-        retry.extensions_mut().insert(window.clone());
-    }
-    if let Some(manual) = parts.extensions.get::<ManualRequest>() {
-        retry.extensions_mut().insert(manual.clone());
-    }
-    if let Some(retries) = parts.extensions.get::<retries::RequestRetries>() {
-        retry.extensions_mut().insert(retries.clone());
     }
     Ok((
         retry,
@@ -688,9 +675,7 @@ async fn forward_once(
         }
         if changed {
             bytes = Bytes::from(serde_json::to_vec(&parsed).expect("JSON"));
-            parts.headers.remove("content-length");
-            parts.headers.remove("digest");
-            parts.headers.remove("content-md5");
+            clear_body_headers(&mut parts.headers);
         }
     }
     let model = parsed.get("model").and_then(Value::as_str).unwrap_or("");
@@ -779,30 +764,7 @@ async fn forward_once(
                             .await
                             .ok()
                     } else {
-                        let mut retry = Request::new(Body::from(bytes.clone()));
-                        *retry.method_mut() = parts.method.clone();
-                        *retry.uri_mut() = parts.uri.clone();
-                        *retry.headers_mut() = parts.headers.clone();
-                        if let Some(ingress) =
-                            parts.extensions.get::<crate::remote::RemoteIngress>()
-                        {
-                            retry.extensions_mut().insert(ingress.clone());
-                        }
-                        if let Some(ingress) =
-                            parts.extensions.get::<crate::chatbot::ChatbotIngress>()
-                        {
-                            retry.extensions_mut().insert(ingress.clone());
-                        }
-                        if let Some(session) = parts.extensions.get::<PreservedScopedSession>() {
-                            retry.extensions_mut().insert(session.clone());
-                        }
-                        if let Some(window) = parts.extensions.get::<RecoveryWindow>() {
-                            retry.extensions_mut().insert(window.clone());
-                        }
-                        if let Some(manual) = parts.extensions.get::<ManualRequest>() {
-                            retry.extensions_mut().insert(manual.clone());
-                        }
-                        retry.extensions_mut().insert(request_retries.clone());
+                        let retry = retry_request(&parts, bytes.clone());
                         Some((
                             retry,
                             RebuildContext {
@@ -892,41 +854,28 @@ async fn forward_once(
         // account/key. It can carry old opaque state only to that exact identity.
         let all =
             routing::candidates_with_session(&state, model, None, affinity_key.as_deref()).await;
-        let bindings = state.bindings.lock().await;
         all.into_iter()
             .filter(|source| {
-                (migrated_source.as_ref().is_some_and(|id| id == &source.id)
+                migrated_source.as_ref().is_some_and(|id| id == &source.id)
                     || (migrated_source.is_none()
                         && source.id == origin.source_id
-                        && source.identity() == origin.source_identity))
-                    && hard_keys
-                        .iter()
-                        .all(|key| state_matches_source(&bindings, key, source, &exclusions))
+                        && source.identity() == origin.source_identity)
             })
             .collect()
-    } else {
-        if let Some(migrated) = &migrated_source {
-            let all =
-                routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
-                    .await;
-            let bindings = state.bindings.lock().await;
-            all.into_iter()
-                .filter(|source| {
-                    source.id == *migrated
-                        && hard_keys
-                            .iter()
-                            .all(|key| state_matches_source(&bindings, key, source, &exclusions))
-                })
-                .collect()
-        } else {
-            routing::candidates_with_session(
-                &state,
-                model,
-                routing_binding.as_deref(),
-                affinity_key.as_deref(),
-            )
+    } else if let Some(migrated) = &migrated_source {
+        routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
             .await
-        }
+            .into_iter()
+            .filter(|source| source.id == *migrated)
+            .collect()
+    } else {
+        routing::candidates_with_session(
+            &state,
+            model,
+            routing_binding.as_deref(),
+            affinity_key.as_deref(),
+        )
+        .await
     };
     if probe_unknown_id {
         // A thread or affinity is an origin hint for an unobserved upstream ID,
@@ -956,14 +905,6 @@ async fn forward_once(
         // A complete reconstruction can use the original source as a final
         // option, but another source should handle the handoff first.
         sources.sort_by_key(|source| source.id == rejected);
-    }
-    if opaque_state {
-        let bindings = state.bindings.lock().await;
-        sources.retain(|source| {
-            opaque_keys
-                .iter()
-                .all(|key| state_matches_source(&bindings, key, source, &exclusions))
-        });
     }
     if opaque_state && session_known {
         let bindings = state.bindings.lock().await;
@@ -1236,25 +1177,13 @@ async fn forward_once(
             .extensions
             .get::<crate::chatbot::ChatbotIngress>()
             .is_some();
-        let mut compatibility_body = if compatibility {
-            parsed.clone()
-        } else {
-            Value::Null
-        };
-        let mut compatibility_changes = Vec::new();
-        let mut role_bytes: Option<Bytes> = None;
-        let mut role_repaired = false;
-        let has_system = roles::has_system(&parsed);
-        if state.role_capabilities.requires_developer(&source) {
-            if let Some(repaired) = roles::convert(&parsed) {
-                if compatibility {
-                    compatibility_body = repaired;
-                } else {
-                    role_bytes = Some(Bytes::from(serde_json::to_vec(&repaired).expect("JSON")));
-                }
-                role_repaired = true;
-            }
-        }
+        let mut payload = Payload::new(
+            &parsed,
+            &bytes,
+            compatibility,
+            &source,
+            &state.role_capabilities,
+        );
         let mut auth_refreshed = false;
         let retries =
             retries::UpstreamRetries::new(&request_retries, &source, &*state.settings.read().await);
@@ -1289,36 +1218,19 @@ async fn forward_once(
             if !eligible {
                 break;
             }
-            let (wire_bytes, mut ignored_parameters) = if parts
-                .extensions
-                .get::<crate::chatbot::ChatbotIngress>()
-                .is_some()
-            {
-                match crate::chatbot::upstream_payload(
-                    &compatibility_body,
-                    source.kind == "official",
-                    history_capture.as_ref().map(|h| &h.request["input"]),
-                ) {
-                    Ok((body, ignored)) => (Bytes::from(body), ignored),
-                    Err(problem) => {
-                        return crate::chatbot::error(
-                            StatusCode::BAD_REQUEST,
-                            problem.message,
-                            Some(problem.param),
-                        )
-                    }
+            let (wire_bytes, ignored_parameters) = match payload.wire(
+                source.kind == "official",
+                history_capture.as_ref().map(|h| &h.request["input"]),
+            ) {
+                Ok(prepared) => prepared,
+                Err(problem) => {
+                    return crate::chatbot::error(
+                        StatusCode::BAD_REQUEST,
+                        problem.message,
+                        Some(problem.param),
+                    )
                 }
-            } else if let Some(bytes) = &role_bytes {
-                (bytes.clone(), Vec::new())
-            } else {
-                (bytes.clone(), Vec::new())
             };
-            ignored_parameters.extend(compatibility_changes.iter().cloned());
-            if role_repaired {
-                ignored_parameters.push("input.role".into());
-            }
-            ignored_parameters.sort();
-            ignored_parameters.dedup();
             let mut attempt = Attempt::new(state.clone(), &source, &request_id, model, input_units);
             if let Some(record) = &mut attempt.record {
                 record.token_details.service_tier = parsed["service_tier"]
@@ -1374,10 +1286,8 @@ async fn forward_once(
             );
             attempt.save_diagnostic(false);
             let mut headers = clean_headers(&parts.headers, true);
-            if role_repaired {
-                headers.remove("content-length");
-                headers.remove("digest");
-                headers.remove("content-md5");
+            if payload.role_repaired() {
+                clear_body_headers(&mut headers);
             }
             let credential = source
                 .secret
@@ -1674,42 +1584,14 @@ async fn forward_once(
             }
             let mut context_rejected = false;
             if matches!(status.as_u16(), 400 | 404 | 409 | 422)
-                && (binding.is_some() || opaque_state || compatibility || has_system)
+                && (binding.is_some() || opaque_state || payload.may_repair())
             {
                 if let Some(value) = read_error_prefix(&mut upstream, &mut prefix).await {
-                    if !role_repaired && matches!(status.as_u16(), 400 | 422) {
-                        let body = if compatibility {
-                            &compatibility_body
-                        } else {
-                            &parsed
-                        };
-                        if let Some(repaired) = roles::adapt(body, &value) {
-                            state.role_capabilities.remember(&source);
-                            if compatibility {
-                                compatibility_body = repaired;
-                            } else {
-                                role_bytes =
-                                    Some(Bytes::from(serde_json::to_vec(&repaired).expect("JSON")));
-                            }
-                            role_repaired = true;
-                            attempt.finish("failed", None);
-                            attempt.collect_error(&mut upstream, &mut prefix).await;
-                            drop(upstream);
-                            continue;
-                        }
-                    }
-                    if compatibility
-                        && status == StatusCode::BAD_REQUEST
-                        && compatibility_changes.len() < 3
-                    {
-                        if let Some(field) = crate::chatbot::repair(&mut compatibility_body, &value)
-                        {
-                            compatibility_changes.push(field);
-                            attempt.finish("failed", None);
-                            attempt.collect_error(&mut upstream, &mut prefix).await;
-                            drop(upstream);
-                            continue;
-                        }
+                    if payload.repair_rejection(status, &value, &source, &state.role_capabilities) {
+                        attempt.finish("failed", None);
+                        attempt.collect_error(&mut upstream, &mut prefix).await;
+                        drop(upstream);
+                        continue;
                     }
                     context_rejected = explicit_context_rejection(&value);
                 }
@@ -1767,7 +1649,7 @@ async fn forward_once(
                                 .and_then(Value::as_str)
                                 .or_else(|| value.pointer("/error/type").and_then(Value::as_str))
                         });
-                        routing::mark_rejection(&state, &source.id, code, retry_after).await;
+                        routing::mark_rejection(&state, &source, code, retry_after).await;
                     }
                 }
             }
@@ -1892,7 +1774,7 @@ async fn forward_once(
                 break;
             }
             if status.is_success() {
-                routing::mark_ready(&state, &source.id).await;
+                routing::mark_ready(&state, &source).await;
             }
             let validated_continuation = hard_keys.iter().any(|key| {
                 exclusions.contains(&crate::continuity::accepted_state(&source.identity(), key))

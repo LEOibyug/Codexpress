@@ -117,6 +117,8 @@ impl ChatbotAccess {
 }
 
 pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
+    // Cross-entry validation and publication form one configuration change.
+    let _configuration = state.config_lock.lock().await;
     let mut listener = state.chatbot.listener.lock().await;
     let mut next = state.chatbot.settings()?;
     if let Some(value) = payload.get("enabled") {
@@ -452,3 +454,4 @@ async fn infer(state: Arc<AppState>, request: Request, format: requests::Format)
 
 pub(crate) use requests::repair;
 pub(crate) use requests::upstream_payload;
+pub(crate) use requests::Invalid;

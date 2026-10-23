@@ -42,7 +42,7 @@ struct UsageLogsView: View {
                 Spacer()
                 Text("\(total) 次请求" + (activeCount > 0 ? " · \(activeCount) 次进行中" : "")).font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
             }.padding(.bottom, 6)
-            UsageFilters(selection: $selection, options: availableOptions)
+            UsageFilters(selection: $selection, options: availableOptions, sourceTitle: "全部上游")
             HStack(spacing: 9) {
                 Picker("入口", selection: $ingress) {
                     Text("全部入口").tag("")
@@ -50,7 +50,7 @@ struct UsageLogsView: View {
                     ForEach(availableOptions["ingresses"].array.compactMap(\.string), id: \.self) { Text(usageIngressName($0)).tag($0) }
                 }.labelsHidden().frame(width: 116)
                 Picker("状态", selection: $status) {
-                    Text("全部状态").tag(""); Text("完成").tag("success"); Text("失败").tag("failed"); Text("已中断").tag("interrupted"); Text("进行中").tag("active")
+                    Text("全部结果").tag(""); Text("成功").tag("success"); Text("未成功").tag("unsuccessful"); Text("进行中").tag("active")
                 }.labelsHidden().frame(width: 105)
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)

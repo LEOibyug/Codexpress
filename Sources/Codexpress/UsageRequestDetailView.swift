@@ -201,9 +201,22 @@ struct UsageRequestDetailView: View {
             if !(await loadMore()) { return }
         }
         guard !Task.isCancelled, isVisible, id == attemptID, detail != .null else { return }
-        var values = ["Codexpress 错误反馈", "时间：" + Date(timeIntervalSince1970: record["started_at"].number ?? 0).formatted(date: .numeric, time: .standard), "来源：" + (record["source_name"].string ?? "—"), "模型：" + (record["model"].string ?? "—"), "状态：" + usageRequestStatus(record)]
+        let startedAt = Date(timeIntervalSince1970: record["started_at"].number ?? 0)
+        var values: [String] = ["Codexpress 错误反馈"]
+        values.append("时间：" + startedAt.formatted(date: .numeric, time: .standard))
+        values.append("来源：" + (record["source_name"].string ?? "—"))
+        values.append("模型：" + (record["model"].string ?? "—"))
+        values.append("状态：" + usageRequestStatus(record))
         if diagnostic != .null {
-            values += ["HTTP：" + (diagnostic["http_status"].number.map { String(Int($0)) } ?? "—"), "入口：" + usageIngressName(diagnostic["ingress"].string), "上游：" + (diagnostic["upstream_url"].string ?? "—"), "错误：" + (diagnostic["error_message"].string ?? "—"), "代码：" + (diagnostic["error_code"].string ?? "—"), "响应头：\n" + usagePrettyJSON(diagnostic["response_headers"]), "参数调整：\n" + usagePrettyJSON(diagnostic["adapted_parameters"]), "错误正文：\n" + bodyText]
+            let httpStatus = diagnostic["http_status"].number.map { String(Int($0)) } ?? "—"
+            values.append("HTTP：" + httpStatus)
+            values.append("入口：" + usageIngressName(diagnostic["ingress"].string))
+            values.append("上游：" + (diagnostic["upstream_url"].string ?? "—"))
+            values.append("错误：" + (diagnostic["error_message"].string ?? "—"))
+            values.append("代码：" + (diagnostic["error_code"].string ?? "—"))
+            values.append("响应头：\n" + usagePrettyJSON(diagnostic["response_headers"]))
+            values.append("参数调整：\n" + usagePrettyJSON(diagnostic["adapted_parameters"]))
+            values.append("错误正文：\n" + bodyText)
             if diagnostic["body_truncated"].bool == true { values.append("正文超过保存上限，已截断。") }
             if diagnostic["body_evicted"].bool == true { values.append("错误正文已清理。") }
         } else { values.append("此记录未保存错误详情。") }

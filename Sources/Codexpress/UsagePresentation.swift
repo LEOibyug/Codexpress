@@ -17,17 +17,11 @@ struct UsageTotals {
     var estimated: Bool { sum("estimated_requests") > 0 }
     var finished: Double { max(0, sum("requests") - sum("active_requests")) }
     var successRate: Double? { finished > 0 ? sum("successes") * 100 / finished : nil }
-    var averageLatency: Double? { finished > 0 ? sum("total_latency_ms") / finished : nil }
-    var firstToken: Double? { sum("first_token_samples") > 0 ? sum("total_first_token_ms") / sum("first_token_samples") : nil }
     var tps: Double? { sum("throughput_latency_ms") > 0 ? sum("throughput_output_tokens") * 1000 / sum("throughput_latency_ms") : nil }
     var cacheRate: Double? { sum("cached_reported_input_tokens") > 0 ? min(100, sum("cached_reported_tokens") * 100 / sum("cached_reported_input_tokens")) : nil }
     var cost: Double? { sum("priced_requests") > 0 ? sum("total_usd") : nil }
     var averageCost: Double? { sum("priced_requests") > 0 ? sum("total_usd") / sum("priced_requests") : nil }
     var savings: Double? { sum("priced_requests") > 0 ? sum("cache_savings_usd") : nil }
-    var costCoverage: String {
-        let priced = Int(sum("priced_requests")), total = Int(sum("requests"))
-        return "已计价 \(priced) / \(total) 次"
-    }
 }
 
 struct UsageComparison: Identifiable {
@@ -213,16 +207,31 @@ struct UsageSourceSlice: Identifiable {
     let id: String
     let name: String
     let value: Double
+    let tokenTotal: Double
+    let cost: Double?
+    let estimated: Bool
 }
 
-func usageSourceSlices(_ groups: [JSONValue], mode: String) -> [UsageSourceSlice] {
-    let ranked = usageComparisons(groups, key: "source_id", sort: mode).compactMap { row -> UsageSourceSlice? in
-        let value = mode == "cost" ? row.totals.cost : row.totals.total
-        guard let value, value.isFinite, value > 0 else { return nil }
-        return UsageSourceSlice(id: row.id, name: row.name, value: value)
+func usageDistributionSlices(_ groups: [JSONValue], groupBy: String) -> [UsageSourceSlice] {
+    let models = groupBy == "model"
+    let rows = usageComparisons(groups, key: groupBy, sort: models ? "tokens" : "cost")
+    var ranked: [UsageSourceSlice] = [], forcedOther: [UsageSourceSlice] = []
+    for row in rows {
+        let value = models ? row.totals.total : row.totals.cost
+        guard let value, value.isFinite, value > 0 else { continue }
+        let slice = UsageSourceSlice(id: row.id, name: row.name, value: value, tokenTotal: row.totals.total, cost: row.totals.cost, estimated: row.totals.estimated)
+        let unknownName = ["", "unknown", "unknown_model", "未知模型"].contains(row.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        // Aggregates currently merge unknown model and tier prices into unpriced_requests.
+        let unlisted = row.totals.sum("unpriced_requests") > 0 && row.totals.sum("priced_requests") == 0
+        if models && (unknownName || unlisted) { forcedOther.append(slice) }
+        else { ranked.append(slice) }
     }
     var slices = Array(ranked.prefix(3))
-    if ranked.count > 3 { slices.append(UsageSourceSlice(id: "usage-other-sources", name: "其他", value: ranked.dropFirst(3).reduce(0) { $0 + $1.value })) }
+    let other = Array(ranked.dropFirst(3)) + forcedOther
+    if !other.isEmpty {
+        let knownCosts = other.compactMap(\.cost)
+        slices.append(UsageSourceSlice(id: "usage-other-sources", name: "其他", value: other.reduce(0) { $0 + $1.value }, tokenTotal: other.reduce(0) { $0 + $1.tokenTotal }, cost: knownCosts.isEmpty ? nil : knownCosts.reduce(0, +), estimated: other.contains(where: \.estimated)))
+    }
     return slices
 }
 
@@ -235,4 +244,23 @@ struct UsageActivityLayout {
         cell = min(24, max(4, (width - 21) / Double(weeks) - 3))
         height = cell * 7 + 18
     }
+}
+
+/// Coordinates are relative to the ring center; twelve o'clock starts a clockwise turn.
+func usageRingHit(x: Double, y: Double, outerRadius: Double, innerRatio: Double, slices: [UsageSourceSlice]) -> String? {
+    guard x.isFinite, y.isFinite, outerRadius.isFinite, outerRadius > 0 else { return nil }
+    let radius = hypot(x, y)
+    guard radius <= outerRadius, radius >= outerRadius * innerRatio else { return nil }
+    let positive = slices.filter { $0.value.isFinite && $0.value > 0 }
+    let total = positive.reduce(0) { $0 + $1.value }
+    guard total.isFinite, total > 0 else { return nil }
+    var angle = atan2(y, x) + .pi / 2
+    if angle < 0 { angle += 2 * .pi }
+    let target = angle / (2 * .pi) * total
+    var upper = 0.0
+    for slice in positive {
+        upper += slice.value
+        if target < upper { return slice.id }
+    }
+    return positive.last?.id
 }
