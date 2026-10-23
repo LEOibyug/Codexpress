@@ -53,12 +53,14 @@ struct MenuView: View {
                                 HStack(spacing: 6) {
                                     Text(source.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
                                     if source.official && model.refreshingQuotas.contains(source.id) { ProgressView().controlSize(.mini).help("正在更新额度") }
+                                    Spacer(minLength: 4)
+                                    SourceRoutingActions(source: source, compact: true).fixedSize()
+                                    Text(source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用")
+                                        .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize()
                                 }
                                 if source.official { compactQuota(model.state(source.id)["quota"]) }
                                 else { APIBalanceView(sourceID: source.id, compact: true) }
                             }.frame(maxWidth: .infinity, alignment: .leading)
-                            Text(source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用")
-                                .font(.system(size: 10)).foregroundStyle(.secondary)
                         }
                     }
                 }

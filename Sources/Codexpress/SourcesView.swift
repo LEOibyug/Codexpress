@@ -100,6 +100,7 @@ struct SourcesView: View {
                 .background(AppPalette.well, in: RoundedRectangle(cornerRadius: 8))
             if let error = model.modelErrors[source.id] { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
             if let reason = model.state(source.id)["last_error"].string { InfoNote(text: reason, symbol: "exclamationmark.triangle", color: .orange) }
+            HStack { Spacer(); SourceRoutingActions(source: source) }
             if source.official { Divider(); OfficialAccountView(source: source) }
             else { APIBalanceView(sourceID: source.id) }
         }.padding(18).cardSurface()

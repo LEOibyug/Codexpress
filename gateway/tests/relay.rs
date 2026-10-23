@@ -47,6 +47,7 @@ fn request(body: &[u8]) -> Request {
 async fn state(sources: Vec<Source>) -> (tempfile::TempDir, Arc<AppState>) {
     let directory = tempfile::tempdir().unwrap();
     let state = AppState::new(directory.path().to_owned(), 0, "local-key".into()).unwrap();
+    state.settings.write().await.strict_priority = false;
     *state.sources.write().await = sources.into_iter().map(SourceRuntime::new).collect();
     // Strict-mode safety fixtures; degraded rebuilding is exercised separately.
     state.settings.write().await.degraded_context_fallback = false;
@@ -526,6 +527,7 @@ async fn sse_completed_before_client_close_keeps_success_usage_and_cancels_trans
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let state = AppState::new(dir.path().to_owned(), address.port(), "local-key".into()).unwrap();
+    state.settings.write().await.strict_priority = false;
     state
         .sources
         .write()
@@ -1960,6 +1962,7 @@ async fn scoped_origin_migrates_once_preserves_new_ciphertext_and_survives_recov
     }
     drop(state);
     let restored = AppState::new(dir.path().to_owned(), 0, "local-key".into()).unwrap();
+    restored.settings.write().await.strict_priority = false;
     *restored.sources.write().await = originals.into_iter().map(SourceRuntime::new).collect();
     let response = relay::router(restored.clone())
         .oneshot(make(2))
@@ -2744,6 +2747,7 @@ async fn portable_history_with_same_session_keeps_new_source_during_idle_protect
     drop(state);
     expire_fixture_affinity(directory.path());
     let restored = AppState::new(directory.path().to_owned(), 0, "local-key".into()).unwrap();
+    restored.settings.write().await.strict_priority = false;
     *restored.sources.write().await = sources;
     let mut portable = request(br#"{"model":"m","input":"complete portable history"}"#);
     portable
@@ -2831,6 +2835,7 @@ async fn idle_return_rebuilds_cached_context_and_failed_return_keeps_working_sou
     for attempt in 0..2 {
         expire_fixture_affinity(directory.path());
         let restored = AppState::new(directory.path().to_owned(), 0, "local-key".into()).unwrap();
+        restored.settings.write().await.strict_priority = false;
         *restored.sources.write().await = vec![
             SourceRuntime::new(first.clone()),
             SourceRuntime::new(second.clone()),
@@ -2905,6 +2910,7 @@ async fn idle_return_keeps_current_route_for_tool_results_disabled_rebuild_and_m
     for case in 0..3 {
         expire_fixture_affinity(directory.path());
         let restored = AppState::new(directory.path().to_owned(), 0, "local-key".into()).unwrap();
+        restored.settings.write().await.strict_priority = false;
         *restored.sources.write().await = vec![
             SourceRuntime::new(first.clone()),
             SourceRuntime::new(second.clone()),
@@ -2998,6 +3004,7 @@ async fn empty_official_quota_never_contacts_proxy_and_recovery_keeps_api_cache_
     drop(app);
     drop(state);
     let restored = AppState::new(dir.path().to_owned(), 0, "local-key".into()).unwrap();
+    restored.settings.write().await.strict_priority = false;
     *restored.sources.write().await = vec![
         SourceRuntime::new(official),
         SourceRuntime::new(source("api", &api, 1)),
@@ -3039,6 +3046,7 @@ async fn content_length_json_over_real_tcp_finalizes_usage_before_last_chunk() {
         "local-key".into(),
     )
     .unwrap();
+    state.settings.write().await.strict_priority = false;
     state
         .sources
         .write()
@@ -3338,6 +3346,7 @@ async fn cached_incremental_history_survives_restart_and_rebuilds_tool_pairs_for
     assert!(state.history.status().unwrap()["blocks"].as_u64().unwrap() > 0);
     drop(state);
     let restored = AppState::new(dir.path().to_owned(), 0, "local-key".into()).unwrap();
+    restored.settings.write().await.strict_priority = false;
     *restored.sources.write().await = vec![SourceRuntime::new(source("b", &b, 0))];
     let next=br#"{"model":"m","previous_response_id":"cached-parent","input":[{"type":"function_call_output","call_id":"cached-tool","output":"tool result"}]}"#;
     let response = relay::router(restored.clone())

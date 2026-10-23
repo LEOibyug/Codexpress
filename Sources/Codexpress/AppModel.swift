@@ -451,6 +451,30 @@ import ServiceManagement
             try self.persistSettings(next); try await self.sync()
         }
     }
+    func recoverSource(_ id: String) {
+        perform {
+            guard self.running else { throw AppError.message("请先启动网关。") }
+            _ = try await self.client.call("routing.recover", .object(["source_id": .string(id)]))
+            try await self.updateStatus()
+            self.notice = "已解除临时冷却。"
+        }
+    }
+    func trySourceOnce(_ id: String) {
+        perform {
+            guard self.running else { throw AppError.message("请先启动网关。") }
+            _ = try await self.client.call("routing.try", .object(["source_id": .string(id)]))
+            try await self.updateStatus()
+            self.notice = "下一条对话请求将优先尝试此来源。"
+        }
+    }
+    func cancelSourceTrial() {
+        guard let id = status["manual_route"]["id"].string else { return }
+        perform {
+            let result = try await self.client.call("routing.cancel", .object(["id": .string(id)]))
+            try await self.updateStatus()
+            self.notice = result["cancelled"].bool == true ? "已取消来源插入。" : "请求已开始或操作已更新。"
+        }
+    }
     func changeLowQuotaThreshold(_ value: Int) {
         perform {
             guard (1...99).contains(value) else { throw AppError.message("余量阈值须为 1–99%。") }
@@ -473,7 +497,7 @@ import ServiceManagement
     func changeIdleReturnDelay(_ minutes: Int) {
         perform {
             guard (0...10080).contains(minutes) else { throw AppError.message("闲置回切时间须为 0–10080 分钟。") }
-            var next = self.settings; next.idleReturnMinutes = minutes
+            var next = self.settings; next.conversationStickyMinutes = minutes
             try self.persistSettings(next); try await self.sync()
         }
     }

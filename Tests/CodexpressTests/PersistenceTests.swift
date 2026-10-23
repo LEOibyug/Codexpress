@@ -6,12 +6,17 @@ final class PersistenceTests: XCTestCase {
         let legacy = Data(#"{"sources":[],"mode":"auto","port":17863,"codexHome":"/temporary/codex"}"#.utf8)
         var settings = try JSONDecoder().decode(AppSettings.self, from: legacy)
         XCTAssertFalse(settings.loadBalanceEnabled)
+        XCTAssertEqual(settings.idleReturnDelay, 5)
+        let prior = Data(#"{"sources":[],"mode":"auto","port":17863,"codexHome":"/temporary/codex","idleReturnMinutes":30}"#.utf8)
+        XCTAssertEqual(try JSONDecoder().decode(AppSettings.self, from: prior).idleReturnDelay, 5)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cx-load-balance-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = MetadataStore(directory: directory)
         settings.loadBalance = true
+        settings.conversationStickyMinutes = 10
         try store.save(settings)
         XCTAssertTrue(try store.load().loadBalanceEnabled)
+        XCTAssertEqual(try store.load().idleReturnDelay, 10)
         settings.loadBalance = false
         try store.save(settings)
         XCTAssertFalse(try store.load().loadBalanceEnabled)

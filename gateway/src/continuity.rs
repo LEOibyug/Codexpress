@@ -6,6 +6,12 @@ use std::collections::HashSet;
 pub fn digest(prefix: &str, text: &str) -> String {
     format!("{prefix}:{:x}", Sha256::digest(text.as_bytes()))
 }
+pub fn accepted_state(identity: &str, key: &str) -> String {
+    digest(
+        "accepted",
+        &serde_json::to_string(&(identity, key)).expect("strings"),
+    )
+}
 pub fn keys(value: &Value, turn: Option<&str>) -> HashSet<String> {
     let mut result = HashSet::new();
     if let Some(items) = value["input"].as_array() {

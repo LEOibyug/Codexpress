@@ -12,6 +12,9 @@ fn source(id: &str, kind: &str) -> Source {
 async fn state() -> (tempfile::TempDir, Arc<AppState>, Source, Source) {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::new(dir.path().to_owned(), 0, "fixture".into()).unwrap();
+    // These component tests exercise the quota-protected routing used by
+    // balancing/fixed modes. Production default-priority relay has its own suite.
+    state.settings.write().await.strict_priority = false;
     let official = source("official", "official");
     let api = source("api", "api");
     *state.sources.write().await = vec![

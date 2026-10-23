@@ -69,6 +69,24 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertEqual(recorded.filter { $0 == "sync" }.count, 1)
         XCTAssertEqual(recorded.filter { $0 == "status" }.count, 2)
         XCTAssertEqual(model.settings.sources.first { $0.id == first.id }?.name, "Renamed")
+
+        func expectManualOperation(_ operation: String, _ action: () -> Void) async throws {
+            try Data().write(to: requests)
+            action()
+            let deadline = Date().addingTimeInterval(5)
+            while model.busy && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertFalse(model.busy)
+            XCTAssertNil(model.error)
+            let recorded = try operations()
+            XCTAssertEqual(recorded.filter { $0 == operation }.count, 1)
+            XCTAssertEqual(recorded.filter { $0 == "status" }.count, 1)
+            XCTAssertFalse(recorded.contains("sync"))
+        }
+        try await expectManualOperation("routing.recover") { model.recoverSource(first.id) }
+        try await expectManualOperation("routing.try") { model.trySourceOnce(second.id) }
+        XCTAssertEqual(model.status["manual_route"]["source_id"].string, second.id)
+        try await expectManualOperation("routing.cancel") { model.cancelSourceTrial() }
+        XCTAssertEqual(model.status["manual_route"], .null)
     }
 
     private static let helperScript = #"""
@@ -78,6 +96,7 @@ final class AppModelSyncTests: XCTestCase {
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(directory / 'control.sock'))
     server.listen()
+    pending_trial = None
     while True:
         connection, _ = server.accept()
         with connection:
@@ -89,7 +108,16 @@ final class AppModelSyncTests: XCTestCase {
             if operation == 'sync':
                 (directory / 'last-sync.json').write_text(json.dumps(request['payload']))
             if operation == 'status':
-                data = dict(process_id=os.getpid(), port=17863, sources=[])
+                data = dict(process_id=os.getpid(), port=17863, sources=[], manual_route=pending_trial)
+            elif operation == 'routing.try':
+                pending_trial = dict(id='fixture-trial', source_id=request['payload']['source_id'])
+                data = pending_trial
+            elif operation == 'routing.cancel':
+                data = dict(cancelled=pending_trial is not None and pending_trial['id'] == request['payload']['id'])
+                if data['cancelled']:
+                    pending_trial = None
+            elif operation == 'routing.recover':
+                data = dict(recovered=True)
             elif operation == 'credentials.storage.status':
                 data = dict(mode='keychain')
             elif operation == 'credentials.read':

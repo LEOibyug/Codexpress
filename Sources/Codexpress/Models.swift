@@ -121,11 +121,12 @@ struct AppSettings: Codable, Sendable {
     var degradedContextFallback: Bool? = nil
     var loadBalance: Bool? = nil
     var idleReturnMinutes: Int? = nil
+    var conversationStickyMinutes: Int? = nil
     var historyCache: HistoryCacheSettings? = nil
     var sshRemoteProfiles: [SSHRemoteProfile]? = nil
     var lowQuotaPercent: Int { officialLowQuotaPercent ?? 10 }
     var loadBalanceEnabled: Bool { loadBalance ?? false }
-    var idleReturnDelay: Int { idleReturnMinutes ?? 30 }
+    var idleReturnDelay: Int { conversationStickyMinutes ?? 5 }
     var historyCacheSettings: HistoryCacheSettings { historyCache ?? HistoryCacheSettings() }
 }
 

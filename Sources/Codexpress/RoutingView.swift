@@ -20,10 +20,11 @@ struct RoutingView: View {
                     } else {
                         Toggle("负载均衡", isOn: Binding(get: { model.settings.loadBalanceEnabled }, set: { model.changeLoadBalance($0) }))
                             .disabled(model.busy)
-                        Text("关闭时按优先级分配新对话；开启时按活跃对话数分配。已有对话保留来源。")
+                        Text("关闭时按优先级逐个尝试；开启时按活跃对话数分配新对话。")
                             .font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                 }
+                if model.settings.loadBalanceEnabled {
                 SettingsCard("官方余量保护", symbol: "shield.lefthalf.filled") {
                     HStack {
                         Text("保留余量阈值").font(.system(size: 12))
@@ -35,8 +36,11 @@ struct RoutingView: View {
                     Text("任一短周期或周额度不高于此值时，为已有活跃对话保留余量；额度归零后跳过此来源。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
+                }
                 SettingsCard("对话接续", symbol: "arrow.triangle.2.circlepath") {
-                    Picker("闲置回切时间", selection: Binding(get: { model.settings.idleReturnDelay }, set: { model.changeIdleReturnDelay($0) })) {
+                    Picker("粘性保持时间", selection: Binding(get: { model.settings.idleReturnDelay }, set: { model.changeIdleReturnDelay($0) })) {
+                        Text("5 分钟").tag(5)
+                        Text("10 分钟").tag(10)
                         Text("15 分钟").tag(15)
                         Text("30 分钟").tag(30)
                         Text("1 小时").tag(60)
@@ -45,12 +49,12 @@ struct RoutingView: View {
                         Text("24 小时").tag(1440)
                         Text("不自动回切").tag(0)
                     }.disabled(model.busy || model.routingMode == "fixed" || model.settings.loadBalanceEnabled)
-                    Text(model.settings.loadBalanceEnabled ? "开启负载均衡时，已有对话保留来源，不按优先级自动回切。" : "从上次请求结束计时。闲置到期后按当前优先级回到可用来源，官方与 API 使用同一排序。")
+                    Text(model.settings.loadBalanceEnabled ? "开启负载均衡时，已有对话保留来源，不按优先级自动回切。" : "成功接续后刷新计时。粘性到期后重新从最高优先级开始尝试。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                     Divider().padding(.vertical, 3)
                     Toggle("无法续接时移除加密块并重建上下文", isOn: Binding(get: { model.settings.degradedContextFallback ?? true }, set: { model.changeContextFallback($0) }))
                         .disabled(model.busy)
-                    Text("跨来源接续加密上下文时使用，可能缺失隐藏推理或压缩摘要。触发时发送系统通知，本地对话记录保留。关闭后，含此类状态的对话保留当前来源。")
+                    Text("上游无法原样续接时重建，可能缺失隐藏推理或压缩摘要，触发时发送系统通知。关闭后不会移除加密状态，无法续接时返回错误。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 if model.sources.isEmpty {
@@ -70,6 +74,7 @@ struct RoutingView: View {
                                     VStack(alignment: .leading, spacing: 4) {
                                         Text(source.name).font(.system(size: 13, weight: .medium))
                                         Text(source.policyLabel).font(.system(size: 11)).foregroundStyle(.secondary)
+                                        SourceRoutingActions(source: source)
                                         if model.state(source.id)["admission"]["capacity_active_conversations"].number != nil || source.max_active_conversations != nil {
                                             SourceCapacityLabel(source: source, admission: model.state(source.id)["admission"], showsRoutingNote: true)
                                                 .font(.system(size: 10))
@@ -87,7 +92,7 @@ struct RoutingView: View {
                                 }.padding(.vertical, 9).listRowBackground(Color.clear)
                             }.onMove { model.move($0, to: $1) }
                         }.listStyle(.plain).scrollContentBackground(.hidden)
-                            .frame(height: CGFloat(min(max(model.sources.count * 80 + 14, 120), 334)))
+                            .frame(height: CGFloat(min(max(model.sources.count * 108 + 14, 140), 390)))
                             .padding(7).cardSurface().disabled(model.busy)
                     }
                 }

@@ -192,6 +192,22 @@ struct RecoveryWindow {
     attempted: bool,
 }
 
+#[derive(Clone)]
+struct ManualRequest {
+    trial: Option<routing::manual::Trial>,
+    attempted: bool,
+}
+
+fn state_matches_source(
+    bindings: &std::collections::HashMap<String, String>,
+    key: &str,
+    source: &Source,
+    accepted: &HashSet<String>,
+) -> bool {
+    bindings.get(key).is_none_or(|id| id == &source.id)
+        || accepted.contains(&crate::continuity::accepted_state(&source.identity(), key))
+}
+
 fn scoped_session(parsed: &Value, parts: &axum::http::request::Parts) -> Option<String> {
     if let Some(session) = parts.extensions.get::<PreservedScopedSession>() {
         // This value already includes any ingress namespace. Reconstruction
@@ -341,6 +357,22 @@ async fn portable_request(
         )));
     }
     excluded.extend(crate::continuity::keys(&portable, None));
+    let mut protected = Vec::new();
+    opaque_bindings(&portable, &mut protected);
+    protected.extend(parsed["previous_response_id"].as_str().map(str::to_owned));
+    protected.extend(
+        parsed["conversation"]
+            .as_str()
+            .or_else(|| parsed["conversation"]["id"].as_str())
+            .map(str::to_owned),
+    );
+    protected.extend(
+        parts
+            .headers
+            .get("x-codex-turn-state")
+            .and_then(|v| v.to_str().ok())
+            .map(turn_binding),
+    );
     strip_opaque_state(&mut portable);
     for field in ["previous_response_id", "conversation", "conversation_id"] {
         portable.as_object_mut().expect("object").remove(field);
@@ -379,11 +411,15 @@ async fn portable_request(
     if let Some(window) = parts.extensions.get::<RecoveryWindow>() {
         retry.extensions_mut().insert(window.clone());
     }
+    if let Some(manual) = parts.extensions.get::<ManualRequest>() {
+        retry.extensions_mut().insert(manual.clone());
+    }
     Ok((
         retry,
         RebuildContext {
             key: affinity.map(str::to_owned),
             excluded,
+            protected_bindings: protected.into_iter().collect(),
             scope,
             route: None,
             rejected_source: None,
@@ -394,6 +430,7 @@ async fn portable_request(
 struct RebuildContext {
     key: Option<String>,
     excluded: HashSet<String>,
+    protected_bindings: HashSet<String>,
     scope: String,
     route: Option<(Source, crate::affinity::RouteLease)>,
     rejected_source: Option<String>,
@@ -411,7 +448,15 @@ struct ResponseContext {
     request_is_stream: bool,
     rebuild: Option<RebuildContext>,
     history: Option<HistoryCapture>,
+    accepted_state: Option<ManualAcceptance>,
 }
+struct ManualAcceptance {
+    key: Option<String>,
+    hashes: HashSet<String>,
+    protected_bindings: HashSet<String>,
+    restored: HashSet<String>,
+}
+
 fn history_scope(parts: &axum::http::request::Parts, parsed: &Value) -> String {
     let session = scoped_session(parsed, parts).or_else(|| {
         parsed["prompt_cache_key"]
@@ -467,6 +512,25 @@ async fn cached_input(
         ));
     }
     Ok(input)
+}
+
+async fn after_manual_failure(
+    state: Arc<AppState>,
+    mut parts: axum::http::request::Parts,
+    bytes: Bytes,
+    rebuild: Option<RebuildContext>,
+    replans: u8,
+) -> Response<Body> {
+    if let Some(manual) = parts.extensions.get_mut::<ManualRequest>() {
+        manual.attempted = true;
+    }
+    Box::pin(forward_once(
+        state,
+        Request::from_parts(parts, Body::from(bytes)),
+        rebuild,
+        replans,
+    ))
+    .await
 }
 
 async fn forward_once(
@@ -542,6 +606,41 @@ async fn forward_once(
             _ => return error(StatusCode::BAD_REQUEST, "Responses 请求需要 JSON 对象"),
         }
     };
+    // Claim once, only after authentication and parsing, never for discovery or
+    // compaction. Reconstructions retain the marker and cannot consume a newer click.
+    let mut manual = parts
+        .extensions
+        .get::<ManualRequest>()
+        .cloned()
+        .unwrap_or_else(|| ManualRequest {
+            trial: if !discovery && parts.uri.path() == "/v1/responses" {
+                state.manual_routing.claim()
+            } else {
+                None
+            },
+            attempted: false,
+        });
+    let manual_target = if !manual.attempted {
+        match &manual.trial {
+            Some(trial) => {
+                routing::manual::source_for_trial(
+                    &state,
+                    trial,
+                    parsed["model"].as_str().unwrap_or(""),
+                )
+                .await
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    parts.extensions.insert(manual.clone());
+    let route_settings = state.settings.read().await.clone();
+    let priority_probe = !discovery
+        && route_settings.strict_priority
+        && route_settings.mode == "auto"
+        && !route_settings.load_balance;
     let stored_key = scoped_session(&parsed, &parts)
         .or_else(|| {
             parsed["prompt_cache_key"]
@@ -554,7 +653,7 @@ async fn forward_once(
         .map(|key| state.affinity.exclusions(key))
         .unwrap_or_default();
     let previously_rebuilt = !exclusions.is_empty();
-    if previously_rebuilt {
+    if previously_rebuilt && manual_target.is_none() && !(priority_probe && !degraded) {
         if let Some(previous) = parsed["previous_response_id"].as_str().filter(|id| {
             state.history.enabled()
                 && exclusions.contains(&crate::continuity::digest("previous_response_id", id))
@@ -657,7 +756,13 @@ async fn forward_once(
                 Some("function_call_output" | "custom_tool_call_output")
             ) || item["role"] == "tool"
         });
-    if !degraded && !discovery && parts.uri.path() == "/v1/responses" && !tool_result {
+    if !degraded
+        && !discovery
+        && parts.uri.path() == "/v1/responses"
+        && !tool_result
+        && manual_target.is_none()
+        && !priority_probe
+    {
         if let Some(key) = affinity_key.as_deref() {
             let has_state = binding.is_some() || opaque_state;
             if !has_state || state.settings.read().await.degraded_context_fallback {
@@ -689,11 +794,15 @@ async fn forward_once(
                         if let Some(window) = parts.extensions.get::<RecoveryWindow>() {
                             retry.extensions_mut().insert(window.clone());
                         }
+                        if let Some(manual) = parts.extensions.get::<ManualRequest>() {
+                            retry.extensions_mut().insert(manual.clone());
+                        }
                         Some((
                             retry,
                             RebuildContext {
                                 key: Some(key.to_owned()),
                                 excluded: HashSet::from(["rebuilt".into()]),
+                                protected_bindings: HashSet::new(),
                                 scope: history_scope(&parts, &parsed),
                                 route: None,
                                 rejected_source: None,
@@ -786,7 +895,7 @@ async fn forward_once(
                         && source.identity() == origin.source_identity))
                     && hard_keys
                         .iter()
-                        .all(|key| bindings.get(*key).is_none_or(|id| id == &source.id))
+                        .all(|key| state_matches_source(&bindings, key, source, &exclusions))
             })
             .collect()
     } else {
@@ -800,7 +909,7 @@ async fn forward_once(
                     source.id == *migrated
                         && hard_keys
                             .iter()
-                            .all(|key| bindings.get(*key).is_none_or(|id| id == &source.id))
+                            .all(|key| state_matches_source(&bindings, key, source, &exclusions))
                 })
                 .collect()
         } else {
@@ -831,7 +940,7 @@ async fn forward_once(
         sources.retain(|source| {
             hard_keys
                 .iter()
-                .all(|key| bindings.get(*key).is_none_or(|id| id == &source.id))
+                .all(|key| state_matches_source(&bindings, key, source, &exclusions))
         });
     }
     if let Some(rejected) = rebuild
@@ -845,12 +954,9 @@ async fn forward_once(
     if opaque_state {
         let bindings = state.bindings.lock().await;
         sources.retain(|source| {
-            opaque_keys.iter().all(|key| match bindings.get(key) {
-                Some(id) => id == &source.id,
-                // A known previous response, turn state, session or another
-                // opaque item has already established the single source.
-                None => true,
-            })
+            opaque_keys
+                .iter()
+                .all(|key| state_matches_source(&bindings, key, source, &exclusions))
         });
     }
     if opaque_state && session_known {
@@ -858,6 +964,19 @@ async fn forward_once(
         sources.retain(|source| {
             session_key.as_ref().and_then(|key| bindings.get(key)) == Some(&source.id)
         });
+    }
+    if priority_probe {
+        sources = routing::priority::candidates(&state, model, affinity_key.as_deref()).await;
+    }
+    if manual.attempted && !degraded {
+        if let Some(trial) = &manual.trial {
+            sources.retain(|source| source.id != trial.source_id);
+        }
+    }
+    if let Some(target) = &manual_target {
+        // Explicit local action: let the selected upstream validate unchanged
+        // state before rebuilding. Normal alternatives keep all origin checks.
+        sources = vec![target.clone()];
     }
     if sources.is_empty() {
         let settings = state.settings.read().await.clone();
@@ -1008,13 +1127,31 @@ async fn forward_once(
     let mut last_error = None;
     let source_count = sources.len();
     for (candidate_index, candidate) in sources.into_iter().enumerate() {
+        let manual_candidate = manual_target.as_ref().is_some_and(|target| {
+            target.id == candidate.id && target.identity() == candidate.identity()
+        });
         if candidate.kind == "official"
             && !matches!(parts.uri.path(), "/v1/responses" | "/v1/responses/compact")
         {
             last_error = Some(error(StatusCode::NOT_IMPLEMENTED, "官方来源尚未验证此端点"));
             continue;
         }
-        let mut route_lease = if let Some((_, lease)) = prepared_route.take() {
+        let mut route_lease = if manual_candidate || priority_probe {
+            match routing::manual::reserve(&state, &candidate, affinity_key.as_deref(), model).await
+            {
+                Some(lease) => Some(lease),
+                None => {
+                    if manual_candidate {
+                        return after_manual_failure(state, parts, bytes, rebuild, replans).await;
+                    }
+                    last_error = Some(error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "来源活跃对话名额已满",
+                    ));
+                    continue;
+                }
+            }
+        } else if let Some((_, lease)) = prepared_route.take() {
             // Reconstruction may await disk work. Honor source removal, model
             // changes, quota updates and fixed-mode changes before submission.
             if !routing::source_is_eligible(&state, &candidate, model).await {
@@ -1064,6 +1201,10 @@ async fn forward_once(
                 Ok(_) => return error(StatusCode::CONFLICT, "来源身份已经变化，请重新开始请求"),
                 Err(_) => {
                     routing::mark_auth_preflight_failure(&state, &candidate).await;
+                    if manual_candidate {
+                        drop(route_lease.take());
+                        return after_manual_failure(state, parts, bytes, rebuild, replans).await;
+                    }
                     last_error = Some(error(
                         StatusCode::BAD_GATEWAY,
                         "官方来源认证暂不可用，请检查登录或网络",
@@ -1086,7 +1227,18 @@ async fn forward_once(
         let mut compatibility_changes = Vec::new();
         let mut auth_refreshed = false;
         for _attempt_number in 0..if compatibility { 5 } else { 2 } {
-            let eligible = routing::source_is_eligible(&state, &source, model).await;
+            let eligible = if manual_candidate {
+                match &manual.trial {
+                    Some(trial) => routing::manual::source_for_trial(&state, trial, model)
+                        .await
+                        .is_some(),
+                    None => false,
+                }
+            } else if priority_probe {
+                routing::priority::eligible(&state, &source, model).await
+            } else {
+                routing::source_is_eligible(&state, &source, model).await
+            };
             let current_revision = state.routing_revision.load(Ordering::Acquire);
             if current_revision != selected_revision {
                 // OAuth and history preparation may await while the user edits
@@ -1145,6 +1297,11 @@ async fn forward_once(
                 Err(_) => {
                     attempt.finish("failed", None);
                     routing::mark_failure(&state, &source.id, 0, None).await;
+                    if manual_candidate {
+                        drop(route_lease.take());
+                        drop(attempt);
+                        return after_manual_failure(state, parts, bytes, rebuild, replans).await;
+                    }
                     last_error = Some(error(StatusCode::BAD_GATEWAY, "来源网络策略无法建立连接"));
                     break;
                 }
@@ -1187,7 +1344,9 @@ async fn forward_once(
             let source_index = state.sources.read().await.iter().position(|runtime| {
                 runtime.source.id == source.id && runtime.source.identity() == source.identity()
             });
-            let selection = if degraded {
+            let selection = if manual_candidate {
+                "manual_trial"
+            } else if degraded {
                 "context_handoff"
             } else if origin.is_some() {
                 "legacy_origin"
@@ -1223,6 +1382,10 @@ async fn forward_once(
                     .notifications
                     .fallback(context.key.as_deref().unwrap_or(&request_id));
             }
+            if manual_candidate {
+                manual.attempted = true;
+                parts.extensions.insert(manual.clone());
+            }
             let upstream = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
                 client
@@ -1257,6 +1420,19 @@ async fn forward_once(
                     );
                     attempt.finish("failed", None);
                     routing::mark_transport_failure(&state, &source.id, &err).await;
+                    if manual_candidate && definitely_unsubmitted {
+                        drop(route_lease.take());
+                        drop(attempt);
+                        return after_manual_failure(state, parts, bytes, rebuild, replans).await;
+                    }
+                    if priority_probe && definitely_unsubmitted {
+                        drop(route_lease.take());
+                        last_error = Some(error(
+                            StatusCode::BAD_GATEWAY,
+                            transport::failure_reason(&err),
+                        ));
+                        break;
+                    }
                     if definitely_unsubmitted
                         && !degraded
                         && !probe_unknown_id
@@ -1335,6 +1511,19 @@ async fn forward_once(
                     }
                     Err(_) => {
                         routing::mark_auth_preflight_failure(&state, &source).await;
+                        if manual_candidate {
+                            drop(route_lease.take());
+                            drop(attempt);
+                            return after_manual_failure(state, parts, bytes, rebuild, replans)
+                                .await;
+                        }
+                        if priority_probe {
+                            last_error = Some(error(
+                                StatusCode::BAD_GATEWAY,
+                                "官方来源认证刷新失败，请检查登录或网络",
+                            ));
+                            break;
+                        }
                         if !degraded
                             && state.settings.read().await.degraded_context_fallback
                             && !routing::candidates_with_session(
@@ -1394,7 +1583,10 @@ async fn forward_once(
             if !degraded
                 && status.is_success()
                 && (binding.is_some() || opaque_state)
-                && (probe_unknown_id || state.settings.read().await.degraded_context_fallback)
+                && (manual_candidate
+                    || priority_probe
+                    || probe_unknown_id
+                    || state.settings.read().await.degraded_context_fallback)
             {
                 // Hold only an initial bounded prefix. A failed Responses SSE
                 // can use HTTP 200, so headers alone do not prove acceptance.
@@ -1431,7 +1623,24 @@ async fn forward_once(
                     }
                 }
             }
-            if probe_unknown_id && context_rejected && candidate_index + 1 < source_count {
+            if manual_candidate
+                && (context_rejected
+                    || ((status.is_client_error() || status.is_server_error())
+                        && !matches!(status.as_u16(), 408 | 504)))
+            {
+                attempt.finish("failed", None);
+                drop(route_lease.take());
+                drop(upstream);
+                drop(attempt);
+                return after_manual_failure(state, parts, bytes, rebuild, replans).await;
+            }
+            if ((probe_unknown_id && context_rejected)
+                || (priority_probe
+                    && (context_rejected
+                        || ((status.is_client_error() || status.is_server_error())
+                            && !matches!(status.as_u16(), 408 | 504)))))
+                && candidate_index + 1 < source_count
+            {
                 // A missing local mapping can mean a different candidate owns
                 // this ID. Explicit rejection permits a bounded unchanged probe
                 // before requiring local history for a new context.
@@ -1450,6 +1659,7 @@ async fn forward_once(
                             request_is_stream: parsed["stream"].as_bool() == Some(true),
                             rebuild: None,
                             history: None,
+                            accepted_state: None,
                         },
                         None,
                     )
@@ -1461,9 +1671,15 @@ async fn forward_once(
                 && (binding.is_some() || opaque_state || origin.is_some())
                 && (context_rejected || matches!(status.as_u16(), 401 | 402 | 403 | 429))
                 && state.settings.read().await.degraded_context_fallback
-                && !routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
-                    .await
-                    .is_empty()
+                && if priority_probe {
+                    !routing::priority::candidates(&state, model, affinity_key.as_deref())
+                        .await
+                        .is_empty()
+                } else {
+                    !routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
+                        .await
+                        .is_empty()
+                }
             {
                 attempt.finish("failed", None);
                 drop(upstream);
@@ -1508,6 +1724,7 @@ async fn forward_once(
                             request_is_stream: parsed["stream"].as_bool() == Some(true),
                             rebuild: None,
                             history: None,
+                            accepted_state: None,
                         },
                         None,
                     )
@@ -1518,6 +1735,32 @@ async fn forward_once(
             if status.is_success() {
                 routing::mark_ready(&state, &source.id).await;
             }
+            let validated_continuation = hard_keys.iter().any(|key| {
+                exclusions.contains(&crate::continuity::accepted_state(&source.identity(), key))
+            });
+            let accepted_state = if manual_candidate || priority_probe || validated_continuation {
+                Some(ManualAcceptance {
+                    key: affinity_key.clone(),
+                    hashes: hard_keys
+                        .iter()
+                        .map(|key| crate::continuity::accepted_state(&source.identity(), key))
+                        .collect(),
+                    protected_bindings: hard_keys
+                        .iter()
+                        .filter(|key| Some(**key) != session_key.as_deref())
+                        .map(|key| (*key).to_owned())
+                        .collect(),
+                    restored: crate::continuity::keys(
+                        &parsed,
+                        parts
+                            .headers
+                            .get("x-codex-turn-state")
+                            .and_then(|value| value.to_str().ok()),
+                    ),
+                })
+            } else {
+                None
+            };
             let mut response = stream_response(
                 state,
                 source.clone(),
@@ -1530,6 +1773,7 @@ async fn forward_once(
                     request_is_stream: parsed["stream"].as_bool() == Some(true),
                     rebuild,
                     history: history_capture,
+                    accepted_state,
                 },
                 route_lease.take(),
             )

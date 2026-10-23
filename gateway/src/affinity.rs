@@ -120,6 +120,22 @@ impl AffinityStore {
             .find(|source| &source.id == id && source.identity() == *identity)
             .map(|source| source.id.clone())
     }
+    pub fn preferred_within(&self, key: &str, sources: &[Source], seconds: u64) -> Option<String> {
+        let data = self.data.lock().ok()?;
+        let (id, identity) = if let Some(pending) = data.pending.get(key) {
+            (&pending.source_id, &pending.identity)
+        } else {
+            let entry = data.entries.get(key)?;
+            if seconds > 0 && now().saturating_sub(entry.last_seen) >= seconds {
+                return None;
+            }
+            (&entry.source_id, &entry.identity)
+        };
+        sources
+            .iter()
+            .find(|source| &source.id == id && source.identity() == *identity)
+            .map(|s| s.id.clone())
+    }
     pub fn exclusions(&self, key: &str) -> HashSet<String> {
         let Ok(data) = self.data.lock() else {
             return HashSet::new();
@@ -135,6 +151,22 @@ impl AffinityStore {
             .unwrap_or_default()
     }
     pub fn confirm_exclusions(&self, key: &str, hashes: &HashSet<String>) -> Result<()> {
+        self.update_exclusions(key, hashes, &HashSet::new())
+    }
+    pub fn confirm_acceptance(
+        &self,
+        key: &str,
+        hashes: &HashSet<String>,
+        restored: &HashSet<String>,
+    ) -> Result<()> {
+        self.update_exclusions(key, hashes, restored)
+    }
+    fn update_exclusions(
+        &self,
+        key: &str,
+        hashes: &HashSet<String>,
+        restored: &HashSet<String>,
+    ) -> Result<()> {
         let data = self
             .data
             .lock()
@@ -149,6 +181,7 @@ impl AffinityStore {
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
+        merged.retain(|key| !restored.contains(key));
         merged.extend(hashes.iter().cloned());
         if merged.len() > 10000 {
             anyhow::bail!("上下文降级记录超过限制");
@@ -761,6 +794,12 @@ mod tests {
             .get_mut(&key)
             .unwrap()
             .last_seen = now() - 3600;
+        assert_eq!(
+            store
+                .preferred_within(&key, &[from.clone(), target.clone()], 300)
+                .as_deref(),
+            Some("api")
+        );
         assert!(store
             .reserve_idle_return(&key, &from, &target, false, 1800)
             .is_none());
@@ -776,6 +815,9 @@ mod tests {
             .get_mut(&key)
             .unwrap()
             .last_seen = now() - 1800;
+        assert!(store
+            .preferred_within(&key, &[from.clone(), target.clone()], 300)
+            .is_none());
         assert!(store
             .reserve_idle_return(&key, &from, &target, false, 0)
             .is_none());

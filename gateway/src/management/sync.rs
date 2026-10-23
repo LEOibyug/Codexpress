@@ -44,7 +44,7 @@ impl SyncRequest {
             .transpose()?
             .unwrap_or(false);
         let idle_return_minutes = match payload.get("idle_return_minutes") {
-            None => 30,
+            None => 5,
             Some(value) => value
                 .as_u64()
                 .filter(|v| *v <= 10080)
@@ -74,6 +74,7 @@ impl SyncRequest {
             sources,
             ids,
             settings: RoutingSettings {
+                strict_priority: true,
                 mode: mode.into(),
                 fixed_source_id: fixed,
                 load_balance,
@@ -163,6 +164,7 @@ pub(super) async fn handle(state: &Arc<AppState>, payload: Value) -> Result<Valu
     // submit using a mixture of old routing settings and new sources.
     state.routing_revision.fetch_add(1, Ordering::AcqRel);
     *current = next;
+    state.manual_routing.retain_sources(&current);
     // Keep the source write lock through binding invalidation. Relay
     // readers and binding writers use sources -> bindings consistently.
     state

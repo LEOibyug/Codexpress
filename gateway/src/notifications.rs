@@ -38,7 +38,7 @@ impl Notifications {
             if !data.exhausted.insert(identity.into()) {
                 return;
             }
-            data.events.push_back(json!({"id":uuid::Uuid::new_v4(),"kind":"official_exhausted","title":"官方来源额度已耗尽","body":format!("{name} 暂停分配请求；可用的新请求将按路由规则选择其他来源。额度恢复后重新参与分配。" )}));
+            data.events.push_back(json!({"id":uuid::Uuid::new_v4(),"kind":"official_exhausted","title":"官方来源额度已耗尽","body":format!("{name} 的额度已耗尽，请求将按路由设置尝试其他来源。" )}));
             while data.events.len() > 100 {
                 data.events.pop_front();
             }

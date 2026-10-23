@@ -18,7 +18,7 @@ async fn management_sync_is_transactional_and_does_not_expose_secrets_in_status(
         .unwrap();
     assert_eq!(status["sources"][0]["id"], "source-a");
     assert_eq!(status["official_low_quota_percent"], 10);
-    assert_eq!(status["idle_return_minutes"], 30);
+    assert_eq!(status["idle_return_minutes"], 5);
     assert_eq!(status["load_balance"], false);
     for invalid in [json!(1), json!("false"), json!(null)] {
         assert!(
@@ -51,7 +51,7 @@ async fn management_sync_is_transactional_and_does_not_expose_secrets_in_status(
         .await
         .is_err());
         assert_eq!(state.sources.read().await.len(), 1);
-        assert_eq!(state.settings.read().await.idle_return_minutes, 30);
+        assert_eq!(state.settings.read().await.idle_return_minutes, 5);
     }
     assert!(management::dispatch(
         &state,

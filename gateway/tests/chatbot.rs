@@ -24,6 +24,7 @@ use tower::ServiceExt;
 async fn state(base: &str) -> (tempfile::TempDir, Arc<AppState>, String, u16) {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::new(dir.path().into(), 17863, "PRIVATE-NATIVE-KEY".into()).unwrap();
+    state.settings.write().await.strict_priority = false;
     let mut source = api_source("api", "API", base, "PRIVATE-UPSTREAM-KEY");
     source.models = vec!["m".into(), "m2".into()];
     state.sources.write().await.push(SourceRuntime::new(source));

@@ -1,7 +1,7 @@
 //! Response observation, usage accounting and streaming lifecycle.
 use super::{
     clean_headers, explicit_context_rejection, opaque_bindings, turn_binding, HistoryCapture,
-    ResponseContext,
+    ManualAcceptance, ResponseContext,
 };
 use crate::{
     model::{now, AppState, Source},
@@ -232,6 +232,9 @@ impl Drop for Attempt {
 /// compressed frames still pass through; unavailable usage is not invented.
 #[derive(Default)]
 pub(super) struct Observer {
+    defer_bindings: bool,
+    protected_bindings: HashSet<String>,
+    accepted_completion: bool,
     buffer: Vec<u8>,
     line: Vec<u8>,
     data: Vec<u8>,
@@ -338,6 +341,14 @@ impl Observer {
             }
         }
         let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        self.accepted_completion |=
+            matches!(event_type, "response.completed" | "response.incomplete")
+                || (!self.sse
+                    && matches!(
+                        response["status"].as_str(),
+                        Some("completed" | "incomplete")
+                    )
+                    && response["output"].is_array());
         // Any generated item, including a tool call or private reasoning, makes
         // replay unsafe even when no text delta has been seen yet.
         self.replay_blocked |= event_type.starts_with("response.output_")
@@ -563,7 +574,7 @@ impl Observer {
 }
 
 async fn bind_ids(state: &Arc<AppState>, source: &Source, observer: &mut Observer) {
-    if observer.ids.is_empty() {
+    if observer.defer_bindings || observer.ids.is_empty() {
         return;
     }
     let sources = state.sources.read().await;
@@ -581,7 +592,9 @@ async fn bind_ids(state: &Arc<AppState>, source: &Source, observer: &mut Observe
         bindings.clear();
     }
     for id in observer.ids.drain(..) {
-        bindings.insert(id, source.id.clone());
+        if !observer.protected_bindings.contains(&id) {
+            bindings.insert(id, source.id.clone());
+        }
     }
 }
 
@@ -635,6 +648,55 @@ async fn finalize_response(
     }
 }
 
+// Persist positive upstream validation only for this conversation/model and
+// source identity. Shared parent ciphertext keeps its original global binding.
+async fn confirm_manual_acceptance(
+    state: &Arc<AppState>,
+    source: &Source,
+    observer: &mut Observer,
+    accepted: &mut Option<ManualAcceptance>,
+    lease: &mut Option<crate::affinity::RouteLease>,
+    session: &mut Option<String>,
+    upstream_success: bool,
+) {
+    if !upstream_success
+        || !(observer.replay_blocked || (observer.accepted_completion && !observer.failed))
+    {
+        return;
+    }
+    let Some(acceptance) = accepted.take() else {
+        return;
+    };
+    {
+        let sources = state.sources.read().await;
+        if !sources
+            .iter()
+            .any(|r| r.source.id == source.id && r.source.identity() == source.identity())
+        {
+            return;
+        }
+        if let Some(lease) = lease {
+            if lease.commit().is_err() {
+                eprintln!("会话来源保存失败");
+            }
+        }
+        if let Some(key) = acceptance.key {
+            if state
+                .affinity
+                .confirm_acceptance(&key, &acceptance.hashes, &acceptance.restored)
+                .is_err()
+            {
+                eprintln!("来源兼容状态保存失败");
+            }
+        }
+        if let Some(session) = session.take() {
+            observer.ids.push(session);
+        }
+        observer.defer_bindings = false;
+    }
+    bind_ids(state, source, observer).await;
+}
+
 pub(super) async fn stream_response(
     state: Arc<AppState>,
     source: Source,
@@ -646,11 +708,28 @@ pub(super) async fn stream_response(
 ) -> Response<Body> {
     let ResponseContext {
         discovery,
-        session_key,
+        mut session_key,
         request_is_stream,
         rebuild,
         history,
+        mut accepted_state,
     } = context;
+    if let Some(context) = rebuild {
+        let acceptance = accepted_state.get_or_insert_with(|| ManualAcceptance {
+            key: context.key,
+            hashes: HashSet::new(),
+            protected_bindings: HashSet::new(),
+            restored: HashSet::new(),
+        });
+        acceptance.hashes.extend(context.excluded);
+        acceptance
+            .protected_bindings
+            .extend(context.protected_bindings);
+    }
+    let rejected_attempt = attempt
+        .record
+        .as_ref()
+        .is_some_and(|record| record.status == "failed");
     let status = upstream.status();
     let headers = clean_headers(upstream.headers(), false);
     let content_length = headers
@@ -661,7 +740,7 @@ pub(super) async fn stream_response(
     // unknown, but receiving an empty successful response is not cancellation.
     if content_length == Some(0) {
         attempt.finish(
-            if status.is_success() {
+            if status.is_success() && !rejected_attempt {
                 "success"
             } else {
                 "failed"
@@ -678,12 +757,17 @@ pub(super) async fn stream_response(
     let sse = response_is_sse(&headers, request_is_stream, status);
     let mut observer = Observer {
         sse,
+        defer_bindings: accepted_state.is_some() || rejected_attempt,
+        protected_bindings: accepted_state
+            .as_ref()
+            .map(|a| a.protected_bindings.clone())
+            .unwrap_or_default(),
         history_request: if status.is_success() { history } else { None },
         ..Default::default()
     };
     if content_length != Some(0) {
         attempt.finish(
-            if status.is_success() {
+            if status.is_success() && !rejected_attempt {
                 "streaming"
             } else {
                 "failed"
@@ -691,8 +775,8 @@ pub(super) async fn stream_response(
             None,
         );
     }
-    if status.is_success() {
-        if let Some(lease) = &mut route_lease {
+    if status.is_success() && !rejected_attempt {
+        if let Some(lease) = route_lease.as_mut().filter(|_| accepted_state.is_none()) {
             let sources = state.sources.read().await;
             if sources.iter().any(|runtime| {
                 runtime.source.id == source.id && runtime.source.identity() == source.identity()
@@ -701,25 +785,10 @@ pub(super) async fn stream_response(
                 eprintln!("会话来源保存失败");
             }
         }
-        if let Some(context) = rebuild {
-            let sources = state.sources.read().await;
-            if sources
-                .iter()
-                .any(|r| r.source.id == source.id && r.source.identity() == source.identity())
-            {
-                if let Some(key) = context.key {
-                    if state
-                        .affinity
-                        .confirm_exclusions(&key, &context.excluded)
-                        .is_err()
-                    {
-                        eprintln!("上下文降级状态保存失败");
-                    }
-                }
+        if accepted_state.is_none() {
+            if let Some(session_key) = session_key.take() {
+                observer.ids.push(session_key);
             }
-        }
-        if let Some(session_key) = session_key {
-            observer.ids.push(session_key);
         }
         if let Some(token) = headers
             .get("x-codex-turn-state")
@@ -732,7 +801,7 @@ pub(super) async fn stream_response(
         bind_ids(&state, &source, &mut observer).await;
     }
     let stream = async_stream::stream! {
-        let _route_lease=route_lease;
+        let mut route_lease=route_lease;
         let prefix = futures_util::stream::iter(prefix.into_iter().map(Ok));
         let mut upstream = prefix.chain(upstream.bytes_stream());
         let mut received = 0u64;
@@ -755,6 +824,7 @@ pub(super) async fn stream_response(
                     } else if !finalized {
                         attempt.finish(if status.is_success() { "streaming" } else { "failed" }, Some(&observer));
                     }
+                    confirm_manual_acceptance(&state, &source, &mut observer, &mut accepted_state, &mut route_lease, &mut session_key, status.is_success() && !rejected_attempt).await;
                     yield Ok::<Bytes, std::io::Error>(chunk);
                     if complete_body { return; }
                 },
@@ -766,6 +836,7 @@ pub(super) async fn stream_response(
             }
         }
         if !finalized { finalize_response(&state, &source, status, discovery, &mut observer, &mut attempt).await; }
+        confirm_manual_acceptance(&state, &source, &mut observer, &mut accepted_state, &mut route_lease, &mut session_key, status.is_success() && !rejected_attempt).await;
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;

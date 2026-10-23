@@ -1,3 +1,6 @@
+pub mod manual;
+pub(crate) mod priority;
+
 use crate::model::{now, AppState, Source};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -464,12 +467,51 @@ pub fn admission(
     sources: &[crate::model::SourceRuntime],
     threshold: u8,
 ) -> Value {
+    admission_status(state, runtime, sources, threshold, false)
+}
+
+pub fn admission_with_settings(
+    state: &Arc<AppState>,
+    runtime: &crate::model::SourceRuntime,
+    sources: &[crate::model::SourceRuntime],
+    settings: &crate::model::RoutingSettings,
+) -> Value {
+    admission_status(
+        state,
+        runtime,
+        sources,
+        settings.official_low_quota_percent,
+        settings.strict_priority && settings.mode == "auto" && !settings.load_balance,
+    )
+}
+
+fn admission_status(
+    state: &Arc<AppState>,
+    runtime: &crate::model::SourceRuntime,
+    sources: &[crate::model::SourceRuntime],
+    threshold: u8,
+    strict: bool,
+) -> Value {
     let active = state.affinity.active_count(&runtime.source);
     let protected_active = state.affinity.protected_active_count(&runtime.source);
     let (capacity_active, capacity_available) = state.affinity.capacity_status(&runtime.source);
     let remaining = account_remaining(runtime, sources);
     let note = if !runtime.source.enabled {
         "已停用"
+    } else if strict && !manual::has_credentials(&runtime.source) {
+        if runtime.source.kind == "official" {
+            "需要登录"
+        } else {
+            "缺少密钥"
+        }
+    } else if strict && !capacity_available {
+        "活跃对话已满"
+    } else if strict {
+        if runtime.health != "ready" || remaining.is_some_and(|value| value <= 0.0) {
+            "按优先级重试"
+        } else {
+            "可接新对话"
+        }
     } else if remaining.is_some_and(|value| value <= 0.0) {
         "额度耗尽"
     } else if runtime.health == "auth_required" {
@@ -485,7 +527,7 @@ pub fn admission(
     } else {
         "可接新对话"
     };
-    json!({"active_conversations":active,"account_active_conversations":protected_active,"capacity_active_conversations":capacity_active,"max_active_conversations":runtime.source.max_active_conversations,"activity_window_seconds":runtime.source.active_conversation_window_seconds,"capacity_available":capacity_available,"remaining_percent":remaining,"accepting_new_conversations":note=="可接新对话","routing_note":note})
+    json!({"active_conversations":active,"account_active_conversations":protected_active,"capacity_active_conversations":capacity_active,"max_active_conversations":runtime.source.max_active_conversations,"activity_window_seconds":runtime.source.active_conversation_window_seconds,"capacity_available":capacity_available,"remaining_percent":remaining,"accepting_new_conversations":matches!(note,"可接新对话"|"按优先级重试"),"routing_note":note})
 }
 
 pub async fn mark_failure(

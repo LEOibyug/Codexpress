@@ -174,6 +174,10 @@ impl SourceRuntime {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RoutingSettings {
+    /// Probe in priority order for new/expired conversations. Legacy component
+    /// fixtures can opt out; production sync always enables this strategy.
+    #[serde(skip, default = "default_strict_priority")]
+    pub strict_priority: bool,
     pub mode: String,
     pub fixed_source_id: Option<String>,
     #[serde(default)]
@@ -186,7 +190,10 @@ pub struct RoutingSettings {
     pub idle_return_minutes: u32,
 }
 fn default_idle_return() -> u32 {
-    30
+    5
+}
+fn default_strict_priority() -> bool {
+    true
 }
 fn default_fallback() -> bool {
     true
@@ -206,6 +213,7 @@ pub struct AppState {
     pub history: Arc<crate::history::HistoryStore>,
     pub remote: crate::remote::RemoteAccess,
     pub notifications: crate::notifications::Notifications,
+    pub manual_routing: crate::routing::manual::ManualRouting,
     pub balances: crate::balance::BalanceStore,
     pub chatbot: crate::chatbot::ChatbotAccess,
     pub images: crate::images::ImageAccess,
@@ -237,6 +245,7 @@ impl AppState {
             routing_sync: Mutex::new(()),
             sources: RwLock::new(Vec::new()),
             settings: RwLock::new(RoutingSettings {
+                strict_priority: true,
                 mode: "auto".into(),
                 fixed_source_id: None,
                 load_balance: false,
@@ -252,6 +261,7 @@ impl AppState {
             )?),
             remote: crate::remote::RemoteAccess::open(&state_dir, port)?,
             notifications: Default::default(),
+            manual_routing: Default::default(),
             balances: Default::default(),
             chatbot,
             images,
