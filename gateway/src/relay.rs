@@ -1,4 +1,5 @@
 mod response;
+mod roles;
 
 use self::response::{probe_context_rejection, read_error_prefix, stream_response, Attempt};
 use crate::{
@@ -1217,8 +1218,11 @@ async fn forward_once(
             Value::Null
         };
         let mut compatibility_changes = Vec::new();
+        let mut role_bytes: Option<Bytes> = None;
+        let mut role_repaired = false;
+        let has_system = roles::has_system(&parsed);
         let mut auth_refreshed = false;
-        for _attempt_number in 0..if compatibility { 5 } else { 2 } {
+        for _attempt_number in 0..if compatibility { 6 } else { 3 } {
             let eligible = if manual_candidate {
                 match &manual.trial {
                     Some(trial) => routing::manual::source_for_trial(&state, trial, model)
@@ -1267,10 +1271,15 @@ async fn forward_once(
                         )
                     }
                 }
+            } else if let Some(bytes) = &role_bytes {
+                (bytes.clone(), Vec::new())
             } else {
                 (bytes.clone(), Vec::new())
             };
             ignored_parameters.extend(compatibility_changes.iter().cloned());
+            if role_repaired {
+                ignored_parameters.push("input.role".into());
+            }
             ignored_parameters.sort();
             ignored_parameters.dedup();
             let mut attempt = Attempt::new(state.clone(), &source, &request_id, model, input_units);
@@ -1303,6 +1312,11 @@ async fn forward_once(
                 Err(_) => return error(StatusCode::BAD_GATEWAY, "来源地址无效"),
             };
             let mut headers = clean_headers(&parts.headers, true);
+            if role_repaired {
+                headers.remove("content-length");
+                headers.remove("digest");
+                headers.remove("content-md5");
+            }
             let credential = source
                 .secret
                 .get(if source.kind == "official" {
@@ -1554,9 +1568,28 @@ async fn forward_once(
             let mut prefix = Vec::new();
             let mut context_rejected = false;
             if matches!(status.as_u16(), 400 | 404 | 409 | 422)
-                && (binding.is_some() || opaque_state || compatibility)
+                && (binding.is_some() || opaque_state || compatibility || has_system)
             {
                 if let Some(value) = read_error_prefix(&mut upstream, &mut prefix).await {
+                    if !role_repaired && matches!(status.as_u16(), 400 | 422) {
+                        let body = if compatibility {
+                            &compatibility_body
+                        } else {
+                            &parsed
+                        };
+                        if let Some(repaired) = roles::adapt(body, &value) {
+                            if compatibility {
+                                compatibility_body = repaired;
+                            } else {
+                                role_bytes =
+                                    Some(Bytes::from(serde_json::to_vec(&repaired).expect("JSON")));
+                            }
+                            role_repaired = true;
+                            attempt.finish("failed", None);
+                            drop(upstream);
+                            continue;
+                        }
+                    }
                     if compatibility
                         && status == StatusCode::BAD_REQUEST
                         && compatibility_changes.len() < 3
