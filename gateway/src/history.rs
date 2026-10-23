@@ -15,8 +15,6 @@ pub const DEFAULT_LIMIT: u64 = 5_000_000_000;
 pub const MIN_LIMIT: u64 = 64_000_000;
 pub const MAX_LIMIT: u64 = 1_000_000_000_000;
 const CHUNK: usize = 64 * 1024;
-const MAX_CONTEXT: usize = 32 * 1024 * 1024;
-const MAX_NODES: usize = 100_000;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HistoryConfig {
@@ -368,13 +366,8 @@ fn capture(data: &mut Data, scope: &str, request: &Value, response: &Value) -> R
     let mut blocks = Vec::new();
     let mut nodes = Vec::new();
     let mut tail = String::new();
-    let mut raw_total = 0;
     for item in &items {
         let bytes = serde_json::to_vec(item)?;
-        raw_total += bytes.len();
-        if raw_total > MAX_CONTEXT {
-            bail!("正文超出缓存单次上限");
-        }
         for (i, chunk) in bytes.chunks(CHUNK).enumerate() {
             let block = hash(chunk);
             let end = (i + 1) * CHUNK >= bytes.len();
@@ -394,9 +387,6 @@ fn capture(data: &mut Data, scope: &str, request: &Value, response: &Value) -> R
         }
     }
     let bytes = serde_json::to_vec(&envelope)?;
-    if raw_total.saturating_add(bytes.len()) > MAX_CONTEXT {
-        bail!("正文超出缓存单次上限");
-    }
     let envelope = hash(&bytes);
     blocks.push(Block {
         hash: envelope.clone(),
@@ -450,12 +440,11 @@ fn read_block(db: &Connection, id: &str) -> Result<Vec<u8>> {
         [id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    if raw > MAX_CONTEXT {
-        bail!("缓存块长度无效");
-    }
+    let read_limit = raw.checked_add(1).context("缓存块长度无效")?;
     let mut bytes = Vec::new();
+    bytes.try_reserve_exact(raw).context("缓存块内存不足")?;
     zstd::stream::read::Decoder::new(compressed.as_slice())?
-        .take((raw + 1) as u64)
+        .take(read_limit as u64)
         .read_to_end(&mut bytes)?;
     if bytes.len() != raw || hash(&bytes) != id {
         bail!("缓存块校验失败");
@@ -473,10 +462,10 @@ fn restore(data: &mut Data, scope: &str, id: &str) -> Result<Vec<Value>> {
     let mut chunks = Vec::new();
     let mut block_ids = vec![envelope];
     let mut node_ids = Vec::new();
-    let mut total = 0;
+    let mut visited = HashSet::new();
     while !tail.is_empty() {
-        if chunks.len() >= MAX_NODES {
-            bail!("缓存链超长");
+        if !visited.insert(tail.clone()) {
+            bail!("缓存索引存在循环");
         }
         let (parent, block, end): (String, String, bool) = data.db.query_row(
             "SELECT parent,block,item_end FROM nodes WHERE hash=?1",
@@ -487,10 +476,6 @@ fn restore(data: &mut Data, scope: &str, id: &str) -> Result<Vec<Value>> {
             bail!("缓存索引校验失败");
         }
         let bytes = read_block(&data.db, &block)?;
-        total += bytes.len();
-        if total > MAX_CONTEXT {
-            bail!("缓存历史超长");
-        }
         chunks.push((bytes, end));
         block_ids.push(block);
         node_ids.push(tail);
@@ -651,7 +636,7 @@ mod tests {
         assert!(store
             .capture(
                 "s",
-                &json!({"input":"x".repeat(MAX_CONTEXT+1)}),
+                &json!({"input":"x".repeat(33 * 1024 * 1024)}),
                 &response("huge", "ok")
             )
             .is_err());

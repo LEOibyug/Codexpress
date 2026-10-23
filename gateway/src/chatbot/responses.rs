@@ -1,7 +1,7 @@
 use super::{
     error,
     requests::{Format, OutputOptions},
-    BODY_LIMIT,
+    RESPONSE_CAPTURE_LIMIT,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -75,7 +75,7 @@ impl Decoder {
                 )
                 .min_by_key(|v| v.0);
             let Some((end, size)) = boundary else { break };
-            if end > BODY_LIMIT {
+            if end > RESPONSE_CAPTURE_LIMIT {
                 return Err(());
             }
             let block = self.pending.drain(..end + size).collect::<Vec<_>>();
@@ -83,7 +83,7 @@ impl Decoder {
                 events.push(value);
             }
         }
-        if self.pending.len() > BODY_LIMIT {
+        if self.pending.len() > RESPONSE_CAPTURE_LIMIT {
             return Err(());
         }
         Ok(events)
@@ -314,7 +314,7 @@ impl ChatStream {
         self.observed = self
             .observed
             .saturating_add(serde_json::to_vec(&event).map_err(|_| ())?.len());
-        if self.observed > BODY_LIMIT * 4 {
+        if self.observed > RESPONSE_CAPTURE_LIMIT * 4 {
             return Err(());
         }
         let mut events = Vec::new();
@@ -476,7 +476,7 @@ pub(super) async fn adapt(response: Response, options: OutputOptions) -> Respons
     let status = response.status();
     let headers = output_headers(response.headers(), options.stream);
     if !status.is_success() {
-        let _ = to_bytes(response.into_body(), BODY_LIMIT).await;
+        let _ = to_bytes(response.into_body(), RESPONSE_CAPTURE_LIMIT).await;
         return error(status, "上游拒绝请求，请检查模型、参数或来源状态", None);
     }
     if response
@@ -496,7 +496,7 @@ pub(super) async fn adapt(response: Response, options: OutputOptions) -> Respons
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("application/json"));
     if is_json {
-        let body = match to_bytes(response.into_body(), BODY_LIMIT).await {
+        let body = match to_bytes(response.into_body(), RESPONSE_CAPTURE_LIMIT).await {
             Ok(b) => b,
             Err(_) => return error(StatusCode::BAD_GATEWAY, "上游响应过大或读取失败", None),
         };

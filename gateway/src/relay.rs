@@ -7,7 +7,7 @@ use crate::{
     usage::content_units,
 };
 use axum::{
-    body::{to_bytes, Body},
+    body::Body,
     extract::State,
     http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode},
     routing::{get, post},
@@ -20,7 +20,6 @@ use std::{
     sync::{atomic::Ordering, Arc},
 };
 
-const BODY_LIMIT: usize = 32 * 1024 * 1024;
 const RECOVERY_WAIT_SECONDS: u64 = 20;
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -504,14 +503,7 @@ async fn cached_input(
         Some(Value::String(text)) => items.push(json!({"role":"user","content":text})),
         _ => return Err((StatusCode::BAD_REQUEST, "无法重建此输入格式")),
     }
-    let input = Value::Array(items);
-    if serde_json::to_vec(&input).map_or(true, |v| v.len() > BODY_LIMIT) {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "恢复后的上下文超过 32 MiB，请先压缩上下文。",
-        ));
-    }
-    Ok(input)
+    Ok(Value::Array(items))
 }
 
 async fn after_manual_failure(
@@ -593,9 +585,9 @@ async fn forward_once(
         return error(StatusCode::FORBIDDEN, "网关不接受浏览器跨站请求");
     }
     let (mut parts, body) = request.into_parts();
-    let mut bytes = match to_bytes(body, BODY_LIMIT).await {
+    let mut bytes = match crate::request_body::read(body, "codex").await {
         Ok(body) => body,
-        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "请求正文过大或无法读取"),
+        Err(problem) => return error(problem.status, problem.message),
     };
     let discovery = parts.method == axum::http::Method::GET;
     let mut parsed = if discovery {

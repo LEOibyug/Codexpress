@@ -6,7 +6,7 @@ mod responses;
 use crate::{config::secure_write, model::AppState};
 use anyhow::{bail, Context, Result};
 use axum::{
-    body::{to_bytes, Body},
+    body::Body,
     extract::{Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
@@ -23,7 +23,7 @@ use std::{
 };
 use tokio::sync::Mutex as AsyncMutex;
 
-const BODY_LIMIT: usize = 32 * 1024 * 1024;
+const RESPONSE_CAPTURE_LIMIT: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct ChatbotIngress {
@@ -378,9 +378,9 @@ async fn responses(State(state): State<Arc<AppState>>, request: Request) -> Resp
 
 async fn infer(state: Arc<AppState>, request: Request, format: requests::Format) -> Response {
     let (mut parts, body) = request.into_parts();
-    let bytes = match to_bytes(body, BODY_LIMIT).await {
+    let bytes = match crate::request_body::read(body, "chatbot").await {
         Ok(b) => b,
-        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "请求超过 32 MiB", None),
+        Err(problem) => return error(problem.status, problem.message, None),
     };
     let body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
