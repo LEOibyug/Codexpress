@@ -7,6 +7,7 @@ struct SourceRoutingActions: View {
 
     private var cooling: Bool { ["cooldown", "proxy_error"].contains(model.state(source.id)["health"].string ?? "") }
     private var queued: Bool { model.status["manual_route"]["source_id"].string == source.id }
+    private var exhausted: Bool { source.official && model.state(source.id)["health"].string == "exhausted" }
 
     var body: some View {
         HStack(spacing: compact ? 4 : 8) {
@@ -16,8 +17,8 @@ struct SourceRoutingActions: View {
                     .disabled(!source.enabled)
             }
             action("立即插入", symbol: "bolt.fill") { model.trySourceOnce(source.id) }
-                .help(queued ? "已等待下一条请求" : "下一条对话请求先尝试此来源，成功后沿用；失败可回退。活跃对话上限仍有效。")
-                .disabled(queued || !source.enabled || model.connectionMode == "official")
+                .help(exhausted ? "官方额度已耗尽，确认恢复后可使用" : queued ? "已等待下一条请求" : "下一条对话请求先尝试此来源，成功后沿用；失败可回退。活跃对话上限仍有效。")
+                .disabled(queued || exhausted || !source.enabled || model.connectionMode == "official")
             if queued {
                 if !compact {
                     Label("等待下一条请求", systemImage: "clock")

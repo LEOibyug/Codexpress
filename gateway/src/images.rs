@@ -415,7 +415,7 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
                     && r.source.identity() == source.identity()
                     && r.source.proxy == source.proxy
                     && selected.as_ref().is_none_or(|id| id == &source.id)
-                    && routing::account_remaining(r, &sources).is_none_or(|v| v > 0.0)
+                    && !routing::official_exhausted(r, &sources)
                     && (r.health == "ready"
                         || matches!(r.health.as_str(), "cooldown" | "proxy_error" | "exhausted")
                             && r.cooldown_until.is_some_and(|until| until <= now()))

@@ -37,6 +37,10 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
                 .iter()
                 .map(|runtime| {
                     let mut value = serde_json::to_value(runtime).expect("source status");
+                    if crate::routing::official_exhausted(runtime, &sources) {
+                        value["health"] = json!("exhausted");
+                        value["last_error"] = json!("官方额度已耗尽，等待额度恢复");
+                    }
                     value["active_requests"] =
                         json!(active.get(&runtime.source.id).copied().unwrap_or(0));
                     value["identity_digest"] = json!(runtime.source.identity());

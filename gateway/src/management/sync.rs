@@ -126,7 +126,24 @@ fn prepare_sources(
                 invalidated.insert(source.id.clone());
             }
         }
-        next.push(SourceRuntime::new(source));
+        let mut runtime = SourceRuntime::new(source);
+        if runtime.source.kind == "official" {
+            let identity = runtime.source.identity();
+            if let Some(previous) = current
+                .iter()
+                .filter(|r| r.source.identity() == identity)
+                .max_by_key(|r| r.quota["fetched_at"].as_u64().unwrap_or(0))
+            {
+                runtime.quota = crate::routing::account_quota_snapshot(previous, current);
+                runtime.credits = previous.credits.clone();
+                runtime.quota_exhausted = crate::routing::official_exhausted(previous, current);
+                if runtime.quota_exhausted {
+                    runtime.health = "exhausted".into();
+                    runtime.last_error = Some("官方额度已耗尽，等待额度恢复".into());
+                }
+            }
+        }
+        next.push(runtime);
     }
     (next, invalidated)
 }

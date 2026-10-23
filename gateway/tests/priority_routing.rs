@@ -14,7 +14,7 @@ use axum::{
 use codexpress_gateway::{
     affinity, continuity, management,
     model::{AppState, Source},
-    relay,
+    relay, routing,
 };
 use serde_json::json;
 use std::sync::{
@@ -54,6 +54,131 @@ async fn configure(state: &Arc<AppState>, sources: &[Source]) {
         .unwrap();
     assert!(state.settings.read().await.strict_priority);
     assert_eq!(state.settings.read().await.idle_return_minutes, 5);
+}
+
+#[tokio::test]
+async fn exhausted_official_accounts_are_skipped_until_confirmed_recovery() {
+    let proxy_hits = Arc::new(AtomicUsize::new(0));
+    let count = proxy_hits.clone();
+    let (proxy, proxy_task) = server::serve(Router::new().fallback(move || {
+        let count = count.clone();
+        async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            StatusCode::BAD_GATEWAY
+        }
+    }))
+    .await;
+    let (api, api_task) = server::serve(Router::new().route(
+        "/responses",
+        post(|| async { axum::Json(json!({"status":"completed","output":[]})) }),
+    ))
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(dir.path().into(), 0, "fixture".into()).unwrap();
+    let mut official = source("official", "https://chatgpt.com/backend-api/codex", 0);
+    official.kind = "official".into();
+    official.account_id = Some("fixture-account".into());
+    official.proxy.mode = "explicit".into();
+    official.proxy.url = Some(proxy);
+    official.secret = json!({"access_token":"fixture","account_id":"fixture-account","expires_at":codexpress_gateway::model::now()+3600});
+    let api_source = source("api", &api, 2);
+    configure(&state, &[official.clone(), api_source.clone()]).await;
+    // A previously successful official affinity must not bypass exhaustion.
+    let key = affinity::key("thread:existing", "m");
+    let mut lease = state
+        .affinity
+        .reserve(Some(&key), &official, false, false, None)
+        .unwrap();
+    lease.commit().unwrap();
+    drop(lease);
+    for window in ["primary", "secondary"] {
+        {
+            let mut runtimes = state.sources.write().await;
+            runtimes[0].health = "ready".into();
+            runtimes[0].quota = json!({"stale":true,"fetched_at":100,"windows":[{"name":window,"used_percent":100,"observed_at":100,"reset_at":1}]});
+        }
+        let status = management::dispatch(&state, "status", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status["sources"][0]["health"], "exhausted");
+        assert_eq!(
+            status["sources"][0]["admission"]["accepting_new_conversations"],
+            false
+        );
+        assert_eq!(
+            status["sources"][0]["admission"]["routing_note"],
+            "额度耗尽"
+        );
+        assert!(
+            management::dispatch(&state, "routing.try", json!({"source_id":"official"}))
+                .await
+                .is_err()
+        );
+        assert_eq!(send(state.clone(), "existing").await, StatusCode::OK);
+        assert_eq!(send(state.clone(), "new").await, StatusCode::OK);
+        assert_eq!(proxy_hits.load(Ordering::SeqCst), 0);
+    }
+    // The same account under another source ID shares the latest quota.
+    let mut duplicate = official.clone();
+    duplicate.id = "duplicate".into();
+    duplicate.priority = 1;
+    let mut duplicate_runtime = codexpress_gateway::model::SourceRuntime::new(duplicate.clone());
+    duplicate_runtime.quota =
+        json!({"fetched_at":101,"windows":[{"name":"primary","used_percent":20}]});
+    state.sources.write().await.insert(1, duplicate_runtime);
+    assert_eq!(
+        send(state.clone(), "duplicate-account").await,
+        StatusCode::OK
+    );
+    assert_eq!(proxy_hits.load(Ordering::SeqCst), 0);
+    // Editing only the proxy must preserve the same account's quota block.
+    let mut changed_proxy = official.clone();
+    changed_proxy.proxy.url = Some("http://127.0.0.1:1".into());
+    configure(
+        &state,
+        &[changed_proxy, duplicate.clone(), api_source.clone()],
+    )
+    .await;
+    assert!(routing::official_exhausted(
+        &state.sources.read().await[0],
+        &state.sources.read().await
+    ));
+    assert_eq!(
+        routing::account_remaining(&state.sources.read().await[0], &state.sources.read().await),
+        Some(0.0)
+    );
+    assert_eq!(
+        send(state.clone(), "after-proxy-edit").await,
+        StatusCode::OK
+    );
+    assert_eq!(proxy_hits.load(Ordering::SeqCst), 0);
+    configure(&state, &[official.clone(), duplicate, api_source.clone()]).await;
+    // A successful older inflight response must not turn known zero into ready.
+    routing::mark_ready(&state, "official").await;
+    let status = management::dispatch(&state, "status", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(status["sources"][0]["health"], "exhausted");
+    // Explicitly confirmed recovery enables the highest-priority account again.
+    {
+        let mut runtimes = state.sources.write().await;
+        for runtime in runtimes.iter_mut().filter(|r| r.source.kind == "official") {
+            runtime.quota = json!({"fetched_at":101,"windows":[{"name":"primary","used_percent":20,"observed_at":101},{"name":"secondary","used_percent":20,"observed_at":101}]});
+            runtime.health = "ready".into();
+            runtime.quota_exhausted = false;
+        }
+    }
+    assert_eq!(send(state.clone(), "recovered-new").await, StatusCode::OK);
+    assert!(proxy_hits.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        state
+            .affinity
+            .preferred(&key, &[official, api_source])
+            .as_deref(),
+        Some("api")
+    );
+    proxy_task.abort();
+    api_task.abort();
 }
 
 #[tokio::test]

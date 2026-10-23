@@ -23,6 +23,8 @@ struct Fixture {
     reads: AtomicUsize,
     quota_reads: AtomicUsize,
     quota_delay_ms: AtomicUsize,
+    credit_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    credit_started: tokio::sync::Notify,
     uncertain: bool,
     headers: Mutex<Vec<String>>,
     quota: Mutex<Option<Value>>,
@@ -34,6 +36,11 @@ async fn fixture(uncertain: bool) -> (String, Arc<Fixture>, tokio::task::JoinHan
     });
     async fn inventory(State(s): State<Arc<Fixture>>) -> Json<Value> {
         s.reads.fetch_add(1, Ordering::SeqCst);
+        let gate = s.credit_gate.lock().await.clone();
+        if let Some(gate) = gate {
+            s.credit_started.notify_one();
+            gate.notified().await;
+        }
         Json(
             json!({"available_count":1,"credits":[{"id":"card-a","title":"模拟卡","status":"available","expires_at":"2099-01-01T00:00:00Z","reset_type":"codex_rate_limits"}]}),
         )
@@ -439,7 +446,7 @@ async fn fresh_quota_recovers_natural_reset_but_preserves_unknown_and_other_rest
         assert_eq!(state.sources.read().await[0].health, health);
     }
     let unknowns = [
-        json!({"rate_limit":{"primary_window":{"used_percent":10}},"additional_rate_limits":[{"limit_name":"unknown","rate_limit":{"primary_window":{"used_percent":null}}}]}),
+        json!({"rate_limit":{"primary_window":{"used_percent":null}},"additional_rate_limits":[{"limit_name":"unknown","rate_limit":{"primary_window":{"used_percent":null}}}]}),
         json!({"rate_limit":{"primary_window":{"used_percent":10}},"additional_rate_limits":[{"rate_limit":{}}]}),
         json!({"rate_limit":{"primary_window":{"used_percent":10}},"additional_rate_limits":"changed-schema"}),
         json!({"rate_limit":{}}),
@@ -452,6 +459,24 @@ async fn fresh_quota_recovers_natural_reset_but_preserves_unknown_and_other_rest
             .unwrap();
         assert_eq!(state.sources.read().await[0].health, "exhausted");
     }
+    // Passing the advertised reset timestamp is never recovery evidence.
+    {
+        let mut sources = state.sources.write().await;
+        sources[0].cooldown_until = Some(model::now() - 1);
+        sources[0].quota = json!({"stale":true,"windows":[{"name":"primary","used_percent":100,"reset_at":model::now()-1}]});
+    }
+    assert!(routing::candidates(&state, "m", None)
+        .await
+        .iter()
+        .all(|source| source.id != "official-a"));
+    // A failed quota query also retains the known zero after that timestamp.
+    official::fixture::snapshots_at(&state, "official-a", "http://127.0.0.1:0")
+        .await
+        .unwrap();
+    assert!(routing::official_exhausted(
+        &state.sources.read().await[0],
+        &state.sources.read().await
+    ));
     let reset = model::now() + 300;
     *counters.quota.lock().await = Some(
         json!({"rate_limit":{"primary_window":{"used_percent":100,"reset_at":reset},"secondary_window":{"used_percent":100,"reset_at":reset+500}}}),
@@ -478,6 +503,101 @@ async fn fresh_quota_recovers_natural_reset_but_preserves_unknown_and_other_rest
         .await
         .unwrap();
     assert_eq!(state.sources.read().await[0].health, "ready");
+    task.abort();
+}
+
+#[tokio::test]
+async fn new_exhaustion_outlives_old_failures_and_older_quota_queries() {
+    let (proxy, counters, task) = fixture(false).await;
+    let (_dir, state) = setup(&proxy).await;
+    let duplicate = state.sources.read().await[0].source.clone();
+    let mut duplicate = SourceRuntime::new(Source {
+        id: "duplicate".into(),
+        ..duplicate
+    });
+    duplicate.health = "exhausted".into();
+    state.sources.write().await.push(duplicate);
+    routing::mark_rejection(&state, "official-a", Some("usage_limit_reached"), Some(1)).await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *counters.credit_gate.lock().await = Some(gate.clone());
+    let copy = state.clone();
+    let query = tokio::spawn(async move {
+        official::fixture::snapshots_at(&copy, "official-a", "http://fixture.invalid")
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        counters.credit_started.notified(),
+    )
+    .await
+    .unwrap();
+    // Quota was already read as positive; a newer rejection must win, even if
+    // old network/auth completions subsequently change the health label.
+    routing::mark_rejection(&state, "duplicate", Some("usage_limit_reached"), Some(1)).await;
+    routing::mark_failure(&state, "official-a", 500, None).await;
+    let source = state.sources.read().await[0].source.clone();
+    routing::mark_auth_preflight_failure(&state, &source).await;
+    routing::mark_ready(&state, "official-a").await;
+    gate.notify_one();
+    query.await.unwrap();
+    {
+        let sources = state.sources.read().await;
+        assert!(routing::official_exhausted(&sources[0], &sources));
+        assert!(routing::official_exhausted(&sources[2], &sources));
+    }
+    // Even when already latched, a later zero query invalidates an older
+    // positive query that is still waiting for its credit lookup.
+    let copy = state.clone();
+    let query = tokio::spawn(async move {
+        official::fixture::snapshots_at(&copy, "official-a", "http://fixture.invalid")
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        counters.credit_started.notified(),
+    )
+    .await
+    .unwrap();
+    *counters.quota.lock().await = Some(
+        json!({"rate_limit":{"primary_window":{"used_percent":20},"secondary_window":{"used_percent":100}}}),
+    );
+    official::fixture::selected_snapshots_at(&state, "official-a", "http://fixture.invalid", false)
+        .await
+        .unwrap();
+    gate.notify_one();
+    query.await.unwrap();
+    assert!(routing::official_exhausted(
+        &state.sources.read().await[0],
+        &state.sources.read().await
+    ));
+    *counters.credit_gate.lock().await = None;
+    *counters.quota.lock().await =
+        Some(json!({"rate_limit":{"primary_window":{"used_percent":20}}}));
+    official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    assert_eq!(
+        routing::account_remaining(&state.sources.read().await[0], &state.sources.read().await),
+        Some(0.0)
+    );
+    assert!(routing::official_exhausted(
+        &state.sources.read().await[0],
+        &state.sources.read().await
+    ));
+    *counters.quota.lock().await = Some(
+        json!({"rate_limit":{"primary_window":{"used_percent":20},"secondary_window":{"used_percent":30}},"additional_rate_limits":[{"limit_name":"other-model","rate_limit":{"primary_window":{"used_percent":100}}}]}),
+    );
+    official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    {
+        let sources = state.sources.read().await;
+        assert!(!routing::official_exhausted(&sources[0], &sources));
+        assert!(!routing::official_exhausted(&sources[2], &sources));
+        assert_eq!(sources[2].health, "ready");
+    }
     task.abort();
 }
 
@@ -665,6 +785,17 @@ async fn missing_low_quota_windows_never_reopen_admission_without_known_recovery
     *counters.quota.lock().await = Some(
         json!({"rate_limit":{"primary_window":{"used_percent":20},"secondary_window":{"used_percent":30}}}),
     );
+    {
+        let mut sources = state.sources.write().await;
+        for runtime in sources
+            .iter_mut()
+            .filter(|r| r.source.account_id.as_deref() == Some("account-a"))
+        {
+            runtime.health = "exhausted".into();
+            runtime.last_error = Some("来源额度已耗尽".into());
+        }
+        sources[1].health = "auth_required".into();
+    }
     let result = official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
         .await
         .unwrap();
@@ -673,5 +804,16 @@ async fn missing_low_quota_windows_never_reopen_admission_without_known_recovery
         codexpress_gateway::routing::remaining(&state.sources.read().await[0]),
         Some(70.0)
     );
+    {
+        let sources = state.sources.read().await;
+        for runtime in sources
+            .iter()
+            .filter(|r| r.source.account_id.as_deref() == Some("account-a"))
+        {
+            assert_eq!(runtime.health, "ready");
+            assert!(!routing::official_exhausted(runtime, &sources));
+        }
+        assert_eq!(sources[1].health, "auth_required");
+    }
     task.abort();
 }

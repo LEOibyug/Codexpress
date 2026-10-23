@@ -13,11 +13,7 @@ pub fn notify_quotas(state: &Arc<AppState>, sources: &[crate::model::SourceRunti
             continue;
         }
         let remaining = account_remaining(runtime, sources);
-        let exhausted = sources.iter().any(|r| {
-            r.source.kind == "official"
-                && r.source.identity() == identity
-                && r.health == "exhausted"
-        }) || remaining == Some(0.0);
+        let exhausted = official_exhausted(runtime, sources);
         if exhausted || remaining.is_some_and(|v| v > 0.0) {
             state
                 .notifications
@@ -126,7 +122,7 @@ async fn recovery_readiness(
                         .is_some_and(|identity| identity != source.identity())
             })
             || (settings.mode == "fixed" && settings.fixed_source_id.as_ref() != Some(&source.id))
-            || account_remaining(runtime, &runtimes).is_some_and(|remaining| remaining <= 0.0)
+            || official_exhausted(runtime, &runtimes)
         {
             continue;
         }
@@ -232,7 +228,7 @@ async fn candidate_sources(
                 && bound_id.as_ref().is_none_or(|id| id == &source.id)
                 && (settings.mode != "fixed"
                     || settings.fixed_source_id.as_ref() == Some(&source.id))
-                && account_remaining(runtime, &runtimes).is_none_or(|percent| percent > 0.0)
+                && !official_exhausted(runtime, &runtimes)
                 && (!check_capacity || state.affinity.capacity_available(session, source))
                 && match runtime.health.as_str() {
                     "ready" => true,
@@ -282,11 +278,41 @@ pub fn account_remaining(
     if runtime.source.kind != "official" {
         return None;
     }
+    account_windows(runtime, sources)
+        .iter()
+        .filter_map(|window| window["used_percent"].as_f64())
+        .map(|used| (100.0 - used).clamp(0.0, 100.0))
+        .min_by(f64::total_cmp)
+}
+
+/// Merge per-window observations, not whole snapshots: a newer partial result
+/// must not discard another entry's still-valid exhausted weekly window.
+pub fn account_quota_snapshot(
+    runtime: &crate::model::SourceRuntime,
+    sources: &[crate::model::SourceRuntime],
+) -> Value {
+    let mut quota = runtime.quota.as_object().cloned().unwrap_or_default();
+    let mut windows: Vec<_> = runtime.quota["windows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| !matches!(w["name"].as_str(), Some("primary" | "secondary")))
+        .cloned()
+        .collect();
+    windows.extend(account_windows(runtime, sources));
+    quota.insert("windows".into(), Value::Array(windows));
+    Value::Object(quota)
+}
+
+fn account_windows(
+    runtime: &crate::model::SourceRuntime,
+    sources: &[crate::model::SourceRuntime],
+) -> Vec<Value> {
     let identity = runtime.source.identity();
     ["primary", "secondary"]
         .iter()
         .filter_map(|name| {
-            let mut latest: Option<(u64, f64)> = None;
+            let mut latest: Option<(u64, f64, Value)> = None;
             for candidate in sources.iter().filter(|candidate| {
                 candidate.source.kind == "official" && candidate.source.identity() == identity
             }) {
@@ -305,16 +331,33 @@ pub fn account_remaining(
                         continue;
                     };
                     let remaining = (100.0 - used).clamp(0.0, 100.0);
-                    if latest.is_none_or(|(timestamp, value)| {
-                        fetched > timestamp || fetched == timestamp && remaining < value
+                    if latest.as_ref().is_none_or(|(timestamp, value, _)| {
+                        fetched > *timestamp || fetched == *timestamp && remaining < *value
                     }) {
-                        latest = Some((fetched, remaining));
+                        let mut observed = window.clone();
+                        observed["observed_at"] = json!(fetched);
+                        latest = Some((fetched, remaining, observed));
                     }
                 }
             }
-            latest.map(|(_, remaining)| remaining)
+            latest.map(|(_, _, window)| window)
         })
-        .min_by(f64::total_cmp)
+        .collect()
+}
+
+/// Exhausted subscription quota is a hard admission block, unlike a transient
+/// cooldown. A stale zero stays blocked until an authenticated refresh recovers.
+pub fn official_exhausted(
+    runtime: &crate::model::SourceRuntime,
+    sources: &[crate::model::SourceRuntime],
+) -> bool {
+    runtime.source.kind == "official"
+        && (account_remaining(runtime, sources).is_some_and(|remaining| remaining <= 0.0)
+            || sources.iter().any(|candidate| {
+                candidate.source.kind == "official"
+                    && candidate.source.identity() == runtime.source.identity()
+                    && (candidate.quota_exhausted || candidate.health == "exhausted")
+            }))
 }
 
 pub async fn reserve(
@@ -344,6 +387,7 @@ pub async fn reserve_idle_return(
     let mut targets: Vec<_> = sources.iter().filter(|runtime| {
         let source = &runtime.source;
         source.enabled && source.priority < from.priority
+            && !official_exhausted(runtime, &sources)
             && (model.is_empty() || source.models.is_empty() || source.models.iter().any(|m| m == model))
             && (runtime.health == "ready" || matches!(runtime.health.as_str(), "cooldown" | "proxy_error" | "exhausted")
                 && runtime.cooldown_until.is_some_and(|until| until <= now()))
@@ -419,7 +463,7 @@ async fn reserve_model_with_policy(
                 && (model.is_empty()
                     || runtime.source.models.is_empty()
                     || runtime.source.models.iter().any(|m| m == model))
-                && account_remaining(runtime, &sources).is_none_or(|v| v > 0.0)
+                && !official_exhausted(runtime, &sources)
                 && (runtime.health == "ready"
                     || matches!(
                         runtime.health.as_str(),
@@ -443,7 +487,7 @@ async fn reserve_model_with_policy(
         return None;
     }
     let remaining = account_remaining(runtime, &sources);
-    if remaining.is_some_and(|value| value <= 0.0) {
+    if official_exhausted(runtime, &sources) {
         return None;
     }
     let low =
@@ -498,6 +542,8 @@ fn admission_status(
     let remaining = account_remaining(runtime, sources);
     let note = if !runtime.source.enabled {
         "已停用"
+    } else if official_exhausted(runtime, sources) {
+        "额度耗尽"
     } else if strict && !manual::has_credentials(&runtime.source) {
         if runtime.source.kind == "official" {
             "需要登录"
@@ -582,6 +628,9 @@ async fn mark_failure_reason(
             }
             _ => ("cooldown", "来源暂时不可用", Some(15)),
         };
+        if runtime.source.kind == "official" && runtime.health == "exhausted" {
+            runtime.quota_exhausted = true;
+        }
         runtime.health = health.into();
         runtime.health_revision = runtime.health_revision.wrapping_add(1);
         runtime.last_error = Some(reason.unwrap_or(message).into());
@@ -599,6 +648,9 @@ pub async fn mark_auth_preflight_failure(state: &Arc<AppState>, source: &Source)
                 "ready" | "cooldown" | "proxy_error" | "exhausted"
             )
     }) {
+        if runtime.health == "exhausted" {
+            runtime.quota_exhausted = true;
+        }
         runtime.health = "proxy_error".into();
         runtime.health_revision = runtime.health_revision.wrapping_add(1);
         runtime.last_error = Some("官方认证查询暂不可用".into());
@@ -607,13 +659,15 @@ pub async fn mark_auth_preflight_failure(state: &Arc<AppState>, source: &Source)
 }
 
 pub async fn mark_ready(state: &Arc<AppState>, source_id: &str) {
-    if let Some(runtime) = state
-        .sources
-        .write()
-        .await
-        .iter_mut()
-        .find(|r| r.source.id == source_id)
+    let mut sources = state.sources.write().await;
+    let Some(index) = sources.iter().position(|r| r.source.id == source_id) else {
+        return;
+    };
+    if official_exhausted(&sources[index], &sources) {
+        return;
+    }
     {
+        let runtime = &mut sources[index];
         runtime.health = "ready".into();
         runtime.health_revision = runtime.health_revision.wrapping_add(1);
         runtime.cooldown_until = None;
@@ -656,6 +710,9 @@ pub async fn mark_rejection(
             }
             .into();
             runtime.health_revision = runtime.health_revision.wrapping_add(1);
+            if exhausted && runtime.source.kind == "official" {
+                runtime.quota_exhausted = true;
+            }
             runtime.last_error = Some(
                 if exhausted {
                     "来源额度已耗尽"

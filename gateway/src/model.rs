@@ -150,6 +150,8 @@ pub struct SourceRuntime {
     pub credits: Value,
     #[serde(skip)]
     pub health_revision: u64,
+    #[serde(skip)]
+    pub quota_exhausted: bool,
 }
 
 impl SourceRuntime {
@@ -168,6 +170,7 @@ impl SourceRuntime {
             quota: Value::Null,
             credits: Value::Null,
             health_revision: 0,
+            quota_exhausted: false,
         }
     }
 }

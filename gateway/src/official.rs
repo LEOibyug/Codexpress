@@ -174,6 +174,7 @@ async fn install(state: &Arc<AppState>, before: &Source, secret: Value) -> Resul
     for &index in &targets {
         let runtime = &mut sources[index];
         if changed_accounts.contains(&runtime.source.id) {
+            runtime.quota_exhausted = false;
             runtime.quota = Value::Null;
             runtime.credits = Value::Null;
             if runtime.health == "exhausted" {

@@ -7,13 +7,12 @@ pub(crate) async fn candidates(
     session: Option<&str>,
 ) -> Vec<Source> {
     let minutes = state.settings.read().await.idle_return_minutes;
-    let mut sources: Vec<_> = state
-        .sources
-        .read()
-        .await
+    let runtimes = state.sources.read().await;
+    let mut sources: Vec<_> = runtimes
         .iter()
         .filter(|runtime| {
             runtime.source.enabled
+                && !super::official_exhausted(runtime, &runtimes)
                 && super::manual::has_credentials(&runtime.source)
                 && (runtime.source.models.is_empty()
                     || runtime.source.models.iter().any(|m| m == model))
@@ -32,10 +31,12 @@ pub(crate) async fn candidates(
 }
 
 pub(crate) async fn eligible(state: &Arc<AppState>, source: &Source, model: &str) -> bool {
-    state.sources.read().await.iter().any(|runtime| {
+    let runtimes = state.sources.read().await;
+    runtimes.iter().any(|runtime| {
         runtime.source.id == source.id
             && runtime.source.identity() == source.identity()
             && runtime.source.enabled
+            && !super::official_exhausted(runtime, &runtimes)
             && super::manual::has_credentials(&runtime.source)
             && (runtime.source.models.is_empty()
                 || runtime.source.models.iter().any(|m| m == model))

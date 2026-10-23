@@ -77,6 +77,13 @@ pub(crate) async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> R
     let id = payload["source_id"].as_str().context("请选择来源")?;
     if op == "routing.recover" {
         let mut sources = state.sources.write().await;
+        if sources
+            .iter()
+            .find(|r| r.source.id == id)
+            .is_some_and(|runtime| super::official_exhausted(runtime, &sources))
+        {
+            bail!("官方额度已耗尽，请刷新额度并确认恢复后再使用");
+        }
         let runtime = sources
             .iter_mut()
             .find(|r| r.source.id == id)
@@ -94,16 +101,19 @@ pub(crate) async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> R
         return Ok(json!({"recovered":true}));
     }
     let sources = state.sources.read().await;
-    let source = &sources
+    let runtime = sources
         .iter()
         .find(|r| r.source.id == id)
-        .context("来源已被移除")?
-        .source;
+        .context("来源已被移除")?;
+    let source = &runtime.source;
     if !source.enabled {
         bail!("请先启用此来源");
     }
     if !has_credentials(source) {
         bail!("请先登录或填写此来源的密钥");
+    }
+    if super::official_exhausted(runtime, &sources) {
+        bail!("官方额度已耗尽，请刷新额度并确认恢复后再使用");
     }
     let trial = Trial {
         id: uuid::Uuid::new_v4().to_string(),
@@ -124,15 +134,14 @@ pub(crate) async fn source_for_trial(
     trial: &Trial,
     model: &str,
 ) -> Option<Source> {
-    state
-        .sources
-        .read()
-        .await
+    let sources = state.sources.read().await;
+    sources
         .iter()
         .find(|r| {
             r.source.id == trial.source_id
                 && r.source.identity() == trial.identity
                 && r.source.enabled
+                && !super::official_exhausted(r, &sources)
                 && has_credentials(&r.source)
                 && (r.source.models.is_empty() || r.source.models.iter().any(|m| m == model))
         })
@@ -150,10 +159,11 @@ pub(crate) async fn reserve(
         r.source.id == source.id
             && r.source.identity() == source.identity()
             && r.source.enabled
+            && !super::official_exhausted(r, &sources)
             && (r.source.models.is_empty() || r.source.models.iter().any(|m| m == model))
     })?;
-    // The user explicitly requests one probe despite cooldown, stale quota or
-    // soft affinity. Concurrent conversation limits remain atomic and binding.
+    // Explicit probes bypass cooldown and soft affinity. Exhausted official
+    // quota and concurrent conversation limits remain hard admission blocks.
     state
         .affinity
         .reserve(session, &runtime.source, false, false, None)

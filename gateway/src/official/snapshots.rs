@@ -199,6 +199,13 @@ fn recover_exhaustion(runtime: &mut crate::model::SourceRuntime) {
     else {
         return;
     };
+    let windows: Vec<_> = windows
+        .iter()
+        .filter(|w| matches!(w["name"].as_str(), Some("primary" | "secondary")))
+        .collect();
+    if windows.is_empty() {
+        return;
+    }
     if windows
         .iter()
         .any(|window| window["used_percent"].as_f64().is_none())
@@ -241,6 +248,14 @@ pub(super) async fn refresh_selected_snapshots(
     include_credits: bool,
 ) -> Result<Value> {
     let threshold = state.settings.read().await.official_low_quota_percent;
+    let account_revisions: std::collections::HashMap<_, _> = state
+        .sources
+        .read()
+        .await
+        .iter()
+        .filter(|r| r.source.identity() == src.identity())
+        .map(|r| (r.source.id.clone(), r.health_revision))
+        .collect();
     let recovering_revision = state
         .sources
         .read()
@@ -263,13 +278,22 @@ pub(super) async fn refresh_selected_snapshots(
         None
     };
     let mut sources = state.sources.write().await;
+    let may_confirm_recovery = sources
+        .iter()
+        .filter(|r| r.source.identity() == src.identity())
+        .all(|r| account_revisions.get(&r.source.id) == Some(&r.health_revision));
+    let previous_quota = sources
+        .iter()
+        .find(|r| same_binding(&r.source, src))
+        .map(|r| crate::routing::account_quota_snapshot(r, &sources))
+        .ok_or_else(|| anyhow!("来源在查询期间发生变化，请刷新"))?;
     let runtime = sources
         .iter_mut()
         .find(|r| same_binding(&r.source, src))
         .ok_or_else(|| anyhow!("来源在查询期间发生变化，请刷新"))?;
     runtime.quota = match quota {
-        Ok(mut v) => {
-            preserve_low_windows(&mut v, &runtime.quota, threshold);
+        Ok(mut v) if may_confirm_recovery => {
+            preserve_low_windows(&mut v, &previous_quota, threshold);
             // A fresh authenticated query proves this proxy path works. Never
             // clear a newer failure, HTTP throttling, or an auth/quota block.
             if runtime.health == "proxy_error"
@@ -280,11 +304,25 @@ pub(super) async fn refresh_selected_snapshots(
                 runtime.cooldown_until = None;
                 runtime.health_revision = runtime.health_revision.wrapping_add(1);
             }
+            runtime.health_revision = runtime.health_revision.wrapping_add(1);
             v
         }
-        Err(e) => stale(runtime.quota.clone(), "quota", &e.to_string()),
+        Ok(_) => stale(
+            previous_quota,
+            "quota",
+            "查询期间额度状态已变化，保留较新的结果",
+        ),
+        Err(e) => stale(previous_quota, "quota", &e.to_string()),
     };
-    recover_exhaustion(runtime);
+    if crate::routing::remaining(runtime).is_some_and(|v| v <= 0.0) {
+        if !runtime.quota_exhausted {
+            runtime.health_revision = runtime.health_revision.wrapping_add(1);
+        }
+        runtime.quota_exhausted = true;
+    }
+    if may_confirm_recovery {
+        recover_exhaustion(runtime);
+    }
     if let Some(credits) = credits {
         runtime.credits = match credits {
             Ok(v) => v,
@@ -292,6 +330,40 @@ pub(super) async fn refresh_selected_snapshots(
         };
     }
     let result = json!({"quota":runtime.quota,"credits":runtime.credits});
+    let confirmed_quota = runtime.quota.clone();
+    let confirmed_recovery = runtime.quota["stale"] == false
+        && runtime.quota["complete"] == true
+        && runtime.quota["windows"].as_array().is_some_and(|windows| {
+            let main: Vec<_> = windows
+                .iter()
+                .filter(|w| matches!(w["name"].as_str(), Some("primary" | "secondary")))
+                .collect();
+            !main.is_empty()
+                && main.iter().all(|window| {
+                    window["used_percent"]
+                        .as_f64()
+                        .is_some_and(|used| used < 100.0)
+                })
+        });
+    // Multiple source entries may share a subscription. A fresh recovery must
+    // release the account block for all of them without clearing auth/network faults.
+    if confirmed_recovery && may_confirm_recovery {
+        let identity = src.identity();
+        for runtime in sources
+            .iter_mut()
+            .filter(|r| r.source.identity() == identity)
+        {
+            runtime.quota = confirmed_quota.clone();
+            runtime.quota_exhausted = false;
+            runtime.health_revision = runtime.health_revision.wrapping_add(1);
+            if runtime.health == "exhausted" {
+                runtime.health = "ready".into();
+                runtime.cooldown_until = None;
+                runtime.last_error = None;
+                runtime.health_revision = runtime.health_revision.wrapping_add(1);
+            }
+        }
+    }
     crate::routing::notify_quotas(state, &sources);
     Ok(result)
 }
