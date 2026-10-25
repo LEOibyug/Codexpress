@@ -158,7 +158,7 @@ async fn edits_accept_sdk_multipart_over_two_megabytes_and_send_inline_codex_jso
     task.abort();
 }
 #[tokio::test]
-async fn invalid_parameters_masks_urls_disabled_and_exhausted_accounts_never_generate() {
+async fn invalid_parameters_masks_urls_and_unavailable_accounts_never_generate() {
     let calls = Arc::new(AtomicUsize::new(0));
     let copy = calls.clone();
     let (_dir, state, key, port, task) = setup(Router::new().fallback(move || {
@@ -207,9 +207,76 @@ async fn invalid_parameters_masks_urls_disabled_and_exhausted_accounts_never_gen
         .await
         .unwrap();
     assert_eq!(response.status(), 503);
-    state.sources.write().await[0].source.enabled = true;
-    state.sources.write().await[0].quota =
-        json!({"windows":[{"name":"primary","used_percent":100}]});
+    for health in ["auth_required", "cooldown", "proxy_error"] {
+        {
+            let mut sources = state.sources.write().await;
+            sources[0].source.enabled = true;
+            sources[0].health = health.into();
+            sources[0].cooldown_until = Some(crate::model::now() + 3600);
+            sources[0].quota = json!({"windows":[{"used_percent":100}]});
+            sources[0].quota_exhausted = true;
+        }
+        let response = images::router(state.clone())
+            .oneshot(request(
+                port,
+                &key,
+                "/v1/images/generations",
+                Some(json!({"prompt":"x"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn exhausted_chat_quota_allows_images_without_reenabling_chat_or_bypassing_capacity() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let (_dir, state, key, port, task) = setup(Router::new().fallback(move || {
+        seen.fetch_add(1, Ordering::Relaxed);
+        async { Json(json!({"data":[{"b64_json":STANDARD.encode(PNG)}]})) }
+    }))
+    .await;
+    let reset_at = crate::model::now() + 3600;
+    for window in ["primary", "secondary"] {
+        {
+            let mut sources = state.sources.write().await;
+            sources[0].quota = json!({"windows":[{"name":window,"used_percent":100}]});
+            sources[0].health = "exhausted".into();
+            sources[0].quota_exhausted = true;
+            sources[0].cooldown_until = Some(reset_at);
+        }
+        for (path, body) in [
+            ("/v1/images/generations", json!({"prompt":"x"})),
+            (
+                "/v1/images/edits",
+                json!({"prompt":"x","images":[{"image_url":format!("data:image/png;base64,{}",STANDARD.encode(PNG))}]}),
+            ),
+        ] {
+            let response = images::router(state.clone())
+                .oneshot(request(port, &key, path, Some(body)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+        }
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+    let sources = state.sources.read().await;
+    assert!(crate::routing::official_exhausted(&sources[0], &sources));
+    assert_eq!(sources[0].health, "exhausted");
+    assert_eq!(sources[0].cooldown_until, Some(reset_at));
+    drop(sources);
+    let source = state.sources.read().await[0].source.clone();
+    let _text = state
+        .affinity
+        .reserve(Some("active-text"), &source, false, false, None)
+        .unwrap();
+    state.sources.write().await[0]
+        .source
+        .max_active_conversations = Some(1);
     let response = images::router(state.clone())
         .oneshot(request(
             port,
@@ -220,7 +287,35 @@ async fn invalid_parameters_masks_urls_disabled_and_exhausted_accounts_never_gen
         .await
         .unwrap();
     assert_eq!(response.status(), 503);
-    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+    task.abort();
+}
+
+#[tokio::test]
+async fn image_rate_limits_do_not_exhaust_chat_quota_or_retry_the_same_account() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let (_dir, state, key, port, task) = setup(Router::new().fallback(move || {
+        seen.fetch_add(1, Ordering::Relaxed);
+        async {
+            (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":{"code":"usage_limit_reached","message":"Image generation limit reached"}})))
+        }
+    }))
+    .await;
+    let response = images::router(state.clone())
+        .oneshot(request(
+            port,
+            &key,
+            "/v1/images/generations",
+            Some(json!({"prompt":"x"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let sources = state.sources.read().await;
+    assert_eq!(sources[0].health, "ready");
+    assert!(!crate::routing::official_exhausted(&sources[0], &sources));
     task.abort();
 }
 #[tokio::test]
@@ -296,7 +391,7 @@ async fn server_errors_are_not_retried_and_access_configuration_is_isolated() {
 }
 
 #[tokio::test]
-async fn official_priority_selection_rate_limit_fallback_and_low_quota_reservations() {
+async fn official_priority_selection_rate_limit_fallback_and_capacity_reservations() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let limited = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen = calls.clone();
@@ -347,13 +442,17 @@ async fn official_priority_selection_rate_limit_fallback_and_low_quota_reservati
     state.sources.write().await[1].source.enabled = false;
     state.sources.write().await[0].quota =
         json!({"windows":[{"name":"primary","used_percent":95}]});
-    // Its own low-quota reservation must not reject the first image request.
+    // Chat quota protection does not gate image generation.
     assert_eq!(run().await.unwrap().status(), 200);
     let source = state.sources.read().await[0].source.clone();
     let _text = state
         .affinity
         .reserve(Some("active-text"), &source, false, false, None)
         .unwrap();
+    assert_eq!(run().await.unwrap().status(), 200);
+    state.sources.write().await[0]
+        .source
+        .max_active_conversations = Some(1);
     let start = calls.lock().unwrap().len();
     assert_eq!(run().await.unwrap().status(), 503);
     assert_eq!(calls.lock().unwrap().len(), start);

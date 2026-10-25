@@ -34,7 +34,7 @@ struct ImageSettingsView: View {
                         }.labelsHidden().frame(maxWidth: 240).disabled(!canEdit)
                     }
                     SettingRow(title: "新 API Key", subtitle: "留空保留现有密钥") { SecureField("16–256 位字符", text: Binding(get: { newKey }, set: { newKey = $0; error = nil })).settingsField().frame(maxWidth: 270).disabled(!canEdit) }
-                    Text("使用所选官方账号的套餐额度及代理设置，仅供本机调用。生图会与对话共用额度。").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text("使用所选官方账号及其代理，仅供本机调用。生图可用额度以官方生图接口返回为准。").font(.system(size: 11)).foregroundStyle(.secondary)
                     HStack(spacing: 10) {
                         Button("复制当前 Key") { copyKey() }.disabled(!canEdit)
                         Button("重新生成…") { confirmReset = true }.disabled(!canEdit)

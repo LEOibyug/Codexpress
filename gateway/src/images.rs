@@ -5,8 +5,8 @@ mod payload;
 use crate::{
     chatbot,
     config::secure_write,
-    model::{now, AppState, Source},
-    routing, transport,
+    model::{now, AppState, Source, SourceRuntime},
+    transport,
     usage::{diagnostics::Capture, TokenDetails, UsageRecord},
 };
 use anyhow::{bail, Context, Result};
@@ -290,18 +290,20 @@ async fn generate(State(state): State<Arc<AppState>>, request: Request) -> Respo
 async fn edit(State(state): State<Arc<AppState>>, request: Request) -> Response {
     handle(state, request, true).await
 }
+fn source_available(runtime: &SourceRuntime) -> bool {
+    // Chat quota exhaustion does not establish image quota exhaustion.
+    runtime.source.kind == "official"
+        && runtime.source.enabled
+        && (matches!(runtime.health.as_str(), "ready" | "exhausted")
+            || matches!(runtime.health.as_str(), "cooldown" | "proxy_error")
+                && runtime.cooldown_until.is_some_and(|until| until <= now()))
+}
 async fn candidates(state: &Arc<AppState>) -> Vec<Source> {
     let selected = state.images.settings().ok().and_then(|s| s.source_id);
-    let threshold = state.settings.read().await.official_low_quota_percent;
     let sources = state.sources.read().await;
     let mut candidates: Vec<_> = sources
         .iter()
-        .filter(|r| {
-            r.source.kind == "official"
-                && selected.as_ref().is_none_or(|id| *id == r.source.id)
-                && routing::admission(state, r, &sources, threshold)["accepting_new_conversations"]
-                    == true
-        })
+        .filter(|r| source_available(r) && selected.as_ref().is_none_or(|id| *id == r.source.id))
         .map(|r| r.source.clone())
         .collect();
     candidates.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.id.cmp(&b.id)));
@@ -425,13 +427,13 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
         Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
     };
     let request_id = uuid::Uuid::new_v4().to_string();
+    let mut rate_limited = false;
     for candidate in candidates(&state).await {
         let source = match crate::official::ensure_access(&state, &candidate.id).await {
             Ok(s) if s.identity() == candidate.identity() => s,
             _ => continue,
         };
         let mut lease = {
-            let threshold = state.settings.read().await.official_low_quota_percent;
             let sources = state.sources.read().await;
             let Some(runtime) = sources.iter().find(|r| {
                 r.source.id == source.id
@@ -440,15 +442,10 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             }) else {
                 continue;
             };
-            if routing::admission(&state, runtime, &sources, threshold)
-                ["accepting_new_conversations"]
-                != true
-            {
+            if !source_available(runtime) {
                 continue;
             }
-            let low = routing::account_remaining(runtime, &sources)
-                .is_some_and(|v| v <= f64::from(threshold));
-            let Some(lease) = state.affinity.reserve(None, &source, false, low, None) else {
+            let Some(lease) = state.affinity.reserve(None, &source, false, false, None) else {
                 continue;
             };
             lease
@@ -459,15 +456,10 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             let sources = state.sources.read().await;
             if !sources.iter().any(|r| {
                 r.source.id == source.id
-                    && r.source.kind == "official"
-                    && r.source.enabled
+                    && source_available(r)
                     && r.source.identity() == source.identity()
                     && r.source.proxy == source.proxy
                     && selected.as_ref().is_none_or(|id| id == &source.id)
-                    && !routing::official_exhausted(r, &sources)
-                    && (r.health == "ready"
-                        || matches!(r.health.as_str(), "cooldown" | "proxy_error" | "exhausted")
-                            && r.cooldown_until.is_some_and(|until| until <= now()))
             }) {
                 continue;
             }
@@ -558,17 +550,10 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             .response(status.as_u16(), upstream.headers());
         let _ = state.usage.diagnostic(&attempt.diagnostic, false);
         if status.as_u16() == 429 {
-            let bytes = attempt.collect_error(&mut upstream).await;
+            attempt.collect_error(&mut upstream).await;
             attempt.finish("failed");
-            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-                routing::mark_rejection(
-                    &state,
-                    &source,
-                    crate::relay::permanent_code(&value),
-                    None,
-                )
-                .await;
-            }
+            // Image limits must not change chat routing or its quota snapshot.
+            rate_limited = true;
             continue;
         }
         if !status.is_success() {
@@ -654,10 +639,17 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
         attempt.finish("success");
         return Json(result_out).into_response();
     }
-    error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "没有可用的官方生图账号，请检查登录、开关、代理及剩余额度",
-    )
+    if rate_limited {
+        error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "官方生图请求已达限制，请稍后再试",
+        )
+    } else {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "没有可用的官方生图账号，请检查登录、开关、代理及并发限制",
+        )
+    }
 }
 use axum::response::IntoResponse;
 

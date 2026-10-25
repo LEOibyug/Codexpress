@@ -2,7 +2,6 @@ mod request;
 mod response;
 mod retries;
 mod roles;
-pub(crate) use retries::permanent_code;
 pub(crate) use roles::RoleCapabilities;
 
 use self::{

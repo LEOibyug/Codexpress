@@ -7,7 +7,7 @@ description: Generate or edit raster images through the local Codexpress image g
 
 Use the bundled `scripts/image.py` with Python 3. It reads the local URL and independent Key from `~/.codexpress/image-client.json`; `CODEXPRESS_IMAGE_CONFIG` can select another configuration file. Never print the Key or include it in prompts, code examples, command arguments, or logs. OAuth credentials stay in Codexpress.
 
-The user must keep Codexpress running and have an enabled, logged-in official source. This route consumes that account's general plan allowance. Do not switch to a paid API or another image service when it fails.
+The user must keep Codexpress running and have an enabled, logged-in official source. Image availability and limits are determined by the official image endpoint; exhausted chat quota does not necessarily prevent image generation. Do not switch to a paid API or another image service when it fails.
 
 To learn or check the connection, read this skill and optionally run `python3 scripts/image.py check`. Do not generate a test image merely to verify setup.
 
