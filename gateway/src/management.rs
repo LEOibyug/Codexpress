@@ -31,6 +31,7 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
         "status" => {
             let settings = state.settings.read().await.clone();
             let sources = state.sources.read().await.clone();
+            state.manual_routing.refresh(&sources, &state.affinity);
             crate::routing::notify_quotas(state, &sources);
             let active = state.usage.active_by_source();
             let sources: Vec<_> = sources

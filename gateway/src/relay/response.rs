@@ -51,12 +51,17 @@ pub(super) async fn read_error_prefix(
 }
 
 /// Probe only the initial response before generated output makes replay unsafe.
+pub(super) struct ResponseProbe {
+    pub context_rejected: bool,
+    pub failure: Option<Value>,
+}
+
 pub(super) async fn probe_context_rejection(
     upstream: &mut reqwest::Response,
     prefix: &mut Vec<Bytes>,
     request_is_stream: bool,
     attempt: &mut Attempt,
-) -> Result<bool, ()> {
+) -> Result<ResponseProbe, ()> {
     let mut probe = Observer {
         sse: response_is_sse(upstream.headers(), request_is_stream, upstream.status()),
         ..Default::default()
@@ -91,7 +96,14 @@ pub(super) async fn probe_context_rejection(
     if let Some(value) = &probe.failure_event {
         attempt.diagnostic.failed_event(value);
     }
-    Ok(probe.context_rejected && !probe.replay_blocked)
+    Ok(ResponseProbe {
+        context_rejected: probe.context_rejected && !probe.replay_blocked,
+        failure: if probe.replay_blocked {
+            None
+        } else {
+            probe.failure_event
+        },
+    })
 }
 
 fn response_is_sse(headers: &HeaderMap, request_is_stream: bool, status: StatusCode) -> bool {
@@ -113,6 +125,7 @@ pub(super) struct Attempt {
     captured_prefix: usize,
     captured_transport_error: bool,
     saved_failure: Option<Value>,
+    pub(super) manual_trial: Option<routing::manual::Trial>,
 }
 impl Attempt {
     pub(super) fn new(
@@ -163,6 +176,7 @@ impl Attempt {
             captured_prefix: 0,
             captured_transport_error: false,
             saved_failure: None,
+            manual_trial: None,
         }
     }
     pub(super) fn save_diagnostic(&self, body: bool) {
@@ -221,6 +235,11 @@ impl Attempt {
         self.save_diagnostic(true);
     }
     pub(super) fn finish(&mut self, status: &str, observer: Option<&Observer>) {
+        if matches!(status, "failed" | "interrupted") {
+            if let Some(trial) = &self.manual_trial {
+                self.state.manual_routing.stop(trial);
+            }
+        }
         if let Some(value) = observer.and_then(|observer| observer.failure_event.as_ref()) {
             if self.saved_failure.as_ref() != Some(value) {
                 self.diagnostic.failed_event(value);
@@ -296,6 +315,11 @@ impl Drop for Attempt {
         if let Some(mut record) = self.record.take() {
             if matches!(record.status.as_str(), "connecting" | "streaming") {
                 record.status = "interrupted".into();
+            }
+            if record.status != "success" {
+                if let Some(trial) = &self.manual_trial {
+                    self.state.manual_routing.stop(trial);
+                }
             }
             record.latency_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             if let Some(first) = self
@@ -768,6 +792,7 @@ async fn confirm_manual_acceptance(
                 eprintln!("会话来源保存失败");
             }
         }
+        state.manual_routing.refresh(&sources, &state.affinity);
         if let Some(key) = acceptance.key {
             if state
                 .affinity

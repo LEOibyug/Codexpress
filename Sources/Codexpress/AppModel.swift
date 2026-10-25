@@ -461,8 +461,8 @@ import ServiceManagement
     func recoverSource(_ id: String) {
         performSourceRouting("routing.recover", sourceID: id, notice: "已解除临时冷却。")
     }
-    func trySourceOnce(_ id: String) {
-        performSourceRouting("routing.try", sourceID: id, notice: "下一条对话请求将优先尝试此来源。")
+    func startSourceTakeover(_ id: String) {
+        performSourceRouting("routing.try", sourceID: id, notice: "已开始抢占后续对话请求。")
     }
     private func performSourceRouting(_ operation: String, sourceID: String, notice: String) {
         perform {
@@ -472,12 +472,12 @@ import ServiceManagement
             self.notice = notice
         }
     }
-    func cancelSourceTrial() {
+    func cancelSourceTakeover() {
         guard let id = status["manual_route"]["id"].string else { return }
         perform {
             let result = try await self.client.call("routing.cancel", .object(["id": .string(id)]))
             try await self.updateStatus()
-            self.notice = result["cancelled"].bool == true ? "已取消来源插入。" : "请求已开始或操作已更新。"
+            self.notice = result["cancelled"].bool == true ? "已停止来源抢占。" : "抢占已结束或已切换来源。"
         }
     }
     func changeLowQuotaThreshold(_ value: Int) {

@@ -117,7 +117,7 @@ async fn recovering_only_clears_transient_failure_and_trial_cancel_is_compare_an
 }
 
 #[tokio::test]
-async fn one_manual_trial_is_claimed_atomically_and_does_not_change_fixed_settings_or_cooldown() {
+async fn takeover_failure_stops_further_claims_without_changing_fixed_settings_or_cooldown() {
     let a_hits = Arc::new(AtomicUsize::new(0));
     let a_copy = a_hits.clone();
     let (a, a_task) = server::serve(Router::new().route(
@@ -587,4 +587,276 @@ async fn manual_selection_respects_capacity_and_invalid_requests_do_not_consume_
     drop(occupied);
     a_task.abort();
     b_task.abort();
+}
+
+struct TakeoverFixture {
+    _directory: tempfile::TempDir,
+    state: Arc<AppState>,
+    a_hits: Arc<AtomicUsize>,
+    b_hits: Arc<AtomicUsize>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+impl Drop for TakeoverFixture {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+impl TakeoverFixture {
+    async fn new(limit: Option<u32>, replies: Vec<u16>) -> Self {
+        let a_hits = Arc::new(AtomicUsize::new(0));
+        let copy = a_hits.clone();
+        let (a, a_task) = server::serve(Router::new().route(
+            "/responses",
+            post(move || {
+                let hits = copy.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({"status":"completed","output":[]}))
+                }
+            }),
+        ))
+        .await;
+        let b_hits = Arc::new(AtomicUsize::new(0));
+        let copy = b_hits.clone();
+        let replies = Arc::new(replies);
+        let (b, b_task) = server::serve(Router::new().route(
+            "/responses",
+            post(move |request: Request| {
+                let hits = copy.clone();
+                let replies = replies.clone();
+                async move {
+                    let index = hits.fetch_add(1, Ordering::SeqCst);
+                    if replies.first() == Some(&409) {
+                        let body: Value = serde_json::from_slice(
+                            &to_bytes(request.into_body(), 10000).await.unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            body["input"][0]["encrypted_content"].is_string(),
+                            index == 0
+                        );
+                    }
+                    let status = replies.get(index).copied().unwrap_or(200);
+                    if status == 200 {
+                        axum::Json(json!({"status":"completed","output":[]})).into_response()
+                    } else {
+                        let code = match status {
+                            429 => "insufficient_quota",
+                            409 => "invalid_encrypted_content",
+                            _ => "server_error",
+                        };
+                        (
+                            StatusCode::from_u16(status).unwrap(),
+                            axum::Json(json!({"error":{"code":code}})),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        ))
+        .await;
+        let mut target = source("b", &b, 1);
+        target.max_active_conversations = limit;
+        target.active_conversation_window_seconds = 300;
+        let (_directory, state) = state(vec![source("a", &a, 0), target]).await;
+        state.settings.write().await.upstream_attempts = 3;
+        Self {
+            _directory,
+            state,
+            a_hits,
+            b_hits,
+            tasks: vec![a_task, b_task],
+        }
+    }
+    async fn send(&self, thread: &str) {
+        let response = relay::router(self.state.clone())
+            .oneshot(request(br#"{"model":"m","input":"next"}"#, thread))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn takeover_continues_until_capacity_or_other_conversations_are_drained() {
+    for limit in [None, Some(2)] {
+        let fixture = TakeoverFixture::new(limit, vec![]).await;
+        for thread in ["first", "second", "third"] {
+            fixture.send(thread).await;
+        }
+        insert(&fixture.state, "b").await;
+        fixture.send("first").await;
+        assert_eq!(fixture.state.manual_routing.status()["source_id"], "b");
+        fixture.send("second").await;
+        fixture.send("third").await;
+        let transferred = if limit.is_some() { 2 } else { 3 };
+        assert_eq!(fixture.b_hits.load(Ordering::SeqCst), transferred);
+        assert!(fixture.state.manual_routing.status().is_null());
+        fixture.send("fresh-after-takeover").await;
+        assert_eq!(fixture.b_hits.load(Ordering::SeqCst), transferred);
+        assert_eq!(
+            fixture.a_hits.load(Ordering::SeqCst),
+            3 + (3 - transferred) + 1
+        );
+    }
+}
+
+#[tokio::test]
+async fn takeover_retries_before_abandoning_and_success_keeps_it_active() {
+    let fixture = TakeoverFixture::new(None, vec![503, 503, 200, 503, 503, 503]).await;
+    fixture
+        .state
+        .settings
+        .write()
+        .await
+        .upstream_retry_delay_seconds = 1;
+    fixture.send("first").await;
+    fixture.send("second").await;
+    insert(&fixture.state, "b").await;
+    let started = std::time::Instant::now();
+    fixture.send("first").await;
+    assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+    assert_eq!(fixture.b_hits.load(Ordering::SeqCst), 3);
+    assert_eq!(fixture.a_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.state.manual_routing.status()["source_id"], "b");
+    fixture.send("second").await;
+    assert_eq!(fixture.b_hits.load(Ordering::SeqCst), 6);
+    assert_eq!(fixture.a_hits.load(Ordering::SeqCst), 3);
+    assert!(fixture.state.manual_routing.status().is_null());
+    fixture.send("third").await;
+    assert_eq!(fixture.b_hits.load(Ordering::SeqCst), 6);
+}
+
+#[tokio::test]
+async fn takeover_stops_on_permanent_rejection_without_extra_retries() {
+    let fixture = TakeoverFixture::new(None, vec![429]).await;
+    fixture.send("first").await;
+    fixture.send("second").await;
+    insert(&fixture.state, "b").await;
+    fixture.send("first").await;
+    assert_eq!(fixture.b_hits.load(Ordering::SeqCst), 1);
+    assert!(fixture.state.manual_routing.status().is_null());
+    fixture.send("second").await;
+    assert_eq!(fixture.b_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn parallel_takeover_requests_never_exceed_the_target_capacity() {
+    let fixture = TakeoverFixture::new(Some(2), vec![]).await;
+    for thread in ["first", "second", "third"] {
+        fixture.send(thread).await;
+    }
+    insert(&fixture.state, "b").await;
+    let mut tasks = Vec::new();
+    for index in 0..8 {
+        let app = relay::router(fixture.state.clone());
+        tasks.push(tokio::spawn(async move {
+            let response = app
+                .oneshot(request(
+                    br#"{"model":"m","input":"next"}"#,
+                    &format!("new-{index}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            to_bytes(response.into_body(), 10000).await.unwrap();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert_eq!(fixture.b_hits.load(Ordering::SeqCst), 2);
+    assert!(fixture.state.manual_routing.status().is_null());
+}
+
+#[tokio::test]
+async fn takeover_retries_explicit_stream_errors_but_never_replays_generated_output() {
+    for generated in [false, true] {
+        let a_hits = Arc::new(AtomicUsize::new(0));
+        let copy = a_hits.clone();
+        let (a, a_task) = server::serve(Router::new().route(
+            "/responses",
+            post(move || {
+                let hits = copy.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        ))
+        .await;
+        let b_hits = Arc::new(AtomicUsize::new(0));
+        let copy = b_hits.clone();
+        let (b, b_task) = server::serve(Router::new().route("/responses", post(move || {
+            let hits = copy.clone(); async move {
+                let call = hits.fetch_add(1, Ordering::SeqCst);
+                let mut events = String::new();
+                if generated { events.push_str("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hello\"}\n\n"); }
+                if generated || call < 2 {
+                    events.push_str("data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\"}}}\n\n");
+                } else {
+                    events.push_str("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n");
+                }
+                ([("content-type", "text/event-stream")], events)
+            }
+        }))).await;
+        let original = source("a", &a, 0);
+        let (_dir, state) = state(vec![original.clone(), source("b", &b, 1)]).await;
+        state.settings.write().await.upstream_attempts = 3;
+        for thread in ["thread:first", "thread:second"] {
+            let key = codexpress_gateway::affinity::key(thread, "m");
+            let mut lease = state
+                .affinity
+                .reserve(Some(&key), &original, false, false, None)
+                .unwrap();
+            lease.commit().unwrap();
+        }
+        insert(&state, "b").await;
+        let response = relay::router(state.clone())
+            .oneshot(request(
+                br#"{"model":"m","stream":true,"input":"next"}"#,
+                "first",
+            ))
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 10000).await.unwrap();
+        assert_eq!(a_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(b_hits.load(Ordering::SeqCst), if generated { 1 } else { 3 });
+        if generated {
+            assert!(String::from_utf8_lossy(&body).contains("hello"));
+            assert!(state.manual_routing.status().is_null());
+        } else {
+            assert!(String::from_utf8_lossy(&body).contains("response.completed"));
+            assert_eq!(state.manual_routing.status()["source_id"], "b");
+        }
+        a_task.abort();
+        b_task.abort();
+    }
+}
+
+#[tokio::test]
+async fn takeover_repairs_recoverable_context_before_giving_up_the_selected_source() {
+    let fixture = TakeoverFixture::new(None, vec![409]).await;
+    fixture
+        .state
+        .settings
+        .write()
+        .await
+        .degraded_context_fallback = true;
+    fixture.send("first").await;
+    fixture.send("second").await;
+    insert(&fixture.state, "b").await;
+    let body = br#"{"model":"m","input":[{"type":"reasoning","encrypted_content":"fixture-cipher"},{"role":"user","content":"next"}]}"#;
+    let response = relay::router(fixture.state.clone())
+        .oneshot(request(body, "first"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert_eq!(fixture.b_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.a_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.state.manual_routing.status()["source_id"], "b");
 }

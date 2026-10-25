@@ -6,7 +6,7 @@ struct SourceRoutingActions: View {
     var compact = false
 
     private var cooling: Bool { ["cooldown", "proxy_error"].contains(model.state(source.id)["health"].string ?? "") }
-    private var queued: Bool { model.status["manual_route"]["source_id"].string == source.id }
+    private var takingOver: Bool { model.status["manual_route"]["source_id"].string == source.id }
     private var exhausted: Bool { source.official && model.state(source.id)["health"].string == "exhausted" }
 
     var body: some View {
@@ -16,16 +16,16 @@ struct SourceRoutingActions: View {
                     .help("解除临时冷却，重新参与分配")
                     .disabled(!source.enabled)
             }
-            action("立即插入", symbol: "bolt.fill") { model.trySourceOnce(source.id) }
-                .help(exhausted ? "官方额度已耗尽，确认恢复后可使用" : queued ? "已等待下一条请求" : "下一条对话请求先尝试此来源，成功后沿用；失败可回退。活跃对话上限仍有效。")
-                .disabled(queued || exhausted || !source.enabled || model.connectionMode == "official")
-            if queued {
+            action("立即抢占", symbol: "bolt.fill") { model.startSourceTakeover(source.id) }
+                .help(exhausted ? "官方额度已耗尽，确认恢复后可使用" : takingOver ? "正在抢占后续请求" : "优先接收后续对话请求，直到达到并发上限或其他来源无活跃对话；临时故障先按设置重试，全部失败再切源。")
+                .disabled(takingOver || exhausted || !source.enabled || model.connectionMode == "official")
+            if takingOver {
                 if !compact {
-                    Label("等待下一条请求", systemImage: "clock")
+                    Label("正在抢占", systemImage: "clock")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
-                action("取消插入", symbol: "xmark.circle") { model.cancelSourceTrial() }
-                    .help("取消等待中的来源插入")
+                action("停止抢占", symbol: "xmark.circle") { model.cancelSourceTakeover() }
+                    .help("停止后续抢占，正在处理的请求继续执行")
             }
         }.controlSize(.small)
             .disabled(model.busy || !model.running)

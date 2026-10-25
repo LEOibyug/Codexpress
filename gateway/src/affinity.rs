@@ -210,6 +210,28 @@ impl AffinityStore {
                 .is_none_or(|limit| active < limit as usize),
         )
     }
+    pub(crate) fn has_other_conversations(
+        &self,
+        target: &str,
+        sources: &[crate::model::SourceRuntime],
+    ) -> bool {
+        let Ok(data) = self.data.lock() else {
+            return true;
+        };
+        let timestamp = Instant::now();
+        data.capacity.iter().any(|(key, activity)| {
+            key.source_id != target
+                && sources.iter().any(|runtime| {
+                    runtime.source.id == key.source_id
+                        && activity.active(timestamp, runtime.source.active_conversation_window_seconds)
+                })
+                // An idle slot left by a successful handoff is no longer a
+                // conversation on its old source. Live requests still count.
+                && (activity.users > 0 || data.entries.get(&key.conversation).is_none_or(|entry| {
+                    entry.source_id == key.source_id && entry.identity == key.identity
+                }))
+        })
+    }
     pub fn order_by_load(&self, sources: &mut [Source]) {
         let Ok(data) = self.data.lock() else { return };
         let timestamp = Instant::now();

@@ -1,5 +1,8 @@
-//! Explicit, one-shot source selection from the local management interface.
-use crate::model::{AppState, Source};
+//! Explicit source takeover, bounded by capacity and remaining conversations.
+use crate::{
+    affinity::AffinityStore,
+    model::{AppState, Source, SourceRuntime},
+};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -9,6 +12,7 @@ pub(crate) struct Trial {
     id: String,
     pub source_id: String,
     identity: String,
+    started: bool,
 }
 
 #[derive(Default)]
@@ -42,9 +46,62 @@ impl ManualRouting {
             .unwrap_or(Value::Null)
     }
 
-    pub(crate) fn claim(&self) -> Option<Trial> {
-        self.pending.lock().ok()?.take()
+    pub(crate) fn stop(&self, trial: &Trial) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        if pending
+            .as_ref()
+            .is_some_and(|current| current.id == trial.id)
+        {
+            *pending = None;
+            return true;
+        }
+        false
     }
+
+    pub(crate) fn refresh(&self, sources: &[SourceRuntime], affinity: &AffinityStore) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        let Some(trial) = pending.as_ref() else {
+            return;
+        };
+        let source = sources.iter().find(|runtime| {
+            runtime.source.id == trial.source_id
+                && runtime.source.identity() == trial.identity
+                && runtime.source.enabled
+                && has_credentials(&runtime.source)
+                && !super::official_exhausted(runtime, sources)
+        });
+        if source.is_none_or(|runtime| {
+            trial.started
+                && (!affinity.capacity_status(&runtime.source).1
+                    || !affinity.has_other_conversations(&runtime.source.id, sources))
+        }) {
+            *pending = None;
+        }
+    }
+
+    fn claim(&self, model: &str, sources: &[SourceRuntime]) -> Option<Trial> {
+        let mut pending = self.pending.lock().ok()?;
+        let trial = pending.as_mut()?;
+        let source = &sources
+            .iter()
+            .find(|r| r.source.id == trial.source_id)?
+            .source;
+        if !source.models.is_empty() && !source.models.iter().any(|m| m == model) {
+            return None;
+        }
+        trial.started = true;
+        Some(trial.clone())
+    }
+}
+
+pub(crate) async fn claim(state: &Arc<AppState>, model: &str) -> Option<Trial> {
+    let sources = state.sources.read().await;
+    state.manual_routing.refresh(&sources, &state.affinity);
+    state.manual_routing.claim(model, &sources)
 }
 
 pub(super) fn has_credentials(source: &Source) -> bool {
@@ -62,12 +119,12 @@ pub(super) fn has_credentials(source: &Source) -> bool {
 
 pub(crate) async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<Value> {
     if op == "routing.cancel" {
-        let id = payload["id"].as_str().context("缺少待执行操作标识")?;
+        let id = payload["id"].as_str().context("缺少抢占操作标识")?;
         let mut pending = state
             .manual_routing
             .pending
             .lock()
-            .map_err(|_| anyhow::anyhow!("无法取消来源插入"))?;
+            .map_err(|_| anyhow::anyhow!("无法停止来源抢占"))?;
         if pending.as_ref().is_some_and(|trial| trial.id == id) {
             *pending = None;
             return Ok(json!({"cancelled":true}));
@@ -119,13 +176,14 @@ pub(crate) async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> R
         id: uuid::Uuid::new_v4().to_string(),
         source_id: id.into(),
         identity: source.identity(),
+        started: false,
     };
     let response = json!({"id":trial.id,"source_id":trial.source_id});
     *state
         .manual_routing
         .pending
         .lock()
-        .map_err(|_| anyhow::anyhow!("无法插入来源"))? = Some(trial);
+        .map_err(|_| anyhow::anyhow!("无法开始来源抢占"))? = Some(trial);
     Ok(response)
 }
 

@@ -204,6 +204,13 @@ struct ManualRequest {
     trial: Option<routing::manual::Trial>,
     attempted: bool,
 }
+impl ManualRequest {
+    fn abandon(&self, state: &AppState) {
+        if let Some(trial) = &self.trial {
+            state.manual_routing.stop(trial);
+        }
+    }
+}
 
 fn state_matches_source(
     bindings: &std::collections::HashMap<String, String>,
@@ -506,9 +513,17 @@ async fn after_manual_failure(
     bytes: Bytes,
     rebuild: Option<RebuildContext>,
     replans: u8,
+    stop_takeover: bool,
 ) -> Response<Body> {
     if let Some(manual) = parts.extensions.get_mut::<ManualRequest>() {
         manual.attempted = true;
+        if stop_takeover {
+            manual.abandon(&state);
+        }
+    }
+    if !stop_takeover {
+        let sources = state.sources.read().await;
+        state.manual_routing.refresh(&sources, &state.affinity);
     }
     Box::pin(forward_once(
         state,
@@ -598,20 +613,19 @@ async fn forward_once(
             _ => return error(StatusCode::BAD_REQUEST, "Responses 请求需要 JSON 对象"),
         }
     };
-    // Claim once, only after authentication and parsing, never for discovery or
-    // compaction. Reconstructions retain the marker and cannot consume a newer click.
-    let mut manual = parts
-        .extensions
-        .get::<ManualRequest>()
-        .cloned()
-        .unwrap_or_else(|| ManualRequest {
+    // Each client request can join the same takeover. Internal replans retain
+    // their marker and cannot pick up a newer operation or retry a failed probe.
+    let mut manual = match parts.extensions.get::<ManualRequest>().cloned() {
+        Some(manual) => manual,
+        None => ManualRequest {
             trial: if !discovery && parts.uri.path() == "/v1/responses" {
-                state.manual_routing.claim()
+                routing::manual::claim(&state, parsed["model"].as_str().unwrap_or("")).await
             } else {
                 None
             },
             attempted: false,
-        });
+        },
+    };
     let manual_target = if !manual.attempted {
         match &manual.trial {
             Some(trial) => {
@@ -1098,7 +1112,8 @@ async fn forward_once(
                 Some(lease) => Some(lease),
                 None => {
                     if manual_candidate {
-                        return after_manual_failure(state, parts, bytes, rebuild, replans).await;
+                        return after_manual_failure(state, parts, bytes, rebuild, replans, false)
+                            .await;
                     }
                     last_error = Some(error(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -1161,7 +1176,8 @@ async fn forward_once(
                     request_retries.block(&candidate);
                     if manual_candidate {
                         drop(route_lease.take());
-                        return after_manual_failure(state, parts, bytes, rebuild, replans).await;
+                        return after_manual_failure(state, parts, bytes, rebuild, replans, true)
+                            .await;
                     }
                     last_error = Some(error(
                         StatusCode::BAD_GATEWAY,
@@ -1252,7 +1268,8 @@ async fn forward_once(
                     if manual_candidate {
                         drop(route_lease.take());
                         drop(attempt);
-                        return after_manual_failure(state, parts, bytes, rebuild, replans).await;
+                        return after_manual_failure(state, parts, bytes, rebuild, replans, true)
+                            .await;
                     }
                     last_error = Some(error(StatusCode::BAD_GATEWAY, "来源网络策略无法建立连接"));
                     break;
@@ -1380,6 +1397,9 @@ async fn forward_once(
                         .diagnostic
                         .transport("timeout", "来源提交结果超时且不明确；未自动重试");
                     attempt.finish("failed", None);
+                    if manual_candidate {
+                        manual.abandon(&state);
+                    }
                     return error(
                         StatusCode::GATEWAY_TIMEOUT,
                         "来源提交结果超时且不明确；未自动重试",
@@ -1419,7 +1439,8 @@ async fn forward_once(
                     if manual_candidate && definitely_unsubmitted {
                         drop(route_lease.take());
                         drop(attempt);
-                        return after_manual_failure(state, parts, bytes, rebuild, replans).await;
+                        return after_manual_failure(state, parts, bytes, rebuild, replans, true)
+                            .await;
                     }
                     if priority_probe && definitely_unsubmitted {
                         drop(route_lease.take());
@@ -1463,6 +1484,9 @@ async fn forward_once(
                         return Box::pin(forward_once(state, retry, Some(context), replans)).await;
                     }
                     if !definitely_unsubmitted || opaque_state {
+                        if manual_candidate {
+                            manual.abandon(&state);
+                        }
                         return error(
                             StatusCode::BAD_GATEWAY,
                             "来源响应中断，提交结果不明确；未自动重试",
@@ -1537,8 +1561,10 @@ async fn forward_once(
                         if manual_candidate {
                             drop(route_lease.take());
                             drop(attempt);
-                            return after_manual_failure(state, parts, bytes, rebuild, replans)
-                                .await;
+                            return after_manual_failure(
+                                state, parts, bytes, rebuild, replans, true,
+                            )
+                            .await;
                         }
                         if priority_probe {
                             last_error = Some(error(
@@ -1596,19 +1622,19 @@ async fn forward_once(
                     context_rejected = explicit_context_rejection(&value);
                 }
             }
-            if !degraded
-                && status.is_success()
-                && (binding.is_some() || opaque_state)
+            if status.is_success()
                 && (manual_candidate
-                    || priority_probe
-                    || probe_unknown_id
-                    || state.settings.read().await.degraded_context_fallback)
+                    || (!degraded
+                        && (binding.is_some() || opaque_state)
+                        && (priority_probe
+                            || probe_unknown_id
+                            || state.settings.read().await.degraded_context_fallback)))
             {
                 // Hold only an initial bounded prefix. A failed Responses SSE
                 // can use HTTP 200, so headers alone do not prove acceptance.
                 // Once any output is seen (or the probe is inconclusive), its
                 // original bytes are streamed without replay.
-                context_rejected = match probe_context_rejection(
+                let probe = match probe_context_rejection(
                     &mut upstream,
                     &mut prefix,
                     parsed["stream"].as_bool() == Some(true),
@@ -1616,14 +1642,58 @@ async fn forward_once(
                 )
                 .await
                 {
-                    Ok(rejected) => rejected,
+                    Ok(probe) => probe,
                     Err(()) => {
+                        if manual_candidate {
+                            manual.abandon(&state);
+                        }
                         return error(
                             StatusCode::BAD_GATEWAY,
                             "来源响应中断，提交结果不明确；未自动重试",
                         );
                     }
                 };
+                context_rejected = probe.context_rejected;
+                if manual_candidate {
+                    if let Some(failure) = probe.failure {
+                        let transient = retries::transient_error(&failure);
+                        let response = failure.get("response").unwrap_or(&failure);
+                        let permanent = retries::permanent_code(response);
+                        if transient {
+                            if let Some(delay) = retries.failed(true) {
+                                attempt.finish("failed", None);
+                                drop(upstream);
+                                drop(attempt);
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                            routing::mark_upstream_failure(
+                                &state,
+                                &source,
+                                503,
+                                None,
+                                retries.confirmed_errors(),
+                            )
+                            .await;
+                        }
+                        if !context_rejected && (transient || permanent.is_some()) {
+                            routing::mark_rejection(&state, &source, permanent, None).await;
+                            attempt.finish("failed", None);
+                            drop(upstream);
+                            drop(route_lease.take());
+                            drop(attempt);
+                            return after_manual_failure(
+                                state, parts, bytes, rebuild, replans, true,
+                            )
+                            .await;
+                        }
+                        // Unrecognized failures may have submitted inference.
+                        // Stop takeover, preserving the upstream response without replay.
+                        if !context_rejected {
+                            manual.abandon(&state);
+                        }
+                    }
+                }
             }
             if matches!(status.as_u16(), 401 | 402 | 403 | 429 | 500..=599) {
                 routing::mark_upstream_failure(
@@ -1658,12 +1728,33 @@ async fn forward_once(
                     || ((status.is_client_error() || status.is_server_error())
                         && !matches!(status.as_u16(), 408 | 504)))
             {
+                // A rejected upstream ID/ciphertext may still be recoverable
+                // with local history. Try the selected source with portable
+                // context once before abandoning the takeover.
+                if context_rejected
+                    && !degraded
+                    && state.settings.read().await.degraded_context_fallback
+                {
+                    if let Ok((mut retry, context)) =
+                        portable_request(&state, &parts, &parsed, affinity_key.as_deref()).await
+                    {
+                        attempt.finish("failed", None);
+                        attempt.collect_error(&mut upstream, &mut prefix).await;
+                        drop(upstream);
+                        drop(route_lease.take());
+                        drop(attempt);
+                        if let Some(manual) = retry.extensions_mut().get_mut::<ManualRequest>() {
+                            manual.attempted = false;
+                        }
+                        return Box::pin(forward_once(state, retry, Some(context), replans)).await;
+                    }
+                }
                 attempt.finish("failed", None);
                 drop(route_lease.take());
                 attempt.collect_error(&mut upstream, &mut prefix).await;
                 drop(upstream);
                 drop(attempt);
-                return after_manual_failure(state, parts, bytes, rebuild, replans).await;
+                return after_manual_failure(state, parts, bytes, rebuild, replans, true).await;
             }
             if ((probe_unknown_id && context_rejected)
                 || (priority_probe
@@ -1776,6 +1867,9 @@ async fn forward_once(
             if status.is_success() {
                 routing::mark_ready(&state, &source).await;
             }
+            if manual_candidate {
+                attempt.manual_trial = manual.trial.clone();
+            }
             let validated_continuation = hard_keys.iter().any(|key| {
                 exclusions.contains(&crate::continuity::accepted_state(&source.identity(), key))
             });
@@ -1827,6 +1921,10 @@ async fn forward_once(
                 }
             }
             return response;
+        }
+        if manual_candidate {
+            drop(route_lease.take());
+            return after_manual_failure(state, parts, bytes, rebuild, replans, true).await;
         }
     }
     last_error.unwrap_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "所有来源暂时不可用"))

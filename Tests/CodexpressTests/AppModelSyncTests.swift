@@ -93,9 +93,9 @@ final class AppModelSyncTests: XCTestCase {
             XCTAssertFalse(recorded.contains("sync"))
         }
         try await expectManualOperation("routing.recover") { model.recoverSource(first.id) }
-        try await expectManualOperation("routing.try") { model.trySourceOnce(second.id) }
+        try await expectManualOperation("routing.try") { model.startSourceTakeover(second.id) }
         XCTAssertEqual(model.status["manual_route"]["source_id"].string, second.id)
-        try await expectManualOperation("routing.cancel") { model.cancelSourceTrial() }
+        try await expectManualOperation("routing.cancel") { model.cancelSourceTakeover() }
         XCTAssertEqual(model.status["manual_route"], .null)
     }
 

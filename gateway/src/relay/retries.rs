@@ -12,6 +12,24 @@ pub(super) fn transient_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503)
 }
 
+const TRANSIENT_CODES: &[&str] = &[
+    "rate_limit_exceeded",
+    "server_error",
+    "internal_server_error",
+    "service_unavailable",
+    "overloaded_error",
+];
+
+pub(super) fn transient_error(value: &Value) -> bool {
+    let response = value.get("response").unwrap_or(value);
+    let error = response.get("error").unwrap_or(response);
+    permanent_code(response).is_none()
+        && [error["code"].as_str(), error["type"].as_str()]
+            .into_iter()
+            .flatten()
+            .any(|code| TRANSIENT_CODES.contains(&code))
+}
+
 pub(crate) fn permanent_code(value: &Value) -> Option<&str> {
     let error = value.get("error").unwrap_or(value);
     let codes = [error["code"].as_str(), error["type"].as_str()];
@@ -51,16 +69,11 @@ pub(crate) fn permanent_code(value: &Value) -> Option<&str> {
         })
         .or_else(|| {
             // A specific temporary error outranks a generic wrapper type.
-            if codes.into_iter().flatten().any(|code| {
-                matches!(
-                    code,
-                    "rate_limit_exceeded"
-                        | "server_error"
-                        | "internal_server_error"
-                        | "service_unavailable"
-                        | "overloaded_error"
-                )
-            }) {
+            if codes
+                .into_iter()
+                .flatten()
+                .any(|code| TRANSIENT_CODES.contains(&code))
+            {
                 None
             } else {
                 codes
