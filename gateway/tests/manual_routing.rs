@@ -860,3 +860,34 @@ async fn takeover_repairs_recoverable_context_before_giving_up_the_selected_sour
     assert_eq!(fixture.a_hits.load(Ordering::SeqCst), 2);
     assert_eq!(fixture.state.manual_routing.status()["source_id"], "b");
 }
+
+#[tokio::test]
+async fn failed_context_repair_skips_the_abandoned_source_even_when_it_has_highest_priority() {
+    let fixture = TakeoverFixture::new(None, vec![409, 400]).await;
+    fixture
+        .state
+        .settings
+        .write()
+        .await
+        .degraded_context_fallback = true;
+    fixture.send("first").await;
+    fixture.send("second").await;
+    {
+        let mut sources = fixture.state.sources.write().await;
+        sources[0].source.priority = 1;
+        sources[1].source.priority = 0;
+    }
+    insert(&fixture.state, "b").await;
+    let body = br#"{"model":"m","input":[{"type":"reasoning","encrypted_content":"fixture-cipher"},{"role":"user","content":"next"}]}"#;
+    let mut request = request(body, "first");
+    request.headers_mut().remove("thread-id");
+    let response = relay::router(fixture.state.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 10000).await.unwrap();
+    assert_eq!(fixture.b_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.a_hits.load(Ordering::SeqCst), 3);
+    assert!(fixture.state.manual_routing.status().is_null());
+}

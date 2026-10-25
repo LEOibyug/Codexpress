@@ -929,7 +929,7 @@ async fn forward_once(
     if priority_probe {
         sources = routing::priority::candidates(&state, model, affinity_key.as_deref()).await;
     }
-    if manual.attempted && !degraded {
+    if manual.attempted {
         if let Some(trial) = &manual.trial {
             sources.retain(|source| source.id != trial.source_id);
         }
