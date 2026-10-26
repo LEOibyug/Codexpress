@@ -51,6 +51,7 @@ pub struct UsageRecord {
 struct StoreData {
     connection: Connection,
     active: HashMap<String, (UsageRecord, Instant)>,
+    analytics_cache: std::collections::VecDeque<analytics::Cached>,
 }
 pub struct UsageStore {
     data: Mutex<StoreData>,
@@ -119,6 +120,7 @@ impl UsageStore {
             data: Mutex::new(StoreData {
                 connection,
                 active: HashMap::new(),
+                analytics_cache: Default::default(),
             }),
         })
     }
@@ -221,11 +223,11 @@ impl UsageStore {
         self.summary_filtered(days, source_id, None)
     }
     pub fn analytics(&self, payload: &Value) -> Result<Value> {
-        let data = self
+        let mut data = self
             .data
             .lock()
             .map_err(|_| anyhow::anyhow!("用量数据库不可用"))?;
-        analytics::build(&data, payload)
+        analytics::build(&mut data, payload)
     }
     pub fn requests(&self, payload: &Value) -> Result<Value> {
         let data = self

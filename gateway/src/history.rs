@@ -45,7 +45,8 @@ pub struct HistoryStore {
 struct Block {
     hash: String,
     raw: usize,
-    compressed: Vec<u8>,
+    compressed: Option<Vec<u8>>,
+    stored_bytes: usize,
 }
 struct Node {
     hash: String,
@@ -85,6 +86,7 @@ impl HistoryStore {
         db.execute_batch("PRAGMA auto_vacuum=FULL; PRAGMA journal_mode=DELETE; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS blocks(hash TEXT PRIMARY KEY, payload BLOB NOT NULL, raw_bytes INTEGER NOT NULL, last_used INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS blocks_lru ON blocks(last_used);
+            CREATE TABLE IF NOT EXISTS block_access(hash TEXT PRIMARY KEY, last_used INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS nodes(hash TEXT PRIMARY KEY, parent TEXT NOT NULL, block TEXT NOT NULL, item_end INTEGER NOT NULL, last_used INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS nodes_lru ON nodes(last_used);
             CREATE TABLE IF NOT EXISTS snapshots(key TEXT PRIMARY KEY, tail TEXT NOT NULL, envelope TEXT NOT NULL, last_used INTEGER NOT NULL);
@@ -103,7 +105,7 @@ impl HistoryStore {
             )
             .optional()?
             .unwrap_or_default();
-        let tick = db.query_row("SELECT MAX(COALESCE((SELECT MAX(last_used) FROM blocks),0),COALESCE((SELECT MAX(last_used) FROM nodes),0))", [], |r| r.get(0))?;
+        let tick = db.query_row("SELECT MAX(COALESCE((SELECT MAX(last_used) FROM blocks),0),COALESCE((SELECT MAX(last_used) FROM nodes),0),COALESCE((SELECT MAX(last_used) FROM block_access),0))", [], |r| r.get(0))?;
         let store = Self {
             data: Mutex::new(Data {
                 db,
@@ -168,7 +170,7 @@ impl HistoryStore {
                 .data
                 .lock()
                 .map_err(|_| anyhow::anyhow!("原文缓存忙碌"))?;
-            data.db.execute_batch("BEGIN IMMEDIATE; DELETE FROM snapshots; DELETE FROM nodes; DELETE FROM blocks; COMMIT;")?;
+            data.db.execute_batch("BEGIN IMMEDIATE; DELETE FROM snapshots; DELETE FROM nodes; DELETE FROM block_access; DELETE FROM blocks; COMMIT;")?;
             data.error = None;
             data.generation += 1;
             data.evicted = 0;
@@ -259,7 +261,7 @@ fn evict(
     let candidates = {
         let mut statement = data
             .db
-            .prepare("SELECT hash,length(payload) FROM blocks ORDER BY last_used,hash")?;
+            .prepare("SELECT b.hash,length(b.payload) FROM blocks b LEFT JOIN block_access a ON a.hash=b.hash ORDER BY COALESCE(a.last_used,b.last_used),b.hash")?;
         let rows =
             statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))?;
         let mut selected = Vec::new();
@@ -279,6 +281,7 @@ fn evict(
     if !candidates.is_empty() {
         let tx = data.db.transaction()?;
         for id in &candidates {
+            tx.execute("DELETE FROM block_access WHERE hash=?1", [id])?;
             tx.execute("DELETE FROM blocks WHERE hash=?1", [id])?;
         }
         tx.commit()?;
@@ -328,6 +331,25 @@ fn input_items(request: &Value) -> Result<Vec<Value>> {
         _ => bail!("无法缓存此输入格式"),
     }
 }
+fn prepare_block(db: &Connection, bytes: &[u8]) -> Result<Block> {
+    let hash = hash(bytes);
+    let existing: Option<usize> = db
+        .prepare_cached("SELECT length(payload) FROM blocks WHERE hash=?1")?
+        .query_row([&hash], |row| row.get(0))
+        .optional()?;
+    let compressed = if existing.is_none() {
+        Some(zstd::stream::encode_all(bytes, 3)?)
+    } else {
+        None
+    };
+    let stored_bytes = existing.unwrap_or_else(|| compressed.as_ref().expect("new block").len());
+    Ok(Block {
+        hash,
+        raw: bytes.len(),
+        compressed,
+        stored_bytes,
+    })
+}
 fn capture(data: &mut Data, scope: &str, request: &Value, response: &Value) -> Result<()> {
     let Some(id) = response["id"]
         .as_str()
@@ -369,37 +391,30 @@ fn capture(data: &mut Data, scope: &str, request: &Value, response: &Value) -> R
     for item in &items {
         let bytes = serde_json::to_vec(item)?;
         for (i, chunk) in bytes.chunks(CHUNK).enumerate() {
-            let block = hash(chunk);
+            let block = prepare_block(&data.db, chunk)?;
             let end = (i + 1) * CHUNK >= bytes.len();
-            let node = node_hash(&tail, &block, end);
-            blocks.push(Block {
-                hash: block.clone(),
-                raw: chunk.len(),
-                compressed: zstd::stream::encode_all(chunk, 3)?,
-            });
+            let node = node_hash(&tail, &block.hash, end);
             nodes.push(Node {
                 hash: node.clone(),
                 parent: tail,
-                block,
+                block: block.hash.clone(),
                 end,
             });
+            blocks.push(block);
             tail = node;
         }
     }
     let bytes = serde_json::to_vec(&envelope)?;
-    let envelope = hash(&bytes);
-    blocks.push(Block {
-        hash: envelope.clone(),
-        raw: bytes.len(),
-        compressed: zstd::stream::encode_all(bytes.as_slice(), 3)?,
-    });
+    let envelope_block = prepare_block(&data.db, &bytes)?;
+    let envelope = envelope_block.hash.clone();
+    blocks.push(envelope_block);
     let protected_blocks: HashSet<_> = blocks.iter().map(|b| b.hash.clone()).collect();
     let protected_nodes: HashSet<_> = nodes.iter().map(|n| n.hash.clone()).collect();
     let mut seen = HashSet::new();
     let budget: u64 = blocks
         .iter()
         .filter(|b| seen.insert(&b.hash))
-        .map(|b| b.compressed.len() as u64 + 256)
+        .map(|b| b.stored_bytes as u64 + 256)
         .sum::<u64>()
         + nodes.len() as u64 * 400
         + 65536;
@@ -411,11 +426,21 @@ fn capture(data: &mut Data, scope: &str, request: &Value, response: &Value) -> R
     loop {
         let result = (|| -> rusqlite::Result<()> {
             let tx = data.db.transaction()?;
+            let mut touched = HashSet::new();
             for block in &blocks {
-                tx.execute("INSERT INTO blocks VALUES(?1,?2,?3,?4) ON CONFLICT(hash) DO UPDATE SET last_used=excluded.last_used",params![block.hash,block.compressed,block.raw,tick])?;
+                if !touched.insert(&block.hash) {
+                    continue;
+                }
+                if let Some(compressed) = &block.compressed {
+                    tx.prepare_cached("INSERT OR IGNORE INTO blocks VALUES(?1,?2,?3,?4)")?
+                        .execute(params![block.hash, compressed, block.raw, tick])?;
+                }
+                tx.prepare_cached("INSERT INTO block_access VALUES(?1,?2) ON CONFLICT(hash) DO UPDATE SET last_used=excluded.last_used")?
+                    .execute(params![block.hash,tick])?;
             }
             for node in &nodes {
-                tx.execute("INSERT INTO nodes VALUES(?1,?2,?3,?4,?5) ON CONFLICT(hash) DO UPDATE SET last_used=excluded.last_used",params![node.hash,node.parent,node.block,node.end,tick])?;
+                tx.prepare_cached("INSERT INTO nodes VALUES(?1,?2,?3,?4,?5) ON CONFLICT(hash) DO UPDATE SET last_used=excluded.last_used")?
+                    .execute(params![node.hash,node.parent,node.block,node.end,tick])?;
             }
             tx.execute(
                 "INSERT OR REPLACE INTO snapshots VALUES(?1,?2,?3,?4)",
@@ -435,11 +460,9 @@ fn capture(data: &mut Data, scope: &str, request: &Value, response: &Value) -> R
     }
 }
 fn read_block(db: &Connection, id: &str) -> Result<Vec<u8>> {
-    let (compressed, raw): (Vec<u8>, usize) = db.query_row(
-        "SELECT payload,raw_bytes FROM blocks WHERE hash=?1",
-        [id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let (compressed, raw): (Vec<u8>, usize) = db
+        .prepare_cached("SELECT payload,raw_bytes FROM blocks WHERE hash=?1")?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let read_limit = raw.checked_add(1).context("缓存块长度无效")?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(raw).context("缓存块内存不足")?;
@@ -467,11 +490,10 @@ fn restore(data: &mut Data, scope: &str, id: &str) -> Result<Vec<Value>> {
         if !visited.insert(tail.clone()) {
             bail!("缓存索引存在循环");
         }
-        let (parent, block, end): (String, String, bool) = data.db.query_row(
-            "SELECT parent,block,item_end FROM nodes WHERE hash=?1",
-            [&tail],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
+        let (parent, block, end): (String, String, bool) = data
+            .db
+            .prepare_cached("SELECT parent,block,item_end FROM nodes WHERE hash=?1")?
+            .query_row([&tail], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         if node_hash(&parent, &block, end) != tail {
             bail!("缓存索引校验失败");
         }
@@ -497,16 +519,13 @@ fn restore(data: &mut Data, scope: &str, id: &str) -> Result<Vec<Value>> {
     let tick = data.tick;
     let tx = data.db.transaction()?;
     for id in block_ids {
-        tx.execute(
-            "UPDATE blocks SET last_used=?1 WHERE hash=?2",
-            params![tick, id],
-        )?;
+        tx.prepare_cached(
+            "INSERT INTO block_access(last_used,hash) VALUES(?1,?2) ON CONFLICT(hash) DO UPDATE SET last_used=excluded.last_used",
+        )?.execute(params![tick, id])?;
     }
     for id in node_ids {
-        tx.execute(
-            "UPDATE nodes SET last_used=?1 WHERE hash=?2",
-            params![tick, id],
-        )?;
+        tx.prepare_cached("UPDATE nodes SET last_used=?1 WHERE hash=?2")?
+            .execute(params![tick, id])?;
     }
     tx.execute(
         "UPDATE snapshots SET last_used=?1 WHERE key=?2",
@@ -521,6 +540,27 @@ mod tests {
     use super::*;
     fn response(id: &str, text: &str) -> Value {
         json!({"id":id,"status":"completed","output":[{"role":"assistant","content":text}]})
+    }
+    #[test]
+    fn repeated_history_uses_existing_payload_without_rewriting_its_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(&dir.path().join("cache")).unwrap();
+        store.configure(true, MIN_LIMIT).unwrap();
+        let input = json!({"input":[{"role":"user","content":"retained history".repeat(65536)}]});
+        store
+            .capture("s", &input, &response("first", "done"))
+            .unwrap();
+        {
+            let data = store.data.lock().unwrap();
+            data.db.execute_batch("CREATE TRIGGER immutable_payload BEFORE UPDATE ON blocks BEGIN SELECT RAISE(ABORT,'existing blocks must not be rewritten'); END;").unwrap();
+        }
+        store
+            .capture("s", &input, &response("second", "done"))
+            .unwrap();
+        assert_eq!(store.restore("s", "second").unwrap()[0], input["input"][0]);
+        drop(store);
+        let store = HistoryStore::open(&dir.path().join("cache")).unwrap();
+        assert_eq!(store.restore("s", "first").unwrap()[0], input["input"][0]);
     }
     #[test]
     fn deduplicated_blocks_restore_tools_across_restart_and_scope_isolation() {

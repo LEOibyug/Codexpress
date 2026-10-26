@@ -41,8 +41,8 @@ struct UsagePerformanceCard: View {
             if let loadError { Text(loadError).font(.system(size: 9)).foregroundStyle(.orange).lineLimit(2).help(loadError) }
             else { Text("已结束的请求").font(.system(size: 9)).foregroundStyle(.secondary) }
         }.padding(16).frame(height: 342)
-        .task(id: refreshID) {
-            guard !sourceID.isEmpty else { loadError = nil; loadingSource = false; return }
+        .task(id: UsageRefreshKey(selection: refreshID, active: model.settingsWindowActive)) {
+            guard model.settingsWindowActive, !sourceID.isEmpty else { loadError = nil; loadingSource = false; return }
             sourceSnapshot = .null; loadError = nil; loadingSource = true
             defer { loadingSource = false }
             let selectedSource = sourceID

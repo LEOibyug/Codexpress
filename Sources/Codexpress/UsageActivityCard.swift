@@ -44,9 +44,9 @@ struct UsageActivityCard: View {
             UsageActivityChart(days: daily, period: $period)
             if let loadError { InfoNote(text: loadError, color: .orange).padding(.horizontal, 3) }
         }
-        .task(id: UsageActivityRefreshKey(query: query, reusesOverview: reusesOverview)) {
+        .task(id: UsageRefreshKey(selection: UsageActivityRefreshKey(query: query, reusesOverview: reusesOverview), active: model.settingsWindowActive)) {
             loadError = nil
-            guard !reusesOverview else { return }
+            guard model.settingsWindowActive, !reusesOverview else { return }
             while !Task.isCancelled {
                 guard let requested = query else { break }
                 do {

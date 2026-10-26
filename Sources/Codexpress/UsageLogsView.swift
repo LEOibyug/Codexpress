@@ -77,7 +77,8 @@ struct UsageLogsView: View {
             }
         }.settingsPage()
         .sheet(item: $selected) { item in UsageRequestDetailView(item: item) }
-        .task(id: filter) {
+        .task(id: UsageRefreshKey(selection: filter, active: model.settingsWindowActive)) {
+            guard model.settingsWindowActive else { return }
             let requested = filter
             guard requested.query != nil else { return }
             do { try await Task.sleep(for: .milliseconds(250)) } catch { return }

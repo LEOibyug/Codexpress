@@ -64,6 +64,7 @@ struct SettingsView: View {
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }.background(AppPalette.canvas)
         }.font(.system(size: 13)).frame(minWidth: 860, minHeight: 620)
+            .environment(\.windowIsActive, model.settingsWindowActive)
             .overlay(alignment: .bottomLeading) { AppFeedbackOverlay() }
     }
 

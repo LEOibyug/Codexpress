@@ -3,6 +3,40 @@ use crate::usage::requests::tests::{fixture, persist, record};
 use std::time::Instant;
 
 #[test]
+fn cached_history_overlays_live_counters_and_invalidates_after_database_changes() {
+    let (_dir, mut data) = fixture();
+    let from = 100_000;
+    let payload = json!({"from":from,"to":from+86400,"day_starts":[from,from+86400]});
+    persist(&data, &record("stored", from), Some("native"));
+    let initial = build(&mut data, &payload).unwrap();
+    assert_eq!(initial["groups"][0]["requests"], 1);
+    let mut active = record("live", from + 1);
+    active.output_tokens = 123;
+    data.active
+        .insert(active.attempt_id.clone(), (active.clone(), Instant::now()));
+    let live = build(&mut data, &payload).unwrap();
+    assert_eq!(live["groups"][0]["output_tokens"], 133);
+    active.output_tokens = 456;
+    data.active
+        .insert(active.attempt_id.clone(), (active.clone(), Instant::now()));
+    let updated = build(&mut data, &payload).unwrap();
+    assert_eq!(updated["groups"][0]["output_tokens"], 466);
+    persist(&data, &active, Some("chatbot"));
+    data.active.clear();
+    let completed = build(&mut data, &payload).unwrap();
+    assert_eq!(completed["groups"][0]["requests"], 2);
+    assert_eq!(completed["groups"][0]["output_tokens"], 466);
+    assert_eq!(completed["groups"][0]["active_requests"], 0);
+    assert!(completed["options"]["ingresses"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("chatbot")));
+    data.connection.execute("DELETE FROM usage", []).unwrap();
+    let empty = build(&mut data, &payload).unwrap();
+    assert!(empty["groups"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn whole_window_filters_daily_zeroes_options_and_timings_are_consistent() {
     let (_dir, mut data) = fixture();
     let from = 100_000;
@@ -32,7 +66,11 @@ fn whole_window_filters_daily_zeroes_options_and_timings_are_consistent() {
     let mut outside = record("outside", days[3]);
     outside.model = "outside-window".into();
     persist(&data, &outside, Some("image"));
-    let full = build(&data, &json!({"from":from,"to":days[3],"day_starts":days})).unwrap();
+    let full = build(
+        &mut data,
+        &json!({"from":from,"to":days[3],"day_starts":days}),
+    )
+    .unwrap();
     let a = &full["groups"][0];
     assert_eq!(a["requests"], 226);
     assert_eq!(a["active_requests"], 1);
@@ -55,7 +93,7 @@ fn whole_window_filters_daily_zeroes_options_and_timings_are_consistent() {
     assert_eq!(full["groups"][1]["unpriced_requests"], 1);
     assert_eq!(full["options"]["models"].as_array().unwrap().len(), 2);
     assert!(!full.to_string().contains("outside-window"));
-    let filtered = build(&data, &json!({"from":from,"to":days[3],"day_starts":days,"source_id":"a","model":"gpt-6.1-sol","ingress":"native"})).unwrap();
+    let filtered = build(&mut data, &json!({"from":from,"to":days[3],"day_starts":days,"source_id":"a","model":"gpt-6.1-sol","ingress":"native"})).unwrap();
     assert_eq!(filtered["groups"].as_array().unwrap().len(), 1);
     assert_eq!(filtered["groups"][0]["requests"], 225); // unknown ingress active is filtered out.
     assert_eq!(filtered["daily"][0]["requests"], 225);
@@ -65,7 +103,7 @@ fn whole_window_filters_daily_zeroes_options_and_timings_are_consistent() {
     assert_eq!(filtered["performance"]["p50_first_token_ms"], 122.0);
     assert_eq!(filtered["options"], full["options"]);
     let missing = build(
-        &data,
+        &mut data,
         &json!({"from":from,"to":days[3],"day_starts":days,"model":"absent"}),
     )
     .unwrap();
@@ -87,7 +125,7 @@ fn invalid_days_are_read_only_and_active_timings_never_become_completed_samples(
     data.active
         .insert(live.attempt_id.clone(), (live, Instant::now()));
     let payload = json!({"from":from,"to":from+86_400,"day_starts":[from,from+86_400]});
-    let result = build(&data, &payload).unwrap();
+    let result = build(&mut data, &payload).unwrap();
     assert_eq!(result["groups"][0]["requests"], 1);
     assert_eq!(result["groups"][0]["successes"], 0);
     assert_eq!(result["groups"][0]["failures"], 0);
@@ -105,7 +143,7 @@ fn invalid_days_are_read_only_and_active_timings_never_become_completed_samples(
         json!({"from":from,"to":from+86_400,"day_starts":[from,from,from+86_400]}),
         json!({"from":from,"to":from+86_400,"day_starts":[from,from+86_400],"status":"success"}),
     ] {
-        assert!(build(&data, &invalid).is_err(), "accepted {invalid}");
+        assert!(build(&mut data, &invalid).is_err(), "accepted {invalid}");
     }
     assert_eq!(snapshot, data.connection.total_changes());
     assert_eq!(data.active.len(), 1);

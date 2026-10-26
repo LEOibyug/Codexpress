@@ -44,15 +44,26 @@ struct BalanceAmount {
     }
 }
 
+private struct WindowActivityKey: EnvironmentKey {
+    static let defaultValue = true
+}
+extension EnvironmentValues {
+    var windowIsActive: Bool {
+        get { self[WindowActivityKey.self] }
+        set { self[WindowActivityKey.self] = newValue }
+    }
+}
+
 struct ActivityDot: View {
     var color: Color = .secondary
     var active = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.windowIsActive) private var windowIsActive
 
     var body: some View {
         Image(systemName: "circle.fill").font(.system(size: 5))
             .foregroundStyle(active ? .green : color)
-            .symbolEffect(.pulse, options: .repeating, isActive: active && !reduceMotion)
+            .symbolEffect(.pulse, options: .repeating, isActive: active && windowIsActive && !reduceMotion)
             .frame(width: 5, height: 5)
             .accessibilityLabel(active ? "正在处理请求" : "")
     }

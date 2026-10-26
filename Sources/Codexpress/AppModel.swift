@@ -16,6 +16,7 @@ import ServiceManagement
     @Published var notice: String?
     @Published private(set) var busy = false
     @Published private(set) var running = false
+    @Published private(set) var settingsWindowActive = false
     @Published private(set) var loginSource: String?
     @Published private(set) var loginFlow: String?
     @Published var callbackURL = ""
@@ -97,7 +98,8 @@ import ServiceManagement
         timerTask = Task { [weak self] in
             var tick = 0
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
+                let interval = self?.settingsWindowActive == true || self?.gatewayHasActivity == true ? 1 : 3
+                try? await Task.sleep(for: .seconds(interval))
                 guard !Task.isCancelled, let self else { break }
                 tick = (tick + 1) % 5
                 await self.poll(refreshCredentials: tick == 0)
@@ -241,7 +243,7 @@ import ServiceManagement
     private func updateStatus() async throws {
         let fresh = try await client.call("status")
         guard let child = helper, child.isRunning, fresh["process_id"].number == Double(child.processIdentifier) else { running = false; throw AppError.message("网关实例已改变，停止发送管理请求。") }
-        status = fresh
+        if status != fresh { status = fresh }
         if Bundle.main.bundleIdentifier == "local.codexpress.mac" {
             let events = try await client.call("notifications.list")
             let result = await LocalNotifications.shared.deliver(events["events"].array)
@@ -254,6 +256,9 @@ import ServiceManagement
             else if let live = fresh["sources"].array.first(where: { $0["id"].string == next.sources[i].id }), let account = live["account_id"].string, !account.isEmpty { next.sources[i].account_id = account }
         }
         if next.sources != settings.sources { try persistSettings(next) }
+    }
+    func setSettingsWindowActive(_ active: Bool) {
+        if settingsWindowActive != active { settingsWindowActive = active }
     }
     private func sync() async throws {
         try requireWritableMetadata()

@@ -194,7 +194,7 @@ fn performance(connection: &Connection, query: &Query) -> Result<Value> {
     Ok(result)
 }
 
-fn options(data: &StoreData, query: &Query, active: &[Value]) -> Result<Value> {
+fn options(data: &StoreData, query: &Query) -> Result<Options> {
     let mut sources = BTreeMap::new();
     let mut models = BTreeSet::new();
     let mut ingresses = BTreeSet::new();
@@ -214,29 +214,59 @@ fn options(data: &StoreData, query: &Query, active: &[Value]) -> Result<Value> {
             target.insert(value?);
         }
     }
-    for record in active {
-        sources.insert(
-            record["source_id"].as_str().unwrap_or("").to_owned(),
-            record["source_name"].as_str().unwrap_or("").to_owned(),
-        );
-        models.insert(record["model"].as_str().unwrap_or("").to_owned());
-        ingresses.insert(record["ingress"].as_str().unwrap_or("unknown").to_owned());
-    }
-    ensure!(
-        sources.len() <= MAX_OPTIONS
-            && models.len() <= MAX_OPTIONS
-            && ingresses.len() <= MAX_OPTIONS,
-        "筛选选项过多，请缩小查询范围"
-    );
-    Ok(
-        json!({"sources":sources.into_iter().map(|(id,name)| json!({"id":id,"name":name})).collect::<Vec<_>>(),"models":models,"ingresses":ingresses}),
-    )
+    Ok(Options {
+        sources,
+        models,
+        ingresses,
+    })
 }
 
-pub(super) fn build(data: &StoreData, payload: &Value) -> Result<Value> {
-    let query = Query::parse(payload, true)?;
-    let active = requests::active_records(data, &query)?;
-    let options = options(data, &query, &active)?;
+#[derive(Clone)]
+struct Options {
+    sources: BTreeMap<String, String>,
+    models: BTreeSet<String>,
+    ingresses: BTreeSet<String>,
+}
+impl Options {
+    fn with_active(mut self, active: &[Value]) -> Result<Value> {
+        for record in active {
+            self.sources.insert(
+                record["source_id"].as_str().unwrap_or("").into(),
+                record["source_name"].as_str().unwrap_or("").into(),
+            );
+            self.models
+                .insert(record["model"].as_str().unwrap_or("").into());
+            self.ingresses
+                .insert(record["ingress"].as_str().unwrap_or("unknown").into());
+        }
+        ensure!(
+            self.sources.len() <= MAX_OPTIONS
+                && self.models.len() <= MAX_OPTIONS
+                && self.ingresses.len() <= MAX_OPTIONS,
+            "筛选选项过多，请缩小查询范围"
+        );
+        Ok(
+            json!({"sources":self.sources.into_iter().map(|(id,name)|json!({"id":id,"name":name})).collect::<Vec<_>>(),"models":self.models,"ingresses":self.ingresses}),
+        )
+    }
+}
+
+#[derive(Clone)]
+struct Snapshot {
+    groups: BTreeMap<(String, String), Value>,
+    daily: Vec<Value>,
+    options: Options,
+    performance: Value,
+}
+
+pub(super) struct Cached {
+    payload: Value,
+    changes: u64,
+    data_version: i64,
+    snapshot: Snapshot,
+}
+
+fn load_snapshot(data: &StoreData, query: &Query) -> Result<Snapshot> {
     let aggregate = aggregate_json();
     let mut statement = data.connection.prepare(&format!("{ATTEMPTS} SELECT source_id,source_name,model,MAX(attempt),{aggregate} FROM attempts WHERE {FILTERS} GROUP BY source_id,model ORDER BY source_id,model LIMIT {}", MAX_OPTIONS + 1))?;
     let mut groups: BTreeMap<(String, String), Value> = BTreeMap::new();
@@ -270,6 +300,54 @@ pub(super) fn build(data: &StoreData, payload: &Value) -> Result<Value> {
             *day = serde_json::from_str(&totals)?;
         }
     }
+    Ok(Snapshot {
+        groups,
+        daily,
+        options: options(data, query)?,
+        performance: performance(&data.connection, query)?,
+    })
+}
+
+pub(super) fn build(data: &mut StoreData, payload: &Value) -> Result<Value> {
+    let query = Query::parse(payload, true)?;
+    let changes = data.connection.total_changes();
+    let data_version = data
+        .connection
+        .pragma_query_value(None, "data_version", |row| row.get(0))?;
+    // Completed history is stable while tokens stream. Cache its aggregates;
+    // active counters and elapsed timings are overlaid fresh on every call.
+    data.analytics_cache
+        .retain(|cached| cached.changes == changes && cached.data_version == data_version);
+    let stored = if let Some(index) = data
+        .analytics_cache
+        .iter()
+        .position(|cached| cached.payload == *payload)
+    {
+        let cached = data.analytics_cache.remove(index).expect("cached query");
+        let snapshot = cached.snapshot.clone();
+        data.analytics_cache.push_back(cached);
+        snapshot
+    } else {
+        let snapshot = load_snapshot(data, &query)?;
+        if data.analytics_cache.len() == 8 {
+            data.analytics_cache.pop_front();
+        }
+        data.analytics_cache.push_back(Cached {
+            payload: payload.clone(),
+            changes,
+            data_version,
+            snapshot: snapshot.clone(),
+        });
+        snapshot
+    };
+    let Snapshot {
+        mut groups,
+        mut daily,
+        options,
+        performance,
+    } = stored;
+    let active = requests::active_records(data, &query)?;
+    let options = options.with_active(&active)?;
     for record in active.iter().filter(|record| query.matches(record)) {
         let key = (
             record["source_id"].as_str().unwrap_or("").to_owned(),
@@ -316,7 +394,7 @@ pub(super) fn build(data: &StoreData, payload: &Value) -> Result<Value> {
         })
         .collect();
     Ok(
-        json!({"groups":groups.into_values().collect::<Vec<_>>(),"daily":daily,"performance":performance(&data.connection,&query)?,"options":options,"from":query.from,"to":query.to,"fetched_at":crate::model::now()}),
+        json!({"groups":groups.into_values().collect::<Vec<_>>(),"daily":daily,"performance":performance,"options":options,"from":query.from,"to":query.to,"fetched_at":crate::model::now()}),
     )
 }
 

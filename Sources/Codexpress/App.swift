@@ -19,6 +19,7 @@ struct GatewayMenuIcon: View {
     let running: Bool
     let active: Bool
     @Environment(\.colorScheme) private var colorScheme
+    private static let cachedImages = NSCache<NSNumber, NSImage>()
 
     var body: some View {
         Image(nsImage: Self.image(running: running, active: active, dark: colorScheme == .dark))
@@ -27,6 +28,8 @@ struct GatewayMenuIcon: View {
     }
 
     static func image(running: Bool, active: Bool, dark: Bool) -> NSImage {
+        let key = NSNumber(value: (running ? 1 : 0) | (active ? 2 : 0) | (dark ? 4 : 0))
+        if let cached = cachedImages.object(forKey: key) { return cached }
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
             let symbol = NSImage(systemSymbolName: running ? "arrow.triangle.branch" : "exclamationmark.circle", accessibilityDescription: nil)
             symbol?.draw(in: NSRect(x: 1, y: 1, width: 16, height: 16))
@@ -44,11 +47,12 @@ struct GatewayMenuIcon: View {
             return true
         }
         image.isTemplate = false
+        cachedImages.setObject(image, forKey: key)
         return image
     }
 }
 
-@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     static weak var current: AppDelegate?
     weak var model: AppModel?
     private var settingsWindow: NSWindow?
@@ -64,13 +68,27 @@ struct GatewayMenuIcon: View {
             window.setContentSize(NSSize(width: 960, height: 780))
             window.minSize = NSSize(width: 860, height: 650)
             window.isReleasedWhenClosed = false
+            window.delegate = self
             window.center()
             settingsWindow = window
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
         AppModel.shared.accountPageOpened()
         NSApp.activate(ignoringOtherApps: true)
+        updateWindowActivity()
     }
+    private func updateWindowActivity() {
+        let active = settingsWindow.map { $0.isVisible && !$0.isMiniaturized && $0.occlusionState.contains(.visible) && NSApp.isActive } ?? false
+        (model ?? AppModel.shared).setSettingsWindowActive(active)
+    }
+    func windowDidBecomeKey(_ notification: Notification) { updateWindowActivity() }
+    func windowDidResignKey(_ notification: Notification) { updateWindowActivity() }
+    func windowDidChangeOcclusionState(_ notification: Notification) { updateWindowActivity() }
+    func windowDidMiniaturize(_ notification: Notification) { updateWindowActivity() }
+    func windowDidDeminiaturize(_ notification: Notification) { updateWindowActivity() }
+    func windowWillClose(_ notification: Notification) { (model ?? AppModel.shared).setSettingsWindowActive(false) }
+    func applicationDidBecomeActive(_ notification: Notification) { updateWindowActivity() }
+    func applicationDidResignActive(_ notification: Notification) { updateWindowActivity() }
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         Self.current = self

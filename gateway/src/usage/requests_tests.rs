@@ -18,6 +18,7 @@ pub(in crate::usage) fn fixture() -> (tempfile::TempDir, StoreData) {
         StoreData {
             connection,
             active: HashMap::new(),
+            analytics_cache: Default::default(),
         },
     )
 }

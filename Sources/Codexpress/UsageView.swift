@@ -54,8 +54,8 @@ struct UsageView: View {
                 }.padding(.bottom, 4)
             }
         }.settingsPage()
-        .task(id: selection) {
-            guard selection.query != nil else { return }
+        .task(id: UsageRefreshKey(selection: selection, active: model.settingsWindowActive)) {
+            guard model.settingsWindowActive, selection.query != nil else { return }
             while !Task.isCancelled {
                 guard let query = selection.query else { break }
                 do {

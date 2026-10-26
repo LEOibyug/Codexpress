@@ -3,6 +3,7 @@ import AppKit
 
 struct MenuView: View {
     @EnvironmentObject var model: AppModel
+    @State private var windowActive = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -74,9 +75,10 @@ struct MenuView: View {
                 Button("退出") { NSApp.terminate(nil) }.keyboardShortcut("q").foregroundStyle(.secondary)
             }.buttonStyle(.borderless).font(.system(size: 11))
         }.padding(18).frame(width: 340)
-            .background(AccountWindowOpenRefresh {
+            .environment(\.windowIsActive, windowActive)
+            .background(AccountWindowOpenRefresh(refresh: {
                 Task { await model.refreshAccountInfo(sourceIDs: Array(model.sources.prefix(4)).map(\.id)) }
-            })
+            }, activityChanged: { windowActive = $0 }))
             .task(id: model.running) { await model.refreshAccountInfo(sourceIDs: Array(model.sources.prefix(4)).map(\.id)) }
             .overlay(alignment: .bottomLeading) { AppFeedbackOverlay() }
     }
@@ -110,19 +112,30 @@ struct MenuView: View {
 // alone does not reliably run on every reopening of the existing panel.
 private struct AccountWindowOpenRefresh: NSViewRepresentable {
     var refresh: () -> Void
-    func makeNSView(context: Context) -> ObserverView { let view = ObserverView(); view.refresh = refresh; return view }
-    func updateNSView(_ view: ObserverView, context: Context) { view.refresh = refresh }
+    var activityChanged: (Bool) -> Void = { _ in }
+    func makeNSView(context: Context) -> ObserverView { let view = ObserverView(); view.refresh = refresh; view.activityChanged = activityChanged; return view }
+    func updateNSView(_ view: ObserverView, context: Context) { view.refresh = refresh; view.activityChanged = activityChanged }
 
     final class ObserverView: NSView {
         var refresh: () -> Void = {}
+        var activityChanged: (Bool) -> Void = { _ in }
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: nil)
+            NotificationCenter.default.removeObserver(self)
             if let window {
                 NotificationCenter.default.addObserver(self, selector: #selector(didOpen(_:)), name: NSWindow.didBecomeKeyNotification, object: window)
+                for name in [NSWindow.didResignKeyNotification, NSWindow.didChangeOcclusionStateNotification] {
+                    NotificationCenter.default.addObserver(self, selector: #selector(activity(_:)), name: name, object: window)
+                }
             }
+            DispatchQueue.main.async { [weak self] in self?.reportActivity() }
         }
-        @objc private func didOpen(_ notification: Notification) { refresh() }
+        @objc private func didOpen(_ notification: Notification) { refresh(); activity(notification) }
+        @objc private func activity(_ notification: Notification) { reportActivity() }
+        private func reportActivity() {
+            let active = window.map { $0.isKeyWindow && $0.isVisible && $0.occlusionState.contains(.visible) } ?? false
+            activityChanged(active)
+        }
         deinit { NotificationCenter.default.removeObserver(self) }
     }
 }

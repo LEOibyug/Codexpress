@@ -90,6 +90,11 @@ private func compactUsageNumber(_ number: Double, minimumFractionDigits: Int = 0
 func usageSeconds(_ milliseconds: Double?) -> String { milliseconds.map { String(format: "%.2f 秒", $0 / 1000) } ?? "—" }
 
 /// An inclusive selection of local calendar dates, sent as half-open day boundaries.
+struct UsageRefreshKey<Selection: Equatable>: Equatable {
+    let selection: Selection
+    let active: Bool
+}
+
 struct UsageQuery: Equatable, Sendable {
     let from: Double
     let to: Double
