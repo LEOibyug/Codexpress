@@ -47,6 +47,13 @@ struct SourcesView: View {
             }
         }.settingsPage()
             .task(id: "\(model.running):\(model.accountRefreshGeneration)") { await model.refreshAccountInfo() }
+            .task(id: "\(model.running):\(model.settingsWindowActive)") {
+                guard model.running, model.settingsWindowActive else { return }
+                while !Task.isCancelled {
+                    model.refreshVisibleModels()
+                    do { try await Task.sleep(for: .seconds(300)) } catch { break }
+                }
+            }
             .sheet(item: $editing) { item in SourceEditor(source: item.source, isNew: item.isNew).environmentObject(model) }
             .alert("删除来源？", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
                 Button("取消", role: .cancel) { deleting = nil }

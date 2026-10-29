@@ -50,7 +50,16 @@ pub(super) fn prepare_compaction(
         }
         return Ok(None);
     }
-    let bytes = serde_json::to_vec_pretty(&compaction::catalog(home, &original, rules)?)?;
+    let additions = std::fs::read(state_dir.join("model-catalogs/official-latest.json"))
+        .ok()
+        .filter(|bytes| bytes.len() <= 4 * 1024 * 1024)
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let bytes = serde_json::to_vec_pretty(&compaction::catalog_with_additions(
+        home,
+        &original,
+        rules,
+        additions.as_ref(),
+    )?)?;
     let path = state_dir
         .join("model-catalogs")
         .join(format!("{:x}.json", Sha256::digest(&bytes)));

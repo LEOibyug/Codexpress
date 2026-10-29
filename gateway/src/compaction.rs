@@ -56,8 +56,17 @@ pub fn catalog(
     original: &DocumentMut,
     rules: &[ModelCompactionRule],
 ) -> Result<Value> {
+    catalog_with_additions(home, original, rules, None)
+}
+
+pub fn catalog_with_additions(
+    home: &Path,
+    original: &DocumentMut,
+    rules: &[ModelCompactionRule],
+    additions: Option<&Value>,
+) -> Result<Value> {
     validate(rules)?;
-    let catalog = if let Some(path) = original.get("model_catalog_json") {
+    let mut catalog = if let Some(path) = original.get("model_catalog_json") {
         let path = path
             .as_str()
             .context("model_catalog_json 必须是路径字符串")?;
@@ -72,6 +81,21 @@ pub fn catalog(
     } else {
         bundled_catalog()?
     };
+    if let Some(additions) = additions.and_then(|value| value["models"].as_array()) {
+        if let Some(models) = catalog["models"].as_array_mut() {
+            let mut names: HashSet<String> = models
+                .iter()
+                .filter_map(|model| model["slug"].as_str().map(str::to_owned))
+                .collect();
+            for model in additions {
+                if let Some(slug) = model["slug"].as_str() {
+                    if names.insert(slug.to_owned()) {
+                        models.push(model.clone());
+                    }
+                }
+            }
+        }
+    }
     catalog_from_value(catalog, original, rules)
 }
 

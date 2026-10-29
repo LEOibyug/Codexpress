@@ -54,7 +54,7 @@ fn parse_models(body: &[u8]) -> Result<Vec<String>> {
     Ok(models.into_iter().collect())
 }
 
-async fn fetch(source: &Source) -> Result<Vec<String>> {
+async fn fetch(source: &Source) -> Result<(Vec<String>, Option<Value>)> {
     source.validate()?;
     let mut request = transport::client(source)?
         .get(endpoint(source)?)
@@ -107,7 +107,21 @@ async fn fetch(source: &Source) -> Result<Vec<String>> {
             transport::BodyReadError::TooLarge => anyhow!("供应商模型列表超过 4 MiB 限制"),
             transport::BodyReadError::ReadFailed => anyhow!("读取模型列表失败，请重试"),
         })?;
-    parse_models(&body)
+    let models = parse_models(&body)?;
+    let catalog = if source.kind == "official" {
+        serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| {
+                let entries = value.get("models")?.as_array()?;
+                entries
+                    .iter()
+                    .all(|entry| entry["slug"].as_str().is_some())
+                    .then(|| json!({"models":entries}))
+            })
+    } else {
+        None
+    };
+    Ok((models, catalog))
 }
 
 pub async fn list(state: &Arc<AppState>, payload: Value) -> Result<Value> {
@@ -139,7 +153,23 @@ pub async fn list(state: &Arc<AppState>, payload: Value) -> Result<Value> {
             source
         }
     };
-    Ok(json!({"models":fetch(&source).await?}))
+    let (models, catalog) = fetch(&source).await?;
+    if let Some(catalog) = catalog {
+        let sources = state.sources.read().await;
+        if sources.iter().any(|current| {
+            current.source.enabled
+                && current.source.id == source.id
+                && current.source.identity() == source.identity()
+                && current.source.proxy == source.proxy
+        }) {
+            let path = state.state_dir.join("model-catalogs/official-latest.json");
+            let bytes = serde_json::to_vec(&catalog)?;
+            if std::fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
+                crate::config::secure_write(&path, &bytes)?;
+            }
+        }
+    }
+    Ok(json!({"models":models}))
 }
 
 #[cfg(test)]

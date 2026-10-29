@@ -20,6 +20,53 @@ fn active_catalog(home: &std::path::Path) -> Value {
 }
 
 #[test]
+fn discovered_models_keep_upstream_capabilities_with_explicit_context_limits() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    let state = root.path().join("app");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(state.join("model-catalogs")).unwrap();
+    fs::write(home.join("config.toml"), "model = \"gpt-6.1-sol\"\n").unwrap();
+    let additions = serde_json::json!({"models":[
+        {"slug":"gpt-6.1-terra","display_name":"GPT-6.1 Terra","context_window":400000,"max_context_window":1050000,
+         "supported_reasoning_levels":[{"effort":"max","description":"Maximum"}],"model_messages":{"instructions_template":"upstream instructions"},"supports_parallel_tool_calls":true},
+        {"slug":"gpt-6.1-sol","model_messages":{"instructions_template":"must not overwrite existing configuration"}}
+    ]});
+    fs::write(
+        state.join("model-catalogs/official-latest.json"),
+        additions.to_string(),
+    )
+    .unwrap();
+    config::attach_with_rules(
+        &home,
+        &state,
+        17863,
+        "fixture-key",
+        &[rule("gpt-6.1-terra", 600000, Some(1000000))],
+    )
+    .unwrap();
+    let catalog = active_catalog(&home);
+    let models = catalog["models"].as_array().unwrap();
+    let terra = models
+        .iter()
+        .find(|m| m["slug"] == "gpt-6.1-terra")
+        .unwrap();
+    assert_eq!(terra["context_window"], 1000000);
+    assert_eq!(terra["auto_compact_token_limit"], 600000);
+    assert_eq!(
+        terra["supported_reasoning_levels"],
+        additions["models"][0]["supported_reasoning_levels"]
+    );
+    assert_eq!(terra["supports_parallel_tool_calls"], true);
+    assert_eq!(terra["base_instructions"], "upstream instructions");
+    let sol = models.iter().find(|m| m["slug"] == "gpt-6.1-sol").unwrap();
+    assert_ne!(
+        sol["base_instructions"],
+        "must not overwrite existing configuration"
+    );
+}
+
+#[test]
 fn catalog_legacy_instructions_preserve_existing_values_and_empty_modern_instructions() {
     let original = toml_edit::DocumentMut::new();
     let catalog = serde_json::json!({"models":[

@@ -414,17 +414,18 @@ import ServiceManagement
         guard !models.isEmpty else { throw AppError.message("供应商未返回可用模型。") }
         return models
     }
-    private func scheduleModelRefresh() {
+    private func scheduleModelRefresh(maximumAge: TimeInterval = 3600) {
         guard modelRefreshTask == nil, running, !metadataLoadFailed else { return }
         modelRefreshTask = Task {
             defer { modelRefreshTask = nil }
             for source in sources where source.enabled && source.discoversModels {
-                guard !busy, Date().timeIntervalSince(lastModelRefresh[source.id] ?? .distantPast) >= 3600 else { continue }
+                guard !busy, Date().timeIntervalSince(lastModelRefresh[source.id] ?? .distantPast) >= maximumAge else { continue }
                 if source.official && source.account_id == nil { continue }
                 await refreshModels(source.id)
             }
         }
     }
+    func refreshVisibleModels() { scheduleModelRefresh(maximumAge: 300) }
     func refreshModels(_ id: String) async {
         guard !refreshingModels.contains(id), let before = settings.sources.first(where: { $0.id == id }), before.discoversModels else { return }
         refreshingModels.insert(id); lastModelRefresh[id] = Date(); modelErrors[id] = nil
