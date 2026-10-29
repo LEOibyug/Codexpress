@@ -123,8 +123,15 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
         }
         "models.list" => crate::discovery::list(state, payload).await,
         "balance.query" => crate::balance::query(state, payload).await,
+        "usage.reconcile" => Ok(crate::balance::billing::schedule(
+            state,
+            true,
+            payload["source_id"].as_str(),
+        )),
+        "usage.reconcile.status" => Ok(crate::balance::billing::status(state)),
         "sync" => sync::handle(state, payload).await,
         "usage.analytics" | "usage.requests" | "usage.detail" => {
+            crate::balance::billing::schedule(state, false, None);
             let usage = state.usage.clone();
             let operation = op.to_owned();
             tokio::task::spawn_blocking(move || match operation.as_str() {
@@ -135,15 +142,18 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             .await
             .context("用量查询失败")?
         }
-        "usage" => state.usage.summary_filtered(
-            payload
-                .get("days")
-                .and_then(Value::as_u64)
-                .unwrap_or(30)
-                .clamp(1, 3660) as u32,
-            payload.get("source_id").and_then(Value::as_str),
-            payload.get("model").and_then(Value::as_str),
-        ),
+        "usage" => {
+            crate::balance::billing::schedule(state, false, None);
+            state.usage.summary_filtered(
+                payload
+                    .get("days")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(30)
+                    .clamp(1, 3660) as u32,
+                payload.get("source_id").and_then(Value::as_str),
+                payload.get("model").and_then(Value::as_str),
+            )
+        }
         op if op.starts_with("config.") => config::handle(state, op, payload).await,
         op if op.starts_with("official.") => crate::official::handle(state, op, payload).await,
         _ => bail!("未知管理操作"),

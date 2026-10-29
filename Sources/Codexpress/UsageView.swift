@@ -79,7 +79,7 @@ struct UsageView: View {
     }
     private var summary: some View {
         HStack(alignment: .top, spacing: 0) {
-            summaryMetric("参考费用 · USD", value: usageMoney(totals.cost), detail: "API 参考价估算", prominent: true)
+            summaryMetric("费用 · USD", value: usageMoney(totals.cost, estimated: totals.costEstimated), detail: totals.cost == nil ? "暂无已计价请求" : totals.costEstimated ? "含 API 参考价估算" : "供应商实际扣费", prominent: true)
             Divider().padding(.vertical, 3).padding(.horizontal, 14)
             summaryMetric("总 Token", value: usageCount(totals.total, estimated: totals.estimated), detail: "输入 + 输出")
             summaryMetric("请求", value: usageCount(totals.sum("requests")), detail: "失败 \(usageCount(totals.sum("failures")))")
@@ -167,7 +167,7 @@ private struct UsagePriceSheet: View {
                     }
                 }
             }
-            Text("官方订阅的 GPT‑6.1 Sol、已开启“订阅来源”的 API 均免长上下文加价。费用按请求时保存的参考价与可用 Token 折算；未收录的模型与计费模式不计价。").font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text("上游实际扣费优先；未提供时按此表折算。参考价估算中，官方订阅的 GPT‑6.1 Sol、已开启“订阅来源”的 API 免长上下文加价。").font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
                 if let raw = catalog["source_url"].string, let url = URL(string: raw) { Link("查看 OpenAI 官方价格", destination: url) }
                 Spacer()

@@ -152,6 +152,7 @@ impl Attempt {
                 output_estimated: true,
                 source_kind: Some(source.kind.clone()),
                 is_subscription: Some(source.is_subscription),
+                source_identity: Some(source.identity()),
                 ..Default::default()
             },
             complete: false,
@@ -299,6 +300,11 @@ impl Attempt {
                     cache_write_retention: record.token_details.cache_write_retention.clone(),
                     source_kind: record.token_details.source_kind.clone(),
                     is_subscription: record.token_details.is_subscription,
+                    source_identity: record.token_details.source_identity.clone(),
+                    upstream_cost: observer
+                        .upstream_cost
+                        .clone()
+                        .or_else(|| record.token_details.upstream_cost.clone()),
                 };
                 record.complete =
                     observer.input.is_some() && observer.output.is_some() && observer.terminal;
@@ -366,6 +372,7 @@ pub(super) struct Observer {
     service_tier: Option<String>,
     reasoning: Option<u64>,
     total: Option<u64>,
+    upstream_cost: Option<crate::usage::ReportedCost>,
     delta_units: HashMap<String, u64>,
     item_units: HashMap<String, u64>,
     final_units: Option<u64>,
@@ -574,6 +581,8 @@ impl Observer {
         ) || !self.sse
         {
             self.terminal = true;
+            self.upstream_cost =
+                crate::pricing::response_charge(response).or_else(|| self.upstream_cost.clone());
         }
         if matches!(event_type, "response.failed" | "error")
             || response.get("status").and_then(Value::as_str) == Some("failed")

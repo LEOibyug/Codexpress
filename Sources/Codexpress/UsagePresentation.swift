@@ -20,8 +20,9 @@ struct UsageTotals {
     var tps: Double? { sum("throughput_latency_ms") > 0 ? sum("throughput_output_tokens") * 1000 / sum("throughput_latency_ms") : nil }
     var cacheRate: Double? { sum("cached_reported_input_tokens") > 0 ? min(100, sum("cached_reported_tokens") * 100 / sum("cached_reported_input_tokens")) : nil }
     var cost: Double? { sum("priced_requests") > 0 ? sum("total_usd") : nil }
+    var costEstimated: Bool { sum("priced_requests") > sum("upstream_priced_requests") }
     var averageCost: Double? { sum("priced_requests") > 0 ? sum("total_usd") / sum("priced_requests") : nil }
-    var savings: Double? { sum("priced_requests") > 0 ? sum("cache_savings_usd") : nil }
+    var savings: Double? { costEstimated ? sum("cache_savings_usd") : nil }
 }
 
 struct UsageComparison: Identifiable {
@@ -45,6 +46,7 @@ func usageMoney(_ amount: Double?, estimated: Bool = true) -> String {
 }
 func usageCostStatus(_ cost: JSONValue) -> String {
     switch cost["status"].string {
+    case "upstream_reported": return "上游实际扣费"
     case "unknown_model": return "未收录价格"
     case "unknown_tier": return "未收录此计费模式"
     case "unobserved": return "无可计费计数"
@@ -56,10 +58,14 @@ func usageCostStatus(_ cost: JSONValue) -> String {
 }
 func usageBillingBasis(_ cost: JSONValue) -> String {
     switch cost["billing_basis"].string {
+    case "upstream_charge": return cost["method"].string == "cch_usage" ? "供应商账单匹配" : "供应商响应"
     case "official_subscription_reference": return "官方订阅参考折算"
     case "subscription_reference": return "订阅来源参考折算"
     default: return cost["source_type_known"].bool == false ? "API 参考折算（历史来源类型未知）" : "API 参考折算"
     }
+}
+func usageCostMoney(_ cost: JSONValue) -> String {
+    usageMoney(cost["total_usd"].number, estimated: cost["billing_basis"].string != "upstream_charge")
 }
 
 func usageCount(_ number: Double, estimated: Bool = false) -> String {
@@ -142,6 +148,7 @@ struct UsageDaily: Identifiable {
     let cost: Double?
     let requests: Double
     let estimated: Bool
+    let costEstimated: Bool
     var id: Date { date }
     init(_ value: JSONValue) {
         date = Date(timeIntervalSince1970: value["start_at"].number ?? 0)
@@ -151,6 +158,7 @@ struct UsageDaily: Identifiable {
         cost = value["total_usd"].number
         requests = value["requests"].number ?? 0
         estimated = (value["estimated_requests"].number ?? 0) > 0
+        costEstimated = (value["priced_requests"].number ?? 0) > (value["upstream_priced_requests"].number ?? 0)
     }
 }
 
@@ -215,6 +223,7 @@ struct UsageSourceSlice: Identifiable {
     let tokenTotal: Double
     let cost: Double?
     let estimated: Bool
+    var costEstimated = true
 }
 
 func usageDistributionSlices(_ groups: [JSONValue], groupBy: String) -> [UsageSourceSlice] {
@@ -224,7 +233,7 @@ func usageDistributionSlices(_ groups: [JSONValue], groupBy: String) -> [UsageSo
     for row in rows {
         let value = models ? row.totals.total : row.totals.cost
         guard let value, value.isFinite, value > 0 else { continue }
-        let slice = UsageSourceSlice(id: row.id, name: row.name, value: value, tokenTotal: row.totals.total, cost: row.totals.cost, estimated: row.totals.estimated)
+        let slice = UsageSourceSlice(id: row.id, name: row.name, value: value, tokenTotal: row.totals.total, cost: row.totals.cost, estimated: row.totals.estimated, costEstimated: row.totals.costEstimated)
         let unknownName = ["", "unknown", "unknown_model", "未知模型"].contains(row.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
         // Aggregates currently merge unknown model and tier prices into unpriced_requests.
         let unlisted = row.totals.sum("unpriced_requests") > 0 && row.totals.sum("priced_requests") == 0
@@ -235,7 +244,7 @@ func usageDistributionSlices(_ groups: [JSONValue], groupBy: String) -> [UsageSo
     let other = Array(ranked.dropFirst(3)) + forcedOther
     if !other.isEmpty {
         let knownCosts = other.compactMap(\.cost)
-        slices.append(UsageSourceSlice(id: "usage-other-sources", name: "其他", value: other.reduce(0) { $0 + $1.value }, tokenTotal: other.reduce(0) { $0 + $1.tokenTotal }, cost: knownCosts.isEmpty ? nil : knownCosts.reduce(0, +), estimated: other.contains(where: \.estimated)))
+        slices.append(UsageSourceSlice(id: "usage-other-sources", name: "其他", value: other.reduce(0) { $0 + $1.value }, tokenTotal: other.reduce(0) { $0 + $1.tokenTotal }, cost: knownCosts.isEmpty ? nil : knownCosts.reduce(0, +), estimated: other.contains(where: \.estimated), costEstimated: other.contains(where: \.costEstimated)))
     }
     return slices
 }

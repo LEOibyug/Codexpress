@@ -64,7 +64,7 @@ struct UsageRequestDetailView: View {
                 GridRow { field("时间", Date(timeIntervalSince1970: record["started_at"].number ?? 0).formatted(date: .numeric, time: .standard)); field("入口", usageIngressName(record["ingress"].string ?? diagnostic["ingress"].string)) }
                 GridRow { field("HTTP 状态", (record["http_status"].number ?? diagnostic["http_status"].number).map { String(Int($0)) } ?? "—"); field("请求耗时", usageSeconds(record["latency_ms"].number)) }
                 GridRow { field("输入 / 输出", usageCount(record["input_tokens"].number ?? 0) + " / " + usageCount(record["output_tokens"].number ?? 0)); field("首 Token", usageSeconds(record["first_token_latency_ms"].number)) }
-                GridRow { field("参考费用", usageMoney(record["cost"]["total_usd"].number)); field("输出速度", usageRate(record["output_tps"].number) + " TPS") }
+                GridRow { field("费用", usageCostMoney(record["cost"])); field("输出速度", usageRate(record["output_tps"].number) + " TPS") }
             }
             if let path = diagnostic["path"].string {
                 Divider()
@@ -91,22 +91,27 @@ struct UsageRequestDetailView: View {
                 else {
                     detailRow("计价状态", usageCostStatus(cost))
                     detailRow("计价依据", usageBillingBasis(cost))
-                    detailRow("计价模型", cost["price_model"].string ?? "—")
-                    if let tier = cost["service_tier"].string { detailRow("计费模式", tier) }
-                    detailRow("非缓存输入", usageMoney(cost["input_usd"].number))
-                    detailRow("缓存读取", usageMoney(cost["cached_input_usd"].number))
-                    detailRow("缓存写入", usageMoney(cost["cache_write_usd"].number))
-                    detailRow("输出", usageMoney(cost["output_usd"].number))
-                    detailRow("合计", usageMoney(cost["total_usd"].number))
-                    detailRow("缓存节省", usageMoney(cost["cache_savings_usd"].number))
-                    if cost["rates"] != .null {
-                        Text("每百万 Token").font(.system(size: 10)).foregroundStyle(.secondary).padding(.top, 3)
-                        detailRow("输入 / 缓存 / 输出", usageMoney(cost["rates"]["input"].number, estimated: false) + " / " + usageMoney(cost["rates"]["cached_input"].number, estimated: false) + " / " + usageMoney(cost["rates"]["output"].number, estimated: false))
+                    if cost["billing_basis"].string == "upstream_charge" {
+                        detailRow("实际扣费", usageCostMoney(cost))
+                        if let id = cost["upstream_record_id"].string { detailRow("账单记录", id) }
+                    } else {
+                        detailRow("计价模型", cost["price_model"].string ?? "—")
+                        if let tier = cost["service_tier"].string { detailRow("计费模式", tier) }
+                        detailRow("非缓存输入", usageMoney(cost["input_usd"].number))
+                        detailRow("缓存读取", usageMoney(cost["cached_input_usd"].number))
+                        detailRow("缓存写入", usageMoney(cost["cache_write_usd"].number))
+                        detailRow("输出", usageMoney(cost["output_usd"].number))
+                        detailRow("合计", usageMoney(cost["total_usd"].number))
+                        detailRow("缓存节省", usageMoney(cost["cache_savings_usd"].number))
+                        if cost["rates"] != .null {
+                            Text("每百万 Token").font(.system(size: 10)).foregroundStyle(.secondary).padding(.top, 3)
+                            detailRow("输入 / 缓存 / 输出", usageMoney(cost["rates"]["input"].number, estimated: false) + " / " + usageMoney(cost["rates"]["cached_input"].number, estimated: false) + " / " + usageMoney(cost["rates"]["output"].number, estimated: false))
+                        }
+                        if cost["long_context_waived"].bool == true { detailRow("长上下文", "已免加价") }
+                        else if cost["long_context"].bool == true { detailRow("长上下文", "已按长上下文价格折算") }
+                        if let revision = cost["revision"].string { detailRow("价格版本", revision) }
+                        if cost["session_scope_estimate"].bool == true { InfoNote(text: "此模型按整段会话区分长上下文价格；此处按本次输入量估算。", color: .orange) }
                     }
-                    if cost["long_context_waived"].bool == true { detailRow("长上下文", "已免加价") }
-                    else if cost["long_context"].bool == true { detailRow("长上下文", "已按长上下文价格折算") }
-                    if let revision = cost["revision"].string { detailRow("价格版本", revision) }
-                    if cost["session_scope_estimate"].bool == true { InfoNote(text: "此模型按整段会话区分长上下文价格；此处按本次输入量估算。", color: .orange) }
                 }
             }.padding(.top, 13)
         }.font(.system(size: 11)).padding(16).cardSurface()

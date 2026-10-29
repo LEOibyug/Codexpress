@@ -2,6 +2,18 @@ import XCTest
 @testable import Codexpress
 
 final class UsagePresentationTests: XCTestCase {
+    func testProviderChargesRemainExactAndMixedTotalsKeepTheirEstimateMarker() {
+        let charge: JSONValue = .object(["billing_basis": .string("upstream_charge"), "status": .string("upstream_reported"), "total_usd": .number(0)])
+        XCTAssertEqual(usageCostMoney(charge), "$0.00")
+        XCTAssertEqual(usageCostStatus(charge), "上游实际扣费")
+        let actual: JSONValue = .object(["priced_requests": .number(2), "upstream_priced_requests": .number(2), "total_usd": .number(0.3)])
+        XCTAssertFalse(UsageTotals(rows: [actual]).costEstimated)
+        XCTAssertNil(UsageTotals(rows: [actual]).savings)
+        let reference: JSONValue = .object(["priced_requests": .number(1), "total_usd": .number(0.2)])
+        let mixed = UsageTotals(rows: [actual, reference])
+        XCTAssertTrue(mixed.costEstimated)
+        XCTAssertEqual(mixed.cost ?? 0, 0.5, accuracy: 1e-9)
+    }
     func testMoneyAndModelComparisonsPreserveUnknownPricesAndSumMatchingModels() {
         XCTAssertEqual(usageMoney(nil), "—")
         XCTAssertEqual(usageMoney(0), "≈$0.00")

@@ -1,4 +1,5 @@
 mod analytics;
+pub(crate) mod billing;
 pub mod diagnostics;
 mod requests;
 mod summary;
@@ -26,6 +27,17 @@ pub struct TokenDetails {
     pub cache_write_retention: Option<String>,
     pub source_kind: Option<String>,
     pub is_subscription: Option<bool>,
+    pub source_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_cost: Option<ReportedCost>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReportedCost {
+    pub usd: f64,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -66,7 +78,8 @@ impl UsageStore {
                 status TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
                 cached_input_tokens INTEGER NOT NULL, complete INTEGER NOT NULL, latency_ms INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS usage_time ON usage(started_at);
-            CREATE INDEX IF NOT EXISTS usage_source ON usage(source_id);")?;
+            CREATE INDEX IF NOT EXISTS usage_source ON usage(source_id);
+            CREATE INDEX IF NOT EXISTS usage_source_time ON usage(source_id,started_at);")?;
         let has_metadata = connection
             .prepare("PRAGMA table_info(usage)")?
             .query_map([], |row| row.get::<_, String>(1))?

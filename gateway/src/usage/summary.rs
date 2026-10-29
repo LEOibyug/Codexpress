@@ -11,12 +11,13 @@ const COST_FIELDS: [&str; 6] = [
     "output_usd",
     "cache_savings_usd",
 ];
-const COST_COUNTS: [&str; 5] = [
+const COST_COUNTS: [&str; 6] = [
     "priced_requests",
     "unpriced_requests",
     "unobserved_requests",
     "partial_cost_requests",
     "estimated_cost_requests",
+    "upstream_priced_requests",
 ];
 
 pub(super) fn build(
@@ -68,7 +69,8 @@ fn load_groups(connection: &Connection, since: u64) -> Result<Vec<Value>> {
         SUM(json_extract(metadata,'$.cost.status') IN ('unknown_model','unknown_tier')),
         SUM(json_extract(metadata,'$.cost.status')='unobserved'),
         SUM(json_extract(metadata,'$.cost.status')='partial'),
-        SUM(json_extract(metadata,'$.cost.status')='estimated' OR json_extract(metadata,'$.cost.historical')=1)
+        SUM(json_extract(metadata,'$.cost.status')='estimated' OR json_extract(metadata,'$.cost.historical')=1),
+        SUM(COALESCE(json_extract(metadata,'$.cost.billing_basis')='upstream_charge',0))
         FROM usage WHERE started_at>=?1 GROUP BY source_id,model"))?;
     for row in cost_query.query_map([since], |r| {
         let mut value = json!({"source_id":r.get::<_,String>(0)?,"model":r.get::<_,String>(1)?});
@@ -171,6 +173,7 @@ fn merge_active_groups(rows: &mut Vec<Value>, active_records: &[Value]) {
             cost["status"] == "unobserved",
             cost["status"] == "partial",
             cost["status"] == "estimated",
+            cost["billing_basis"] == "upstream_charge",
         ]) {
             if applies {
                 row[name] = json!(row[name].as_u64().unwrap_or(0) + 1);

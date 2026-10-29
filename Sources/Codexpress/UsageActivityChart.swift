@@ -115,7 +115,7 @@ struct UsageActivityChart: View {
                     }
                     HStack(spacing: 12) {
                         Text(usageCount(day.total, estimated: day.estimated) + " Token")
-                        Text("参考费用 " + activityCost(day)).foregroundStyle(.secondary)
+                        Text("费用 " + activityCost(day)).foregroundStyle(.secondary)
                     }.monospacedDigit()
                 }
                 Spacer(minLength: 0)
@@ -131,10 +131,10 @@ struct UsageActivityChart: View {
     }
     private func activityCost(_ day: UsageDaily) -> String {
         let cost = day.cost ?? (day.total == 0 && day.requests == 0 ? 0 : nil)
-        return cost.map { usageMoney($0) } ?? "未计价"
+        return cost.map { usageMoney($0, estimated: day.costEstimated) } ?? "未计价"
     }
     private func activityHelp(_ day: UsageDaily) -> String {
-        day.date.formatted(.dateTime.year().month().day()) + "\n" + usageCount(day.total, estimated: day.estimated) + " Token · " + usageCount(day.requests) + " 次请求\n参考费用：" + activityCost(day)
+        day.date.formatted(.dateTime.year().month().day()) + "\n" + usageCount(day.total, estimated: day.estimated) + " Token · " + usageCount(day.requests) + " 次请求\n费用：" + activityCost(day)
     }
     private func cellTextColor(_ level: Int) -> Color {
         if colorScheme == .dark { return level >= 3 ? Color.black.opacity(0.82) : .white.opacity(0.9) }

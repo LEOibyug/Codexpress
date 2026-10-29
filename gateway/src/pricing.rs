@@ -1,4 +1,4 @@
-//! Versioned reference token prices. Never represents a provider invoice.
+//! Provider-reported charges, with versioned reference prices as a fallback.
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::OnceLock;
@@ -61,6 +61,26 @@ fn dollars(tokens: u64, per_million: f64, multiplier: f64) -> f64 {
     (u128::from(tokens) * rate).min(i64::MAX as u128) as f64 / 1_000_000_000_000.0
 }
 
+pub fn response_charge(response: &Value) -> Option<crate::usage::ReportedCost> {
+    let usage = &response["usage"];
+    let value = usage
+        .get("cost_usd")
+        .or_else(|| response.get("cost_usd"))
+        .or_else(|| {
+            (usage["currency"]
+                .as_str()
+                .is_some_and(|c| c.eq_ignore_ascii_case("USD")))
+            .then(|| usage.get("cost"))
+            .flatten()
+        })?;
+    let usd = value.as_f64().or_else(|| value.as_str()?.parse().ok())?;
+    (usd.is_finite() && usd >= 0.0).then(|| crate::usage::ReportedCost {
+        usd,
+        method: "response".into(),
+        record_id: None,
+    })
+}
+
 pub fn estimate(record: &Value, historical: bool) -> Value {
     let details = &record["token_details"];
     let model = details["billing_model"]
@@ -70,6 +90,17 @@ pub fn estimate(record: &Value, historical: bool) -> Value {
     let model = model.strip_prefix("openai/").unwrap_or(model);
     let official = details["source_kind"] == "official";
     let subscription = details["is_subscription"] == true;
+    if details["source_kind"] == "api" {
+        let charge = &details["upstream_cost"];
+        if let Some(usd) = charge["usd"]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+        {
+            return json!({"currency":"USD","status":"upstream_reported","historical":false,
+                "billing_basis":"upstream_charge","source_type_known":true,"total_usd":usd,
+                "method":charge["method"],"upstream_record_id":charge["record_id"]});
+        }
+    }
     let basis = if official {
         "official_subscription_reference"
     } else if subscription {
@@ -224,6 +255,48 @@ mod tests {
         assert_eq!(flex["rates"]["output"], 2.5);
         value["token_details"]["service_tier"] = json!("ultrafast");
         assert_eq!(estimate(&value, false)["status"], "unknown_tier");
+    }
+    #[test]
+    fn upstream_charge_overrides_reference_rates_even_for_unknown_models_and_zero_cost() {
+        let mut value = record(512000, 400000);
+        value["model"] = json!("provider-custom-model");
+        value["token_details"]["source_kind"] = json!("api");
+        value["token_details"]["upstream_cost"] =
+            json!({"usd":0.15652124,"method":"cch_usage","record_id":"42"});
+        let cost = estimate(&value, false);
+        assert_eq!(cost["total_usd"], 0.15652124);
+        assert_eq!(cost["billing_basis"], "upstream_charge");
+        assert_eq!(cost["status"], "upstream_reported");
+        assert!(cost["rates"].is_null());
+        assert!(cost["input_usd"].is_null());
+        value["token_details"]["upstream_cost"]["usd"] = json!(0);
+        assert_eq!(estimate(&value, false)["total_usd"], 0.0);
+        value["token_details"]["upstream_cost"]["usd"] = json!(-1);
+        assert_eq!(estimate(&value, false)["status"], "unknown_model");
+        value["token_details"]["upstream_cost"]["usd"] = json!(1);
+        value["model"] = json!("gpt-6.1-sol");
+        value["token_details"]["source_kind"] = json!("official");
+        assert_eq!(
+            estimate(&value, false)["billing_basis"],
+            "official_subscription_reference"
+        );
+    }
+    #[test]
+    fn ambiguous_currency_and_invalid_response_charges_do_not_replace_reference_prices() {
+        for usage in [
+            json!({"cost":1}),
+            json!({"cost":1,"currency":"CNY"}),
+            json!({"cost_usd":-1}),
+            json!({"cost_usd":"NaN"}),
+        ] {
+            assert!(response_charge(&json!({"usage":usage})).is_none());
+        }
+        assert_eq!(
+            response_charge(&json!({"usage":{"cost":0,"currency":"USD"}}))
+                .unwrap()
+                .usd,
+            0.0
+        );
     }
     #[test]
     fn unknown_prices_and_missing_usage_do_not_become_free_requests() {

@@ -58,6 +58,40 @@ async fn state(sources: Vec<Source>) -> (tempfile::TempDir, Arc<AppState>) {
 }
 
 #[tokio::test]
+async fn upstream_response_charge_is_observed_without_changing_stream_bytes() {
+    let wire = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"priced\",\"model\":\"custom-model\",\"usage\":{\"input_tokens\":100,\"output_tokens\":9,\"cost_usd\":\"0.01234\"}}}\n\ndata: [DONE]\n\n";
+    let (address, task) = serve(Router::new().route(
+        "/v1/responses",
+        post(move || async move {
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from(wire))
+                .unwrap()
+        }),
+    ))
+    .await;
+    let (_dir, state) = state(vec![source("charged", &format!("{address}/v1"), 0)]).await;
+    let response = relay::router(state.clone())
+        .oneshot(request(
+            br#"{"model":"custom-model","input":"hello","stream":true}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        &to_bytes(response.into_body(), 10000).await.unwrap()[..],
+        wire.as_bytes()
+    );
+    let summary = state.usage.summary(1).unwrap();
+    assert_eq!(summary["recent"][0]["cost"]["total_usd"], 0.01234);
+    assert_eq!(
+        summary["recent"][0]["cost"]["billing_basis"],
+        "upstream_charge"
+    );
+    assert_eq!(summary["rows"][0]["priced_requests"], 1);
+    task.abort();
+}
+
+#[tokio::test]
 async fn raw_json_headers_query_and_usage_survive_relay() {
     let seen = Arc::new(Mutex::new(None));
     let copy = seen.clone();

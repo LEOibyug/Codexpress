@@ -35,7 +35,7 @@ struct UsagePerformanceCard: View {
                 metric("缓存命中率", value: totals.cacheRate.map { String(format: "%.1f%%", $0) } ?? "—", detail: "已报告缓存的输入")
                 metric("首 Token · P50", value: usageSeconds(data["performance"]["p50_first_token_ms"].number), detail: "P95 " + usageSeconds(data["performance"]["p95_first_token_ms"].number))
                 metric("请求耗时 · P50", value: usageSeconds(data["performance"]["p50_latency_ms"].number), detail: "P95 " + usageSeconds(data["performance"]["p95_latency_ms"].number))
-                metric("平均每次费用", value: usageMoney(totals.averageCost), detail: "仅已计价请求")
+                metric("平均每次费用", value: usageMoney(totals.averageCost, estimated: totals.costEstimated), detail: "仅已计价请求")
                 metric("缓存节省", value: usageMoney(totals.savings), detail: "按参考价格折算")
             }.frame(maxHeight: .infinity, alignment: .top).padding(.top, 3)
             if let loadError { Text(loadError).font(.system(size: 9)).foregroundStyle(.orange).lineLimit(2).help(loadError) }

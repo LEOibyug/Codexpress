@@ -80,7 +80,7 @@ struct UsageDistributionChart: View {
                     .labelsHidden().pickerStyle(.segmented).frame(width: 108).controlSize(.small)
             }
             HStack(alignment: .center, spacing: 10) {
-                UsageCompactRing(slices: slices, colors: colors, total: groupBy == "model" ? usageCount(totals.total, estimated: totals.estimated) : usageMoney(totals.cost), caption: groupBy == "model" ? "总 Token" : "参考费用", hoveredSource: $hoveredSource)
+                UsageCompactRing(slices: slices, colors: colors, total: groupBy == "model" ? usageCount(totals.total, estimated: totals.estimated) : usageMoney(totals.cost, estimated: totals.costEstimated), caption: groupBy == "model" ? "总 Token" : "费用", hoveredSource: $hoveredSource)
                     .frame(width: 128, height: 128)
                 VStack(alignment: .leading, spacing: 4) {
                     if slices.isEmpty { Text(groupBy == "model" ? "暂无 Token 用量" : "暂无已计价用量").font(.system(size: 11)).foregroundStyle(.secondary) }
@@ -115,14 +115,14 @@ struct UsageDistributionChart: View {
                 }.frame(maxWidth: .infinity, alignment: .leading)
 
             }.frame(maxHeight: .infinity)
-            Text(groupBy == "model" ? "输入与输出 Token" : "按 API 参考价格估算")
+            Text(groupBy == "model" ? "输入与输出 Token" : "上游扣费优先 · 缺失时使用参考价")
                 .font(.system(size: 9)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }.padding(16).frame(height: 342)
             .onChange(of: groupBy) { _, _ in hoveredSource = nil }
             .onChange(of: slices.map(\.id)) { _, ids in if let hoveredSource, !ids.contains(hoveredSource) { self.hoveredSource = nil } }
     }
     private func sourceCost(_ slice: UsageSourceSlice) -> some View {
-        Text(usageMoney(slice.cost)).font(.system(size: 15, weight: .medium, design: .rounded)).monospacedDigit()
+        Text(usageMoney(slice.cost, estimated: slice.costEstimated)).font(.system(size: 15, weight: .medium, design: .rounded)).monospacedDigit()
     }
     private func sourceTokens(_ slice: UsageSourceSlice) -> some View {
         Text(usageCount(slice.tokenTotal, estimated: slice.estimated) + " Token").font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)

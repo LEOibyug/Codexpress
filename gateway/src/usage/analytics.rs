@@ -17,12 +17,13 @@ const COST_FIELDS: [&str; 6] = [
     "output_usd",
     "cache_savings_usd",
 ];
-const COST_COUNTS: [&str; 5] = [
+const COST_COUNTS: [&str; 6] = [
     "priced_requests",
     "unpriced_requests",
     "unobserved_requests",
     "partial_cost_requests",
     "estimated_cost_requests",
+    "upstream_priced_requests",
 ];
 
 /// These are fixed SQL expressions; every caller-controlled value is bound.
@@ -61,6 +62,7 @@ fn aggregate_json() -> String {
         "SUM(COALESCE(json_extract(metadata,'$.cost.status')='unobserved',0))",
         "SUM(COALESCE(json_extract(metadata,'$.cost.status')='partial',0))",
         "SUM(COALESCE(json_extract(metadata,'$.cost.status')='estimated',0) OR COALESCE(json_extract(metadata,'$.cost.historical'),0)=1)",
+        "SUM(COALESCE(json_extract(metadata,'$.cost.billing_basis')='upstream_charge',0))",
     ]) { fields.push((field, expression.into())); }
     format!(
         "json_object({})",
@@ -152,6 +154,7 @@ fn merge_active(target: &mut Value, active: &Value) {
         cost["status"] == "unobserved",
         cost["status"] == "partial",
         cost["status"] == "estimated" || cost["historical"] == true,
+        cost["billing_basis"] == "upstream_charge",
     ]) {
         if applies {
             add_number(target, field, 1);
@@ -387,6 +390,7 @@ pub(super) fn build(data: &mut StoreData, payload: &Value) -> Result<Value> {
                 "failures",
                 "estimated_requests",
                 "priced_requests",
+                "upstream_priced_requests",
             ] {
                 value[field] = day[field].clone();
             }

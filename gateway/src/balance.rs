@@ -1,5 +1,6 @@
 //! Read-only balance discovery. All credentials and login sessions stay in
 //! memory; only the normalized remaining amount crosses the management socket.
+pub(crate) mod billing;
 mod parsers;
 
 use crate::{
@@ -70,6 +71,7 @@ struct Entry {
 #[derive(Default)]
 pub struct BalanceStore {
     entries: Mutex<HashMap<String, Arc<AsyncMutex<Entry>>>>,
+    billing: billing::Sync,
 }
 
 impl BalanceStore {
@@ -219,11 +221,24 @@ impl<'a> Probe<'a> {
         })
     }
     async fn request(&self, path: &str, auth: Auth<'_>, body: Option<Value>) -> Option<Reply> {
+        self.request_with_timeout(path, auth, body, 6).await
+    }
+    async fn request_with_timeout(
+        &self,
+        path: &str,
+        auth: Auth<'_>,
+        body: Option<Value>,
+        seconds: u64,
+    ) -> Option<Reply> {
         if self.rate_limited.load(Ordering::Relaxed) {
             return None;
         }
         let mut url = self.base.clone();
+        let (path, query) = path
+            .split_once('?')
+            .map_or((path, None), |(p, q)| (p, Some(q)));
         url.set_path(&format!("{}{path}", self.base.path().trim_end_matches('/')));
+        url.set_query(query);
         // Endpoints always remain on the exact configured origin and mount.
         // No redirects, automatic cookies, external login URLs or query-string keys.
         let mut request = self
@@ -236,7 +251,7 @@ impl<'a> Probe<'a> {
                 },
                 url,
             )
-            .timeout(Duration::from_secs(6))
+            .timeout(Duration::from_secs(seconds))
             .header(header::ACCEPT, "application/json")
             .header(header::ACCEPT_ENCODING, "identity")
             .header(header::USER_AGENT, "Mozilla/5.0 Codexpress/0.1");
