@@ -80,13 +80,17 @@ impl UsageStore {
             )?;
         }
         diagnostics::initialize(&connection)?;
-        // Backfill once with today's reference list, retaining an explicit
-        // historical marker. Subsequent price updates never rewrite snapshots.
+        // Fill legacy records and revisit previously unavailable prices once per
+        // catalog revision. Existing priced snapshots are never rewritten.
+        let revision = crate::pricing::catalog()["revision"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
         loop {
             let pending = {
-                let mut query = connection.prepare("SELECT attempt,request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata FROM usage WHERE json_type(metadata,'$.cost') IS NULL LIMIT 1000")?;
+                let mut query = connection.prepare("SELECT attempt,request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata FROM usage WHERE json_type(metadata,'$.cost') IS NULL OR (json_extract(metadata,'$.cost.status') IN ('unknown_model','unknown_tier') AND json_extract(metadata,'$.cost.revision') IS NOT ?1) LIMIT 1000")?;
                 let values = query
-                    .query_map([], |row| {
+                    .query_map([&revision], |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, String>(12)?,
@@ -103,7 +107,8 @@ impl UsageStore {
             for (id, metadata, record) in pending {
                 let mut metadata: Value =
                     serde_json::from_str(&metadata).unwrap_or_else(|_| json!({}));
-                metadata["cost"] = crate::pricing::estimate(&record, true);
+                let historical = metadata["cost"]["historical"].as_bool().unwrap_or(true);
+                metadata["cost"] = crate::pricing::estimate(&record, historical);
                 transaction.execute(
                     "UPDATE usage SET metadata=?1 WHERE attempt=?2",
                     params![metadata.to_string(), id],
@@ -430,6 +435,52 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+    #[test]
+    fn new_catalog_fills_unpriced_requests_without_changing_existing_costs_or_source_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.sqlite");
+        drop(UsageStore::open(&path).unwrap());
+        let db = Connection::open(&path).unwrap();
+        let metadata = json!({"token_details":{"source_kind":"api","is_subscription":true,"output_available":true,"cached_input_reported":true},
+            "cost":{"status":"unknown_model","revision":"before-terra","historical":false}});
+        let priced = json!({"status":"reported","total_usd":9.0,"revision":"older-price","historical":false});
+        for (id, model, cost) in [
+            ("terra", "gpt-6.1-terra", metadata["cost"].clone()),
+            ("unknown", "unknown-model", metadata["cost"].clone()),
+            ("priced", "gpt-6.1-terra", priced.clone()),
+        ] {
+            let mut meta = metadata.clone();
+            meta["cost"] = cost;
+            db.execute("INSERT INTO usage (request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata) VALUES (?1,?1,?1,?2,?3,'success',512000,1000,400000,1,20,?4)", params![id, model, crate::model::now(), meta.to_string()]).unwrap();
+        }
+        drop(db);
+        let store = UsageStore::open(&path).unwrap();
+        // A changed source setting must not replace the captured subscription flag.
+        store
+            .reprice_historical(&[("terra".into(), "api".into(), false)])
+            .unwrap();
+        let terra = store.summary_for(1, Some("terra")).unwrap()["recent"][0]["cost"].clone();
+        assert_eq!(terra["historical"], false);
+        assert_eq!(terra["long_context_waived"], true);
+        assert!((terra["total_usd"].as_f64().unwrap() - 0.137).abs() < 1e-9);
+        assert_eq!(
+            store.summary_for(1, Some("priced")).unwrap()["recent"][0]["cost"],
+            priced
+        );
+        let unknown = store.summary_for(1, Some("unknown")).unwrap()["recent"][0]["cost"].clone();
+        assert_eq!(unknown["status"], "unknown_model");
+        assert_eq!(unknown["revision"], crate::pricing::catalog()["revision"]);
+        drop(store);
+        let reopened = UsageStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.summary_for(1, Some("terra")).unwrap()["recent"][0]["cost"],
+            terra
+        );
+        assert_eq!(
+            reopened.summary_for(1, Some("unknown")).unwrap()["recent"][0]["cost"],
+            unknown
+        );
     }
     #[test]
     fn persisted_attempts_keep_name_snapshot_and_cached_input_subset() {

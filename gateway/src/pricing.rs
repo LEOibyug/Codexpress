@@ -196,6 +196,36 @@ mod tests {
         assert!((cost["total_usd"].as_f64().unwrap() - 0.053).abs() < 1e-9);
     }
     #[test]
+    fn terra_prices_cache_writes_long_context_and_supported_service_tiers() {
+        let mut value = record(272000, 200000);
+        value["model"] = json!("gpt-6.1-terra");
+        value["token_details"]["cache_write_input_tokens"] = json!(2000);
+        value["token_details"]["source_kind"] = json!("api");
+        let standard = estimate(&value, false);
+        assert_eq!(standard["long_context"], false);
+        assert!((standard["total_usd"].as_f64().unwrap() - 0.0875).abs() < 1e-9);
+        value["input_tokens"] = json!(272001);
+        let long = estimate(&value, false);
+        assert_eq!(long["rates"]["input"], 2.0);
+        assert_eq!(long["rates"]["cached_input"], 0.1);
+        assert_eq!(long["rates"]["output"], 7.5);
+        assert!((long["total_usd"].as_f64().unwrap() - 0.172502).abs() < 1e-9);
+        value["token_details"]["is_subscription"] = json!(true);
+        value["token_details"]["cache_write_retention"] = json!("12h");
+        value["token_details"]["service_tier"] = json!("fast");
+        let fast = estimate(&value, false);
+        assert_eq!(fast["long_context_waived"], true);
+        assert_eq!(fast["rates"]["input"], 2.0);
+        assert_eq!(fast["rates"]["cache_write"], 5.0);
+        assert_eq!(fast["rates"]["output"], 10.0);
+        value["token_details"]["service_tier"] = json!("flex");
+        let flex = estimate(&value, false);
+        assert_eq!(flex["rates"]["input"], 0.5);
+        assert_eq!(flex["rates"]["output"], 2.5);
+        value["token_details"]["service_tier"] = json!("ultrafast");
+        assert_eq!(estimate(&value, false)["status"], "unknown_tier");
+    }
+    #[test]
     fn unknown_prices_and_missing_usage_do_not_become_free_requests() {
         let mut value = record(100, 50);
         value["model"] = json!("gpt-6.1-sol-unverified");
