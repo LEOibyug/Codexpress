@@ -51,7 +51,27 @@ struct UsageRequestDetailView: View {
         }.padding(24).frame(width: 740, height: 690)
         .onAppear { isVisible = true }
         .onDisappear { isVisible = false; copyTask?.cancel(); copyTask = nil }
-        .task(id: attemptID) { copyTask?.cancel(); await load() }
+        .task(id: UsageRefreshKey(selection: attemptID, active: model.settingsWindowActive)) {
+            guard model.settingsWindowActive else { return }
+            copyTask?.cancel()
+            await load()
+            let id = attemptID
+            while !Task.isCancelled, id == attemptID, detail != .null,
+                  record["cost"]["billing_basis"].string != "upstream_charge",
+                  record["active"].bool == true || (record["status"].string == "success"
+                    && record["token_details"]["source_kind"].string == "api"
+                    && Date().timeIntervalSince1970 - (record["started_at"].number ?? 0)
+                        - (record["latency_ms"].number ?? 0) / 1000 < 600) {
+                do { try await Task.sleep(for: .seconds(3)) } catch { break }
+                guard !Task.isCancelled, id == attemptID else { break }
+                // Keep body pagination, selections and error text intact.
+                if let next = try? await model.usageDetail(attemptID: id, recordOnly: true),
+                   !Task.isCancelled, id == attemptID, case .object(var fields) = detail {
+                    fields["record"] = next["record"]
+                    detail = .object(fields)
+                }
+            }
+        }
     }
     private var metadata: some View {
         VStack(alignment: .leading, spacing: 13) {
@@ -95,6 +115,10 @@ struct UsageRequestDetailView: View {
                         detailRow("实际扣费", usageCostMoney(cost))
                         if let id = cost["upstream_record_id"].string { detailRow("账单记录", id) }
                     } else {
+                        if tokens["source_kind"].string == "api" {
+                            Text("未取得可匹配的上游扣费，暂按参考价估算。账单核对后自动更新。")
+                                .font(.system(size: 10)).foregroundStyle(.secondary)
+                        }
                         detailRow("计价模型", cost["price_model"].string ?? "—")
                         if let tier = cost["service_tier"].string { detailRow("计费模式", tier) }
                         detailRow("非缓存输入", usageMoney(cost["input_usd"].number))

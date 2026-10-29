@@ -115,6 +115,10 @@ struct UsageLogsView: View {
                 Text(item["model"].string ?? "未知模型").font(.system(size: 12, weight: .medium)).lineLimit(1)
                 Text(item["source_name"].string ?? "已移除来源").font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
                 Spacer(minLength: 5)
+                if item["cost"]["total_usd"].number != nil {
+                    Text(item["cost"]["billing_basis"].string == "upstream_charge" ? "扣费" : "暂估")
+                        .font(.system(size: 9)).foregroundStyle(.secondary)
+                }
                 Text(usageCostMoney(item["cost"])).font(.system(size: 12, weight: .medium, design: .rounded)).monospacedDigit()
                 StatusPill(text: usageRequestStatus(item), color: statusColor(item), active: item["active"].bool == true)
                 Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(.tertiary)

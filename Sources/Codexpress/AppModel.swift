@@ -598,8 +598,8 @@ import ServiceManagement
         if let before { payload["before"] = .number(before) }
         return try await client.call("usage.requests", .object(payload))
     }
-    func usageDetail(attemptID: String, bodyOffset: Double = 0) async throws -> JSONValue {
-        try await client.call("usage.detail", .object(["attempt_id": .string(attemptID), "body_offset": .number(bodyOffset), "body_limit": .number(65_536)]))
+    func usageDetail(attemptID: String, bodyOffset: Double = 0, recordOnly: Bool = false) async throws -> JSONValue {
+        try await client.call("usage.detail", .object(["attempt_id": .string(attemptID), "body_offset": .number(bodyOffset), "body_limit": .number(65_536), "record_only": .bool(recordOnly)]))
     }
     func prepareCredit(source: Source, credit: JSONValue) async throws -> CreditConfirmation {
         try requireWritableMetadata()

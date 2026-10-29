@@ -52,7 +52,7 @@ func usageCostStatus(_ cost: JSONValue) -> String {
     case "unobserved": return "无可计费计数"
     case "partial": return "部分计价"
     case "estimated": return cost["historical"].bool == true ? "历史参考价补算" : "含估算项"
-    case "reported": return "上游计数计价"
+    case "reported": return "参考价估算"
     default: return "待计价"
     }
 }

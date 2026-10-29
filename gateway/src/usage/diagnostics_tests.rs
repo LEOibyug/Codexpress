@@ -16,6 +16,31 @@ fn stored(data: &StoreData, id: &str) -> Value {
 }
 
 #[test]
+fn record_refresh_returns_updated_cost_without_reading_error_body() {
+    let (_dir, data) = fixture();
+    let attempt = persist(&data, &record("cost-refresh", crate::model::now()), None);
+    data.connection.execute("INSERT INTO diagnostics(attempt_id,created_at,metadata,body) VALUES ('cost-refresh',?1,'{}',X'FF')", [crate::model::now()]).unwrap();
+    data.connection
+        .execute(
+            "UPDATE usage SET metadata=json_set(metadata,'$.cost',json(?1)) WHERE attempt=?2",
+            rusqlite::params![
+                json!({"billing_basis":"upstream_charge","total_usd":0.123}).to_string(),
+                attempt
+            ],
+        )
+        .unwrap();
+    let refreshed = detail(
+        &data,
+        &json!({"attempt_id":"cost-refresh","record_only":true}),
+    )
+    .unwrap();
+    assert_eq!(refreshed["record"]["cost"]["total_usd"], 0.123);
+    assert!(refreshed.get("diagnostic").is_none());
+    assert!(refreshed.get("related").is_none());
+    assert!(detail(&data, &json!({"attempt_id":"cost-refresh"})).is_err());
+}
+
+#[test]
 fn unicode_empty_tokens_and_existing_placeholders_are_redacted_without_panics() {
     let input = "错误 Bearer 秘密令牌，路径 https://example.test/?code=&state=oauth-state&key=\" Bearer [已隐藏]，后续";
     let output = redact_tokens(input);

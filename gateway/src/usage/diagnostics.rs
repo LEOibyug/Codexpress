@@ -642,7 +642,6 @@ pub(super) fn detail(data: &StoreData, payload: &Value) -> Result<Value> {
         })
         .transpose()?
         .unwrap_or(65536);
-    prune(&data.connection)?;
     let saved = data.connection.query_row(&format!("SELECT {COLUMNS} FROM usage WHERE json_extract(metadata,'$.attempt_id')=?1 OR ('legacy:'||attempt)=?1 LIMIT 1"), [id], stored_record).optional()?;
     let active = data.active.get(id).map(|(record, started)| {
         let mut value = serde_json::to_value(record).expect("record");
@@ -660,6 +659,12 @@ pub(super) fn detail(data: &StoreData, payload: &Value) -> Result<Value> {
         value
     });
     let record = saved.or(active).context("请求记录不存在")?;
+    // Live cost refreshes must not read/decompress error bodies, query related
+    // attempts or run retention cleanup on every refresh.
+    if payload["record_only"] == true {
+        return Ok(json!({"record":record}));
+    }
+    prune(&data.connection)?;
     let diagnostic: Option<(String, Option<Vec<u8>>)> = data
         .connection
         .query_row(
