@@ -5,116 +5,74 @@ struct RoutingView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                PageHeading("路由")
-                SettingsCard("路由模式", symbol: "arrow.triangle.branch") {
-                    Picker("分配方式", selection: Binding(get: { model.routingMode }, set: { model.changeRouting(mode: $0, fixed: model.settings.fixed_source_id ?? model.sources.first?.id) })) {
-                        Text("自动切换").tag("auto")
-                        Text("固定来源").tag("fixed")
-                    }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 330).disabled(model.busy || model.sources.isEmpty)
+            VStack(alignment: .leading, spacing: AppMetrics.sectionSpacing) {
+                PageHeading("分配策略")
+                SettingsCard("分配方式", symbol: "arrow.triangle.branch") {
+                    SettingRow(title: "路由模式") {
+                        Picker("路由模式", selection: Binding(get: { model.routingMode }, set: { model.changeRouting(mode: $0, fixed: model.settings.fixed_source_id ?? model.sources.first?.id) })) {
+                            Text("自动切换").tag("auto")
+                            Text("固定来源").tag("fixed")
+                        }.pickerStyle(.segmented).labelsHidden().frame(width: 230)
+                            .disabled(model.busy || model.sources.isEmpty)
+                    }
+                    Divider()
                     if model.routingMode == "fixed" {
-                        Picker("固定来源", selection: Binding(get: { model.fixedSourceID ?? "" }, set: { model.changeRouting(mode: "fixed", fixed: $0) })) {
-                            ForEach(model.sources.filter(\.enabled)) { Text($0.name).tag($0.id) }
-                        }.disabled(model.busy)
-                        InfoNote(text: "来源不可用时暂停请求。")
+                        SettingRow(title: "固定来源", subtitle: "来源不可用时暂停请求") {
+                            Picker("固定来源", selection: Binding(get: { model.fixedSourceID ?? "" }, set: { model.changeRouting(mode: "fixed", fixed: $0) })) {
+                                ForEach(model.sources.filter(\.enabled)) { Text($0.name).tag($0.id) }
+                            }.labelsHidden().frame(width: 230).disabled(model.busy)
+                        }
                     } else {
-                        Toggle("负载均衡", isOn: Binding(get: { model.settings.loadBalanceEnabled }, set: { model.changeLoadBalance($0) }))
-                            .disabled(model.busy)
-                        Text("关闭时按优先级逐个尝试；开启时按活跃对话数分配新对话。")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                        SettingRow(title: "负载均衡", subtitle: model.settings.loadBalanceEnabled ? "按活跃对话数分配新对话" : "按优先级依次尝试可用来源") {
+                            Toggle("负载均衡", isOn: Binding(get: { model.settings.loadBalanceEnabled }, set: { model.changeLoadBalance($0) }))
+                                .labelsHidden().toggleStyle(.switch).controlSize(.small).disabled(model.busy)
+                        }
                     }
-                }
-                if model.settings.loadBalanceEnabled {
-                SettingsCard("官方余量保护", symbol: "shield.lefthalf.filled") {
-                    HStack {
-                        Text("保留余量阈值").font(.system(size: 12))
-                        Spacer()
-                        Stepper(value: Binding(get: { model.settings.lowQuotaPercent }, set: { model.changeLowQuotaThreshold($0) }), in: 1...99) {
-                            Text("\(model.settings.lowQuotaPercent)%").monospacedDigit().frame(width: 42, alignment: .trailing)
-                        }.fixedSize().disabled(model.busy)
+                    if model.settings.loadBalanceEnabled {
+                        Divider()
+                        SettingRow(title: "官方余量保护", subtitle: "低于阈值时为已有对话保留余量；额度归零后跳过") {
+                            Stepper(value: Binding(get: { model.settings.lowQuotaPercent }, set: { model.changeLowQuotaThreshold($0) }), in: 1...99) {
+                                Text("\(model.settings.lowQuotaPercent)%").monospacedDigit().frame(width: 46, alignment: .trailing)
+                            }.fixedSize().disabled(model.busy)
+                        }
                     }
-                    Text("任一短周期或周额度不高于此值时，为已有活跃对话保留余量；额度归零后跳过此来源。")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                }
                 }
                 SettingsCard("上游重试", symbol: "arrow.clockwise") {
-                    HStack {
-                        Text("单个来源最多尝试").font(.system(size: 12))
-                        Spacer()
+                    SettingRow(title: "每个来源最多尝试", subtitle: "包含首次请求") {
                         Stepper(value: Binding(get: { model.settings.upstreamAttemptLimit }, set: { model.changeUpstreamRetry(attempts: $0, delaySeconds: model.settings.upstreamRetryDelay) }), in: 1...10) {
-                            Text("\(model.settings.upstreamAttemptLimit) 次").monospacedDigit().frame(width: 54, alignment: .trailing)
+                            Text("\(model.settings.upstreamAttemptLimit) 次").monospacedDigit().frame(width: 62, alignment: .trailing)
                         }.fixedSize()
                     }
-                    HStack {
-                        Text("失败后等待").font(.system(size: 12))
-                        Spacer()
+                    Divider()
+                    SettingRow(title: "重试间隔", subtitle: "全部重试失败后，再按路由规则切换来源") {
                         Stepper(value: Binding(get: { model.settings.upstreamRetryDelay }, set: { model.changeUpstreamRetry(attempts: model.settings.upstreamAttemptLimit, delaySeconds: $0) }), in: 0...300) {
-                            Text("\(model.settings.upstreamRetryDelay) 秒").monospacedDigit().frame(width: 54, alignment: .trailing)
+                            Text("\(model.settings.upstreamRetryDelay) 秒").monospacedDigit().frame(width: 62, alignment: .trailing)
                         }.fixedSize()
                     }
-                    Text("次数包含首次请求。连接失败或暂时服务错误时先重试，仍失败后再按路由规则切换来源。")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
                 }.disabled(model.busy)
                 SettingsCard("对话接续", symbol: "arrow.triangle.2.circlepath") {
-                    Picker("粘性保持时间", selection: Binding(get: { model.settings.idleReturnDelay }, set: { model.changeIdleReturnDelay($0) })) {
-                        Text("5 分钟").tag(5)
-                        Text("10 分钟").tag(10)
-                        Text("15 分钟").tag(15)
-                        Text("30 分钟").tag(30)
-                        Text("1 小时").tag(60)
-                        Text("2 小时").tag(120)
-                        Text("6 小时").tag(360)
-                        Text("24 小时").tag(1440)
-                        Text("不自动回切").tag(0)
-                    }.disabled(model.busy || model.routingMode == "fixed" || model.settings.loadBalanceEnabled)
-                    Text(model.settings.loadBalanceEnabled ? "开启负载均衡时，已有对话保留来源，不按优先级自动回切。" : "成功接续后刷新计时。粘性到期后重新从最高优先级开始尝试。")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                    Divider().padding(.vertical, 3)
+                    SettingRow(title: "来源粘性", subtitle: model.settings.loadBalanceEnabled ? "负载均衡下，已有对话保留来源" : "接续后刷新计时，到期后从最高优先级重新尝试") {
+                        Picker("粘性保持时间", selection: Binding(get: { model.settings.idleReturnDelay }, set: { model.changeIdleReturnDelay($0) })) {
+                            Text("5 分钟").tag(5)
+                            Text("10 分钟").tag(10)
+                            Text("15 分钟").tag(15)
+                            Text("30 分钟").tag(30)
+                            Text("1 小时").tag(60)
+                            Text("2 小时").tag(120)
+                            Text("6 小时").tag(360)
+                            Text("24 小时").tag(1440)
+                            Text("不自动回切").tag(0)
+                        }.labelsHidden().frame(width: 160)
+                            .disabled(model.busy || model.routingMode == "fixed" || model.settings.loadBalanceEnabled)
+                    }
+                    Divider()
                     Toggle("无法续接时移除加密块并重建上下文", isOn: Binding(get: { model.settings.degradedContextFallback ?? true }, set: { model.changeContextFallback($0) }))
                         .disabled(model.busy)
-                    Text("上游无法原样续接时重建，可能缺失隐藏推理或压缩摘要，触发时发送系统通知。关闭后不会移除加密状态，无法续接时返回错误。")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text("可能缺失隐藏推理或压缩摘要，触发时发送系统通知。关闭后无法续接将返回错误。")
+                        .font(AppTypography.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
-                if model.sources.isEmpty {
-                    EmptyState("暂无来源", subtitle: "添加来源后可设置优先级。", symbol: "arrow.triangle.branch")
-                } else {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("来源优先级").font(.system(size: 12, weight: .semibold))
-                            Spacer()
-                            Text("拖动或使用箭头排序").font(.system(size: 11)).foregroundStyle(.tertiary)
-                        }.padding(.horizontal, 4)
-                        List {
-                            ForEach(Array(model.sources.enumerated()), id: \.element.id) { index, source in
-                                HStack(spacing: 12) {
-                                    Text("\(index + 1)").font(.system(size: 11, weight: .medium, design: .monospaced))
-                                        .foregroundStyle(.secondary).frame(width: 26, height: 26).background(AppPalette.well, in: RoundedRectangle(cornerRadius: 7))
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(source.name).font(.system(size: 13, weight: .medium))
-                                        Text(source.policyLabel).font(.system(size: 11)).foregroundStyle(.secondary)
-                                        SourceRoutingActions(source: source)
-                                        if model.state(source.id)["admission"]["capacity_active_conversations"].number != nil || source.max_active_conversations != nil {
-                                            SourceCapacityLabel(source: source, admission: model.state(source.id)["admission"], showsRoutingNote: true)
-                                                .font(.system(size: 10))
-                                        } else if let active = model.state(source.id)["admission"]["active_conversations"].number {
-                                            Text("\(Int(active)) 个活跃对话" + (source.official ? " · \(model.state(source.id)["admission"]["routing_note"].string ?? "")" : ""))
-                                                .font(.system(size: 10)).foregroundStyle(.secondary)
-                                        }
-                                    }
-                                    Spacer()
-                                    StatusPill(text: source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用")
-                                    HStack(spacing: 8) {
-                                        Button { model.move(IndexSet(integer: index), to: index - 1) } label: { Image(systemName: "chevron.up") }.disabled(index == 0 || model.busy).help("提高优先级")
-                                        Button { model.move(IndexSet(integer: index), to: index + 2) } label: { Image(systemName: "chevron.down") }.disabled(index == model.sources.count - 1 || model.busy).help("降低优先级")
-                                    }.buttonStyle(.borderless).foregroundStyle(.secondary)
-                                }.padding(.vertical, 9).listRowBackground(Color.clear)
-                            }.onMove { model.move($0, to: $1) }
-                        }.listStyle(.plain).scrollContentBackground(.hidden)
-                            .frame(height: CGFloat(min(max(model.sources.count * 108 + 14, 140), 390)))
-                            .padding(7).cardSurface().disabled(model.busy)
-                    }
-                }
-            }
-        }.settingsPage()
+            }.settingsPage()
+        }
     }
+
 }

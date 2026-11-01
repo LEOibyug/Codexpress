@@ -21,17 +21,17 @@ struct UsageActivityChart: View {
             }
             activityDetails
             legend
-        }.padding(18).cardSurface()
+        }.padding(20).cardSurface()
             .onChange(of: period) { _, _ in hoveredDate = nil; pinnedDate = nil }
     }
     private var header: some View {
         HStack {
-            Text("每日活跃").font(.system(size: 13, weight: .semibold))
+            Text("每日活跃").font(.system(size: 14, weight: .semibold))
             Spacer()
-            Text("\(activeDays) / \(days.count) 天有用量").font(.system(size: 10)).foregroundStyle(.secondary)
+            Text("\(activeDays) / \(days.count) 天有用量").font(.system(size: 12)).foregroundStyle(.secondary)
             Picker("活跃范围", selection: $period) {
                 ForEach(UsageActivityPeriod.allCases) { item in Text(item.label).tag(item) }
-            }.labelsHidden().pickerStyle(.segmented).controlSize(.small).frame(width: 86)
+            }.labelsHidden().pickerStyle(.segmented).controlSize(.regular).frame(width: 108)
         }
     }
     private func activityGrid(width: CGFloat) -> some View {
@@ -41,7 +41,7 @@ struct UsageActivityChart: View {
             VStack(spacing: 3) {
                 ForEach(0..<7, id: \.self) { weekday in
                     Text(["一", "", "三", "", "五", "", "日"][weekday])
-                        .font(.system(size: 9)).foregroundStyle(.tertiary)
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
                         .frame(width: 16, height: layout.cell)
                 }
             }
@@ -75,7 +75,7 @@ struct UsageActivityChart: View {
             Spacer(); Text("少").foregroundStyle(.secondary)
             ForEach(0...4, id: \.self) { level in RoundedRectangle(cornerRadius: 2).fill(color(level)).frame(width: 10, height: 10) }
             Text("多").foregroundStyle(.secondary)
-        }.font(.system(size: 9))
+        }.font(.system(size: 11))
     }
     private func activityCell(_ day: UsageDaily, width: CGFloat, height: CGFloat) -> some View {
         let level = usageActivityLevel(day.total, maximum: maximum)
@@ -89,10 +89,10 @@ struct UsageActivityChart: View {
                 .overlay {
                     if period == .month && width >= 42 {
                         HStack(spacing: 3) {
-                            Text("\(Calendar.current.component(.month, from: day.date))/\(Calendar.current.component(.day, from: day.date))").font(.system(size: 8))
+                            Text("\(Calendar.current.component(.month, from: day.date))/\(Calendar.current.component(.day, from: day.date))").font(.system(size: 10))
                             Spacer(minLength: 0)
-                            Text(usageCount(day.total)).font(.system(size: 9, weight: .medium)).monospacedDigit()
-                        }.lineLimit(1).minimumScaleFactor(0.7).padding(.horizontal, 5)
+                            Text(usageCount(day.total)).font(.system(size: 10, weight: .semibold)).monospacedDigit()
+                        }.lineLimit(1).minimumScaleFactor(0.9).padding(.horizontal, 5)
                             .foregroundStyle(cellTextColor(level)).allowsHitTesting(false)
                     }
                 }
@@ -124,10 +124,10 @@ struct UsageActivityChart: View {
                         .buttonStyle(.plain).foregroundStyle(.secondary).help("取消固定")
                 }
             } else {
-                Text("悬停查看每日用量，点击固定显示").foregroundStyle(.tertiary)
+                Text("悬停查看每日用量，点击固定显示").foregroundStyle(.secondary)
                 Spacer(minLength: 0)
             }
-        }.font(.system(size: 10)).frame(height: 32, alignment: .leading)
+        }.font(.system(size: 12)).frame(height: 40, alignment: .leading)
     }
     private func activityCost(_ day: UsageDaily) -> String {
         let cost = day.cost ?? (day.total == 0 && day.requests == 0 ? 0 : nil)

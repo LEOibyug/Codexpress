@@ -36,30 +36,30 @@ struct UsageLogsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
-            HStack(spacing: 11) {
-                Button(action: onBack) { Image(systemName: "chevron.left").font(.system(size: 14, weight: .semibold)).frame(width: 26, height: 30) }.buttonStyle(.plain).help("返回用量概览")
-                Text("连接日志").font(.system(size: 25, weight: .bold))
-                Spacer()
-                Text("\(total) 次请求" + (activeCount > 0 ? " · \(activeCount) 次进行中" : "")).font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
-            }.padding(.bottom, 6)
             UsageFilters(selection: $selection, options: availableOptions, sourceTitle: "全部上游")
             HStack(spacing: 9) {
                 Picker("入口", selection: $ingress) {
                     Text("全部入口").tag("")
                     if !ingress.isEmpty && !availableOptions["ingresses"].array.compactMap(\.string).contains(ingress) { Text(usageIngressName(ingress)).tag(ingress) }
                     ForEach(availableOptions["ingresses"].array.compactMap(\.string), id: \.self) { Text(usageIngressName($0)).tag($0) }
-                }.labelsHidden().frame(width: 116)
+                }.frame(width: 164)
                 Picker("状态", selection: $status) {
                     Text("全部结果").tag(""); Text("成功").tag("success"); Text("未成功").tag("unsuccessful"); Text("进行中").tag("active")
-                }.labelsHidden().frame(width: 105)
+                }.frame(width: 152)
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                     TextField("搜索模型、来源或错误代码", text: $search).textFieldStyle(.plain)
                     if !search.isEmpty { Button { search = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain) }
-                }.font(.system(size: 11)).padding(.horizontal, 9).padding(.vertical, 6).background(AppPalette.well, in: RoundedRectangle(cornerRadius: 6))
-            }.controlSize(.small)
+                }.font(.system(size: 13)).padding(.horizontal, 9).padding(.vertical, 6).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6)).overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)))
+            }.controlSize(.regular).font(.system(size: 13))
             if selection.query == nil { InfoNote(text: "请选择不超过 366 天的日期范围。", color: .orange) }
             if let loadError { InfoNote(text: loadError, color: .orange) }
+            HStack {
+                Text("请求记录").font(.system(size: 13, weight: .semibold))
+                Spacer()
+                Text("\(total) 次请求" + (activeCount > 0 ? " · \(activeCount) 次进行中" : ""))
+                    .font(.system(size: 12)).foregroundStyle(.secondary).monospacedDigit()
+            }
             ScrollView {
                 LazyVStack(spacing: 0) {
                     if records.isEmpty {
@@ -71,11 +71,11 @@ struct UsageLogsView: View {
                     }
                     if nextCursor != nil {
                         Divider()
-                        Button("显示更多") { Task { await loadMore() } }.buttonStyle(.plain).foregroundStyle(Color.accentColor).font(.system(size: 11)).padding(14).disabled(loadingMore)
+                        Button("显示更多") { Task { await loadMore() } }.buttonStyle(.plain).foregroundStyle(Color.accentColor).font(.system(size: 13)).padding(16).disabled(loadingMore)
                     }
                 }.cardSurface().padding(.bottom, 4)
             }
-        }.settingsPage()
+        }
         .sheet(item: $selected) { item in UsageRequestDetailView(item: item) }
         .task(id: UsageRefreshKey(selection: filter, active: model.settingsWindowActive)) {
             guard model.settingsWindowActive else { return }
@@ -109,30 +109,34 @@ struct UsageLogsView: View {
     }
     private func requestRow(_ request: UsageItem) -> some View {
         let item = request.value
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Circle().fill(statusColor(item)).frame(width: 6, height: 6)
-                Text(item["model"].string ?? "未知模型").font(.system(size: 12, weight: .medium)).lineLimit(1)
-                Text(item["source_name"].string ?? "已移除来源").font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
-                Spacer(minLength: 5)
-                if item["cost"]["total_usd"].number != nil {
-                    Text(item["cost"]["billing_basis"].string == "upstream_charge" ? "扣费" : "暂估")
-                        .font(.system(size: 9)).foregroundStyle(.secondary)
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center, spacing: 10) {
+                Circle().fill(statusColor(item)).frame(width: 7, height: 7)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item["model"].string ?? "未知模型").font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                    Text(item["source_name"].string ?? "已移除来源").font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
                 }
-                Text(usageCostMoney(item["cost"])).font(.system(size: 12, weight: .medium, design: .rounded)).monospacedDigit()
+                Spacer(minLength: 12)
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text(usageCostMoney(item["cost"])).font(.system(size: 14, weight: .semibold)).monospacedDigit()
+                    if item["cost"]["total_usd"].number != nil {
+                        Text(item["cost"]["billing_basis"].string == "upstream_charge" ? "实际扣费" : "参考价估算")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
                 StatusPill(text: usageRequestStatus(item), color: statusColor(item), active: item["active"].bool == true)
-                Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(.tertiary)
+                Image(systemName: "chevron.right").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
             }
-            HStack(spacing: 10) {
+            HStack(spacing: 14) {
                 Text(Date(timeIntervalSince1970: item["started_at"].number ?? 0).formatted(.dateTime.month().day().hour().minute().second()))
                 Text(usageIngressName(item["ingress"].string))
                 Text("入 " + usageCount(item["input_tokens"].number ?? 0) + " · 出 " + usageCount(item["output_tokens"].number ?? 0))
                 Spacer(minLength: 0)
-                if let code = item["error_code"].string { Text(code).foregroundStyle(.orange).lineLimit(1) }
+                if let code = item["error_code"].string { Text(code).foregroundStyle(.orange).lineLimit(1).help(code) }
                 else if let status = item["http_status"].number { Text("HTTP \(Int(status))") }
-                Text(usageSeconds(item["latency_ms"].number))
-            }.font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
-        }.padding(15).contentShape(Rectangle())
+                Text(usageSeconds(item["latency_ms"].number)).fixedSize()
+            }.font(.system(size: 12)).foregroundStyle(.secondary).monospacedDigit()
+        }.padding(18).contentShape(Rectangle())
     }
     private func statusColor(_ item: JSONValue) -> Color {
         item["active"].bool == true ? .accentColor : item["status"].string == "success" ? .green : .orange

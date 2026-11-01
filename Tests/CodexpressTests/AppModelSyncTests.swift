@@ -97,11 +97,28 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertEqual(model.status["manual_route"]["source_id"].string, second.id)
         try await expectManualOperation("routing.cancel") { model.cancelSourceTakeover() }
         XCTAssertEqual(model.status["manual_route"], .null)
+
+        await model.refreshConfigurationBackups()
+        XCTAssertEqual(model.configurationBackups.first?["id"].string, settings.codexHome)
+        try Data().write(to: requests)
+        let pending = Task { await model.refreshConfigurationBackups() }
+        let deadline = Date().addingTimeInterval(3)
+        while !(try operations()).contains("config.backups"), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(try operations().contains("config.backups"))
+        var changedDirectory = model.settings
+        changedDirectory.codexHome = directory.appendingPathComponent("other-codex").path
+        try model.persistSettings(changedDirectory)
+        await pending.value
+        XCTAssertTrue(model.configurationBackups.isEmpty, "An old directory's backups must not appear in the new directory")
+        await model.refreshConfigurationBackups()
+        XCTAssertEqual(model.configurationBackups.first?["id"].string, changedDirectory.codexHome)
     }
 
     private static let helperScript = #"""
     #!/usr/bin/env python3
-    import json, os, pathlib, socket, sys
+    import json, os, pathlib, socket, sys, time
     directory = pathlib.Path(sys.argv[sys.argv.index('--state-dir') + 1])
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(directory / 'control.sock'))
@@ -130,6 +147,9 @@ final class AppModelSyncTests: XCTestCase {
                 data = dict(recovered=True)
             elif operation == 'credentials.storage.status':
                 data = dict(mode='keychain')
+            elif operation == 'config.backups':
+                time.sleep(0.1)
+                data = dict(backups=[dict(id=request['payload']['codex_home'])])
             elif operation == 'credentials.read':
                 data = dict(items=[dict(source_id=source, secret=dict(api_key='fixture-api-key')) for source in request['payload']['source_ids']])
             elif operation == 'credentials':

@@ -40,9 +40,9 @@ struct UsageActivityCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             UsageActivityChart(days: daily, period: $period)
-            if let loadError { InfoNote(text: loadError, color: .orange).padding(.horizontal, 3) }
+            if let loadError { InfoNote(text: loadError, color: .orange).padding(.horizontal, 2) }
         }
         .task(id: UsageRefreshKey(selection: UsageActivityRefreshKey(query: query, reusesOverview: reusesOverview), active: model.settingsWindowActive)) {
             loadError = nil

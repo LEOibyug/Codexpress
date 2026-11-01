@@ -736,10 +736,13 @@ import ServiceManagement
     }
     func refreshConfigurationBackups() async {
         guard running else { return }
+        let home = settings.codexHome
+        configurationBackups = []
         do {
-            let result = try await client.call("config.backups", .object(["codex_home":.string(settings.codexHome)]))
+            let result = try await client.call("config.backups", .object(["codex_home":.string(home)]))
+            guard !Task.isCancelled, settings.codexHome == home else { return }
             configurationBackups = result["backups"].array
-        } catch { self.error = error.localizedDescription }
+        } catch { if !Task.isCancelled, settings.codexHome == home { self.error = error.localizedDescription } }
     }
     func restoreConfigurationBackup(_ id: String) {
         perform {

@@ -15,8 +15,8 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/usage-live-overview.png" width="920" alt="Codexpress 用量页面">
-  <br><sub>用量概览，图中为演示数据</sub>
+  <img src="docs/images/overview.png" width="920" alt="Codexpress 概览：当前连接、用量、来源状态与接入入口">
+  <br><sub>概览，图中为演示数据</sub>
 </p>
 
 ## 功能
@@ -37,10 +37,14 @@
 <details>
 <summary>更多界面</summary>
 <br>
+<p align="center">
+  <img src="docs/images/usage-live-overview.png" width="920" alt="用量统计：费用、Token、来源占比与性能">
+  <br><sub>用量与费用</sub>
+</p>
 <table>
   <tr>
-    <td width="50%" align="center"><img src="docs/images/sources-clean.png" alt="来源管理页面"><br><sub>来源管理</sub></td>
-    <td width="50%" align="center"><img src="docs/images/chatbot-settings.png" alt="聊天客户端接入页面"><br><sub>聊天客户端</sub></td>
+    <td width="50%" align="center"><img src="docs/images/sources-clean.png" alt="来源池：额度、余额和优先级"><br><sub>来源池</sub></td>
+    <td width="50%" align="center"><img src="docs/images/chatbot-settings.png" alt="接入中的聊天客户端设置"><br><sub>聊天客户端接入</sub></td>
   </tr>
 </table>
 <p align="center">
@@ -67,16 +71,16 @@
 
 ## 开始使用
 
-1. 在「来源」添加 ChatGPT 账号或第三方 API，按需填写本地代理端口。
-2. 调整来源优先级。
-3. 在「设置」预览并应用连接设置。应用会备份原配置与认证文件，然后重启 Codex。
+1. 在「来源池」添加 ChatGPT 账号或第三方 API，按需填写本地代理端口。
+2. 用来源旁的箭头调整优先级，在「分配策略」设置自动切换、重试与对话接续。
+3. 在「接入 → Codex」预览并应用连接设置。应用会备份原配置与认证文件，然后重启 Codex。
 4. 开始对话，在「用量」查看请求使用的来源和消耗。
 
-来源池模式下需保持 Codexpress 运行。停用前可在设置中恢复原连接；需要使用 Codex 原生官方功能时，可切换到「直接官方登录」。
+来源池模式下需保持 Codexpress 运行。停用前可在「接入 → Codex」恢复原连接；需要使用 Codex 原生官方功能时，可切换到「直接官方登录」。
 
-接入其他聊天软件时，在「聊天客户端」复制地址和 Key，按 OpenAI 兼容供应商填写即可。
+接入其他聊天软件时，在「接入 → 聊天客户端」复制地址和 Key，按 OpenAI 兼容供应商填写即可。
 
-需要生图时，打开「图片生成」，复制接入提示词发给 Codex 或其他本机 Agent。Skill 和调用脚本已包含在应用内。
+需要生图时，打开「接入 → 图片生成」，复制接入提示词发给 Codex 或其他本机 Agent。Skill 和调用脚本已包含在应用内。
 
 代理设置、旧对话接续、SSH 接入和备份还原等操作见 [使用指南](docs/usage.md)。
 

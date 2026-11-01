@@ -11,10 +11,9 @@ struct APIBalanceView: View {
         let amount = balance["amount"].number
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text("余额").foregroundStyle(.secondary)
-            if !compact { Spacer(minLength: 8) }
             if let amount, amount.isFinite, let currency = balance["currency"].string {
                 Text(balanceMoney(amount, currency: currency))
-                    .font(compact ? AccountTypography.compactValue : .system(size: 18, weight: .semibold, design: .rounded))
+                    .font(compact ? AccountTypography.compactValue : AccountTypography.value)
                     .monospacedDigit()
                     .foregroundStyle(AccountLevel.balance(amount, threshold: model.sources.first { $0.id == sourceID }?.balanceWarningThreshold).color)
                     .textSelection(.enabled).lineLimit(1).minimumScaleFactor(1)
@@ -26,6 +25,7 @@ struct APIBalanceView: View {
                     .foregroundStyle(.secondary)
             }
             if showUpdating { ProgressView().controlSize(.mini).help("正在更新余额") }
+            if !compact { Spacer(minLength: 8) }
         }.font(.system(size: compact ? 10 : 12))
             .help(balance["updated_at"].number.map { "\(balance["scope"].string == "key" ? "当前密钥可用余额" : "账户总余额") · 更新于 \(timestampLabel(.number($0)))" } ?? "供应商需支持余额查询")
             .task(id: model.refreshingBalances.contains(sourceID)) {

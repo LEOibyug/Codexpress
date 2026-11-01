@@ -1,71 +1,82 @@
 import SwiftUI
 
-private enum SettingsPage: String, CaseIterable, Identifiable {
-    case sources = "来源", routing = "路由", usage = "用量", remote = "远端", chatbot = "聊天客户端", images = "图片生成", general = "设置"
+enum SettingsPage: String, CaseIterable, Identifiable {
+    case overview = "概览", sources = "来源池", usage = "用量", connections = "接入", general = "设置"
     var id: String { rawValue }
     var symbol: String {
         switch self {
+        case .overview: return "square.grid.2x2"
         case .sources: return "server.rack"
-        case .routing: return "arrow.triangle.branch"
         case .usage: return "chart.bar.xaxis"
-        case .remote: return "desktopcomputer.and.arrow.down"
-        case .chatbot: return "bubble.left.and.bubble.right"
-        case .images: return "photo"
+        case .connections: return "point.3.connected.trianglepath.dotted"
         case .general: return "slider.horizontal.3"
         }
     }
 }
 
+extension Notification.Name {
+    static let codexpressNavigate = Notification.Name("local.codexpress.navigate")
+}
+
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
-    @State private var page: SettingsPage? = .sources
+    @State private var page: SettingsPage? = .overview
+    @State private var connectionSection: ConnectionSection = .codex
 
     var body: some View {
         NavigationSplitView {
             VStack(spacing: 0) {
-                HStack(spacing: 10) {
-                    Image(systemName: "arrow.triangle.branch")
-                        .font(.system(size: 17, weight: .semibold)).foregroundStyle(.white)
-                        .frame(width: 34, height: 34)
-                        .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 10))
-                    Text("Codexpress").font(.system(size: 14, weight: .semibold))
-                    Spacer(minLength: 0)
-                }.padding(.horizontal, 18).padding(.top, 18).padding(.bottom, 23)
-
-                List(SettingsPage.allCases, selection: $page) { item in
-                    Label {
-                        Text(item.rawValue).font(.system(size: 13, weight: page == item ? .medium : .regular))
-                    } icon: {
-                        Image(systemName: item.symbol).font(.system(size: 14, weight: .medium)).frame(width: 20)
-                    }.listItemTint(.monochrome).padding(.vertical, 5).tag(item)
-                }.listStyle(.sidebar).scrollContentBackground(.hidden)
-
-                VStack(alignment: .leading, spacing: 9) {
-                    Divider().padding(.bottom, 5)
-                    HStack(spacing: 7) {
-                        Circle().fill(model.running ? .green : .orange).frame(width: 6, height: 6)
-                        Text(model.running ? "网关运行中" : "网关未连接").font(.system(size: 11, weight: .medium))
+                List(selection: $page) {
+                    Section {
+                        ForEach([SettingsPage.overview, .sources, .usage]) { navigationItem($0) }
                     }
-                }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
-            }.navigationSplitViewColumnWidth(min: 178, ideal: 190, max: 210)
+                    Section {
+                        navigationItem(.connections)
+                        navigationItem(.general)
+                    }
+                }.listStyle(.sidebar).scrollContentBackground(.hidden)
+                    .padding(.top, 10)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Divider()
+                    HStack(spacing: 8) {
+                        ActivityDot(color: model.running ? .green : .orange, active: model.gatewayHasActivity)
+                        Text(model.running ? "网关运行中" : "网关未连接").font(.system(size: 12))
+                        Spacer(minLength: 0)
+                    }
+                    Text("端口 \(model.settings.port)").font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, alignment: .leading).padding(16)
+            }.navigationSplitViewColumnWidth(min: 190, ideal: 206, max: 230)
         } detail: {
             VStack(spacing: 0) {
                 notices
                 Group {
-                    switch page ?? .sources {
+                    switch page ?? .overview {
+                    case .overview: OverviewView(openSources: { page = .sources }, openUsage: { page = .usage }, openConnection: { connectionSection = $0; page = .connections })
                     case .sources: SourcesView()
-                    case .routing: RoutingView()
                     case .usage: UsageView()
-                    case .remote: SSHRemoteView()
-                    case .chatbot: ChatbotSettingsView()
-                    case .images: ImageSettingsView()
+                    case .connections: ConnectionSettingsView(section: $connectionSection)
                     case .general: GeneralSettingsView()
                     }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }.background(AppPalette.canvas)
-        }.font(.system(size: 13)).frame(minWidth: 860, minHeight: 620)
+        }.navigationSplitViewStyle(.balanced)
+            .toolbarBackground(AppPalette.canvas, for: .windowToolbar)
+            .toolbarBackground(.visible, for: .windowToolbar)
+            .font(AppTypography.body).frame(minWidth: 960, minHeight: 700)
             .environment(\.windowIsActive, model.settingsWindowActive)
             .overlay(alignment: .bottomLeading) { AppFeedbackOverlay() }
+            .onReceive(NotificationCenter.default.publisher(for: .codexpressNavigate)) { notification in
+                if let destination = notification.object as? SettingsPage { page = destination }
+            }
+    }
+
+    private func navigationItem(_ item: SettingsPage) -> some View {
+        Label {
+            Text(item.rawValue).font(.system(size: 13, weight: page == item ? .medium : .regular))
+        } icon: {
+            Image(systemName: item.symbol).font(.system(size: 14)).frame(width: 20)
+        }.padding(.vertical, 4).tag(item)
     }
 
     @ViewBuilder private var notices: some View {
@@ -77,7 +88,7 @@ struct SettingsView: View {
                 if model.pendingSync {
                     banner("配置尚未应用到网关，当前路由仍使用上次设置。请重试启动。", symbol: "arrow.triangle.2.circlepath", color: .orange)
                 }
-            }.padding(.horizontal, 28).padding(.top, 18).frame(maxWidth: 820)
+            }.padding(.horizontal, AppMetrics.pageInset).padding(.top, 18).frame(maxWidth: 1120)
         }
     }
 

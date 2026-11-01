@@ -24,8 +24,8 @@ struct UsageRequestDetailView: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("请求详情").font(.system(size: 21, weight: .semibold))
-                    Text(record["model"].string ?? "未知模型").font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text("请求详情").font(.system(size: 22, weight: .semibold))
+                    Text(record["model"].string ?? "未知模型").font(.system(size: 13)).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button(copied ? "已复制" : "复制错误反馈") { copyTask?.cancel(); copyTask = Task { await copyFeedback() } }.disabled(!failed || loading || copying || detail == .null)
@@ -43,12 +43,12 @@ struct UsageRequestDetailView: View {
                             if !diagnostic["adapted_parameters"].array.isEmpty {
                                 DisclosureGroup("参数调整") { codeBlock(usagePrettyJSON(diagnostic["adapted_parameters"])) }
                             }
-                        }.font(.system(size: 11)).padding(16).cardSurface()
+                        }.font(.system(size: 13)).padding(18).cardSurface()
                     }
                     if !detail["related"].array.isEmpty { relatedAttempts }
                 }.padding(.bottom, 4)
             }
-        }.padding(24).frame(width: 740, height: 690)
+        }.padding(24).frame(minWidth: 760, idealWidth: 820, maxWidth: 980, minHeight: 660, idealHeight: 760, maxHeight: 900)
         .onAppear { isVisible = true }
         .onDisappear { isVisible = false; copyTask?.cancel(); copyTask = nil }
         .task(id: UsageRefreshKey(selection: attemptID, active: model.settingsWindowActive)) {
@@ -76,7 +76,7 @@ struct UsageRequestDetailView: View {
     private var metadata: some View {
         VStack(alignment: .leading, spacing: 13) {
             HStack {
-                Text(record["source_name"].string ?? "已移除来源").font(.system(size: 13, weight: .semibold))
+                Text(record["source_name"].string ?? "已移除来源").font(.system(size: 14, weight: .semibold))
                 Spacer()
                 StatusPill(text: usageRequestStatus(record), color: record["status"].string == "success" ? .green : record["active"].bool == true ? .accentColor : .orange)
             }
@@ -88,10 +88,10 @@ struct UsageRequestDetailView: View {
             }
             if let path = diagnostic["path"].string {
                 Divider()
-                Text((diagnostic["method"].string ?? "POST") + " " + path).font(.system(size: 10, design: .monospaced)).textSelection(.enabled)
+                Text((diagnostic["method"].string ?? "POST") + " " + path).font(.system(size: 12, design: .monospaced)).textSelection(.enabled)
             }
-            if let url = diagnostic["upstream_url"].string { Text(url).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
-        }.padding(16).cardSurface()
+            if let url = diagnostic["upstream_url"].string { Text(url).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
+        }.padding(18).cardSurface()
     }
     private var tokenAndPricing: some View {
         let tokens = record["token_details"], cost = record["cost"]
@@ -117,7 +117,7 @@ struct UsageRequestDetailView: View {
                     } else {
                         if tokens["source_kind"].string == "api" {
                             Text("未取得可匹配的上游扣费，暂按参考价估算。账单核对后自动更新。")
-                                .font(.system(size: 10)).foregroundStyle(.secondary)
+                                .font(.system(size: 12)).foregroundStyle(.secondary)
                         }
                         detailRow("计价模型", cost["price_model"].string ?? "—")
                         if let tier = cost["service_tier"].string { detailRow("计费模式", tier) }
@@ -128,7 +128,7 @@ struct UsageRequestDetailView: View {
                         detailRow("合计", usageMoney(cost["total_usd"].number))
                         detailRow("缓存节省", usageMoney(cost["cache_savings_usd"].number))
                         if cost["rates"] != .null {
-                            Text("每百万 Token").font(.system(size: 10)).foregroundStyle(.secondary).padding(.top, 3)
+                            Text("每百万 Token").font(.system(size: 12)).foregroundStyle(.secondary).padding(.top, 3)
                             detailRow("输入 / 缓存 / 输出", usageMoney(cost["rates"]["input"].number, estimated: false) + " / " + usageMoney(cost["rates"]["cached_input"].number, estimated: false) + " / " + usageMoney(cost["rates"]["output"].number, estimated: false))
                         }
                         if cost["long_context_waived"].bool == true { detailRow("长上下文", "已免加价") }
@@ -138,7 +138,7 @@ struct UsageRequestDetailView: View {
                     }
                 }
             }.padding(.top, 13)
-        }.font(.system(size: 11)).padding(16).cardSurface()
+        }.font(.system(size: 13)).padding(18).cardSurface()
     }
     private func detailRow(_ title: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 18) {
@@ -149,52 +149,52 @@ struct UsageRequestDetailView: View {
     }
     private func field(_ name: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(name).font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 70, alignment: .leading)
-            Text(value).font(.system(size: 11)).monospacedDigit().textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            Text(name).font(.system(size: 12)).foregroundStyle(.secondary).frame(width: 78, alignment: .leading)
+            Text(value).font(.system(size: 13)).monospacedDigit().textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
         }
     }
     private var errorFeedback: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack { Text("错误反馈").font(.system(size: 13, weight: .semibold)); Spacer(); if loading { ProgressView().controlSize(.small) } }
+            HStack { Text("错误反馈").font(.system(size: 14, weight: .semibold)); Spacer(); if loading { ProgressView().controlSize(.small) } }
             if diagnostic == .null {
-                Text(loading ? "正在读取…" : "此记录未保存错误详情。较早的请求仅保留计数与性能数据。").font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(loading ? "正在读取…" : "此记录未保存错误详情。较早的请求仅保留计数与性能数据。").font(.system(size: 13)).foregroundStyle(.secondary)
             } else {
                 if let message = diagnostic["error_message"].string, !message.isEmpty { Text(message).font(.system(size: 12)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
                 HStack(spacing: 14) {
                     if let kind = diagnostic["error_kind"].string { Text(kind) }
                     if let code = diagnostic["error_code"].string { Text("代码 " + code) }
                     if let param = diagnostic["error_param"].string { Text("参数 " + param) }
-                }.font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+                }.font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
                 if let error = diagnostic["body_decode_error"].string { InfoNote(text: error, color: .orange) }
                 else if diagnostic["body_evicted"].bool == true {
                     InfoNote(text: "错误正文已过保留期限或已清理。请求状态与性能记录仍可查看。")
                 } else if !bodyText.isEmpty {
                     ScrollView { codeBlock(bodyText) }
-                        .frame(height: min(280, max(70, CGFloat(bodyText.split(separator: "\n", omittingEmptySubsequences: false).count) * 15 + 24)))
+                        .frame(height: min(280, max(70, CGFloat(bodyText.split(separator: "\n", omittingEmptySubsequences: false).count) * 17 + 24)))
                 }
-                else if !loading { Text("上游未返回错误正文。").font(.system(size: 11)).foregroundStyle(.secondary) }
+                else if !loading { Text("上游未返回错误正文。").font(.system(size: 13)).foregroundStyle(.secondary) }
                 if diagnostic["body_truncated"].bool == true { InfoNote(text: "上游错误正文超过保存上限，已保留前 " + byteCount(diagnostic["body_saved_bytes"].number) + "。", color: .orange) }
                 if diagnostic["body_complete"].bool == false && diagnostic["body_truncated"].bool != true && diagnostic["body_evicted"].bool != true { InfoNote(text: "连接结束前未收到完整错误正文。", color: .orange) }
                 if nextOffset != nil {
-                    HStack { Text("已读取 " + byteCount(Double(bodyText.utf8.count)) + " / " + byteCount(diagnostic["body_saved_bytes"].number)).foregroundStyle(.secondary); Spacer(); Button("读取更多") { Task { await loadMore() } }.disabled(loading || copying) }.font(.system(size: 10))
+                    HStack { Text("已读取 " + byteCount(Double(bodyText.utf8.count)) + " / " + byteCount(diagnostic["body_saved_bytes"].number)).foregroundStyle(.secondary); Spacer(); Button("读取更多") { Task { await loadMore() } }.disabled(loading || copying) }.font(.system(size: 12))
                 }
             }
-        }.padding(16).cardSurface()
+        }.padding(18).cardSurface()
     }
     private var relatedAttempts: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("相关尝试").font(.system(size: 13, weight: .semibold))
+            Text("相关尝试").font(.system(size: 14, weight: .semibold))
             ForEach(Array(detail["related"].array.enumerated()), id: \.offset) { _, related in
                 if let id = related["attempt_id"].string {
                     Button { selectedID = id } label: {
-                        HStack { Text(related["source_name"].string ?? "已移除来源"); Text(related["model"].string ?? "").foregroundStyle(.secondary); Spacer(); Text(usageRequestStatus(related)); Image(systemName: "chevron.right").foregroundStyle(.tertiary) }.font(.system(size: 11)).contentShape(Rectangle())
+                        HStack { Text(related["source_name"].string ?? "已移除来源"); Text(related["model"].string ?? "").foregroundStyle(.secondary); Spacer(); Text(usageRequestStatus(related)); Image(systemName: "chevron.right").foregroundStyle(.tertiary) }.font(.system(size: 13)).contentShape(Rectangle())
                     }.buttonStyle(.plain)
                 }
             }
-        }.padding(16).cardSurface()
+        }.padding(18).cardSurface()
     }
     private func codeBlock(_ text: String) -> some View {
-        Text(text).font(.system(size: 10, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(12).background(AppPalette.well, in: RoundedRectangle(cornerRadius: 7)).fixedSize(horizontal: false, vertical: true)
+        Text(text).font(.system(size: 12, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(12).background(AppPalette.well, in: RoundedRectangle(cornerRadius: 7)).fixedSize(horizontal: false, vertical: true)
     }
     private func byteCount(_ value: Double?) -> String { value.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) } ?? "—" }
     private func load() async {

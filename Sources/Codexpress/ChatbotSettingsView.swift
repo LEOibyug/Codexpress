@@ -16,29 +16,31 @@ struct ChatbotSettingsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 24) {
                 PageHeading("聊天客户端")
                 SettingsCard("本地 API", symbol: "bubble.left.and.bubble.right", accessory: {
                     StatusPill(text: status["running"].bool == true ? "运行中" : status["enabled"].bool == false ? "已关闭" : "未启动", color: status["running"].bool == true ? .green : .secondary)
                 }) {
                     SettingRow(title: "启用接入") {
                         Toggle("启用聊天客户端接入", isOn: Binding(get: { status["enabled"].bool ?? true }, set: { enabled in update(.object(["enabled": .bool(enabled)])) }))
-                            .toggleStyle(.switch).labelsHidden().controlSize(.small).disabled(!canEdit || status == .null)
+                            .toggleStyle(.switch).labelsHidden().disabled(!canEdit || status == .null)
                     }
                     Divider()
                     SettingRow(title: "监听端口") {
-                        TextField("17865", text: $port).multilineTextAlignment(.trailing).settingsField().frame(width: 100).disabled(!canEdit || status == .null)
+                        TextField("17865", text: $port).font(.system(size: 13, design: .monospaced))
+                            .multilineTextAlignment(.trailing).settingsField().frame(width: 130).disabled(!canEdit || status == .null)
                     }
                     SettingRow(title: "新 API Key", subtitle: "留空保留现有密钥") {
-                        SecureField("16–256 位字符", text: $newKey).settingsField().frame(maxWidth: 270).disabled(!canEdit || status == .null)
+                        SecureField("16–256 位字符", text: $newKey).settingsField().frame(maxWidth: 360).disabled(!canEdit || status == .null)
                     }
-                    HStack(spacing: 10) {
+                    Divider()
+                    HStack(spacing: 12) {
                         Button("复制当前 Key") { copyKey() }.disabled(!canEdit || status == .null)
                         Button("重新生成…") { confirmReset = true }.disabled(!canEdit || status == .null)
                         Spacer()
                         if working { ProgressView().controlSize(.small) }
                         Button("应用设置") { save() }.buttonStyle(.borderedProminent).disabled(!canEdit || !changed)
-                    }.controlSize(.small)
+                    }
                     if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
                     if status["enabled"].bool == true && status["running"].bool == false {
                         InfoNote(text: "入口未启动，请更换端口后应用设置。", color: .orange)
@@ -46,15 +48,16 @@ struct ChatbotSettingsView: View {
                 }
                 SettingsCard("供应商填写", symbol: "link") {
                     LabeledContent("类型", value: "OpenAI 兼容")
-                    HStack(alignment: .firstTextBaseline, spacing: 12) {
-                        Text("API 基址").foregroundStyle(.secondary)
-                        Spacer(minLength: 0)
-                        Text(address).font(.system(size: 12, design: .monospaced)).textSelection(.enabled)
-                        Button { copy(address, message: "API 地址已复制。") } label: { Image(systemName: "doc.on.doc") }
-                            .buttonStyle(.plain).accessibilityLabel("复制 API 地址").disabled(status == .null)
+                    LabeledContent("API 基址") {
+                        HStack(spacing: 10) {
+                            Text(address).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
+                            Button { copy(address, message: "API 地址已复制。") } label: { Image(systemName: "doc.on.doc") }
+                                .accessibilityLabel("复制 API 地址").help("复制 API 地址").disabled(status == .null)
+                        }
                     }
+                    Divider()
                     LabeledContent("接口", value: "Chat Completions / Responses")
-                    Text("在客户端填入上方地址和此处生成的 Key，再获取模型列表。此入口仅供本机客户端使用。").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text("在客户端填入上方地址和此处生成的 Key，再获取模型列表。此入口仅供本机客户端使用。").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
             }.settingsPage()
         }.task(id: model.running) { await load() }

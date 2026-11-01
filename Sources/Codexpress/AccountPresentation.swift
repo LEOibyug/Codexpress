@@ -1,6 +1,7 @@
 import SwiftUI
 
 enum AccountTypography {
+    static let value = Font.system(size: 22, weight: .semibold, design: .rounded)
     static let compactValue = Font.system(size: 16, weight: .semibold, design: .rounded)
 }
 

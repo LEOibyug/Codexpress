@@ -35,7 +35,7 @@ struct SourceRoutingActions: View {
         if compact {
             Button(action: perform) {
                 Image(systemName: symbol).font(.system(size: 11, weight: .medium))
-                    .frame(width: 18, height: 16).contentShape(Rectangle())
+                    .frame(width: 22, height: 22).contentShape(Rectangle())
             }.buttonStyle(.plain).accessibilityLabel(title)
         } else {
             Button(title, action: perform)

@@ -10,6 +10,7 @@ private struct FeedbackMessage: Identifiable {
 struct AppFeedbackOverlay: View {
     @EnvironmentObject var model: AppModel
     @State private var messages: [FeedbackMessage] = []
+    var compact = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -18,7 +19,7 @@ struct AppFeedbackOverlay: View {
                     onExpire: { dismiss(message) }
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-        }.frame(maxWidth: 380, alignment: .leading).padding(20)
+        }.frame(maxWidth: compact ? 312 : 400, alignment: .leading).padding(compact ? 12 : 20)
             .animation(.easeInOut(duration: 0.2), value: messages.map(\.id))
             .onChange(of: model.notice, initial: true) { _, text in present(text, isError: false) }
             .onChange(of: model.error, initial: true) { _, text in present(text, isError: true) }

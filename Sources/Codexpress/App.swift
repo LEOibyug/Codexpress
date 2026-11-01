@@ -57,16 +57,17 @@ struct GatewayMenuIcon: View {
     weak var model: AppModel?
     private var settingsWindow: NSWindow?
     private let terminationGuard = TerminationGuard()
-    func showSettings() {
+    func showSettings(destination: SettingsPage? = nil) {
         if settingsWindow == nil {
             let content = SettingsView().environmentObject(AppModel.shared)
             let window = NSWindow(contentViewController: NSHostingController(rootView: content))
-            window.title = "Codexpress 设置"
+            window.title = "Codexpress"
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.titlebarAppearsTransparent = true
-            window.titleVisibility = .hidden
-            window.setContentSize(NSSize(width: 960, height: 780))
-            window.minSize = NSSize(width: 860, height: 650)
+            window.titleVisibility = .visible
+            window.toolbarStyle = .unified
+            window.setContentSize(NSSize(width: 1040, height: 800))
+            window.minSize = NSSize(width: 960, height: 700)
             window.isReleasedWhenClosed = false
             window.delegate = self
             window.center()
@@ -75,6 +76,11 @@ struct GatewayMenuIcon: View {
         settingsWindow?.makeKeyAndOrderFront(nil)
         AppModel.shared.accountPageOpened()
         NSApp.activate(ignoringOtherApps: true)
+        if let destination {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .codexpressNavigate, object: destination)
+            }
+        }
         updateWindowActivity()
     }
     private func updateWindowActivity() {
