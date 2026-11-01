@@ -82,26 +82,27 @@ struct UsageView: View {
     }
     private var breakdown: some View {
         HStack(alignment: .top, spacing: 0) {
-            UsageDistributionChart(groups: snapshot["groups"].array).frame(maxWidth: .infinity)
+            UsageDistributionChart(groups: snapshot["groups"].array).frame(maxWidth: .infinity, maxHeight: .infinity)
             UsagePerformanceCard(selection: selection, snapshot: snapshot).frame(maxWidth: .infinity)
         }
+        .fixedSize(horizontal: false, vertical: true)
         .overlay { Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1).padding(.vertical, 18).allowsHitTesting(false) }
         .cardSurface()
     }
     private var summary: some View {
         HStack(alignment: .top, spacing: 0) {
-            summaryMetric("费用 · USD", value: usageMoney(totals.cost, estimated: totals.costEstimated), detail: totals.cost == nil ? "暂无已计价请求" : totals.costEstimated ? "含 API 参考价估算" : "供应商实际扣费", prominent: true)
+            summaryMetric("费用 · USD", value: usageMoney(totals.cost, estimated: totals.costEstimated), detail: totals.cost == nil ? "暂无已计价请求" : totals.costEstimated ? "参考价估算" : "实际扣费", prominent: true)
             Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1, height: 64).padding(.horizontal, 20)
-            summaryMetric("总 Token", value: usageCount(totals.total, estimated: totals.estimated), detail: "输入 + 输出")
+            summaryMetric("总 Token", value: usageCount(totals.total, estimated: totals.estimated))
             summaryMetric("请求", value: usageCount(totals.sum("requests")), detail: "失败 \(usageCount(totals.sum("failures")))")
             summaryMetric("成功率", value: totals.successRate.map { String(format: "%.1f%%", $0) } ?? "—", detail: "进行中 \(usageCount(totals.sum("active_requests")))")
         }.padding(20).cardSurface()
     }
-    private func summaryMetric(_ title: String, value: String, detail: String, prominent: Bool = false) -> some View {
+    private func summaryMetric(_ title: String, value: String, detail: String? = nil, prominent: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             Text(title).font(.system(size: 12)).foregroundStyle(.secondary)
             Text(value).font(.system(size: prominent ? 28 : 25, weight: .semibold)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.85)
-            Text(detail).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let detail { Text(detail).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -117,6 +118,7 @@ struct UsageFilters: View {
                 VStack(alignment: .leading, spacing: 6) {
                     filterLabel("时间范围")
                     Picker("时间范围", selection: $selection.days) {
+                        Text("近 1 天").tag(1)
                         Text("近 7 天").tag(7); Text("近 30 天").tag(30); Text("近 90 天").tag(90); Text("近 365 天").tag(365); Text("自定义").tag(0)
                     }.labelsHidden().frame(maxWidth: .infinity)
                 }.frame(width: 138)
@@ -180,7 +182,7 @@ private struct UsagePriceSheet: View {
                                 Text(usageMoney(row["output"].number, estimated: false)).frame(width: 86, alignment: .trailing)
                             }.font(.system(size: 13)).monospacedDigit()
                             if let limit = row["long_context_over"].number {
-                                Text("输入 > \(usageCount(limit))：输入／缓存 ×\(String(format: "%.1f", row["long_input_multiplier"].number ?? 1))，输出 ×\(String(format: "%.1f", row["long_output_multiplier"].number ?? 1))" + (row["session_scope"].bool == true ? "（按会话，逐请求估算）" : "（整条请求）")).font(.system(size: 12)).foregroundStyle(.secondary)
+                                Text("输入 > \(usageCount(limit))：输入／缓存 ×\(String(format: "%.1f", row["long_input_multiplier"].number ?? 1))，输出 ×\(String(format: "%.1f", row["long_output_multiplier"].number ?? 1))" + (row["session_scope"].bool == true ? "（按会话）" : "（整条请求）")).font(.system(size: 12)).foregroundStyle(.secondary)
                             }
                             if let write = row["cache_write_30m"].number {
                                 Text("缓存写入：30 分钟 \(usageMoney(write, estimated: false))" + (row["cache_write_12h"].number.map { " · 12 小时 \(usageMoney($0, estimated: false))" } ?? "")).font(.system(size: 12)).foregroundStyle(.secondary)
@@ -189,7 +191,6 @@ private struct UsagePriceSheet: View {
                     }
                 }
             }
-            Text("上游实际扣费优先；未提供时按此表折算。参考价估算中，官方订阅的 GPT‑6.1 Sol、已开启“订阅来源”的 API 免长上下文加价。").font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
                 if let raw = catalog["source_url"].string, let url = URL(string: raw) { Link("查看 OpenAI 官方价格", destination: url) }
                 Spacer()

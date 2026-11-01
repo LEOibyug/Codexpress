@@ -29,7 +29,7 @@ struct OverviewView: View {
                 }) {
                     if model.sources.isEmpty {
                         HStack {
-                            Text("添加官方账号或 API 来源，开始使用来源池。")
+                            Text("暂无来源")
                                 .foregroundStyle(.secondary)
                             Spacer()
                             Button("添加来源", action: openSources).buttonStyle(.borderedProminent)
@@ -45,15 +45,13 @@ struct OverviewView: View {
                 }
                 SettingsCard("接入与服务", symbol: "point.3.connected.trianglepath.dotted") {
                     LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)], spacing: 12) {
-                        entry(.codex, symbol: "terminal", description: "登录方式、模型规则与配置备份")
-                        entry(.chatbot, symbol: "bubble.left.and.bubble.right", description: "为聊天软件提供本地 API")
-                        entry(.remote, symbol: "desktopcomputer", description: "通过 SSH 连接远端 Codex")
-                        entry(.images, symbol: "photo", description: "官方套餐生图与 Agent 接入")
+                        entry(.codex, symbol: "terminal")
+                        entry(.chatbot, symbol: "bubble.left.and.bubble.right")
+                        entry(.remote, symbol: "desktopcomputer")
+                        entry(.images, symbol: "photo")
                     }
                 }
                 HStack {
-                    Text("直接官方登录的请求不经过本地网关，不计入用量。")
-                        .font(AppTypography.small).foregroundStyle(.secondary)
                     Spacer()
                     Button("查看用量", action: openUsage).buttonStyle(.link)
                 }
@@ -88,8 +86,10 @@ struct OverviewView: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text(model.connectionMode == "official" ? "Codex 直接官方登录" : model.connectionMode == "gateway" ? (model.running ? "Codex 已连接来源池" : "Codex 配置为来源池") : "尚未接入 Codex")
                         .font(.system(size: 17, weight: .semibold))
-                    Text(model.connectionMode == "official" ? "使用 Codex 原生功能与系统代理" : model.connectionMode == "gateway" ? (model.routingMode == "auto" ? "按来源池策略自动分配请求" : "固定来源：\(model.fixedName)") : "配置本机连接或接入其他客户端")
-                        .font(AppTypography.caption).foregroundStyle(.secondary)
+                    if model.connectionMode == "gateway" {
+                        Text(model.routingMode == "auto" ? "自动切换" : "固定来源：\(model.fixedName)")
+                            .font(AppTypography.caption).foregroundStyle(.secondary)
+                    }
                 }
                 Spacer(minLength: 0)
                 StatusPill(text: model.running ? "网关运行中" : "网关未连接", color: model.running ? .green : .orange, active: model.gatewayHasActivity)
@@ -138,14 +138,11 @@ struct OverviewView: View {
         }
     }
 
-    private func entry(_ section: ConnectionSection, symbol: String, description: String) -> some View {
+    private func entry(_ section: ConnectionSection, symbol: String) -> some View {
         Button { openConnection(section) } label: {
             HStack(spacing: 11) {
                 Image(systemName: symbol).font(.system(size: 16)).foregroundStyle(.secondary).frame(width: 24)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(section.rawValue).font(.system(size: 13, weight: .medium))
-                    Text(description).font(AppTypography.small).foregroundStyle(.secondary).lineLimit(2)
-                }
+                Text(section.rawValue).font(.system(size: 13, weight: .medium))
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.tertiary)
             }.padding(12).frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)

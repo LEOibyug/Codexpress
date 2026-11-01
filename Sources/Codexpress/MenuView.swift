@@ -73,7 +73,6 @@ struct MenuView: View {
                 } else {
                     DirectOfficialLoginButton()
                 }
-                Text("切换后会重启 Codex").font(.system(size: 10)).foregroundStyle(.secondary)
             }.buttonStyle(.bordered).controlSize(.small)
         }.padding(.horizontal, 2).padding(.vertical, 1)
     }

@@ -17,7 +17,7 @@ struct UsageTrendChart: View {
                 if let selected {
                     Text(selected.date.formatted(.dateTime.month().day()) + " · " + usageCount(selected.total, estimated: selected.estimated) + " Token")
                         .font(.system(size: 12, weight: .medium)).monospacedDigit()
-                } else { Text("每日输入 + 输出").font(.system(size: 12)).foregroundStyle(.secondary) }
+                }
             }
             Chart {
                 ForEach(days) { day in
@@ -117,9 +117,7 @@ struct UsageDistributionChart: View {
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
 
-            }
-            Text(groupBy == "model" ? "输入与输出 Token" : "上游扣费优先 · 缺失时使用参考价")
-                .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }.frame(maxHeight: .infinity)
         }.padding(20)
             .onChange(of: groupBy) { _, _ in hoveredSource = nil }
             .onChange(of: slices.map(\.id)) { _, ids in if let hoveredSource, !ids.contains(hoveredSource) { self.hoveredSource = nil } }

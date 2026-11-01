@@ -44,8 +44,6 @@ struct SSHRemoteView: View {
                 Text(remote.port.isEmpty ? "—" : remote.port)
                     .font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
             }
-            Text("随本地网关启动。远端使用独立机器 Key；仅用于可信局域网或 VPN。更改端口后需重新应用远端配置。")
-                .font(.system(size: 12)).foregroundStyle(.secondary)
             if let old = remote.status["previous_port"].number {
                 InfoNote(text: "原远端端口为 \(Int(old))，请重新预览并应用连接以使用当前端口。", color: .orange)
             }
@@ -98,10 +96,9 @@ struct SSHRemoteView: View {
                 }
                 field("私钥文件", placeholder: "使用 ssh-agent 或 SSH 配置", text: $remote.profile.identityFile)
                 HStack(alignment: .firstTextBaseline, spacing: 20) {
-                    Text("需预先确认主机指纹并完成密钥登录，远端需 Python 3。")
-                        .font(.system(size: 12)).foregroundStyle(.secondary)
                     Spacer()
                     Button("连接并探测") { remote.discover(model) }
+                        .help("SSH 密钥登录 · Python 3")
                 }
             }
         }
@@ -119,14 +116,8 @@ struct SSHRemoteView: View {
                     }
                 }
                 field("远端可访问的本机地址", placeholder: "自动探测或填写局域网／VPN IP", text: $remote.profile.gatewayHost)
-                Text("SSH 探测地址仅供参考；应用前会从远端实际验证，不通时不会写入配置。")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
                 Divider()
                 Toggle("同时接入已有自定义供应商 ID", isOn: $remote.profile.mapExistingProviders)
-                if remote.profile.mapExistingProviders {
-                    Text("旧对话可能带有原来源的加密状态，接入后可能触发上下文降级。")
-                        .font(.system(size: 12)).foregroundStyle(.secondary)
-                }
                 HStack {
                     Button("还原接入前设置…") { confirmation = "restore" }.disabled(!remote.canRestore)
                     Spacer()
@@ -146,8 +137,11 @@ struct SSHRemoteView: View {
             }
             Divider()
             HStack(alignment: .firstTextBaseline, spacing: 20) {
-                Text(!remote.canApply(model) ? "设置已变化，请重新预览。" : !remote.running ? "请先启动本地网关。" : "配置、文件认证与模型目录将在远端备份。")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                if !remote.canApply(model) {
+                    Text("设置已变化，请重新预览。").font(.system(size: 12)).foregroundStyle(.secondary)
+                } else if !remote.running {
+                    Text("请先启动本地网关。").font(.system(size: 12)).foregroundStyle(.secondary)
+                }
                 Spacer()
                 Button("备份并应用…") { confirmation = "apply" }
                     .disabled(!remote.canApply(model) || !remote.running).buttonStyle(.borderedProminent)

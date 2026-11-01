@@ -37,11 +37,10 @@ struct ImageSettingsView: View {
                             if !sourceID.isEmpty && !model.sources.contains(where: {$0.id == sourceID}) { Text("原账号已移除").tag(sourceID) }
                         }.labelsHidden().frame(maxWidth: 360, alignment: .trailing).disabled(!canEdit)
                     }
-                    SettingRow(title: "新 API Key", subtitle: "留空保留现有密钥") {
-                        SecureField("16–256 位字符", text: Binding(get: { newKey }, set: { newKey = $0; error = nil }))
+                    SettingRow(title: "新 API Key") {
+                        SecureField("留空保留原 Key", text: Binding(get: { newKey }, set: { newKey = $0; error = nil }))
                             .settingsField().frame(maxWidth: 360).disabled(!canEdit)
                     }
-                    Text("使用所选官方账号及其代理，仅供本机调用。生图可用额度以官方生图接口返回为准。").font(.system(size: 12)).foregroundStyle(.secondary)
                     Divider()
                     HStack(spacing: 12) {
                         Button("复制当前 Key") { copyKey() }.disabled(!canEdit)
@@ -54,13 +53,11 @@ struct ImageSettingsView: View {
                     if status["enabled"].bool == true && status["running"].bool == false { InfoNote(text: "图片入口未启动，请检查端口后重新应用设置。", color: .orange) }
                 }
                 SettingsCard("接入 Codex 或其他 Agent", symbol: "doc.on.clipboard") {
-                    Text("将接入提示词发送给本机 Agent，即可生成或编辑图片。").font(.system(size: 13))
                     HStack {
                         Text("gpt-image-2 · 生成／编辑 · PNG").font(.system(size: 12)).foregroundStyle(.secondary)
                         Spacer()
                         Button("复制接入提示词") { copyPrompt() }.buttonStyle(.borderedProminent).disabled(!canEdit)
                     }
-                    Text("接入提示词不含密钥；密钥保存在本机私有配置中。").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 SettingsCard("其他 Images API 客户端", symbol: "link") {
                     LabeledContent("API 基址") {
@@ -70,7 +67,6 @@ struct ImageSettingsView: View {
                                 .disabled(status == .null).accessibilityLabel("复制图片 API 地址").help("复制图片 API 地址")
                         }
                     }
-                    Text("在支持自定义图片接口的 Skill 或客户端中填写此地址与独立 Key，选择 gpt-image-2 和 PNG 输出。").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
             }.settingsPage()
         }.task(id: model.running) { await load() }

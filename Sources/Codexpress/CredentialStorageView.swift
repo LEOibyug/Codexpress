@@ -14,25 +14,20 @@ struct CredentialStorageView: View {
                     }.pickerStyle(.segmented).labelsHidden().frame(width: 240)
                         .disabled(model.busy || !model.canManageCredentials || model.credentialStorage == .null)
                 }
-                Divider()
                 if model.credentialStorageMode == "file" {
+                    Divider()
                     Text(model.credentialStorage["file_path"].string ?? model.localCredentialFile.path)
                         .font(.system(size: 13, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
                     HStack(alignment: .firstTextBaseline, spacing: 20) {
-                        Text("本地文件不加密，请勿分享或同步此目录。")
-                            .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        Text("明文文件")
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
                         Spacer(minLength: 0)
                         Button("打开目录") {
                             let file = model.credentialStorage["file_path"].string.map { URL(fileURLWithPath: $0) } ?? model.localCredentialFile
                             NSWorkspace.shared.open(file.deletingLastPathComponent())
                         }
                     }
-                } else {
-                    Text("由 macOS 钥匙串保护；系统可能要求授权访问。")
-                        .font(.system(size: 12)).foregroundStyle(.secondary)
                 }
-                Text("切换后原位置保留副本，后续更新只写入当前存储。")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
             }
         }
         .task { await model.refreshCredentialStorage() }

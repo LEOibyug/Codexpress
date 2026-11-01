@@ -50,8 +50,7 @@ struct OfficialAccountView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Divider()
                     Text(model.loginMessage ?? "等待浏览器授权…").font(.system(size: 13, weight: .medium))
-                    InfoNote(text: "未自动完成时，粘贴浏览器中的完整回调地址。")
-                    SecureField("回调地址", text: $model.callbackURL).settingsField()
+                    SecureField("完整回调地址", text: $model.callbackURL).settingsField()
                     HStack {
                         Button("完成登录") { model.completeLogin() }.buttonStyle(.borderedProminent).disabled(model.callbackURL.isEmpty || model.busy || model.loginFlow == nil)
                         Button("取消等待") { model.cancelLogin() }.disabled(model.busy)

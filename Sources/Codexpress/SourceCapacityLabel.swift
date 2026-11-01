@@ -22,7 +22,7 @@ struct SourceCapacityLabel: View {
     }
     private var help: String {
         let seconds = admission["activity_window_seconds"].number.map { Int($0) } ?? source.activeConversationWindowSeconds
-        return "进行中的请求持续占用名额；结束后闲置 \(seconds) 秒释放，同一对话使用同一模型时复用名额。"
+        return "空闲释放：\(seconds) 秒"
     }
 
     var body: some View {

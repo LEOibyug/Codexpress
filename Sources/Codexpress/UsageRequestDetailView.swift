@@ -105,7 +105,6 @@ struct UsageRequestDetailView: View {
                 detailRow("上游报告总量", tokens["reported_total_tokens"].number.map { usageCount($0) } ?? "未报告")
                 detailRow("计数状态", record["complete"].bool == true ? "完整" : "未完整报告")
                 detailRow("传输阶段速度", usageRate(record["generation_tps"].number) + " TPS")
-                    .help("从首个可见输出开始计时。上游缓冲后集中返回时，此速度可能高于实际生成速度。")
                 Divider()
                 if cost == .null { Text("此记录未保存计价详情。").foregroundStyle(.secondary) }
                 else {
@@ -115,10 +114,6 @@ struct UsageRequestDetailView: View {
                         detailRow("实际扣费", usageCostMoney(cost))
                         if let id = cost["upstream_record_id"].string { detailRow("账单记录", id) }
                     } else {
-                        if tokens["source_kind"].string == "api" {
-                            Text("未取得可匹配的上游扣费，暂按参考价估算。账单核对后自动更新。")
-                                .font(.system(size: 12)).foregroundStyle(.secondary)
-                        }
                         detailRow("计价模型", cost["price_model"].string ?? "—")
                         if let tier = cost["service_tier"].string { detailRow("计费模式", tier) }
                         detailRow("非缓存输入", usageMoney(cost["input_usd"].number))
@@ -134,7 +129,6 @@ struct UsageRequestDetailView: View {
                         if cost["long_context_waived"].bool == true { detailRow("长上下文", "已免加价") }
                         else if cost["long_context"].bool == true { detailRow("长上下文", "已按长上下文价格折算") }
                         if let revision = cost["revision"].string { detailRow("价格版本", revision) }
-                        if cost["session_scope_estimate"].bool == true { InfoNote(text: "此模型按整段会话区分长上下文价格；此处按本次输入量估算。", color: .orange) }
                     }
                 }
             }.padding(.top, 13)
@@ -157,7 +151,7 @@ struct UsageRequestDetailView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack { Text("错误反馈").font(.system(size: 14, weight: .semibold)); Spacer(); if loading { ProgressView().controlSize(.small) } }
             if diagnostic == .null {
-                Text(loading ? "正在读取…" : "此记录未保存错误详情。较早的请求仅保留计数与性能数据。").font(.system(size: 13)).foregroundStyle(.secondary)
+                Text(loading ? "正在读取…" : "未保存错误详情").font(.system(size: 13)).foregroundStyle(.secondary)
             } else {
                 if let message = diagnostic["error_message"].string, !message.isEmpty { Text(message).font(.system(size: 12)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
                 HStack(spacing: 14) {
@@ -167,7 +161,7 @@ struct UsageRequestDetailView: View {
                 }.font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
                 if let error = diagnostic["body_decode_error"].string { InfoNote(text: error, color: .orange) }
                 else if diagnostic["body_evicted"].bool == true {
-                    InfoNote(text: "错误正文已过保留期限或已清理。请求状态与性能记录仍可查看。")
+                    InfoNote(text: "错误正文已过期或已清理。")
                 } else if !bodyText.isEmpty {
                     ScrollView { codeBlock(bodyText) }
                         .frame(height: min(280, max(70, CGFloat(bodyText.split(separator: "\n", omittingEmptySubsequences: false).count) * 17 + 24)))

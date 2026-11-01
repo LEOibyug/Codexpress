@@ -4,7 +4,6 @@ struct CodexSettingsView: View {
     @EnvironmentObject var model: AppModel
     @State private var home = ""
     @State private var confirming: String?
-    @State private var connectionDetails = false
     @State private var selectedBackup = ""
 
     private var preferencesChanged: Bool { home != model.settings.codexHome }
@@ -66,7 +65,6 @@ struct CodexSettingsView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(model.connectionMode == "official" ? "官方连接 · 系统代理" : model.connectionMode == "gateway" ? "来源池" : "连接方式")
                             .font(.system(size: 13, weight: .medium))
-                        Text("切换时会重启 Codex").font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                     Spacer()
                     if model.connectionMode == "official" {
@@ -81,10 +79,6 @@ struct CodexSettingsView: View {
                     TextField("Codex 配置目录（绝对路径）", text: $home)
                         .font(.system(size: 13, design: .monospaced)).settingsField()
                 }
-                DisclosureGroup("生效方式", isExpanded: $connectionDetails) {
-                    Text("应用后自动重启 Codex。已有对话须确认原来源的同一账号和密钥，才能接入网关；未确认的供应商保持原连接。")
-                        .font(.system(size: 12)).foregroundStyle(.secondary).padding(.top, 7)
-                }.font(.system(size: 12)).foregroundStyle(.secondary)
             }
         }
     }
@@ -98,13 +92,11 @@ struct CodexSettingsView: View {
         SettingsCard("配置备份", symbol: "clock.arrow.circlepath") {
             VStack(alignment: .leading, spacing: 16) {
                 if model.configurationBackups.isEmpty {
-                    Text("暂无备份，应用配置时自动创建。 ").font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text("暂无备份").font(.system(size: 12)).foregroundStyle(.secondary)
                 } else {
                     Picker("备份时间", selection: Binding(get: { backupID }, set: { selectedBackup = $0 })) {
                         ForEach(Array(model.configurationBackups.enumerated()), id: \.offset) { _, item in Text(backupLabel(item)).tag(item["id"].string ?? "") }
                     }
-                    Text("还原配置文件与 auth.json 等文件认证；钥匙串登录由 Codex 管理。")
-                        .font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 HStack {
                     Button("刷新") { Task { await model.refreshConfigurationBackups() } }.disabled(model.busy || !model.running)
@@ -135,7 +127,6 @@ struct CodexSettingsView: View {
                     Text("接入已有供应商连接：" + model.preview["compatibility_provider_ids"].array.compactMap(\.string).joined(separator: "、"))
                         .font(.system(size: 12)).foregroundStyle(.secondary)
                 }
-                InfoNote(text: "应用前自动备份配置与文件认证，并重启 Codex。")
                 if !model.preview["legacy_providers"].array.isEmpty || model.preview["origin_error"].string != nil { LegacyProviderOriginsView() }
                 HStack(spacing: 10) {
                     Button("恢复原连接…") { confirming = "config.restore" }.disabled(model.preview["attached"].bool != true)

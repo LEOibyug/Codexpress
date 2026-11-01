@@ -124,7 +124,6 @@ struct UsageActivityChart: View {
                         .buttonStyle(.plain).foregroundStyle(.secondary).help("取消固定")
                 }
             } else {
-                Text("悬停查看每日用量，点击固定显示").foregroundStyle(.secondary)
                 Spacer(minLength: 0)
             }
         }.font(.system(size: 12)).frame(height: 40, alignment: .leading)

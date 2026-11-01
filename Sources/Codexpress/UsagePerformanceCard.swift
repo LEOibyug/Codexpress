@@ -31,15 +31,14 @@ struct UsagePerformanceCard: View {
                 }.labelsHidden().controlSize(.regular).frame(maxWidth: 160)
             }
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), alignment: .leading), count: 2), alignment: .leading, spacing: 22) {
-                metric("平均输出速度", value: usageRate(totals.tps, estimated: totals.estimated) + " TPS", detail: "含首 Token 等待")
-                metric("缓存命中率", value: totals.cacheRate.map { String(format: "%.1f%%", $0) } ?? "—", detail: "已报告缓存的输入")
+                metric("平均输出速度", value: usageRate(totals.tps, estimated: totals.estimated) + " TPS")
+                metric("缓存命中率", value: totals.cacheRate.map { String(format: "%.1f%%", $0) } ?? "—")
                 metric("首 Token · P50", value: usageSeconds(data["performance"]["p50_first_token_ms"].number), detail: "P95 " + usageSeconds(data["performance"]["p95_first_token_ms"].number))
                 metric("请求耗时 · P50", value: usageSeconds(data["performance"]["p50_latency_ms"].number), detail: "P95 " + usageSeconds(data["performance"]["p95_latency_ms"].number))
-                metric("平均每次费用", value: usageMoney(totals.averageCost, estimated: totals.costEstimated), detail: "仅已计价请求")
-                metric("缓存节省", value: usageMoney(totals.savings), detail: "按参考价格折算")
+                metric("平均每次费用", value: usageMoney(totals.averageCost, estimated: totals.costEstimated))
+                metric("缓存节省", value: usageMoney(totals.savings))
             }.padding(.top, 2)
             if let loadError { Text(loadError).font(.system(size: 11)).foregroundStyle(.orange).lineLimit(2).help(loadError) }
-            else { Text("已结束的请求").font(.system(size: 11)).foregroundStyle(.secondary) }
         }.padding(20)
         .task(id: UsageRefreshKey(selection: refreshID, active: model.settingsWindowActive)) {
             guard model.settingsWindowActive, !sourceID.isEmpty else { loadError = nil; loadingSource = false; return }
@@ -61,11 +60,11 @@ struct UsagePerformanceCard: View {
             }
         }
     }
-    private func metric(_ title: String, value: String, detail: String) -> some View {
+    private func metric(_ title: String, value: String, detail: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(2)
             Text(value).font(.system(size: 20, weight: .semibold)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.85)
-            Text(detail).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let detail { Text(detail).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
 }

@@ -61,10 +61,7 @@ struct SourceEditor: View {
                     TextField("名称", text: $source.name)
                     TextField("API 基址", text: $source.base_url).textContentType(.URL).disabled(source.official)
                     if !source.official {
-                        SecureField(isNew ? "API 密钥" : "新 API 密钥", text: $apiKey)
-                        if !isNew {
-                            Text("留空保留现有密钥。").font(.system(size: 12)).foregroundStyle(.secondary)
-                        }
+                        SecureField(isNew ? "API 密钥" : "新 API 密钥", text: $apiKey, prompt: Text(isNew ? "API 密钥" : "留空保留现有密钥"))
                     }
                     Toggle("启用此来源", isOn: $source.enabled).toggleStyle(.switch)
                 }
@@ -75,15 +72,11 @@ struct SourceEditor: View {
                             .toggleStyle(.switch)
                         if balanceWarningEnabled {
                             TextField("预警余额", text: $balanceWarningAmount, prompt: Text("例如 10"))
-                            Text("余额不高于此金额时发送系统通知，币种以供应商返回的余额为准。")
-                                .font(.system(size: 12)).foregroundStyle(.secondary)
                         }
                     }
                     Section("费用估算") {
                         Toggle("订阅来源", isOn: Binding(get: { source.is_subscription ?? false }, set: { source.is_subscription = $0 }))
                             .toggleStyle(.switch)
-                        Text("开启后参考费用不计长上下文加价。旧版记录按当前设置补算。")
-                            .font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                 }
                 Section("网络") {
@@ -94,7 +87,7 @@ struct SourceEditor: View {
                     if source.proxy.mode == "explicit" {
                         TextField("本地代理端口", text: $proxyPort, prompt: Text("例如 7890"))
                         if source.proxy.localPort == nil, let existing = source.proxy.url {
-                            Text("现有代理：\(existing)；填写端口改用本地代理。")
+                            Text("现有代理：\(existing)")
                                 .font(.system(size: 12)).foregroundStyle(.secondary)
                         }
                     }
@@ -119,15 +112,10 @@ struct SourceEditor: View {
                                     ForEach(source.models, id: \.self) { Text($0).frame(maxWidth: .infinity, alignment: .leading) }
                                 }.font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
                             }.frame(height: min(CGFloat(source.models.count) * 24, 144))
-                        } else if !canFetch {
-                            Text(source.official ? "登录后自动获取模型。" : "填写 API 基址和密钥后自动获取。")
-                                .font(.system(size: 12)).foregroundStyle(.secondary)
                         }
                         if let modelError { Text(modelError).font(.system(size: 12)).foregroundStyle(.orange) }
                     } else {
-                        TextField("支持模型", text: $modelsText, prompt: Text("模型 ID，以逗号分隔"))
-                        Text("留空表示不限模型。")
-                            .font(.system(size: 12)).foregroundStyle(.secondary)
+                        TextField("支持模型", text: $modelsText, prompt: Text("模型 ID，以逗号分隔；留空不限"))
                     }
                 }
             }.formStyle(.grouped).scrollContentBackground(.hidden)
@@ -157,10 +145,8 @@ struct SourceEditor: View {
             Toggle("限制活跃对话数", isOn: $capacityLimitEnabled)
                 .toggleStyle(.switch)
             if capacityLimitEnabled {
-                TextField("对话上限", text: $maxActiveConversations, prompt: Text("1–1024，建议 3"))
+                TextField("对话上限", text: $maxActiveConversations, prompt: Text("1–1024"))
                 TextField("空闲释放时间（秒）", text: $activityWindowSeconds, prompt: Text("1–300，默认 15"))
-                Text("进行中的请求持续占用名额，结束后按此时间保留。同一对话使用同一模型时复用名额；自动模式会跳过满额来源。")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
             }
         }
     }

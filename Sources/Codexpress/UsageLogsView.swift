@@ -63,7 +63,7 @@ struct UsageLogsView: View {
             ScrollView {
                 LazyVStack(spacing: 0) {
                     if records.isEmpty {
-                        EmptyState("暂无连接记录", subtitle: "所选时间范围与筛选条件下没有请求。", symbol: "list.bullet.rectangle").frame(height: 310)
+                        EmptyState("暂无连接记录", subtitle: "当前筛选下没有请求", symbol: "list.bullet.rectangle").frame(height: 310)
                     }
                     ForEach(records) { item in
                         Button { selected = item } label: { requestRow(item) }.buttonStyle(.plain)

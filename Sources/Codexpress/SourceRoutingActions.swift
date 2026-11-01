@@ -17,7 +17,7 @@ struct SourceRoutingActions: View {
                     .disabled(!source.enabled)
             }
             action("立即抢占", symbol: "bolt.fill") { model.startSourceTakeover(source.id) }
-                .help(exhausted ? "官方额度已耗尽，确认恢复后可使用" : takingOver ? "正在抢占后续请求" : "优先接收后续对话请求，直到达到并发上限或其他来源无活跃对话；临时故障先按设置重试，全部失败再切源。")
+                .help(exhausted ? "额度已耗尽" : takingOver ? "正在抢占" : "立即抢占")
                 .disabled(takingOver || exhausted || !source.enabled || model.connectionMode == "official")
             if takingOver {
                 if !compact {
@@ -25,7 +25,7 @@ struct SourceRoutingActions: View {
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 action("停止抢占", symbol: "xmark.circle") { model.cancelSourceTakeover() }
-                    .help("停止后续抢占，正在处理的请求继续执行")
+                    .help("停止抢占")
             }
         }.controlSize(.small)
             .disabled(model.busy || !model.running)

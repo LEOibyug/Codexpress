@@ -30,8 +30,8 @@ struct ChatbotSettingsView: View {
                         TextField("17865", text: $port).font(.system(size: 13, design: .monospaced))
                             .multilineTextAlignment(.trailing).settingsField().frame(width: 130).disabled(!canEdit || status == .null)
                     }
-                    SettingRow(title: "新 API Key", subtitle: "留空保留现有密钥") {
-                        SecureField("16–256 位字符", text: $newKey).settingsField().frame(maxWidth: 360).disabled(!canEdit || status == .null)
+                    SettingRow(title: "新 API Key") {
+                        SecureField("留空保留原 Key", text: $newKey).settingsField().frame(maxWidth: 360).disabled(!canEdit || status == .null)
                     }
                     Divider()
                     HStack(spacing: 12) {
@@ -57,7 +57,6 @@ struct ChatbotSettingsView: View {
                     }
                     Divider()
                     LabeledContent("接口", value: "Chat Completions / Responses")
-                    Text("在客户端填入上方地址和此处生成的 Key，再获取模型列表。此入口仅供本机客户端使用。").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
             }.settingsPage()
         }.task(id: model.running) { await load() }

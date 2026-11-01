@@ -28,7 +28,7 @@ struct GeneralSettingsView: View {
             StatusPill(text: model.running ? "运行中" : "未连接", color: model.running ? .green : .orange)
         }) {
             VStack(alignment: .leading, spacing: 16) {
-                SettingRow(title: "监听端口", subtitle: "更改后需重新启动 Codexpress") {
+                SettingRow(title: "监听端口") {
                     HStack(spacing: 8) {
                         TextField("端口", value: $port, format: .number.grouping(.never))
                             .font(.system(size: 13, design: .monospaced)).multilineTextAlignment(.trailing).settingsField().frame(width: 120)
@@ -43,7 +43,6 @@ struct GeneralSettingsView: View {
                 LabeledContent("网关地址") {
                     Text(model.baseURL).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
                 }.foregroundStyle(.secondary)
-                Text("SSH 远端共用此端口，使用独立机器 Key；仅用于可信局域网或 VPN。").font(.system(size: 12)).foregroundStyle(.secondary)
             }
         }
     }

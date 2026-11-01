@@ -26,14 +26,10 @@ struct LegacyProviderOriginsView: View {
             Toggle("所选来源与原供应商使用同一账号和 API Key", isOn: $confirmed)
                 .font(.system(size: 13))
             HStack(alignment: .firstTextBaseline, spacing: 20) {
-                Text("已有对话固定回原来源，新对话按优先级分配。")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
                 Spacer()
                 Button("确认来源并更新预览") { model.saveLegacyOrigins(selections) }
                     .disabled(model.busy || (!confirmed && selections.values.contains(where: { !$0.isEmpty })))
             }
-            Text("原来源无法续接时，网关会尝试移除请求中的加密块并通知；隐藏上下文可能缺失，本地记录保留。")
-                .font(.system(size: 12)).foregroundStyle(.secondary)
         }
             .onAppear { selections = Dictionary(uniqueKeysWithValues: (model.settings.legacyProviderOrigins ?? []).map { ($0.provider_id, $0.source_id) }) }
     }

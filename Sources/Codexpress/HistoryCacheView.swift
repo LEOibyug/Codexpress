@@ -14,11 +14,11 @@ struct HistoryCacheView: View {
     var body: some View {
         SettingsCard("本地原文缓存", symbol: "externaldrive") {
             VStack(alignment: .leading, spacing: 16) {
-                SettingRow(title: "保存原文", subtitle: "保存经过网关的输入和回复，用于恢复对话上下文") {
+                SettingRow(title: "保存原文") {
                     Toggle("保存原文", isOn: $enabled).toggleStyle(.switch).labelsHidden()
                 }
                 Divider().overlay(AppPalette.border)
-                SettingRow(title: "最大容量", subtitle: "容量不足时，按增量块的最近使用时间淘汰") {
+                SettingRow(title: "最大容量") {
                     HStack(spacing: 6) {
                         TextField("容量", text: $capacity).multilineTextAlignment(.trailing).settingsField().frame(width: 110)
                         Text("GB").foregroundStyle(.secondary)
@@ -42,8 +42,6 @@ struct HistoryCacheView: View {
                         catch { validationError = error.localizedDescription }
                     }.disabled(!changed)
                 }
-                Text("仅保留网关收到的内容。关闭后停止采集；清空或淘汰会减少可恢复的历史，Codex 中的对话记录保留。")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
             }.disabled(model.busy || model.metadataLoadFailed)
         }
         .onAppear { let value = model.settings.historyCacheSettings; enabled = value.enabled; capacity = String(format: "%g", Double(value.maxBytes) / 1_000_000_000) }

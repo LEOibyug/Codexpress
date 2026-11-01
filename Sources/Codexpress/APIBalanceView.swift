@@ -27,7 +27,7 @@ struct APIBalanceView: View {
             if showUpdating { ProgressView().controlSize(.mini).help("正在更新余额") }
             if !compact { Spacer(minLength: 8) }
         }.font(.system(size: compact ? 10 : 12))
-            .help(balance["updated_at"].number.map { "\(balance["scope"].string == "key" ? "当前密钥可用余额" : "账户总余额") · 更新于 \(timestampLabel(.number($0)))" } ?? "供应商需支持余额查询")
+            .help(balance["updated_at"].number.map { "\(balance["scope"].string == "key" ? "当前密钥可用余额" : "账户总余额") · 更新于 \(timestampLabel(.number($0)))" } ?? "")
             .task(id: model.refreshingBalances.contains(sourceID)) {
                 if model.refreshingBalances.contains(sourceID) {
                     do { try await Task.sleep(for: .milliseconds(150)) } catch { return }
