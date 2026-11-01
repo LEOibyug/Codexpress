@@ -79,23 +79,29 @@ struct OfficialResetControl: View {
         let inventory = CreditInventory(live["credits"])
         let exhausted = QuotaOverview(live["quota"]).isExhausted || live["health"].string == "exhausted"
         let quick = exhausted && inventory.hasAvailableCredits
-        VStack(alignment: compact ? .trailing : .leading, spacing: compact ? 3 : 5) {
-            HStack(spacing: 4) {
-                Image(systemName: "ticket")
-                Text("重置卡")
-                Text(inventory.countLabel).font(.system(size: compact ? 12 : 18, weight: .semibold)).monospacedDigit()
-                    .foregroundStyle(quick ? Color.accentColor : Color.primary)
-                if inventory.snapshot["stale"].bool == true {
-                    Image(systemName: "clock").help("卡片信息待更新")
+        Group {
+            if compact {
+                resetButton(quick: true).buttonStyle(.borderedProminent)
+                    .accessibilityLabel("重置 \(source.name) 的额度")
+            } else {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "ticket")
+                        Text("重置卡")
+                        Text(inventory.countLabel).font(.system(size: 18, weight: .semibold)).monospacedDigit()
+                            .foregroundStyle(quick ? Color.accentColor : Color.primary)
+                        if inventory.snapshot["stale"].bool == true {
+                            Image(systemName: "clock").help("卡片信息待更新")
+                        }
+                    }.font(AppTypography.small).foregroundStyle(.secondary)
+                    Group {
+                        if quick { resetButton(quick: true).buttonStyle(.borderedProminent) }
+                        else { resetButton(quick: false).buttonStyle(.bordered) }
+                    }.accessibilityLabel("\(source.name)，重置卡 \(inventory.countLabel)，\(quick ? "立即重置" : "查看卡片")")
                 }
-            }.font(compact ? .system(size: 10) : AppTypography.small).foregroundStyle(.secondary)
-            Group {
-                if quick { resetButton(quick: true).buttonStyle(.borderedProminent) }
-                else { resetButton(quick: false).buttonStyle(.bordered) }
-            }.controlSize(.small).fixedSize()
-                .disabled(!model.running || model.busy || model.metadataLoadFailed || source.account_id == nil)
-                .accessibilityLabel("\(source.name)，重置卡 \(inventory.countLabel)，\(quick ? "立即重置" : "查看卡片")")
-        }.fixedSize(horizontal: true, vertical: false)
+            }
+        }.controlSize(.small).fixedSize(horizontal: true, vertical: false)
+            .disabled(!model.running || model.busy || model.metadataLoadFailed || source.account_id == nil)
     }
 
     private func resetButton(quick: Bool) -> some View {
@@ -103,7 +109,7 @@ struct OfficialResetControl: View {
             if compact { AppDelegate.current?.showSettings(destination: .sources) }
             model.creditResetRequest = CreditResetRequest(source: source, quickReset: quick)
         } label: {
-            Text(quick ? "立即重置…" : "查看卡片…")
+            Text(compact ? "重置" : quick ? "立即重置…" : "查看卡片…")
                 .font(.system(size: compact ? 10 : 12, weight: quick ? .semibold : .regular))
         }
     }

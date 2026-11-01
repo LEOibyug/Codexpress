@@ -78,7 +78,12 @@ struct MenuView: View {
     }
 
     private func sourceRow(_ source: Source) -> some View {
-        HStack(alignment: .top, spacing: 8) {
+        let live = model.state(source.id)
+        let canReset = QuotaOverview(live["quota"]).isExhausted
+            && CreditInventory(live["credits"]).usableCards.contains {
+                model.canSubmitCredit(for: source, creditID: $0["id"].string ?? "")
+            }
+        return HStack(alignment: .top, spacing: 8) {
             ActivityDot(color: source.enabled && model.state(source.id)["health"].string == "ready" ? .green : .secondary,
                         active: model.sourceHasActivity(source.id)).padding(.top, 5)
             VStack(alignment: .leading, spacing: 5) {
@@ -101,7 +106,9 @@ struct MenuView: View {
                 if source.official {
                     HStack(alignment: .center, spacing: 8) {
                         compactQuota(model.state(source.id)["quota"])
-                        OfficialResetControl(source: source, compact: true)
+                        if canReset {
+                            OfficialResetControl(source: source, compact: true)
+                        }
                     }
                 }
                 else { APIBalanceView(sourceID: source.id, compact: true) }
