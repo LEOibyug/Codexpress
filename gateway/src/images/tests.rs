@@ -318,6 +318,65 @@ async fn image_rate_limits_do_not_exhaust_chat_quota_or_retry_the_same_account()
     assert!(!crate::routing::official_exhausted(&sources[0], &sources));
     task.abort();
 }
+
+#[tokio::test]
+async fn image_rate_limits_skip_account_aliases_before_trying_another_account() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let (_dir, state, key, port, task) = setup(Router::new().fallback(move |req: Request| {
+        let account = req.headers()["chatgpt-account-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        captured.lock().unwrap().push(account.clone());
+        async move {
+            if account == "account-fixture" {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error":{"code":"usage_limit_reached"}})),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(json!({"data":[{"b64_json":STANDARD.encode(PNG)}]})),
+                )
+            }
+        }
+    }))
+    .await;
+    {
+        let mut sources = state.sources.write().await;
+        let mut alias = sources[0].source.clone();
+        alias.id = "official-copy".into();
+        alias.priority = 2;
+        sources.push(SourceRuntime::new(alias));
+        let mut other = sources[0].source.clone();
+        other.id = "official-b".into();
+        other.account_id = Some("account-b".into());
+        other.priority = 3;
+        sources.push(SourceRuntime::new(other));
+    }
+    let response = images::router(state.clone())
+        .oneshot(request(
+            port,
+            &key,
+            "/v1/images/generations",
+            Some(json!({"prompt":"x"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        output(response).await["data"][0]["b64_json"],
+        STANDARD.encode(PNG)
+    );
+    assert_eq!(*seen.lock().unwrap(), vec!["account-fixture", "account-b"]);
+    let sources = state.sources.read().await;
+    assert!(sources.iter().all(|runtime| {
+        runtime.health == "ready" && !crate::routing::official_exhausted(runtime, &sources)
+    }));
+    task.abort();
+}
 #[tokio::test]
 async fn server_errors_are_not_retried_and_access_configuration_is_isolated() {
     let calls = Arc::new(AtomicUsize::new(0));

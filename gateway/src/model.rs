@@ -46,24 +46,72 @@ fn default_active_conversation_window_seconds() -> u64 {
 }
 
 impl Source {
+    pub fn official_account_id(&self) -> Option<&str> {
+        if self.kind != "official" {
+            return None;
+        }
+        self.account_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                self.secret
+                    .get("account_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+            })
+    }
+
+    pub fn validate_official_account(&self) -> Result<()> {
+        if self.kind == "official" {
+            let metadata = self
+                .account_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            let credential = self
+                .secret
+                .get("account_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            if metadata
+                .zip(credential)
+                .is_some_and(|(metadata, credential)| metadata != credential)
+            {
+                bail!("官方账号身份不一致，请重新登录");
+            }
+        }
+        Ok(())
+    }
+
     /// Stable across token refresh for an official workspace, but different for
     /// another workspace, API credential or upstream. Used only for routing
     /// consistency; the digest itself is never sent to upstreams or logged.
     pub fn identity(&self) -> String {
         use sha2::{Digest, Sha256};
         let authority = if self.kind == "official" {
-            self.account_id
-                .as_deref()
-                .or_else(|| self.secret.get("account_id").and_then(Value::as_str))
-                .unwrap_or("")
+            self.official_account_id().unwrap_or("")
         } else {
             self.secret
                 .get("api_key")
                 .and_then(Value::as_str)
                 .unwrap_or("")
         };
-        let encoded =
-            serde_json::to_vec(&(&self.kind, &self.base_url, authority)).unwrap_or_default();
+        let base_url = if self.kind == "official" {
+            self.base_url.trim_end_matches('/')
+        } else {
+            &self.base_url
+        };
+        // Keep established account digests unchanged; unidentified sources must
+        // not share quota or conversation state before their first login.
+        let encoded = if self.kind == "official" && authority.is_empty() {
+            serde_json::to_vec(&(&self.kind, base_url, ("source", &self.id)))
+        } else {
+            serde_json::to_vec(&(&self.kind, base_url, authority))
+        }
+        .unwrap_or_default();
         format!("{:x}", Sha256::digest(encoded))
     }
 
@@ -312,4 +360,53 @@ pub fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn official() -> Source {
+        serde_json::from_value(json!({
+            "id":"official-a","name":"Fixture","kind":"official",
+            "base_url":"https://chatgpt.com/backend-api/codex",
+            "enabled":true,"priority":1,"proxy":{"mode":"explicit","url":"http://127.0.0.1:1"},
+            "account_id":"account-fixture","secret":{"access_token":"fixture"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn official_identity_preserves_existing_accounts_across_token_rotation() {
+        let mut source = official();
+        let previous = "c9ed5a73f5078f51d4661232eb8ea81523322fa82803070fc8b2d12878e320a3";
+        assert_eq!(source.identity(), previous);
+        source.secret = json!({"access_token":"rotated","refresh_token":"new"});
+        assert_eq!(source.identity(), previous);
+    }
+
+    #[test]
+    fn official_account_aliases_share_identity_despite_trailing_slashes() {
+        let original = official();
+        let mut alias = original.clone();
+        alias.id = "official-copy".into();
+        alias.base_url.push_str("//");
+        alias.validate().unwrap();
+        assert_eq!(alias.identity(), original.identity());
+    }
+
+    #[test]
+    fn unidentified_official_sources_never_share_an_account_identity() {
+        for empty in [None, Some("".into()), Some(" ".into())] {
+            let mut original = official();
+            original.account_id = empty;
+            let mut other = original.clone();
+            other.id = "official-b".into();
+            assert_ne!(original.identity(), other.identity());
+            let mut known = official();
+            known.account_id = Some("official-a".into());
+            assert_ne!(original.identity(), known.identity());
+        }
+    }
 }

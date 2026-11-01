@@ -80,10 +80,7 @@ fn token<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
 }
 fn account(source: &Source) -> Option<&str> {
-    source
-        .account_id
-        .as_deref()
-        .or_else(|| source.secret.get("account_id").and_then(Value::as_str))
+    source.official_account_id()
 }
 async fn source(state: &Arc<AppState>, id: &str) -> Result<Source> {
     let source = state
@@ -117,7 +114,12 @@ fn same_binding(a: &Source, b: &Source) -> bool {
         && account(a) == account(b)
         && a.secret == b.secret
 }
-async fn install(state: &Arc<AppState>, before: &Source, secret: Value) -> Result<Source> {
+async fn install(
+    state: &Arc<AppState>,
+    before: &Source,
+    secret: Value,
+    new_login: bool,
+) -> Result<Source> {
     let mut sources = state.sources.write().await;
     let current = sources
         .iter()
@@ -125,6 +127,24 @@ async fn install(state: &Arc<AppState>, before: &Source, secret: Value) -> Resul
         .ok_or_else(|| anyhow!("登录来源已删除"))?;
     if !same_binding(&current.source, before) {
         bail!("来源或凭据已经变化，请重新操作");
+    }
+    let next_account = secret
+        .get("account_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    if new_login || account(before) != next_account {
+        if let Some(existing) = sources.iter().find(|runtime| {
+            runtime.source.id != before.id
+                && runtime.source.kind == "official"
+                && next_account.is_some()
+                && account(&runtime.source) == next_account
+        }) {
+            bail!(
+                "此官方账号已存在于「{}」，请使用已有来源",
+                existing.source.name
+            );
+        }
     }
     // Persist the whole refresh-token family before any source can use the rotation.
     let refresh = token(&before.secret, "refresh_token");
@@ -135,7 +155,7 @@ async fn install(state: &Arc<AppState>, before: &Source, secret: Value) -> Resul
             runtime.source.id == before.id
                 || (!refresh.is_empty()
                     && account(before).is_some()
-                    && account(before) == secret.get("account_id").and_then(Value::as_str)
+                    && account(before) == next_account
                     && runtime.source.kind == "official"
                     && account(&runtime.source) == account(before)
                     && token(&runtime.source.secret, "refresh_token") == refresh)
@@ -158,9 +178,7 @@ async fn install(state: &Arc<AppState>, before: &Source, secret: Value) -> Resul
     }
     let changed_accounts: Vec<_> = targets
         .iter()
-        .filter(|index| {
-            account(&sources[**index].source) != secret.get("account_id").and_then(Value::as_str)
-        })
+        .filter(|index| account(&sources[**index].source) != next_account)
         .map(|index| sources[*index].source.id.clone())
         .collect();
     // Lock affinity state before publication so no old-account continuation survives login.
@@ -177,11 +195,9 @@ async fn install(state: &Arc<AppState>, before: &Source, secret: Value) -> Resul
             runtime.quota_exhausted = false;
             runtime.quota = Value::Null;
             runtime.credits = Value::Null;
-            if runtime.health == "exhausted" {
-                runtime.health = "ready".into();
-                runtime.cooldown_until = None;
-                runtime.last_error = None;
-            }
+            runtime.health = "ready".into();
+            runtime.cooldown_until = None;
+            runtime.last_error = None;
         }
         runtime.source.account_id = secret
             .get("account_id")
@@ -190,8 +206,10 @@ async fn install(state: &Arc<AppState>, before: &Source, secret: Value) -> Resul
         runtime.source.secret = secret.clone();
         if runtime.health == "auth_required" {
             runtime.health = "ready".into();
+            runtime.cooldown_until = None;
             runtime.last_error = None;
         }
+        runtime.health_revision = runtime.health_revision.wrapping_add(1);
     }
     Ok(sources
         .iter()
@@ -357,7 +375,7 @@ async fn refresh_inner(
             bail!("刷新返回了不同账号，请重新登录确认");
         }
     }
-    install(state, &current, secret).await
+    install(state, &current, secret, false).await
 }
 pub async fn ensure_access(state: &Arc<AppState>, source_id: &str) -> Result<Source> {
     refresh_inner(state, source_id, false, ENDPOINTS).await
@@ -399,6 +417,7 @@ async fn complete(
     callback: &str,
     endpoints: Endpoints<'_>,
 ) -> Result<Value> {
+    let current = source(state, id).await?;
     let (before, verifier, code) = {
         let mut flows = flows().lock().await;
         let flow = flows
@@ -413,7 +432,10 @@ async fn complete(
         // Validate state even when a flow is already complete.
         let code = callback_values(callback, &flow.state)?;
         if let Some(result) = &flow.result {
-            return Ok(result.clone());
+            validate_completed_login(&flow.source, &current, result)?;
+            return Ok(
+                json!({"connected":true,"secret":current.secret,"account_id":current.account_id}),
+            );
         }
         if flow.exchanging || flow.error.is_some() {
             bail!("登录交换已提交，请查询登录状态或重新登录");
@@ -446,7 +468,22 @@ async fn complete(
         if token(&secret, "account_id").is_empty() {
             bail!("官方未返回账号身份，请重新登录");
         }
-        let installed = install(state, &before, secret.clone()).await?;
+        // Serialize flow invalidation with credential publication. Source reads
+        // elsewhere release their guards before acquiring the flow mutex.
+        let pending = flows().lock().await;
+        let active = pending
+            .get(flow_id)
+            .filter(|flow| {
+                flow.source.id == id
+                    && flow.owner.ptr_eq(&Arc::downgrade(state))
+                    && flow.expires > now()
+            })
+            .ok_or_else(|| anyhow!("登录流程已取消或过期，请使用当前登录流程"))?;
+        if !active.exchanging || active.error.is_some() {
+            bail!("登录流程已失效，请重新登录");
+        }
+        let installed = install(state, &before, secret.clone(), true).await?;
+        drop(pending);
         Ok(json!({"connected":true,"secret":secret,"account_id":installed.account_id}))
     }
     .await;
@@ -460,8 +497,16 @@ async fn complete(
     }
     result
 }
+fn validate_completed_login(before: &Source, current: &Source, result: &Value) -> Result<()> {
+    if current.proxy != before.proxy
+        || current.base_url != before.base_url
+        || result["account_id"].as_str() != account(current)
+    {
+        bail!("登录来源已经变化，请重新登录");
+    }
+    Ok(())
+}
 async fn start(state: &Arc<AppState>, id: &str) -> Result<Value> {
-    let source = source(state, id).await?;
     let verifier = random();
     let nonce = random();
     let flow_id = uuid::Uuid::new_v4().to_string();
@@ -480,6 +525,9 @@ async fn start(state: &Arc<AppState>, id: &str) -> Result<Value> {
         ("originator", "codex_cli_rs"),
     ]);
     let mut pending = flows().lock().await;
+    // Use the same flows -> sources order as completion, and capture the source
+    // after any earlier completion has finished publishing its credentials.
+    let source = source(state, id).await?;
     pending.retain(|_, flow| flow.expires > now());
     // One active flow per source; replacing it invalidates old browser callbacks.
     pending.retain(|_, flow| !(flow.source.id == id && flow.owner.ptr_eq(&Arc::downgrade(state))));
@@ -566,6 +614,17 @@ async fn callback_server(listener: TcpListener) {
 pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<Value> {
     match op {
         "official.login.start" => start(state, field(&payload, "source_id")?).await,
+        "official.login.cancel" => {
+            let id = field(&payload, "source_id")?;
+            let flow_id = field(&payload, "flow_id")?;
+            let mut pending = flows().lock().await;
+            if let Some(flow) = pending.get(flow_id) {
+                if flow.source.id != id || !flow.owner.ptr_eq(&Arc::downgrade(state)) {
+                    bail!("登录流程不属于此来源");
+                }
+            }
+            Ok(json!({"cancelled":pending.remove(flow_id).is_some()}))
+        }
         "official.login.complete" => {
             complete(
                 state,
@@ -591,14 +650,9 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
             if flow.source.id != id || !flow.owner.ptr_eq(&Arc::downgrade(state)) {
                 bail!("登录流程不属于此来源");
             }
-            if current.proxy != flow.source.proxy
-                || current.base_url != flow.source.base_url
-                || (flow.result.is_none() && !same_binding(&current, &flow.source))
-                || flow
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| result["account_id"].as_str() != account(&current))
-            {
+            if let Some(result) = &flow.result {
+                validate_completed_login(&flow.source, &current, result)?;
+            } else if !same_binding(&current, &flow.source) {
                 bail!("登录来源已经变化，请重新登录");
             }
             let expired = flow.expires <= now();
@@ -684,7 +738,7 @@ pub(crate) mod fixture {
         id: &str,
         secret: Value,
     ) -> Result<Source> {
-        install(state, &source(state, id).await?, secret).await
+        install(state, &source(state, id).await?, secret, true).await
     }
     pub(crate) async fn snapshots_at(state: &Arc<AppState>, id: &str, base: &str) -> Result<Value> {
         selected_snapshots_at(state, id, base, true).await

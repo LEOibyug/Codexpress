@@ -23,6 +23,9 @@ struct Fixture {
     reads: AtomicUsize,
     quota_reads: AtomicUsize,
     quota_delay_ms: AtomicUsize,
+    reflect_redemption: std::sync::atomic::AtomicBool,
+    invalid_credits: std::sync::atomic::AtomicBool,
+    token_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     credit_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     credit_started: tokio::sync::Notify,
     uncertain: bool,
@@ -36,14 +39,20 @@ async fn fixture(uncertain: bool) -> (String, Arc<Fixture>, tokio::task::JoinHan
     });
     async fn inventory(State(s): State<Arc<Fixture>>) -> Json<Value> {
         s.reads.fetch_add(1, Ordering::SeqCst);
+        let inventory = if s.invalid_credits.load(Ordering::SeqCst) {
+            json!([])
+        } else if s.reflect_redemption.load(Ordering::SeqCst) && s.posts.load(Ordering::SeqCst) > 0
+        {
+            json!({"available_count":0,"credits":[{"id":"card-a","status":"redeemed","expires_at":"2099-01-01T00:00:00Z","reset_type":"codex_rate_limits"}]})
+        } else {
+            json!({"available_count":1,"credits":[{"id":"card-a","title":"模拟卡","status":"available","expires_at":"2099-01-01T00:00:00Z","reset_type":"codex_rate_limits"}]})
+        };
         let gate = s.credit_gate.lock().await.clone();
         if let Some(gate) = gate {
             s.credit_started.notify_one();
             gate.notified().await;
         }
-        Json(
-            json!({"available_count":1,"credits":[{"id":"card-a","title":"模拟卡","status":"available","expires_at":"2099-01-01T00:00:00Z","reset_type":"codex_rate_limits"}]}),
-        )
+        Json(inventory)
     }
     async fn usage(State(s): State<Arc<Fixture>>) -> Json<Value> {
         s.quota_reads.fetch_add(1, Ordering::SeqCst);
@@ -80,7 +89,11 @@ async fn fixture(uncertain: bool) -> (String, Arc<Fixture>, tokio::task::JoinHan
         Json(json!({"code":"reset","windows_reset":2}))
     }
     async fn token(State(s): State<Arc<Fixture>>) -> Json<Value> {
+        let gate = s.token_gate.lock().await.clone();
         s.tokens.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         Json(
             json!({"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600,"id_token":"eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjb3VudC1hIn19."}),
@@ -180,6 +193,111 @@ async fn frequent_quota_refresh_retains_weekly_data_and_does_not_poll_credits() 
         .await
         .unwrap();
     assert_eq!(counters.reads.load(Ordering::SeqCst), 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn account_queries_deduplicate_and_publish_quota_before_slow_cards() {
+    let (proxy, counters, task) = fixture(false).await;
+    let (_dir, state) = setup(&proxy).await;
+    {
+        let mut sources = state.sources.write().await;
+        sources[0].quota_exhausted = true;
+        sources[0].health = "exhausted".into();
+        let mut duplicate = sources[0].clone();
+        duplicate.source.id = "duplicate-a".into();
+        sources[1].credits = json!({"credits":[{"id":"account-b-card"}]});
+        sources.push(duplicate);
+    }
+    counters.quota_delay_ms.store(50, Ordering::SeqCst);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *counters.credit_gate.lock().await = Some(gate.clone());
+    let copy = state.clone();
+    let queries = tokio::spawn(async move {
+        tokio::join!(
+            official::fixture::snapshots_at(&copy, "official-a", "http://fixture.invalid"),
+            official::fixture::snapshots_at(&copy, "duplicate-a", "http://fixture.invalid"),
+        )
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        counters.credit_started.notified(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let sources = state.sources.read().await;
+            if !routing::official_exhausted(&sources[0], &sources) {
+                assert!(!routing::official_exhausted(&sources[2], &sources));
+                assert!(sources[0].credits.is_null());
+                break;
+            }
+            drop(sources);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!queries.is_finished());
+    assert_eq!(counters.quota_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.reads.load(Ordering::SeqCst), 1);
+    gate.notify_one();
+    let (first, second) = queries.await.unwrap();
+    assert_eq!(first.unwrap(), second.unwrap());
+    {
+        let sources = state.sources.read().await;
+        assert_eq!(sources[0].credits, sources[2].credits);
+        assert_eq!(sources[1].credits["credits"][0]["id"], "account-b-card");
+    }
+    *counters.credit_gate.lock().await = None;
+    counters.reflect_redemption.store(true, Ordering::SeqCst);
+    let old_inventory_gate = Arc::new(tokio::sync::Notify::new());
+    *counters.credit_gate.lock().await = Some(old_inventory_gate.clone());
+    let copy = state.clone();
+    let old_inventory = tokio::spawn(async move {
+        official::fixture::snapshots_at(&copy, "official-a", "http://fixture.invalid")
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        counters.credit_started.notified(),
+    )
+    .await
+    .unwrap();
+    *counters.credit_gate.lock().await = None;
+    let payload = json!({"source_id":"official-a","expected_account_id":"account-a","credit_id":"card-a","operation_id":"alias-reset","confirmed":true});
+    let copy = state.clone();
+    let mut reset = tokio::spawn(async move {
+        official::fixture::consume_at(&copy, &payload, "http://fixture.invalid")
+            .await
+            .unwrap()
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), &mut reset)
+            .await
+            .is_err()
+    );
+    assert_eq!(counters.posts.load(Ordering::SeqCst), 0);
+    old_inventory_gate.notify_one();
+    old_inventory.await.unwrap();
+    let result = reset.await.unwrap();
+    assert_eq!(result["code"], "reset");
+    {
+        let sources = state.sources.read().await;
+        assert_eq!(sources[0].credits["credits"][0]["status"], "redeemed");
+        assert_eq!(sources[0].credits, sources[2].credits);
+        assert_eq!(sources[1].credits["credits"][0]["id"], "account-b-card");
+    }
+    counters.invalid_credits.store(true, Ordering::SeqCst);
+    official::fixture::snapshots_at(&state, "official-a", "http://fixture.invalid")
+        .await
+        .unwrap();
+    let sources = state.sources.read().await;
+    assert_eq!(sources[0].credits["stale"], true);
+    assert_eq!(sources[2].credits["stale"], false);
+    assert_eq!(sources[2].credits["credits"][0]["status"], "redeemed");
     task.abort();
 }
 
@@ -314,6 +432,37 @@ async fn login_strictly_binds_source_and_state_before_any_exchange() {
     )
     .await
     .is_err());
+    let mut rotated = connected["secret"].clone();
+    rotated["access_token"] = json!("newer-access");
+    rotated["refresh_token"] = json!("newer-refresh");
+    official::fixture::install_secret(&state, "official-a", rotated)
+        .await
+        .unwrap();
+    let replay = official::fixture::complete_at(
+        &state,
+        "official-a",
+        flow,
+        &callback,
+        "http://fixture.invalid",
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay["secret"]["access_token"], "newer-access");
+    let mut switched = state.sources.read().await[1].source.secret.clone();
+    switched["account_id"] = json!("account-c");
+    official::fixture::install_secret(&state, "official-a", switched)
+        .await
+        .unwrap();
+    assert!(official::fixture::complete_at(
+        &state,
+        "official-a",
+        flow,
+        &callback,
+        "http://fixture.invalid",
+    )
+    .await
+    .is_err());
+    assert_eq!(counters.tokens.load(Ordering::SeqCst), 1);
     task.abort();
 }
 
@@ -322,13 +471,20 @@ async fn concurrent_refresh_rotates_once_and_never_writes_tokens_to_disk() {
     let (proxy, counters, task) = fixture(false).await;
     let (dir, state) = setup(&proxy).await;
     state.sources.write().await[0].source.secret["expires_at"] = json!(1);
+    let mut duplicate = state.sources.read().await[0].clone();
+    duplicate.source.id = "duplicate-a".into();
+    state.sources.write().await.push(duplicate);
     let (a, b) = tokio::join!(
         official::fixture::refresh_at(&state, "official-a", "http://fixture.invalid"),
-        official::fixture::refresh_at(&state, "official-a", "http://fixture.invalid")
+        official::fixture::refresh_at(&state, "duplicate-a", "http://fixture.invalid")
     );
     assert_eq!(a.unwrap().secret["access_token"], "new-access");
     assert_eq!(b.unwrap().secret["refresh_token"], "new-refresh");
     assert_eq!(counters.tokens.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.sources.read().await[1].source.secret["refresh_token"],
+        "fixture-refresh"
+    );
     for entry in std::fs::read_dir(dir.path()).unwrap() {
         let path = entry.unwrap().path();
         if path.is_file() {
@@ -336,6 +492,267 @@ async fn concurrent_refresh_rotates_once_and_never_writes_tokens_to_disk() {
             assert!(!String::from_utf8_lossy(&bytes).contains("new-refresh"));
         }
     }
+    task.abort();
+}
+
+#[tokio::test]
+async fn concurrent_logins_for_one_account_install_only_one_source() {
+    let (proxy, counters, task) = fixture(false).await;
+    let (_dir, original) = setup(&proxy).await;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(CredentialFixture::default());
+    let state = AppState::new_with_credential_store(
+        directory.path().to_path_buf(),
+        0,
+        "fixture".into(),
+        Some(store.clone()),
+    )
+    .unwrap();
+    *store.owner.lock().unwrap() = Arc::downgrade(&state);
+    *state.sources.write().await = original.sources.read().await.clone();
+    for runtime in state.sources.write().await.iter_mut() {
+        runtime.source.account_id = None;
+        runtime.source.secret = json!({});
+        runtime.health = "auth_required".into();
+    }
+    let mut logins = Vec::new();
+    for id in ["official-a", "official-b"] {
+        let started = official::handle(&state, "official.login.start", json!({"source_id":id}))
+            .await
+            .unwrap();
+        let authorization = url::Url::parse(started["auth_url"].as_str().unwrap()).unwrap();
+        let nonce = authorization
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        logins.push((
+            started["flow_id"].as_str().unwrap().to_owned(),
+            format!("http://localhost:1455/auth/callback?code=fixture-code&state={nonce}"),
+        ));
+    }
+    let (first, second) = tokio::join!(
+        official::fixture::complete_at(
+            &state,
+            "official-a",
+            &logins[0].0,
+            &logins[0].1,
+            "http://fixture.invalid"
+        ),
+        official::fixture::complete_at(
+            &state,
+            "official-b",
+            &logins[1].0,
+            &logins[1].1,
+            "http://fixture.invalid"
+        ),
+    );
+    assert_ne!(first.is_ok(), second.is_ok());
+    let sources = state.sources.read().await;
+    let winner = sources
+        .iter()
+        .find(|runtime| runtime.source.account_id.is_some())
+        .unwrap();
+    let rejected = if first.is_err() {
+        first.unwrap_err()
+    } else {
+        second.unwrap_err()
+    }
+    .to_string();
+    assert!(rejected.contains(&winner.source.name));
+    assert!(!rejected.contains("account-a"));
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|runtime| runtime.source.account_id.is_some())
+            .count(),
+        1
+    );
+    let unchanged = sources
+        .iter()
+        .find(|runtime| runtime.source.account_id.is_none())
+        .unwrap();
+    assert_eq!(unchanged.source.secret, json!({}));
+    assert_eq!(unchanged.health, "auth_required");
+    assert_eq!(store.saved.lock().unwrap().len(), 1);
+    assert_eq!(counters.tokens.load(Ordering::SeqCst), 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn replaced_login_cannot_install_after_its_token_exchange_started() {
+    let (proxy, counters, task) = fixture(false).await;
+    let (_dir, original) = setup(&proxy).await;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(CredentialFixture::default());
+    let state = AppState::new_with_credential_store(
+        directory.path().to_path_buf(),
+        0,
+        "fixture".into(),
+        Some(store.clone()),
+    )
+    .unwrap();
+    *store.owner.lock().unwrap() = Arc::downgrade(&state);
+    *state.sources.write().await = original.sources.read().await.clone();
+    let previous_secret = state.sources.read().await[0].source.secret.clone();
+    let callback = |started: &Value| {
+        let authorization = url::Url::parse(started["auth_url"].as_str().unwrap()).unwrap();
+        let nonce = authorization
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        format!("http://localhost:1455/auth/callback?code=fixture-code&state={nonce}")
+    };
+    let started = official::handle(
+        &state,
+        "official.login.start",
+        json!({"source_id":"official-a"}),
+    )
+    .await
+    .unwrap();
+    let old_flow = started["flow_id"].as_str().unwrap().to_owned();
+    let old_callback = callback(&started);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *counters.token_gate.lock().await = Some(gate.clone());
+    let copy = state.clone();
+    let pending = tokio::spawn(async move {
+        official::fixture::complete_at(
+            &copy,
+            "official-a",
+            &old_flow,
+            &old_callback,
+            "http://fixture.invalid",
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while counters.tokens.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let replacement = official::handle(
+        &state,
+        "official.login.start",
+        json!({"source_id":"official-a"}),
+    )
+    .await
+    .unwrap();
+    *counters.token_gate.lock().await = None;
+    gate.notify_one();
+    assert!(pending.await.unwrap().is_err());
+    assert!(store.saved.lock().unwrap().is_empty());
+    assert_eq!(state.sources.read().await[0].source.secret, previous_secret);
+    let new_flow = replacement["flow_id"].as_str().unwrap();
+    assert_eq!(
+        official::handle(
+            &state,
+            "official.login.status",
+            json!({"source_id":"official-a","flow_id":new_flow})
+        )
+        .await
+        .unwrap()["state"],
+        "pending"
+    );
+    let connected = official::fixture::complete_at(
+        &state,
+        "official-a",
+        new_flow,
+        &callback(&replacement),
+        "http://fixture.invalid",
+    )
+    .await
+    .unwrap();
+    assert_eq!(connected["connected"], true);
+    assert_eq!(store.saved.lock().unwrap().len(), 1);
+    assert_eq!(counters.tokens.load(Ordering::SeqCst), 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn cancelled_login_cannot_persist_its_inflight_token_exchange() {
+    let (proxy, counters, task) = fixture(false).await;
+    let (_dir, original) = setup(&proxy).await;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(CredentialFixture::default());
+    let state = AppState::new_with_credential_store(
+        directory.path().to_path_buf(),
+        0,
+        "fixture".into(),
+        Some(store.clone()),
+    )
+    .unwrap();
+    *store.owner.lock().unwrap() = Arc::downgrade(&state);
+    *state.sources.write().await = original.sources.read().await.clone();
+    let previous_secret = state.sources.read().await[0].source.secret.clone();
+    let started = official::handle(
+        &state,
+        "official.login.start",
+        json!({"source_id":"official-a"}),
+    )
+    .await
+    .unwrap();
+    let flow = started["flow_id"].as_str().unwrap().to_owned();
+    let payload = json!({"source_id":"official-a","flow_id":flow});
+    let authorization = url::Url::parse(started["auth_url"].as_str().unwrap()).unwrap();
+    let nonce = authorization
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let callback = format!("http://localhost:1455/auth/callback?code=fixture-code&state={nonce}");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *counters.token_gate.lock().await = Some(gate.clone());
+    let copy = state.clone();
+    let pending = tokio::spawn(async move {
+        official::fixture::complete_at(
+            &copy,
+            "official-a",
+            &flow,
+            &callback,
+            "http://fixture.invalid",
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while counters.tokens.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(official::handle(
+        &state,
+        "official.login.cancel",
+        json!({"source_id":"official-b","flow_id":payload["flow_id"]})
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        official::handle(&state, "official.login.cancel", payload.clone())
+            .await
+            .unwrap()["cancelled"],
+        true
+    );
+    assert_eq!(
+        official::handle(&state, "official.login.cancel", payload.clone())
+            .await
+            .unwrap()["cancelled"],
+        false
+    );
+    gate.notify_one();
+    assert!(pending.await.unwrap().is_err());
+    assert!(store.saved.lock().unwrap().is_empty());
+    assert_eq!(state.sources.read().await[0].source.secret, previous_secret);
+    assert!(official::handle(&state, "official.login.status", payload)
+        .await
+        .is_err());
+    assert_eq!(counters.tokens.load(Ordering::SeqCst), 1);
     task.abort();
 }
 
@@ -417,6 +834,82 @@ async fn timed_out_reset_remains_pending_across_restart_and_new_operation_ids() 
     assert!(text.contains("pending_verification"));
     assert!(!text.contains("fixture-access"));
     assert!(!text.contains("fixture-refresh"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn uncertain_reset_is_scoped_to_its_account_after_source_relogin() {
+    let (proxy, counters, task) = fixture(true).await;
+    let (_dir, state) = setup(&proxy).await;
+    let mut payload = json!({"source_id":"official-a","expected_account_id":"account-a","credit_id":"card-a","operation_id":"prior-account-op","confirmed":true});
+    assert_eq!(
+        official::fixture::consume_at(&state, &payload, "http://fixture.invalid")
+            .await
+            .unwrap()["code"],
+        "pending_verification"
+    );
+    // A second source for the same account remains blocked by the durable intent.
+    let mut duplicate = state.sources.read().await[0].clone();
+    duplicate.source.id = "duplicate-a".into();
+    state.sources.write().await.push(duplicate);
+    payload["source_id"] = json!("duplicate-a");
+    payload["operation_id"] = json!("duplicate-account-op");
+    assert!(
+        official::fixture::consume_at(&state, &payload, "http://fixture.invalid")
+            .await
+            .is_err()
+    );
+    assert_eq!(counters.posts.load(Ordering::SeqCst), 1);
+
+    // Card IDs can overlap across accounts; the old account's pending operation
+    // must not prevent the newly confirmed account from using its own card.
+    let mut switched = state.sources.read().await[1].source.secret.clone();
+    switched["account_id"] = json!("account-c");
+    official::fixture::install_secret(&state, "official-a", switched)
+        .await
+        .unwrap();
+    payload["source_id"] = json!("official-a");
+    payload["expected_account_id"] = json!("account-c");
+    payload["operation_id"] = json!("new-account-op");
+    assert_eq!(
+        official::fixture::consume_at(&state, &payload, "http://fixture.invalid")
+            .await
+            .unwrap()["code"],
+        "pending_verification"
+    );
+    assert_eq!(counters.posts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *counters.headers.lock().await,
+        vec!["account-a", "account-c"]
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn new_account_does_not_inherit_previous_account_cooldown_or_inventory() {
+    let (proxy, _counters, task) = fixture(false).await;
+    let (_dir, state) = setup(&proxy).await;
+    {
+        let mut sources = state.sources.write().await;
+        sources[0].health = "cooldown".into();
+        sources[0].cooldown_until = Some(model::now() + 1000);
+        sources[0].last_error = Some("来源限流".into());
+        sources[0].quota_exhausted = true;
+        sources[0].quota = json!({"windows":[{"used_percent":100}]});
+        sources[0].credits = json!({"credits":[{"id":"old-account-card"}]});
+    }
+    let mut switched = state.sources.read().await[1].source.secret.clone();
+    switched["account_id"] = json!("account-c");
+    official::fixture::install_secret(&state, "official-a", switched)
+        .await
+        .unwrap();
+    let sources = state.sources.read().await;
+    assert_eq!(sources[0].health, "ready");
+    assert!(sources[0].cooldown_until.is_none());
+    assert!(sources[0].last_error.is_none());
+    assert!(!sources[0].quota_exhausted);
+    assert!(sources[0].quota.is_null());
+    assert!(sources[0].credits.is_null());
     task.abort();
 }
 
@@ -521,6 +1014,7 @@ async fn new_exhaustion_outlives_old_failures_and_older_quota_queries() {
     routing::mark_rejection(&state, &original, Some("usage_limit_reached"), Some(1)).await;
     let gate = Arc::new(tokio::sync::Notify::new());
     *counters.credit_gate.lock().await = Some(gate.clone());
+    let revision = state.sources.read().await[0].health_revision;
     let copy = state.clone();
     let query = tokio::spawn(async move {
         official::fixture::snapshots_at(&copy, "official-a", "http://fixture.invalid")
@@ -531,6 +1025,13 @@ async fn new_exhaustion_outlives_old_failures_and_older_quota_queries() {
         std::time::Duration::from_secs(2),
         counters.credit_started.notified(),
     )
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while state.sources.read().await[0].health_revision == revision {
+            tokio::task::yield_now().await;
+        }
+    })
     .await
     .unwrap();
     // Quota was already read as positive; a newer rejection must win, even if
@@ -558,6 +1059,7 @@ async fn new_exhaustion_outlives_old_failures_and_older_quota_queries() {
     }
     // Even when already latched, a later zero query invalidates an older
     // positive query that is still waiting for its credit lookup.
+    let revision = state.sources.read().await[0].health_revision;
     let copy = state.clone();
     let query = tokio::spawn(async move {
         official::fixture::snapshots_at(&copy, "official-a", "http://fixture.invalid")
@@ -568,6 +1070,13 @@ async fn new_exhaustion_outlives_old_failures_and_older_quota_queries() {
         std::time::Duration::from_secs(2),
         counters.credit_started.notified(),
     )
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while state.sources.read().await[0].health_revision == revision {
+            tokio::task::yield_now().await;
+        }
+    })
     .await
     .unwrap();
     *counters.quota.lock().await = Some(

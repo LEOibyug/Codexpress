@@ -133,6 +133,7 @@ struct OverviewView: View {
                                 .foregroundStyle(AccountLevel.quota(window.remaining).color).help(window.resetLabel)
                         }
                     }
+                    OfficialResetControl(source: source)
                 }
             } else { APIBalanceView(sourceID: source.id).fixedSize(horizontal: true, vertical: false) }
         }

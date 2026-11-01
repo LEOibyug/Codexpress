@@ -1,5 +1,5 @@
-use codexpress_gateway::{management, model::AppState};
-use serde_json::json;
+use codexpress_gateway::{management, model::AppState, routing};
+use serde_json::{json, Value};
 
 #[tokio::test]
 async fn upstream_retry_settings_default_and_invalid_edits_are_transactional() {
@@ -142,7 +142,7 @@ async fn management_sync_is_transactional_and_does_not_expose_secrets_in_status(
 async fn official_refresh_generation_cannot_be_overwritten_by_stale_ui_sync() {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::new(dir.path().to_owned(), 17863, "local-test-key".into()).unwrap();
-    let source = json!({"id":"official-a","name":"Official","kind":"official","base_url":"https://chatgpt.com/backend-api/codex","enabled":true,"priority":0,"proxy":{"mode":"explicit","url":"http://127.0.0.1:7890"},"secret":{"access_token":"old-access","refresh_token":"old-refresh"}});
+    let source = json!({"id":"official-a","name":"Official","kind":"official","base_url":"https://chatgpt.com/backend-api/codex","enabled":true,"priority":0,"proxy":{"mode":"explicit","url":"http://127.0.0.1:7890"},"account_id":"account-fixture","secret":{"access_token":"old-access","refresh_token":"old-refresh"}});
     management::dispatch(
         &state,
         "sync",
@@ -191,4 +191,155 @@ async fn changing_api_identity_invalidates_prior_server_state_bindings() {
         .await
         .unwrap();
     assert!(state.bindings.lock().await.get("old-response").is_none());
+}
+
+fn official_source(id: &str, account: Option<&str>) -> Value {
+    json!({
+        "id":id,"name":id,"kind":"official",
+        "base_url":"https://chatgpt.com/backend-api/codex","enabled":true,"priority":0,
+        "proxy":{"mode":"explicit","url":"http://127.0.0.1:9"},
+        "account_id":account,"secret":{"access_token":"fixture","account_id":account}
+    })
+}
+
+#[tokio::test]
+async fn duplicate_official_accounts_are_rejected_before_any_sync_publication() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(dir.path().into(), 0, "fixture".into()).unwrap();
+    let original = official_source("official-a", Some("account-a"));
+    let held = json!({"id":"held","name":"Held","kind":"api","base_url":"https://api.example/v1","enabled":true,"priority":1,"proxy":{"mode":"direct"},"secret":{"api_key":"fixture-api"}});
+    management::dispatch(&state, "sync", json!({"sources":[original.clone(),held]}))
+        .await
+        .unwrap();
+    let held = state.sources.read().await[1].source.clone();
+    let mut lease = state
+        .affinity
+        .reserve(Some("retained"), &held, false, false, None)
+        .unwrap();
+    lease.commit().unwrap();
+    drop(lease);
+    state
+        .bindings
+        .lock()
+        .await
+        .insert("response".into(), "held".into());
+    let revision = state.routing_revision.load(Ordering::Acquire);
+
+    for account_location in ["metadata", "credential", "both"] {
+        let mut duplicate = official_source("official-copy", Some("account-a"));
+        duplicate["enabled"] = json!(false);
+        duplicate["base_url"] = json!("https://chatgpt.com/backend-api/codex/");
+        duplicate["proxy"]["url"] = json!("http://127.0.0.1:10");
+        if account_location == "credential" {
+            duplicate["account_id"] = Value::Null;
+        } else if account_location == "metadata" {
+            duplicate["secret"]["account_id"] = Value::Null;
+        }
+        let result = management::dispatch(
+            &state,
+            "sync",
+            json!({"sources":[original.clone(),duplicate],"load_balance":true}),
+        )
+        .await;
+        assert!(result.is_err());
+        let sources = state.sources.read().await;
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[1].source.id, "held");
+        let active: Vec<_> = sources.iter().map(|r| r.source.clone()).collect();
+        assert_eq!(
+            state.affinity.preferred("retained", &active).as_deref(),
+            Some("held")
+        );
+        assert_eq!(
+            state
+                .bindings
+                .lock()
+                .await
+                .get("response")
+                .map(String::as_str),
+            Some("held")
+        );
+        assert_eq!(state.routing_revision.load(Ordering::Acquire), revision);
+        assert!(!state.settings.read().await.load_balance);
+    }
+}
+
+#[tokio::test]
+async fn official_uniqueness_uses_credentials_preserved_after_stale_ui_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(dir.path().into(), 0, "fixture".into()).unwrap();
+    let original = official_source("official-a", Some("account-a"));
+    management::dispatch(&state, "sync", json!({"sources":[original.clone()]}))
+        .await
+        .unwrap();
+    let mut stale = original;
+    stale["account_id"] = json!("outdated-metadata");
+    stale["secret"]["account_id"] = json!("outdated-secret");
+    stale["secret"]["access_token"] = json!("outdated-token");
+    let duplicate = official_source("official-copy", Some("account-a"));
+    assert!(
+        management::dispatch(&state, "sync", json!({"sources":[stale.clone(),duplicate]}))
+            .await
+            .is_err()
+    );
+    assert_eq!(state.sources.read().await.len(), 1);
+    management::dispatch(&state, "sync", json!({"sources":[stale]}))
+        .await
+        .unwrap();
+    let sources = state.sources.read().await;
+    assert_eq!(sources[0].source.account_id.as_deref(), Some("account-a"));
+    assert_eq!(sources[0].source.secret["access_token"], "fixture");
+}
+
+#[tokio::test]
+async fn official_conflicting_or_unidentified_credentials_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(dir.path().into(), 0, "fixture".into()).unwrap();
+    let mut conflicting = official_source("conflicting", Some("account-a"));
+    conflicting["secret"]["account_id"] = json!("account-b");
+    let unidentified = official_source("unknown", None);
+    for invalid in [conflicting, unidentified] {
+        assert!(
+            management::dispatch(&state, "sync", json!({"sources":[invalid]}))
+                .await
+                .is_err()
+        );
+        assert!(state.sources.read().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn distinct_official_accounts_and_empty_drafts_do_not_restrict_api_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(dir.path().into(), 0, "fixture".into()).unwrap();
+    let first = official_source("official-a", Some("account-a"));
+    let mut second = official_source("official-b", Some("account-b"));
+    second["account_id"] = Value::Null;
+    let mut draft = official_source("draft-a", None);
+    draft["secret"] = json!({});
+    let mut another_draft = draft.clone();
+    another_draft["id"] = json!("draft-b");
+    another_draft["account_id"] = json!(" ");
+    let api = json!({"id":"api-a","name":"API","kind":"api","account_id":"account-a","base_url":"https://api.example/v1","enabled":true,"priority":1,"proxy":{"mode":"direct"},"secret":{"api_key":"same-api-key","account_id":"unrelated"}});
+    let mut another_api = api.clone();
+    another_api["id"] = json!("api-b");
+    management::dispatch(
+        &state,
+        "sync",
+        json!({"sources":[first,second,draft,another_draft,api,another_api]}),
+    )
+    .await
+    .unwrap();
+    let candidates = routing::candidates(&state, "fixture-model", None).await;
+    let mut ids: Vec<_> = candidates.iter().map(|source| source.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["api-a", "api-b", "official-a", "official-b"]);
+    let sources = state.sources.read().await;
+    assert_eq!(sources.len(), 6);
+    assert!(sources
+        .iter()
+        .filter(|r| r.source.id.starts_with("draft-"))
+        .all(|r| r.health == "auth_required"));
 }

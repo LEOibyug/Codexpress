@@ -119,14 +119,19 @@ async fn exhausted_official_accounts_are_skipped_until_confirmed_recovery() {
         assert_eq!(send(state.clone(), "new").await, StatusCode::OK);
         assert_eq!(proxy_hits.load(Ordering::SeqCst), 0);
     }
-    // The same account under another source ID shares the latest quota.
+    // Legacy same-account aliases still share quota defensively; new syncs
+    // reject duplicates, so this historical state is injected directly.
     let mut duplicate = official.clone();
     duplicate.id = "duplicate".into();
     duplicate.priority = 1;
     let mut duplicate_runtime = codexpress_gateway::model::SourceRuntime::new(duplicate.clone());
     duplicate_runtime.quota =
         json!({"fetched_at":101,"windows":[{"name":"primary","used_percent":20}]});
-    state.sources.write().await.insert(1, duplicate_runtime);
+    state
+        .sources
+        .write()
+        .await
+        .insert(1, duplicate_runtime.clone());
     assert_eq!(
         send(state.clone(), "duplicate-account").await,
         StatusCode::OK
@@ -135,11 +140,12 @@ async fn exhausted_official_accounts_are_skipped_until_confirmed_recovery() {
     // Editing only the proxy must preserve the same account's quota block.
     let mut changed_proxy = official.clone();
     changed_proxy.proxy.url = Some("http://127.0.0.1:1".into());
-    configure(
-        &state,
-        &[changed_proxy, duplicate.clone(), api_source.clone()],
-    )
-    .await;
+    configure(&state, &[changed_proxy, api_source.clone()]).await;
+    state
+        .sources
+        .write()
+        .await
+        .insert(1, duplicate_runtime.clone());
     assert!(routing::official_exhausted(
         &state.sources.read().await[0],
         &state.sources.read().await
@@ -153,7 +159,8 @@ async fn exhausted_official_accounts_are_skipped_until_confirmed_recovery() {
         StatusCode::OK
     );
     assert_eq!(proxy_hits.load(Ordering::SeqCst), 0);
-    configure(&state, &[official.clone(), duplicate, api_source.clone()]).await;
+    configure(&state, &[official.clone(), api_source.clone()]).await;
+    state.sources.write().await.insert(1, duplicate_runtime);
     // A successful older inflight response must not turn known zero into ready.
     routing::mark_ready(&state, &official).await;
     let status = management::dispatch(&state, "status", json!({}))

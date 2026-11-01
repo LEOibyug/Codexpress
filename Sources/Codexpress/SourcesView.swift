@@ -84,7 +84,16 @@ struct SourcesView: View {
         if model.routingMode == "fixed" { return "固定来源 · \(model.fixedName)" }
         return model.settings.loadBalanceEnabled ? "自动切换 · 负载均衡" : "自动切换 · 按优先级分配"
     }
-    private func addOfficial() { editing = EditingSource(source: .newOfficial(), isNew: true) }
+    private func addOfficial() {
+        var source = Source.newOfficial()
+        let names = Set(model.sources.map(\.name))
+        var suffix = 2
+        while names.contains(source.name) {
+            source.name = "官方账号 \(suffix)"
+            suffix += 1
+        }
+        editing = EditingSource(source: source, isNew: true)
+    }
     private func addAPI() { editing = EditingSource(source: Source(), isNew: true) }
 
     private func sourceRow(_ source: Source, index: Int) -> some View {
@@ -96,6 +105,7 @@ struct SourcesView: View {
                 HStack(alignment: .center, spacing: 16) {
                     if source.official {
                         quotaSummary(source)
+                        OfficialResetControl(source: source)
                     } else {
                         APIBalanceView(sourceID: source.id)
                     }
@@ -148,6 +158,10 @@ struct SourcesView: View {
                 Text(source.official ? "官方账号" : "Responses API").font(AppTypography.small).foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)
+            if source.official, source.account_id == nil {
+                Button("登录…") { model.login(source) }.buttonStyle(.borderedProminent).controlSize(.small)
+                    .disabled(model.busy || model.loginFlow != nil)
+            }
             SourceRoutingActions(source: source, compact: true).fixedSize()
             StatusPill(text: source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用",
                        color: sourceColor(source), active: model.sourceHasActivity(source.id))

@@ -1,135 +1,174 @@
 import SwiftUI
 
-struct OfficialAccountView: View {
+struct ResetCreditsSheet: View {
     @EnvironmentObject var model: AppModel
-    let source: Source
-    @State private var creditsExpanded = false
-
-    var body: some View {
-        let live = model.state(source.id)
-        let quota = live["quota"]
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
-                Text(quota["plan_type"].string ?? "套餐未知").font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary).fixedSize()
-                if let account = live["account_id"].string {
-                    Text(account).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-                        .truncationMode(.middle).textSelection(.enabled).help("账号／工作区：\(account)")
-                }
-                Spacer(minLength: 0)
-                Button(live["account_id"].string == nil ? "登录…" : "重新登录…") { model.login(source) }.disabled(model.busy || model.loginFlow != nil)
-                Button { model.refresh(source.id) } label: {
-                    Label(model.refreshingQuotas.contains(source.id) ? "刷新中…" : "刷新额度", systemImage: "arrow.clockwise")
-                }.disabled(model.busy || model.refreshingQuotas.contains(source.id))
-            }.controlSize(.small)
-            if live["account_id"].string == nil && quota["windows"].array.isEmpty {
-                Text("登录后查看额度").font(.system(size: 11)).foregroundStyle(.secondary)
-            } else {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 24)], spacing: 14) {
-                    ForEach(QuotaOverview(quota).windows) { window in
-                        quotaWindow(window)
-                    }
-                }
-            }
-            if quota != .null {
-                HStack(spacing: 5) {
-                    Image(systemName: "clock").font(.system(size: 10))
-                    Text("更新于 \(timestampLabel(quota["fetched_at"]))" + (quota["stale"].bool == true ? " · 更新失败" : ""))
-                }.font(.system(size: 11)).foregroundStyle(quota["stale"].bool == true ? Color.orange : Color.secondary)
-            }
-            if let error = quota["error"].string { InfoNote(text: error, color: .orange) }
-            DisclosureGroup(isExpanded: $creditsExpanded) {
-                ResetCreditsView(source: source).padding(.top, 8)
-            } label: {
-                HStack(spacing: 7) {
-                    Text("重置卡")
-                    Text("可用 \(countLabel(live["credits"]["available_count"]))").foregroundStyle(.secondary)
-                }.font(.system(size: 12))
-            }
-            if model.loginSource == source.id {
-                VStack(alignment: .leading, spacing: 10) {
-                    Divider()
-                    Text(model.loginMessage ?? "等待浏览器授权…").font(.system(size: 13, weight: .medium))
-                    SecureField("完整回调地址", text: $model.callbackURL).settingsField()
-                    HStack {
-                        Button("完成登录") { model.completeLogin() }.buttonStyle(.borderedProminent).disabled(model.callbackURL.isEmpty || model.busy || model.loginFlow == nil)
-                        Button("取消等待") { model.cancelLogin() }.disabled(model.busy)
-                    }.controlSize(.small)
-                }.padding(.top, 2)
-            } else if model.loginMessage == "官方账号已连接。" {
-                Label("官方账号已连接", systemImage: "checkmark.circle").font(.system(size: 11)).foregroundStyle(.green)
-            }
-        }
-    }
-
-    private func quotaWindow(_ window: QuotaWindow) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text(window.title).font(.system(size: 12)).foregroundStyle(.secondary)
-            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text(window.remainingLabel)
-                    .font(AccountTypography.value).monospacedDigit()
-                    .foregroundStyle(AccountLevel.quota(window.remaining).color)
-                Text("剩余").font(.system(size: 11)).foregroundStyle(.secondary)
-                Spacer(minLength: 0)
-            }
-            if let remaining = window.remaining {
-                ProgressView(value: remaining, total: 100).tint(AccountLevel.quota(remaining).color).controlSize(.small)
-            }
-            Text(window.resetLabel).font(.system(size: 11)).foregroundStyle(.secondary)
-                .lineLimit(1).help(window.resetLabel)
-        }.padding(.vertical, 2)
-    }
-
-}
-struct ResetCreditsView: View {
-    @EnvironmentObject var model: AppModel
-    let source: Source
+    @Environment(\.dismiss) private var dismiss
+    let request: CreditResetRequest
     @State private var confirmation: CreditConfirmation?
     @State private var refreshing = false
     @State private var localError: String?
+    @State private var quotaRecovered = false
+
+    // A sheet never follows a source into a different account after it has opened.
+    private var source: Source? {
+        model.settings.sources.first {
+            $0.id == request.sourceID && $0.official && $0.account_id == request.accountID
+                && $0.account_id != nil && model.state($0.id)["account_id"].string == request.accountID
+        }
+    }
+
     var body: some View {
-        let credits = model.state(source.id)["credits"]
-        VStack(alignment: .leading, spacing: 12) {
-            if credits["stale"].bool == true { Label("请刷新卡片后使用。", systemImage: "clock").font(.system(size: 12)).foregroundStyle(.orange) }
-            if let message = credits["error"].string { Text(message).font(.system(size: 12)).foregroundStyle(.orange) }
-            if credits["credits"].array.isEmpty { Text(credits["available_count"].number == 0 ? "暂无可用重置卡" : "暂无卡片数据").font(.system(size: 12)).foregroundStyle(.secondary) }
-            ForEach(Array(credits["credits"].array.enumerated()), id: \.offset) { index, credit in
-                let key = source.id + ":" + (credit["id"].string ?? "")
-                if index > 0 { Divider() }
-                HStack(alignment: .top, spacing: 16) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(credit["title"].string ?? "重置卡").font(.system(size: 13, weight: .medium))
-                        Text("状态 · \(creditStatus(credit["status"].string))  到期 · \(timestampLabel(credit["expires_at"]))").font(.system(size: 12)).foregroundStyle(.secondary)
-                        if let result = model.resetResults[key] { Text(result).font(.system(size: 12)).foregroundStyle(.orange) }
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(confirmation == nil ? "重置卡" : "确认使用重置卡").font(.system(size: 22, weight: .semibold))
+                    if let source {
+                        Text(source.name).font(.system(size: 14, weight: .medium))
+                        Text(request.accountID ?? "").font(AppTypography.small).foregroundStyle(.secondary)
+                            .textSelection(.enabled)
                     }
-                    Spacer()
-                    Button(model.consuming.contains(key) ? "提交中…" : "使用…") { prepare(credit) }
-                        .buttonStyle(.bordered).controlSize(.small)
-                        .disabled(refreshing || model.busy || model.refreshingQuotas.contains(source.id) || model.consuming.contains(key) || model.consuming.contains("all") || credit["expiry_known"].bool != true || model.resetResults[key] != nil || credit["status"].string != "available" || credit["id"].string?.isEmpty != false || credits["stale"].bool == true)
+                }
+                Spacer()
+                if refreshing { ProgressView().controlSize(.small) }
+                else if confirmation == nil, let source {
+                    Button { Task { await refresh(source: source, quick: false) } } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }.help("刷新额度与卡片").disabled(model.refreshingQuotas.contains(source.id))
                 }
             }
-            if let localError { Text(localError).font(.system(size: 12)).foregroundStyle(.orange) }
-        }.sheet(item: $confirmation) { item in
-            VStack(alignment: .leading, spacing: 16) {
-                Text("确认使用重置卡").font(.system(size: 22, weight: .semibold))
-                LabeledContent("来源", value: item.source.name)
-                LabeledContent("账号／工作区", value: item.accountID)
-                LabeledContent("卡片", value: item.credit["title"].string ?? "重置卡")
-                LabeledContent("到期时间", value: timestampLabel(item.credit["expires_at"]))
-                Divider()
-                ForEach(QuotaOverview(item.quota).windows) { window in Text("\(window.title)：剩余 \(window.remainingLabel)").font(.system(size: 13)) }
-                Text("此操作将消耗一张重置卡。若结果待确认，请刷新额度后再操作。").font(.system(size: 13)).foregroundStyle(.secondary)
-                HStack { Spacer(); Button("取消") { confirmation = nil }.keyboardShortcut(.cancelAction); Button("确认使用") { model.consume(item); confirmation = nil }.buttonStyle(.borderedProminent) }
-            }.font(.system(size: 13)).padding(24).frame(width: 470)
+            Divider()
+            if let source {
+                if let confirmation { confirmationContent(confirmation) }
+                else { inventoryContent(source) }
+            } else {
+                InfoNote(text: "来源或账号已变化，请关闭后重新选择。", color: .orange)
+            }
+            if quotaRecovered { Label("额度已恢复", systemImage: "checkmark.circle").foregroundStyle(.green) }
+            if let localError { InfoNote(text: localError, color: .orange) }
+            Divider()
+            HStack {
+                if confirmation != nil {
+                    Button("返回卡片") { confirmation = nil }.disabled(refreshing)
+                }
+                Spacer()
+                Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction)
+                if let confirmation {
+                    Button("确认使用") {
+                        model.consume(confirmation)
+                        self.confirmation = nil
+                    }.buttonStyle(.borderedProminent)
+                        .disabled(source == nil || !model.canSubmitCredit(for: confirmation.source, creditID: confirmation.credit["id"].string ?? ""))
+                }
+            }
+        }.font(AppTypography.body).padding(24).frame(width: 560)
+            .overlay(alignment: .bottomLeading) { AppFeedbackOverlay(compact: true) }
+            .task {
+                guard let source else { return }
+                await refresh(source: source, quick: request.quickReset)
+            }
+    }
+
+    private func inventoryContent(_ source: Source) -> some View {
+        let inventory = CreditInventory(model.state(source.id)["credits"])
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("可用卡片").foregroundStyle(.secondary)
+                Text(inventory.countLabel).font(.system(size: 24, weight: .semibold)).monospacedDigit()
+                Spacer()
+                if let fetched = inventory.snapshot["fetched_at"].number {
+                    Text("更新于 \(timestampLabel(.number(fetched)))").font(AppTypography.small).foregroundStyle(.secondary)
+                }
+            }
+            if inventory.snapshot["stale"].bool == true {
+                InfoNote(text: "卡片信息待更新。", symbol: "clock", color: .orange)
+            }
+            if let message = inventory.snapshot["error"].string { InfoNote(text: message, color: .orange) }
+            if inventory.cards.isEmpty {
+                Text(inventory.availableCount == 0 ? "暂无可用重置卡" : "暂无卡片数据")
+                    .foregroundStyle(.secondary).padding(.vertical, 16)
+            } else {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(Array(inventory.cards.enumerated()), id: \.offset) { index, credit in
+                            if index > 0 { Divider().padding(.vertical, 12) }
+                            cardRow(credit, source: source, inventory: inventory)
+                        }
+                    }.padding(14).background(AppPalette.well, in: RoundedRectangle(cornerRadius: 9))
+                }.frame(height: min(CGFloat(inventory.cards.count) * 96, 310))
+            }
         }
     }
-    private func prepare(_ credit: JSONValue) {
+
+    private func cardRow(_ credit: JSONValue, source: Source, inventory: CreditInventory) -> some View {
+        let creditID = credit["id"].string ?? ""
+        return HStack(spacing: 16) {
+            Image(systemName: "ticket").font(.system(size: 20)).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(credit["title"].string ?? "重置卡").font(.system(size: 13, weight: .semibold))
+                Text("\(creditStatus(credit["status"].string)) · 到期 \(timestampLabel(credit["expires_at"]))")
+                    .font(AppTypography.small).foregroundStyle(.secondary)
+                if let result = model.resetResult(for: source, creditID: creditID) {
+                    Text(result).font(AppTypography.small).foregroundStyle(.orange)
+                }
+            }
+            Spacer(minLength: 0)
+            Button(model.isConsumingCredit(for: source, creditID: creditID) ? "提交中…" : "使用…") {
+                Task { await prepare(credit, source: source) }
+            }.buttonStyle(.bordered).controlSize(.small)
+                .disabled(refreshing || model.busy || model.refreshingQuotas.contains(source.id) || !inventory.isFresh
+                          || !CreditInventory.isUsable(credit) || !model.canSubmitCredit(for: source, creditID: creditID))
+        }
+    }
+
+    private func confirmationContent(_ item: CreditConfirmation) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            LabeledContent("卡片", value: item.credit["title"].string ?? "重置卡")
+            LabeledContent("到期时间", value: timestampLabel(item.credit["expires_at"]))
+            ForEach(QuotaOverview(item.quota).mainWindows) { window in
+                LabeledContent(window.title, value: "剩余 \(window.remainingLabel)")
+            }
+            Text("将消耗 1 张重置卡。").foregroundStyle(.secondary).padding(.top, 4)
+        }
+    }
+
+    private func refresh(source: Source, quick: Bool) async {
+        refreshing = true; localError = nil; quotaRecovered = false
+        defer { refreshing = false }
+        do {
+            try await model.queryOfficial(source.id, includeCredits: true)
+            guard !Task.isCancelled, let current = self.source else { return }
+            if quick {
+                let live = model.state(current.id)
+                let quota = QuotaOverview(live["quota"])
+                if !quota.isExhausted && live["health"].string != "exhausted" {
+                    quotaRecovered = live["quota"]["stale"].bool == false && quota.mainWindows.contains { ($0.remaining ?? 0) > 0 }
+                    return
+                }
+                if let card = CreditInventory(live["credits"]).usableCards.first(where: {
+                    model.canSubmitCredit(for: current, creditID: $0["id"].string ?? "")
+                }) {
+                    confirmation = try CreditConfirmation.make(source: current, live: live, creditID: card["id"].string)
+                }
+            }
+        } catch { if !Task.isCancelled { localError = error.localizedDescription } }
+    }
+
+    private func prepare(_ credit: JSONValue, source: Source) async {
         refreshing = true; localError = nil
-        Task {
-            do { confirmation = try await model.prepareCredit(source: source, credit: credit) }
-            catch { localError = error.localizedDescription }
-            refreshing = false
+        defer { refreshing = false }
+        do {
+            let prepared = try await model.prepareCredit(source: source, credit: credit)
+            guard !Task.isCancelled, self.source != nil else { return }
+            confirmation = prepared
+        } catch { if !Task.isCancelled { localError = error.localizedDescription } }
+    }
+
+    private func creditStatus(_ value: String?) -> String {
+        switch value {
+        case "available": return "可用"
+        case "consumed", "redeemed": return "已使用"
+        case "expired": return "已过期"
+        default: return "未知"
         }
     }
-    private func creditStatus(_ value: String?) -> String { switch value { case "available": return "可用"; case "consumed", "redeemed": return "已使用"; case "expired": return "已过期"; default: return "未知" } }
 }

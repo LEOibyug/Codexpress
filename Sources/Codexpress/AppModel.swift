@@ -17,18 +17,18 @@ import ServiceManagement
     @Published private(set) var busy = false
     @Published private(set) var running = false
     @Published private(set) var settingsWindowActive = false
-    @Published private(set) var loginSource: String?
-    @Published private(set) var loginFlow: String?
+    @Published var loginSource: String?
+    @Published var loginFlow: String?
     @Published var callbackURL = ""
     @Published var loginMessage: String?
     @Published var preview: JSONValue = .null
-    @Published private(set) var consuming = Set<String>()
-    @Published private(set) var resetResults: [String: String] = [:]
+    @Published var creditResetRequest: CreditResetRequest?
+    @Published var consuming = Set<String>()
     @Published private(set) var launchAtLogin = false
     @Published private(set) var metadataLoadFailed = false
     @Published private(set) var pendingSync = false
     @Published private(set) var refreshingModels = Set<String>()
-    @Published private(set) var refreshingQuotas = Set<String>()
+    @Published var refreshingQuotas = Set<String>()
     @Published private(set) var apiBalances: [String: JSONValue] = [:]
     @Published private(set) var refreshingBalances = Set<String>()
     @Published private(set) var accountRefreshGeneration = 0
@@ -38,8 +38,8 @@ import ServiceManagement
     @Published private(set) var credentialStorage: JSONValue = .null
     let directory: URL
     private let metadata: MetadataStore
-    private var credentialSnapshot = CredentialSnapshot()
-    private let client: GatewayClient
+    var credentialSnapshot = CredentialSnapshot()
+    let client: GatewayClient
     private var helper: Process?
     private var logPipe: Pipe?
     private var timerTask: Task<Void, Never>?
@@ -47,11 +47,12 @@ import ServiceManagement
     private var restarting = false
     private var restartCount = 0
     private var shuttingDown = false
-    private var operations: [String: ResetOperation] = [:]
-    private var officialRefreshSchedule = OfficialRefreshSchedule()
+    @Published var operations: [String: ResetOperation] = [:]
+    var officialRefreshSchedule = OfficialRefreshSchedule()
+    var officialQueries: [String: (includeCredits: Bool, task: Task<Void, Error>)] = [:]
     private var startInProgress = false
     private var starting = false
-    private var lastModelRefresh: [String: Date] = [:]
+    var lastModelRefresh: [String: Date] = [:]
     private var modelRefreshTask: Task<Void, Never>?
     private var usageDays = 30
     private var usageSourceID: String?
@@ -86,7 +87,6 @@ import ServiceManagement
         if settings.codexHome.isEmpty { settings.codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path }
         do {
             operations = try ResetOperationStore(directory: directory).load()
-            resetResults = operations.mapValues { $0.result }
         } catch { self.error = "重置卡操作记录读取失败，已停用手动提交。"; consuming.insert("all") }
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
@@ -118,6 +118,7 @@ import ServiceManagement
         guard !startInProgress else { return }
         startInProgress = true
         defer { startInProgress = false }
+        var verifiedProcessID: Int32?
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
@@ -143,23 +144,28 @@ import ServiceManagement
                 try process.run(); helper = process; logPipe = pipe
                 process.terminationHandler = { [weak self] _ in Task { @MainActor in await self?.helperStopped() } }
             }
-            var connected = false
             for _ in 0..<30 {
                 if let result = try? await client.call("status") {
                     guard let child = helper, child.isRunning, result["process_id"].number == Double(child.processIdentifier) else { throw AppError.message("网关实例不匹配，已拒绝同步来源。") }
-                    status = result; connected = true; break
+                    status = result; verifiedProcessID = child.processIdentifier; break
                 }
                 guard helper?.isRunning == true else { throw AppError.message("网关启动后退出，请检查端口是否被占用。") }
                 try? await Task.sleep(for: .milliseconds(100))
             }
-            guard connected else { throw AppError.message("网关未能启动。请检查端口冲突和受保护的 gateway.log。") }
+            guard verifiedProcessID != nil else { throw AppError.message("网关未能启动。请检查端口冲突和受保护的 gateway.log。") }
             running = true
             credentialStorage = try await client.call("credentials.storage.status")
             credentialSnapshot = CredentialSnapshot()
             try await loadCredentialSnapshot(settings.sources.map(\.id))
             try await sync()
             await poll()
-        } catch { running = false; self.error = error.localizedDescription }
+        } catch {
+            // A rejected sync still leaves our verified helper available for
+            // repairing source settings. Never adopt an unverified instance.
+            running = helper?.isRunning == true && helper?.processIdentifier == verifiedProcessID
+            if running { pendingSync = true }
+            self.error = error.localizedDescription
+        }
     }
     private func helperStopped() async {
         running = false
@@ -219,7 +225,7 @@ import ServiceManagement
             self.notice = mode == "file" ? "已改用本地文件保存凭据，旧钥匙串副本保留。" : "已改用钥匙串保存凭据，旧本地文件副本保留。"
         }
     }
-    private func loadCredentialSnapshot(_ ids: [String]) async throws {
+    func loadCredentialSnapshot(_ ids: [String]) async throws {
         guard !ids.isEmpty else { return }
         let response = try await client.call("credentials.read", .object(["source_ids": .array(ids.map(JSONValue.string))]))
         try credentialSnapshot.apply(response, requested: ids)
@@ -235,12 +241,12 @@ import ServiceManagement
         next.sources = try OfficialCredentialMirror.mergedSources(settings.sources, response: data, loadDurable: credentialSnapshot.load)
         if next.sources != settings.sources { try persistSettings(next) }
     }
-    @discardableResult private func refreshCredentials() async throws -> JSONValue {
+    @discardableResult func refreshCredentials() async throws -> JSONValue {
         let notification = try await client.call("credentials")
         try await mergeCredentials(notification)
         return notification
     }
-    private func updateStatus() async throws {
+    func updateStatus() async throws {
         let fresh = try await client.call("status")
         guard let child = helper, child.isRunning, fresh["process_id"].number == Double(child.processIdentifier) else { running = false; throw AppError.message("网关实例已改变，停止发送管理请求。") }
         if status != fresh { status = fresh }
@@ -260,7 +266,7 @@ import ServiceManagement
     func setSettingsWindowActive(_ active: Bool) {
         if settingsWindowActive != active { settingsWindowActive = active }
     }
-    private func sync() async throws {
+    func sync() async throws {
         try requireWritableMetadata()
         pendingSync = true
         // Always retrieve helper-authoritative rotated tokens before building a source snapshot.
@@ -293,8 +299,10 @@ import ServiceManagement
                 try await self.refreshCredentials()
                 if let id = loginSource, let flow = loginFlow {
                     let result = try await client.call("official.login.status", .object(["source_id": .string(id), "flow_id": .string(flow)]))
-                    if result["state"].string == "complete" { try await finishLogin(id) }
-                    else if result["state"].string == "failed" { loginMessage = result["error"].string ?? "登录失败，请重新发起。"; loginFlow = nil }
+                    if loginSource == id && loginFlow == flow {
+                        if result["state"].string == "complete" { try await finishLogin(id) }
+                        else if result["state"].string == "failed" { loginMessage = result["error"].string ?? "登录失败，请重新发起。"; loginFlow = nil }
+                    }
                 }
                 scheduleModelRefresh()
             }
@@ -323,7 +331,7 @@ import ServiceManagement
             }
         }
     }
-    private func refreshAccount(_ id: String, foreground: Bool) async {
+    func refreshAccount(_ id: String, foreground: Bool) async {
         guard running, !busy, !Task.isCancelled, let before = settings.sources.first(where: { $0.id == id }), before.enabled else { return }
         if before.official {
             guard !refreshingQuotas.contains(id), officialRefreshSchedule.isDue(id, foreground: foreground), let secret = try? credentialSnapshot.load(id), secret["access_token"].string?.isEmpty == false else { return }
@@ -371,6 +379,7 @@ import ServiceManagement
         try await updateStatus()
         var source = source
         if source.official { source = source.preservingOfficialIdentity(current: settings.sources.first { $0.id == source.id }, live: state(source.id)) }
+        try requireUniqueOfficialAccount(source)
         if !source.official, !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             _ = try await client.call("credentials.save_api", .object(["source_id": .string(source.id), "api_key": .string(apiKey.trimmingCharacters(in: .whitespacesAndNewlines))]))
             try await loadCredentialSnapshot([source.id])
@@ -414,7 +423,7 @@ import ServiceManagement
         guard !models.isEmpty else { throw AppError.message("供应商未返回可用模型。") }
         return models
     }
-    private func scheduleModelRefresh(maximumAge: TimeInterval = 3600) {
+    func scheduleModelRefresh(maximumAge: TimeInterval = 3600) {
         guard modelRefreshTask == nil, running, !metadataLoadFailed else { return }
         modelRefreshTask = Task {
             defer { modelRefreshTask = nil }
@@ -532,47 +541,6 @@ import ServiceManagement
     func state(_ id: String) -> JSONValue { status["sources"].array.first { $0["id"].string == id } ?? .null }
     var gatewayHasActivity: Bool { running && (status["inflight"].number ?? 0) > 0 }
     func sourceHasActivity(_ id: String) -> Bool { running && (state(id)["active_requests"].number ?? 0) > 0 }
-    func login(_ source: Source) {
-        perform {
-            try await self.sync()
-            let result = try await self.client.call("official.login.start", .object(["source_id": .string(source.id)]))
-            guard let urlString = result["auth_url"].string, let url = URL(string: urlString), url.scheme == "https", url.host == "auth.openai.com", let flow = result["flow_id"].string else { throw AppError.message("网关返回了无效的登录地址。") }
-            self.loginSource = source.id; self.loginFlow = flow; self.loginMessage = "请在浏览器中完成登录。"; self.callbackURL = ""
-            NSWorkspace.shared.open(url)
-        }
-    }
-    func cancelLogin() {
-        callbackURL = ""; loginSource = nil; loginFlow = nil; loginMessage = nil
-    }
-    func completeLogin() {
-        guard let id = loginSource, let flow = loginFlow else { return }
-        perform {
-            _ = try await self.client.call("official.login.complete", .object(["source_id": .string(id), "flow_id": .string(flow), "callback_url": .string(self.callbackURL)]))
-            try await self.finishLogin(id)
-        }
-    }
-    private func finishLogin(_ id: String) async throws {
-        // The helper durably installs official credentials before returning; never replay an IPC token snapshot.
-        try await loadCredentialSnapshot([id])
-        let durable = try OfficialCredentialMirror.requireDurable(credentialSnapshot.load(id))
-        var next = settings
-        if let i = next.sources.firstIndex(where: { $0.id == id }) { next.sources[i].account_id = durable["account_id"].string }
-        try persistSettings(next); callbackURL = ""; loginSource = nil; loginFlow = nil; loginMessage = "官方账号已连接。"
-        officialRefreshSchedule.reset(id)
-        lastModelRefresh[id] = nil
-        scheduleModelRefresh()
-        Task { await refreshAccount(id, foreground: true) }
-    }
-    private func queryOfficial(_ id: String, includeCredits: Bool) async throws {
-        guard !refreshingQuotas.contains(id) else { throw AppError.message("此账号正在刷新，请稍后重试。") }
-        refreshingQuotas.insert(id)
-        defer { refreshingQuotas.remove(id) }
-        officialRefreshSchedule.record(id, includeCredits: includeCredits)
-        _ = try await client.call("official.refresh", .object(["source_id": .string(id), "include_credits": .bool(includeCredits)]))
-        try await refreshCredentials()
-        try await updateStatus()
-    }
-    func refresh(_ id: String) { perform { try await self.queryOfficial(id, includeCredits: true) } }
     func loadUsage(days: Int, sourceID: String? = nil, modelID: String? = nil) async {
         if usageDays != days { usage = .null; usageUpdatedAt = nil }
         usageDays = days; usageSourceID = sourceID; usageModelID = modelID
@@ -600,41 +568,6 @@ import ServiceManagement
     }
     func usageDetail(attemptID: String, bodyOffset: Double = 0, recordOnly: Bool = false) async throws -> JSONValue {
         try await client.call("usage.detail", .object(["attempt_id": .string(attemptID), "body_offset": .number(bodyOffset), "body_limit": .number(65_536), "record_only": .bool(recordOnly)]))
-    }
-    func prepareCredit(source: Source, credit: JSONValue) async throws -> CreditConfirmation {
-        try requireWritableMetadata()
-        guard let before = settings.sources.first(where: { $0.id == source.id }), before == source else { throw AppError.message("来源已删除或发生变化，请重新选择重置卡。") }
-        try await queryOfficial(source.id, includeCredits: true)
-        guard let current = settings.sources.first(where: { $0.id == source.id }), current.sameConfiguration(as: before) else { throw AppError.message("来源已删除或网络策略发生变化，请重新选择重置卡。") }
-        return try CreditConfirmation.make(source: current, live: state(source.id), creditID: credit["id"].string)
-    }
-    func consume(_ confirmation: CreditConfirmation) {
-        let source = confirmation.source
-        let credit = confirmation.credit
-        guard let creditID = credit["id"].string, !creditID.isEmpty else { return }
-        let key = source.id + ":" + creditID
-        guard !consuming.contains("all"), !consuming.contains(key), resetResults[key] == nil else { return }
-        do {
-            try requireWritableMetadata()
-            guard let currentSource = settings.sources.first(where: { $0.id == source.id }), currentSource == source else { throw AppError.message("来源或账号已变化，请重新确认。") }
-            try confirmation.validate(live: state(source.id))
-        } catch { self.error = error.localizedDescription; return }
-        let operation = UUID().uuidString
-        operations[key] = ResetOperation(sourceID: source.id, creditID: creditID, operationID: operation, createdAt: Date().timeIntervalSince1970, result: "结果待核实，请刷新额度和卡片。", accountID: confirmation.accountID)
-        do { try ResetOperationStore(directory: directory).save(operations) } catch { self.error = error.localizedDescription; return }
-        consuming.insert(key)
-        Task {
-            defer {
-                consuming.remove(key)
-                if let result = resetResults[key] { operations[key]?.result = result; do { try ResetOperationStore(directory: directory).save(operations) } catch { self.error = error.localizedDescription } }
-            }
-            do {
-                let result = try await client.call("official.credits.consume", confirmation.consumePayload(operationID: operation))
-                let labels = ["reset": "已重置；以刷新后的窗口为准", "nothing_to_reset": "当前无需重置", "no_credit": "无可用重置卡", "already_redeemed": "卡片已使用", "unknown": "结果待核实，请刷新，勿重复提交", "pending_verification": "结果待核实，请刷新，勿重复提交"]
-                resetResults[key] = labels[result["code"].string ?? "unknown"] ?? "结果待核实，请刷新"
-                try await updateStatus()
-            } catch { resetResults[key] = "结果待核实，请先刷新额度和卡片。"; self.error = error.localizedDescription }
-        }
     }
     func savePreferences(port: Int, codexHome: String) {
         perform {

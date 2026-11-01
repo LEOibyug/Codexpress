@@ -22,6 +22,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{atomic::Ordering, Arc, Mutex},
     time::{Duration, Instant},
@@ -427,8 +428,11 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
         Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
     };
     let request_id = uuid::Uuid::new_v4().to_string();
-    let mut rate_limited = false;
+    let mut rate_limited_accounts = HashSet::new();
     for candidate in candidates(&state).await {
+        if rate_limited_accounts.contains(&candidate.identity()) {
+            continue;
+        }
         let source = match crate::official::ensure_access(&state, &candidate.id).await {
             Ok(s) if s.identity() == candidate.identity() => s,
             _ => continue,
@@ -553,7 +557,7 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             attempt.collect_error(&mut upstream).await;
             attempt.finish("failed");
             // Image limits must not change chat routing or its quota snapshot.
-            rate_limited = true;
+            rate_limited_accounts.insert(source.identity());
             continue;
         }
         if !status.is_success() {
@@ -639,7 +643,7 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
         attempt.finish("success");
         return Json(result_out).into_response();
     }
-    if rate_limited {
+    if !rate_limited_accounts.is_empty() {
         error(
             StatusCode::TOO_MANY_REQUESTS,
             "官方生图请求已达限制，请稍后再试",

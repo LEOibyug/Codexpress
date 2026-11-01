@@ -1,5 +1,5 @@
 //! Official quota and reset-credit snapshots, including recovery and low-quota retention.
-use super::{account, json_response, same_binding, token, Endpoints, REQUEST_TIMEOUT};
+use super::{account, json_response, lock, same_binding, token, Endpoints, REQUEST_TIMEOUT};
 use crate::{
     model::{now, AppState, Source},
     transport,
@@ -186,32 +186,27 @@ fn stale(mut previous: Value, kind: &str, error: &str) -> Value {
     previous["error"] = json!(error);
     previous
 }
-fn recover_exhaustion(runtime: &mut crate::model::SourceRuntime) {
-    if runtime.health != "exhausted"
-        || runtime.quota["stale"] != false
-        || runtime.quota["complete"] != true
-    {
-        return;
+fn confirmed_main_windows(quota: &Value) -> Option<Vec<&Value>> {
+    if quota["stale"] != false || quota["complete"] != true {
+        return None;
     }
-    let Some(windows) = runtime.quota["windows"]
-        .as_array()
-        .filter(|v| !v.is_empty())
-    else {
-        return;
-    };
-    let windows: Vec<_> = windows
+    let windows: Vec<_> = quota["windows"]
+        .as_array()?
         .iter()
         .filter(|w| matches!(w["name"].as_str(), Some("primary" | "secondary")))
         .collect();
-    if windows.is_empty() {
+    if windows.is_empty() || windows.iter().any(|w| w["used_percent"].as_f64().is_none()) {
+        return None;
+    }
+    Some(windows)
+}
+fn recover_exhaustion(runtime: &mut crate::model::SourceRuntime) {
+    if runtime.health != "exhausted" {
         return;
     }
-    if windows
-        .iter()
-        .any(|window| window["used_percent"].as_f64().is_none())
-    {
+    let Some(windows) = confirmed_main_windows(&runtime.quota) else {
         return;
-    }
+    };
     let exhausted: Vec<_> = windows
         .iter()
         .filter(|window| {
@@ -247,36 +242,59 @@ pub(super) async fn refresh_selected_snapshots(
     endpoints: Endpoints<'_>,
     include_credits: bool,
 ) -> Result<Value> {
+    let (quota, credits) = tokio::join!(refresh_quota(state, src, endpoints), async {
+        if include_credits {
+            refresh_credits(state, src, endpoints).await
+        } else {
+            Ok(())
+        }
+    });
+    quota?;
+    credits?;
+    let sources = state.sources.read().await;
+    let runtime = sources
+        .iter()
+        .find(|r| same_binding(&r.source, src))
+        .ok_or_else(|| anyhow!("来源在查询期间发生变化，请刷新"))?;
+    Ok(json!({"quota":runtime.quota,"credits":runtime.credits}))
+}
+
+async fn refresh_quota(
+    state: &Arc<AppState>,
+    src: &Source,
+    endpoints: Endpoints<'_>,
+) -> Result<()> {
+    let mutex = lock(state, format!("quota:{}", src.identity())).await;
+    let _guard = match mutex.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            // Reuse the completed in-flight query, including its stale/error
+            // state. Another source entry for this account needs no second GET.
+            let _guard = mutex.lock().await;
+            let sources = state.sources.read().await;
+            if !sources.iter().any(|r| same_binding(&r.source, src)) {
+                bail!("来源在查询期间发生变化，请刷新");
+            }
+            return Ok(());
+        }
+    };
     let threshold = state.settings.read().await.official_low_quota_percent;
-    let account_revisions: std::collections::HashMap<_, _> = state
-        .sources
-        .read()
-        .await
+    let sources = state.sources.read().await;
+    let account_revisions: std::collections::HashMap<_, _> = sources
         .iter()
         .filter(|r| r.source.identity() == src.identity())
         .map(|r| (r.source.id.clone(), r.health_revision))
         .collect();
-    let recovering_revision = state
-        .sources
-        .read()
-        .await
+    let recovering_revision = sources
         .iter()
         .find(|r| {
             same_binding(&r.source, src) && r.health == "proxy_error" && r.cooldown_until.is_some()
         })
         .map(|r| r.health_revision);
+    drop(sources);
     let quota = get(src, endpoints.usage)
         .await
         .and_then(|v| quota_snapshot(&v));
-    let credits = if include_credits {
-        Some(
-            get(src, endpoints.credits)
-                .await
-                .and_then(|v| credits_snapshot(&v)),
-        )
-    } else {
-        None
-    };
     let mut sources = state.sources.write().await;
     let may_confirm_recovery = sources
         .iter()
@@ -323,28 +341,14 @@ pub(super) async fn refresh_selected_snapshots(
     if may_confirm_recovery {
         recover_exhaustion(runtime);
     }
-    if let Some(credits) = credits {
-        runtime.credits = match credits {
-            Ok(v) => v,
-            Err(e) => stale(runtime.credits.clone(), "credits", &e.to_string()),
-        };
-    }
-    let result = json!({"quota":runtime.quota,"credits":runtime.credits});
     let confirmed_quota = runtime.quota.clone();
-    let confirmed_recovery = runtime.quota["stale"] == false
-        && runtime.quota["complete"] == true
-        && runtime.quota["windows"].as_array().is_some_and(|windows| {
-            let main: Vec<_> = windows
-                .iter()
-                .filter(|w| matches!(w["name"].as_str(), Some("primary" | "secondary")))
-                .collect();
-            !main.is_empty()
-                && main.iter().all(|window| {
-                    window["used_percent"]
-                        .as_f64()
-                        .is_some_and(|used| used < 100.0)
-                })
-        });
+    let confirmed_recovery = confirmed_main_windows(&runtime.quota).is_some_and(|windows| {
+        windows.iter().all(|window| {
+            window["used_percent"]
+                .as_f64()
+                .is_some_and(|used| used < 100.0)
+        })
+    });
     // Multiple source entries may share a subscription. A fresh recovery must
     // release the account block for all of them without clearing auth/network faults.
     if confirmed_recovery && may_confirm_recovery {
@@ -365,7 +369,55 @@ pub(super) async fn refresh_selected_snapshots(
         }
     }
     crate::routing::notify_quotas(state, &sources);
-    Ok(result)
+    Ok(())
+}
+
+async fn refresh_credits(
+    state: &Arc<AppState>,
+    src: &Source,
+    endpoints: Endpoints<'_>,
+) -> Result<()> {
+    let mutex = lock(state, format!("credits-query:{}", src.identity())).await;
+    let _guard = match mutex.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let _guard = mutex.lock().await;
+            let sources = state.sources.read().await;
+            if !sources.iter().any(|r| same_binding(&r.source, src)) {
+                bail!("来源在查询期间发生变化，请刷新");
+            }
+            return Ok(());
+        }
+    };
+    // Reset preflight/submission uses the inventory lock too, but it does not
+    // count as a completed query that concurrent refresh callers can reuse.
+    let inventory_mutex = lock(state, format!("credits:{}", src.identity())).await;
+    let _inventory_guard = inventory_mutex.lock().await;
+    let credits = get(src, endpoints.credits)
+        .await
+        .and_then(|v| credits_snapshot(&v));
+    let mut sources = state.sources.write().await;
+    if !sources.iter().any(|r| same_binding(&r.source, src)) {
+        bail!("来源在查询期间发生变化，请刷新");
+    }
+    // Inventory belongs to the account. Serializing its query and publication
+    // prevents an older response from replacing the inventory after a reset.
+    match credits {
+        Ok(value) => {
+            for runtime in sources
+                .iter_mut()
+                .filter(|r| r.source.kind == "official" && r.source.identity() == src.identity())
+            {
+                runtime.credits = value.clone();
+            }
+        }
+        Err(error) => {
+            if let Some(runtime) = sources.iter_mut().find(|r| same_binding(&r.source, src)) {
+                runtime.credits = stale(runtime.credits.clone(), "credits", &error.to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn preserve_low_windows(fresh: &mut Value, previous: &Value, threshold: u8) {

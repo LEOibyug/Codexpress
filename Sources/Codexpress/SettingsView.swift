@@ -66,6 +66,9 @@ struct SettingsView: View {
             .font(AppTypography.body).frame(minWidth: 960, minHeight: 700)
             .environment(\.windowIsActive, model.settingsWindowActive)
             .overlay(alignment: .bottomLeading) { AppFeedbackOverlay() }
+            .sheet(item: $model.creditResetRequest) { request in
+                ResetCreditsSheet(request: request).environmentObject(model)
+            }
             .onReceive(NotificationCenter.default.publisher(for: .codexpressNavigate)) { notification in
                 if let destination = notification.object as? SettingsPage { page = destination }
             }

@@ -164,6 +164,29 @@ fn prepare_sources(
     (next, invalidated)
 }
 
+fn validate_official_accounts(sources: &[SourceRuntime]) -> Result<()> {
+    let mut accounts = HashSet::new();
+    for source in sources
+        .iter()
+        .map(|runtime| &runtime.source)
+        .filter(|source| source.kind == "official")
+    {
+        source.validate_official_account()?;
+        if let Some(account) = source.official_account_id() {
+            if !accounts.insert(account) {
+                bail!("此官方账号已存在，请使用已有来源");
+            }
+        } else if ["access_token", "refresh_token"].iter().any(|key| {
+            source.secret[*key]
+                .as_str()
+                .is_some_and(|token| !token.is_empty())
+        }) {
+            bail!("官方凭据缺少账号身份，请重新登录");
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn handle(state: &Arc<AppState>, payload: Value) -> Result<Value> {
     let _routing_sync = state.routing_sync.lock().await;
     let SyncRequest {
@@ -173,6 +196,9 @@ pub(super) async fn handle(state: &Arc<AppState>, payload: Value) -> Result<Valu
     } = SyncRequest::parse(&payload)?;
     let mut current = state.sources.write().await;
     let (next, invalidated) = prepare_sources(sources, &current);
+    // Refresh credentials are helper-owned; validate the effective accounts
+    // before affinity, billing or routing state can change.
+    validate_official_accounts(&next)?;
     state.affinity.retain_identities(
         &next
             .iter()

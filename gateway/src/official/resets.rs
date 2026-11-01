@@ -79,6 +79,9 @@ pub(super) async fn consume(
     let operation_id = field(payload, "operation_id")?;
     let expected_account = field(payload, "expected_account_id")?;
     let initial = source(state, id).await?;
+    if account(&initial) != Some(expected_account) {
+        bail!("确认的账号已变化，请重新确认重置卡操作");
+    }
     let mutex = lock(
         state,
         format!("consume:{}", account(&initial).unwrap_or(id)),
@@ -128,9 +131,12 @@ pub(super) async fn consume(
                 &std::fs::read(entry.path()).map_err(|_| anyhow!("无法读取待确认操作"))?,
             )
             .map_err(|_| anyhow!("重置操作记录损坏，禁止提交"))?;
-            if ((operation.account_id.is_some()
-                && operation.account_id.as_deref() == account(&src))
-                || operation.source_id == id)
+            if operation
+                .account_id
+                .as_deref()
+                .map_or(operation.source_id == id, |account_id| {
+                    Some(account_id) == account(&src)
+                })
                 && operation.credit_id == credit
                 && ["pending_verification", "unknown"]
                     .contains(&operation.result["code"].as_str().unwrap_or(""))
@@ -139,6 +145,10 @@ pub(super) async fn consume(
             }
         }
     }
+    // A snapshot started before redemption must finish publishing before the
+    // POST, so it cannot later restore an already-used card to the account.
+    let credits_mutex = lock(state, format!("credits:{}", src.identity())).await;
+    let credits_guard = credits_mutex.lock().await;
     let cards = credits_snapshot(&get(&src, endpoints.credits).await?)?;
     let card = cards["credits"]
         .as_array()
@@ -207,6 +217,7 @@ pub(super) async fn consume(
             );
         }
     }
+    drop(credits_guard);
     if let Ok(refreshed) = refresh_snapshots(state, &src, endpoints).await {
         operation.result["quota"] = refreshed["quota"].clone();
         operation.result["credits"] = refreshed["credits"].clone();

@@ -98,7 +98,12 @@ struct MenuView: View {
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                         .fixedSize().frame(minWidth: 24, alignment: .trailing)
                 }
-                if source.official { compactQuota(model.state(source.id)["quota"]) }
+                if source.official {
+                    HStack(alignment: .center, spacing: 8) {
+                        compactQuota(model.state(source.id)["quota"])
+                        OfficialResetControl(source: source, compact: true)
+                    }
+                }
                 else { APIBalanceView(sourceID: source.id, compact: true) }
             }.frame(maxWidth: .infinity, alignment: .leading)
         }.padding(.vertical, 9)
