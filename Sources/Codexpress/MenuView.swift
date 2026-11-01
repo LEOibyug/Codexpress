@@ -79,10 +79,10 @@ struct MenuView: View {
 
     private func sourceRow(_ source: Source) -> some View {
         let live = model.state(source.id)
-        let canReset = QuotaOverview(live["quota"]).isExhausted
-            && CreditInventory(live["credits"]).usableCards.contains {
-                model.canSubmitCredit(for: source, creditID: $0["id"].string ?? "")
-            }
+        let availableCredits = CreditInventory(live["credits"]).usableCards.filter {
+            model.canSubmitCredit(for: source, creditID: $0["id"].string ?? "")
+        }.count
+        let canReset = QuotaOverview(live["quota"]).isExhausted && availableCredits > 0
         return HStack(alignment: .top, spacing: 8) {
             ActivityDot(color: source.enabled && model.state(source.id)["health"].string == "ready" ? .green : .secondary,
                         active: model.sourceHasActivity(source.id)).padding(.top, 5)
@@ -106,8 +106,15 @@ struct MenuView: View {
                 if source.official {
                     HStack(alignment: .center, spacing: 8) {
                         compactQuota(model.state(source.id)["quota"])
-                        if canReset {
-                            OfficialResetControl(source: source, compact: true)
+                        if availableCredits > 0 {
+                            VStack(alignment: .trailing, spacing: 4) {
+                                Label("\(availableCredits)", systemImage: "ticket")
+                                    .font(.system(size: 11, weight: .medium)).monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                                    .help("可用重置卡 \(availableCredits) 张")
+                                    .accessibilityLabel("可用重置卡 \(availableCredits) 张")
+                                if canReset { OfficialResetControl(source: source, compact: true) }
+                            }.fixedSize()
                         }
                     }
                 }
