@@ -505,3 +505,82 @@ async fn filtering_the_selected_provider_is_rejected_before_mutation() {
         json!(["codexpress/**"])
     );
 }
+
+#[tokio::test]
+async fn status_extension_upgrade_is_reversible_and_never_overwrites_user_edits() {
+    let (directory, state) = fixture().await;
+    let home = directory.path().join("agent");
+    let extensions = home.join("extensions");
+    fs::create_dir_all(&extensions).unwrap();
+    let plugin = extensions.join("codexpress-status.ts");
+    fs::write(&plugin, "// user extension\n").unwrap();
+    assert!(call(&state, "omp.attach", &home, json!({"model_id":"m"}))
+        .await
+        .is_err());
+    assert!(!home.join("models.yml").exists());
+    assert!(!home.join("config.yml").exists());
+    assert_eq!(fs::read_to_string(&plugin).unwrap(), "// user extension\n");
+    fs::remove_file(&plugin).unwrap();
+
+    apply(&state, &home).await;
+    let snapshot_path = directory.path().join("state/omp/attachment.json");
+    // Simulate an attachment created by v0.4.0 before extension installation.
+    let mut snapshot: Value = serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+    snapshot.as_object_mut().unwrap().remove("status_plugin");
+    fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    fs::remove_file(&plugin).unwrap();
+    let status = call(&state, "omp.status", &home, json!({})).await.unwrap();
+    assert_eq!(status["needs_update"], true);
+    assert_eq!(status["status_plugin_installed"], false);
+    let status = apply(&state, &home).await;
+    assert_eq!(status["status_plugin_installed"], true);
+
+    let models = fs::read(home.join("models.yml")).unwrap();
+    let settings = fs::read(home.join("config.yml")).unwrap();
+    let managed = fs::read(&plugin).unwrap();
+    fs::write(&plugin, "// later user edit\n").unwrap();
+    assert!(call(&state, "omp.restore", &home, json!({})).await.is_err());
+    assert!(call(&state, "omp.attach", &home, json!({"model_id":"m"}))
+        .await
+        .is_err());
+    assert_eq!(fs::read(home.join("models.yml")).unwrap(), models);
+    assert_eq!(fs::read(home.join("config.yml")).unwrap(), settings);
+    assert_eq!(fs::read_to_string(&plugin).unwrap(), "// later user edit\n");
+    fs::write(&plugin, managed).unwrap();
+    call(&state, "omp.restore", &home, json!({})).await.unwrap();
+    assert!(!plugin.exists());
+    assert!(!home.join("models.yml").exists());
+    assert!(!home.join("config.yml").exists());
+}
+
+#[tokio::test]
+async fn compact_context_preserves_user_segments_and_original_display_setting() {
+    let (directory, state) = fixture().await;
+    let home = directory.path().join("agent");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("config.yml"), "statusLine:\n  preset: custom\n  contextLine: embedded\n  leftSegments: [model, path, context_pct]\n  rightSegments: [tokens]\n").unwrap();
+    apply(&state, &home).await;
+    let settings = yaml(&home.join("config.yml"));
+    assert_eq!(settings["statusLine"]["contextLine"], "off");
+    assert_eq!(
+        settings["statusLine"]["leftSegments"],
+        json!(["model", "path", "context_pct", "status"])
+    );
+    let mut settings = settings;
+    settings["theme"] = json!("dark");
+    fs::write(
+        home.join("config.yml"),
+        serde_yaml::to_string(&settings).unwrap(),
+    )
+    .unwrap();
+    apply(&state, &home).await;
+    call(&state, "omp.restore", &home, json!({})).await.unwrap();
+    let restored = yaml(&home.join("config.yml"));
+    assert_eq!(restored["statusLine"]["contextLine"], "embedded");
+    assert_eq!(restored["statusLine"]["rightSegments"], json!(["tokens"]));
+    assert_eq!(
+        restored["statusLine"]["leftSegments"],
+        json!(["model", "path", "context_pct"])
+    );
+    assert_eq!(restored["theme"], "dark");
+}

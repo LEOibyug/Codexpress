@@ -126,6 +126,7 @@ pub(super) struct Attempt {
     captured_transport_error: bool,
     saved_failure: Option<Value>,
     pub(super) manual_trial: Option<routing::manual::Trial>,
+    pub(super) conversation_status: Option<crate::chatbot::status::ActiveAttempt>,
 }
 impl Attempt {
     pub(super) fn new(
@@ -178,6 +179,7 @@ impl Attempt {
             captured_transport_error: false,
             saved_failure: None,
             manual_trial: None,
+            conversation_status: None,
         }
     }
     pub(super) fn save_diagnostic(&self, body: bool) {
@@ -236,6 +238,9 @@ impl Attempt {
         self.save_diagnostic(true);
     }
     pub(super) fn finish(&mut self, status: &str, observer: Option<&Observer>) {
+        if let Some(tracking) = &mut self.conversation_status {
+            tracking.finish(status);
+        }
         if matches!(status, "failed" | "interrupted") {
             if let Some(trial) = &self.manual_trial {
                 self.state.manual_routing.stop(trial);

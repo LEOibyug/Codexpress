@@ -2,6 +2,7 @@
 //! never enters this adapter and keeps its original request/response bytes.
 mod requests;
 mod responses;
+pub(crate) mod status;
 
 use crate::{config::secure_write, model::AppState};
 use anyhow::{bail, Context, Result};
@@ -45,6 +46,7 @@ pub struct ChatbotAccess {
     settings: Mutex<Settings>,
     path: PathBuf,
     listener: AsyncMutex<Option<Listener>>,
+    conversation_status: Arc<status::Store>,
 }
 
 fn generate_key() -> String {
@@ -96,6 +98,7 @@ impl ChatbotAccess {
             settings: Mutex::new(settings),
             path,
             listener: AsyncMutex::new(None),
+            conversation_status: Arc::new(status::Store::default()),
         })
     }
     fn settings(&self) -> Result<Settings> {
@@ -312,6 +315,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/chat/completions", post(chat))
         .route("/v1/responses", post(responses))
         .route("/responses", post(responses))
+        .route("/v1/codexpress/status", get(status::get))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, gate))
 }
@@ -384,9 +388,33 @@ async fn infer(state: Arc<AppState>, request: Request, format: requests::Format)
         Ok(b) => b,
         Err(problem) => return error(problem.status, problem.message, None),
     };
-    let body: Value = match serde_json::from_slice(&bytes) {
+    let mut body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(_) => return error(StatusCode::BAD_REQUEST, "请求须为 JSON 对象", None),
+    };
+    // Plugin correlation is local-only metadata, never a vendor payload field.
+    let local_thread = match body
+        .as_object_mut()
+        .and_then(|body| body.remove("codexpress_session_id"))
+    {
+        None => None,
+        Some(value) => {
+            let header = value
+                .as_str()
+                .filter(|value| status::valid(value, 512))
+                .and_then(|value| HeaderValue::from_str(value).ok())
+                .filter(|value| value.to_str().is_ok());
+            match header {
+                Some(header) => Some(header),
+                None => {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "codexpress_session_id 须为有效非空会话标识",
+                        Some("codexpress_session_id"),
+                    )
+                }
+            }
+        }
     };
     let session = body["session_id"]
         .as_str()
@@ -416,10 +444,26 @@ async fn infer(state: Arc<AppState>, request: Request, format: requests::Format)
             headers.insert(axum::http::HeaderName::from_static(name), value.clone());
         }
     }
+    if !headers.contains_key("thread-id") && !headers.contains_key("thread_id") {
+        if let Some(thread) = local_thread {
+            headers.insert("thread-id", thread);
+        }
+    }
     if !headers.contains_key("thread-id") && !headers.contains_key("session-id") {
         if let Some(session) = session {
             headers.insert("session-id", session.parse().unwrap());
         }
+    }
+    if let (Some(ingress), Some(model), Some(thread)) = (
+        parts.extensions.get::<ChatbotIngress>(),
+        body["model"].as_str(),
+        status::thread(&headers),
+    ) {
+        let tracking = state
+            .chatbot
+            .conversation_status
+            .begin(&ingress.namespace, thread, model);
+        parts.extensions.insert(tracking);
     }
     headers.insert(
         header::HOST,

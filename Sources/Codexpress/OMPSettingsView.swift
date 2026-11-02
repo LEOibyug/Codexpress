@@ -68,6 +68,10 @@ struct OMPSettingsView: View {
                         Text((model.settings.modelCompaction ?? []).isEmpty ? "OMP 默认" : "同步 \((model.settings.modelCompaction ?? []).count) 条模型规则")
                             .foregroundStyle(.secondary)
                     }
+                    SettingRow(title: "状态栏扩展") {
+                        Text(status["status_plugin_installed"].bool == true ? "已安装" : "随一键设置安装")
+                            .foregroundStyle(.secondary)
+                    }
                     Divider()
                     LabeledContent("网关", value: chatbot["base_url"].string ?? status["base_url"].string ?? "—")
                         .font(.system(size: 12, design: .monospaced)).textSelection(.enabled)
@@ -98,7 +102,7 @@ struct OMPSettingsView: View {
         .alert("还原 OMP 原配置？", isPresented: $confirmRestore) {
             Button("取消", role: .cancel) {}
             Button("还原") { restore() }
-        } message: { Text("撤回 Codexpress 的供应商、默认模型和压缩规则设置。") }
+        } message: { Text("撤回 Codexpress 的供应商、默认模型、压缩规则和状态栏扩展。") }
     }
 
     private func detect() async {
@@ -132,7 +136,7 @@ struct OMPSettingsView: View {
 
     private func apply() {
         let name = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        perform("omp.attach", additional: ["model_id": .string(name), "model_rules": (try? JSONValue.from(model.settings.modelCompaction ?? [])) ?? .array([])], message: "OMP 已接入来源池，新会话生效。")
+        perform("omp.attach", additional: ["model_id": .string(name), "model_rules": (try? JSONValue.from(model.settings.modelCompaction ?? [])) ?? .array([])], message: "OMP 接入与状态栏扩展已设置，重新启动 OMP 后生效。")
     }
 
     private func restore() { perform("omp.restore", message: "OMP 原配置已还原。") }

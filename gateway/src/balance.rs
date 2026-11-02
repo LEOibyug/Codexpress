@@ -75,6 +75,25 @@ pub struct BalanceStore {
 }
 
 impl BalanceStore {
+    /// Read a normalized snapshot without querying, waiting for discovery, or
+    /// exposing credentials/session material. Busy or invalid caches are hidden.
+    pub(crate) fn cached_amount(&self, source: &Source) -> Option<(f64, String)> {
+        let entry = self.entries.lock().ok()?.get(&source.id)?.clone();
+        let entry = entry.try_lock().ok()?;
+        if entry.identity != source.identity() || entry.proxy.as_ref() != Some(&source.proxy) {
+            return None;
+        }
+        let snapshot = entry.snapshot.as_ref()?;
+        if snapshot.status != "available" || snapshot.stale {
+            return None;
+        }
+        let amount = snapshot.amount.filter(|amount| amount.is_finite())?;
+        let currency = snapshot
+            .currency
+            .as_ref()
+            .filter(|currency| !currency.trim().is_empty())?;
+        Some((amount, currency.clone()))
+    }
     async fn query(&self, source: &Source) -> Result<Snapshot> {
         let entry = {
             let mut entries = self
@@ -500,4 +519,53 @@ async fn discover(source: &Source, entry: &mut Entry) -> Option<Amount> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cached_amount_never_discovers_and_rejects_busy_stale_or_changed_identity() {
+        let source: Source = serde_json::from_value(json!({"id":"api","name":"API","kind":"api","base_url":"http://127.0.0.1:1","enabled":true,"priority":1,"proxy":{"mode":"direct"},"secret":{"api_key":"fixture-private-key"}})).unwrap();
+        let store = BalanceStore::default();
+        assert!(store.cached_amount(&source).is_none());
+        assert!(store.entries.lock().unwrap().is_empty());
+        let entry = Arc::new(AsyncMutex::new(Entry {
+            identity: source.identity(),
+            proxy: Some(source.proxy.clone()),
+            snapshot: Some(Snapshot {
+                status: "available",
+                amount: Some(0.0),
+                currency: Some("USD".into()),
+                scope: Some("account"),
+                stale: false,
+                checked_at: now(),
+                updated_at: Some(now()),
+            }),
+            ..Default::default()
+        }));
+        store
+            .entries
+            .lock()
+            .unwrap()
+            .insert(source.id.clone(), entry.clone());
+        assert_eq!(store.cached_amount(&source), Some((0.0, "USD".into())));
+        let mut changed = source.clone();
+        changed.secret["api_key"] = json!("another-private-key");
+        assert!(store.cached_amount(&changed).is_none());
+        changed = source.clone();
+        changed.proxy = ProxyPolicy {
+            mode: "explicit".into(),
+            url: Some("http://127.0.0.1:9".into()),
+        };
+        assert!(store.cached_amount(&changed).is_none());
+        {
+            let mut locked = entry.lock().await;
+            assert!(store.cached_amount(&source).is_none());
+            locked.snapshot.as_mut().unwrap().stale = true;
+        }
+        assert!(store.cached_amount(&source).is_none());
+        assert!(entry.lock().await.attempted.is_none());
+    }
 }

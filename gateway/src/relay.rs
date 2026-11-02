@@ -1380,6 +1380,10 @@ async fn forward_once(
                 manual.attempted = true;
                 parts.extensions.insert(manual.clone());
             }
+            attempt.conversation_status = parts
+                .extensions
+                .get::<crate::chatbot::status::Tracking>()
+                .map(|tracking| tracking.submit(&source));
             let upstream = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
                 client

@@ -1,0 +1,10 @@
+{
+  "name": "codexpress-status",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "当前 Codexpress 会话来源与缓存额度状态",
+  "omp": {
+    "extensions": ["./codexpress-status.ts"]
+  }
+}

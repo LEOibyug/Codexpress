@@ -359,3 +359,273 @@ async fn unfinished_streams_do_not_claim_success_and_unsupported_requests_do_not
     );
     task.abort();
 }
+
+#[tokio::test]
+async fn status_is_authenticated_exact_thread_cache_only_and_tracks_actual_attempts() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let inference_calls = Arc::new(AtomicUsize::new(0));
+    let balance_calls = Arc::new(AtomicUsize::new(0));
+    let (base, task) = serve(Router::new()
+        .route("/responses", post({
+            let started = started.clone();
+            let release = release.clone();
+            let calls = inference_calls.clone();
+            move || {
+                let started = started.clone();
+                let release = release.clone();
+                let calls = calls.clone();
+                async move {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    release.notified().await;
+                    if call == 0 {
+                        sse_events(vec![json!({"type":"response.completed","response":complete()})])
+                    } else {
+                        Response::builder().status(400).header("content-type", "application/json")
+                            .body(Body::from(json!({"error":{"message":"fixture rejection"}}).to_string())).unwrap()
+                    }
+                }
+            }
+        }))
+        .route("/api/v1/me/quota", axum::routing::get({
+            let calls = balance_calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { axum::Json(json!({"data":{"userLimitTotalUsd":100,"userCurrentTotalUsd":12.5}})) }
+            }
+        }))).await;
+    let (_dir, state, key, port) = state(&base).await;
+    let app = chatbot::router(state.clone());
+    let status_path = "/v1/codexpress/status?model=m&session_id=thread-a";
+    let response = app
+        .clone()
+        .oneshot(request(port, "invalid-key", status_path, None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let poll = |path: &'static str| {
+        let app = app.clone();
+        let key = key.clone();
+        async move {
+            let response = app.oneshot(request(port, &key, path, None)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 8192).await.unwrap())
+                .unwrap()
+        }
+    };
+    assert_eq!(poll(status_path).await, json!({"source":null}));
+    codexpress_gateway::balance::query(&state, json!({"source_id":"api"}))
+        .await
+        .unwrap();
+    assert_eq!(balance_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(poll(status_path).await, json!({"source":null}));
+    let launch = || {
+        let app = app.clone();
+        let mut req = request(
+            port,
+            &key,
+            "/v1/chat/completions",
+            Some(
+                json!({"model":"m","messages":[{"role":"user","content":"PRIVATE-STATUS-PROMPT"}]}),
+            ),
+        );
+        req.headers_mut()
+            .insert("thread-id", "thread-a".parse().unwrap());
+        req.headers_mut().insert(
+            "x-private-fixture",
+            "PRIVATE-STATUS-HEADER".parse().unwrap(),
+        );
+        // Thread wins over the broader session header.
+        req.headers_mut()
+            .insert("session-id", "different-session".parse().unwrap());
+        tokio::spawn(async move {
+            let response = app.oneshot(req).await.unwrap();
+            let status = response.status();
+            let _ = to_bytes(response.into_body(), 8192).await.unwrap();
+            status
+        })
+    };
+    let inference = launch();
+    started.notified().await;
+    let expected = json!({"source":{"id":"api","name":"API","kind":"api","balance":{"amount":87.5,"currency":"USD"}}});
+    let actual = poll(status_path).await;
+    assert_eq!(actual, expected);
+    for secret in [
+        "PRIVATE-STATUS-PROMPT",
+        "PRIVATE-STATUS-HEADER",
+        "PRIVATE-UPSTREAM-KEY",
+        "PRIVATE-NATIVE-KEY",
+        key.as_str(),
+    ] {
+        assert!(!actual.to_string().contains(secret));
+    }
+    for path in [
+        "/v1/codexpress/status?model=m2&session_id=thread-a",
+        "/v1/codexpress/status?model=m&session_id=thread-b",
+        "/v1/codexpress/status?model=m&session_id=Thread-a",
+        "/v1/codexpress/status?model=m&session_id=different-session",
+    ] {
+        assert_eq!(poll(path).await, json!({"source":null}));
+    }
+    release.notify_one();
+    assert_eq!(inference.await.unwrap(), StatusCode::OK);
+    assert_eq!(poll(status_path).await, expected);
+    assert_eq!(balance_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(inference_calls.load(Ordering::SeqCst), 1);
+    let removed = state.sources.write().await.pop().unwrap();
+    assert_eq!(poll(status_path).await, json!({"source":null}));
+    state.sources.write().await.push(removed);
+    let original = state.sources.read().await[0].source.clone();
+    state.sources.write().await[0].source.secret["api_key"] = json!("changed-private-fixture");
+    assert_eq!(poll(status_path).await, json!({"source":null}));
+    state.sources.write().await[0].source = original;
+    let rejected = launch();
+    started.notified().await;
+    release.notify_one();
+    assert_eq!(rejected.await.unwrap(), StatusCode::BAD_REQUEST);
+    assert_eq!(poll(status_path).await, json!({"source":null}));
+    state.sources.write().await.clear();
+    assert_eq!(poll(status_path).await, json!({"source":null}));
+    assert_eq!(balance_calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn local_plugin_session_is_consumed_preserves_cache_key_and_defers_to_explicit_thread() {
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (base, task) = serve(
+        Router::new()
+            .route(
+                "/responses",
+                post({
+                    let captured = captured.clone();
+                    move |request: Request| {
+                        let captured = captured.clone();
+                        async move {
+                            let thread =
+                                request.headers()["thread-id"].to_str().unwrap().to_owned();
+                            let payload: Value = serde_json::from_slice(
+                                &to_bytes(request.into_body(), 8192).await.unwrap(),
+                            )
+                            .unwrap();
+                            captured.lock().unwrap().push((thread, payload));
+                            sse_events(vec![
+                                json!({"type":"response.completed","response":complete()}),
+                            ])
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/me/quota",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"data":{"userLimitTotalUsd":100,"userCurrentTotalUsd":12.5}}))
+                }),
+            ),
+    )
+    .await;
+    let (_dir, state, key, port) = state(&base).await;
+    codexpress_gateway::balance::query(&state, json!({"source_id":"api"}))
+        .await
+        .unwrap();
+    let app = chatbot::router(state.clone());
+    for (path, input, local_id, explicit) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","content":"fixture"}]}),
+            "plugin-chat",
+            None,
+        ),
+        (
+            "/v1/responses",
+            json!({"input":"fixture"}),
+            "plugin-responses",
+            None,
+        ),
+        (
+            "/v1/responses",
+            json!({"input":"fixture"}),
+            "ignored-local",
+            Some("explicit-thread"),
+        ),
+    ] {
+        let mut payload = input;
+        payload["model"] = json!("m");
+        payload["prompt_cache_key"] = json!("original-private-cache-key");
+        payload["codexpress_session_id"] = json!(local_id);
+        let mut req = request(port, &key, path, Some(payload));
+        if let Some(thread) = explicit {
+            req.headers_mut()
+                .insert("thread-id", thread.parse().unwrap());
+        }
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 8192).await.unwrap();
+        let session = explicit.unwrap_or(local_id);
+        let status_path = format!("/v1/codexpress/status?model=m&session_id={session}");
+        let response = app
+            .clone()
+            .oneshot(request(port, &key, &status_path, None))
+            .await
+            .unwrap();
+        let status: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(status["source"]["id"], "api");
+        assert!(!status.to_string().contains("original-private-cache-key"));
+    }
+    {
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 3);
+        for ((thread, payload), expected) in
+            captured
+                .iter()
+                .zip(["plugin-chat", "plugin-responses", "explicit-thread"])
+        {
+            assert_eq!(thread, expected);
+            assert!(payload.get("codexpress_session_id").is_none());
+            assert_eq!(payload["prompt_cache_key"], "original-private-cache-key");
+        }
+    }
+    let response = app
+        .clone()
+        .oneshot(request(
+            port,
+            &key,
+            "/v1/codexpress/status?model=m&session_id=ignored-local",
+            None,
+        ))
+        .await
+        .unwrap();
+    let status: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+    assert_eq!(status, json!({"source":null}));
+    for invalid in [
+        Value::Null,
+        json!(42),
+        json!(""),
+        json!("x".repeat(513)),
+        json!("PRIVATE-INVALID-SESSION\n"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                port,
+                &key,
+                "/v1/responses",
+                Some(json!({"model":"m","input":"fixture","codexpress_session_id":invalid})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(error["error"]["param"], "codexpress_session_id");
+        assert!(!error.to_string().contains("PRIVATE-INVALID-SESSION"));
+    }
+    assert_eq!(captured.lock().unwrap().len(), 3);
+    task.abort();
+}

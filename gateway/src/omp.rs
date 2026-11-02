@@ -1,4 +1,5 @@
 //! Reversible OMP connection setup. Authentication stores and sessions are never opened.
+mod footer;
 use crate::{compaction::ModelCompactionRule, config::secure_write, model::AppState};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,8 @@ const SNAPSHOT_LIMIT: usize = 24 * 1024 * 1024;
 const PROVIDER: &[&str] = &["providers", "codexpress"];
 const DEFAULT_MODEL: &[&str] = &["modelRoles", "default"];
 const THRESHOLDS: &[&str] = &["compaction", "modelThresholds"];
+const STATUS_PLUGIN: &[u8] =
+    include_bytes!("../../Resources/omp/codexpress-status/codexpress-status.ts");
 
 #[derive(Clone, Serialize, Deserialize)]
 struct AttachedFile {
@@ -36,6 +39,10 @@ struct Snapshot {
     settings: AttachedFile,
     // A serialized YAML value distinguishes an absent key from an explicit null.
     threshold_before: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    status_plugin: Option<Vec<u8>>,
+    #[serde(default)]
+    footer_before: BTreeMap<String, Option<String>>,
 }
 struct Document {
     path: PathBuf,
@@ -239,6 +246,9 @@ fn owned_matches(snapshot: &Snapshot, models: &Value, settings: &Value) -> Resul
     let applied_settings = parse(&snapshot.settings.applied)?;
     Ok(at(models, PROVIDER) == at(&applied_models, PROVIDER)
         && at(settings, DEFAULT_MODEL) == at(&applied_settings, DEFAULT_MODEL)
+        && snapshot.footer_before.keys().all(|field| {
+            at(settings, &["statusLine", field]) == at(&applied_settings, &["statusLine", field])
+        })
         && snapshot.threshold_before.keys().all(|model| {
             at(settings, &["compaction", "modelThresholds", model])
                 == at(&applied_settings, &["compaction", "modelThresholds", model])
@@ -250,6 +260,17 @@ fn verify(snapshot: &Snapshot, models: &Document, settings: &Document) -> Result
         || !owned_matches(snapshot, &models.value, &settings.value)?
     {
         bail!("OMP 连接或模型压缩设置已被其他程序修改；为保留你的更改，未覆盖或恢复");
+    }
+    Ok(())
+}
+fn plugin_file(home: &Path) -> Result<PathBuf> {
+    let directory = normalized_dir(&home.join("extensions"))?;
+    Ok(directory.join("codexpress-status.ts"))
+}
+
+fn verify_plugin(snapshot: &Snapshot, current: Option<&[u8]>) -> Result<()> {
+    if snapshot.status_plugin.as_deref() != current {
+        bail!("OMP 状态栏插件已存在或被其他程序修改，未覆盖或恢复");
     }
     Ok(())
 }
@@ -449,12 +470,18 @@ fn status(
     let default = at(&settings.value, DEFAULT_MODEL)
         .and_then(Value::as_str)
         .and_then(|model| model.strip_prefix("codexpress/"));
+    let installed = read(&plugin_file(home)?, FILE_LIMIT)?;
+    let plugin_installed = snapshot
+        .and_then(|s| s.status_plugin.as_deref())
+        .is_some_and(|bytes| installed.as_deref() == Some(bytes));
     let needs_update = if let Some(snapshot) = snapshot {
         !owned_matches(snapshot, &models.value, &settings.value)?
             || at(&models.value, &["providers", "codexpress", "baseUrl"]).and_then(Value::as_str)
                 != Some(base_url)
             || at(&models.value, &["providers", "codexpress", "apiKey"]).and_then(Value::as_str)
                 != Some(local_key)
+            || !plugin_installed
+            || snapshot.status_plugin.as_deref() != Some(STATUS_PLUGIN)
     } else {
         false
     };
@@ -463,7 +490,7 @@ fn status(
         "settings_file":settings.path,"model_id":default,
         "model_count":provider.and_then(|provider| at(provider, &["models"]))
             .and_then(Value::as_sequence).map_or(0,Vec::len),
-        "base_url":base_url,"needs_update":needs_update}),
+        "base_url":base_url,"needs_update":needs_update,"status_plugin_installed":plugin_installed}),
     )
 }
 
@@ -476,6 +503,8 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
     let home = normalized_dir(Path::new(home))?;
     let mut models = choose(&home, "models", "models.json")?;
     let mut settings = choose(&home, "config", "settings.json")?;
+    let plugin_path = plugin_file(&home)?;
+    let plugin_before = read(&plugin_path, FILE_LIMIT)?;
     let previous = load_snapshot(&state.state_dir)?;
     if let Some(snapshot) = &previous {
         same_home(snapshot, &home, &models, &settings)?;
@@ -498,6 +527,7 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
     }
     if let Some(snapshot) = &previous {
         verify(snapshot, &models, &settings)?;
+        verify_plugin(snapshot, plugin_before.as_deref())?;
     }
     if op == "omp.restore" {
         let Some(snapshot) = previous else {
@@ -519,12 +549,26 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
             DEFAULT_MODEL,
             at(&original_settings, DEFAULT_MODEL).cloned(),
         )?;
+        for (field, original) in &snapshot.footer_before {
+            let original = original
+                .as_ref()
+                .map(|value| {
+                    serde_yaml::from_str(value).map_err(|_| anyhow::anyhow!("OMP 连接快照损坏"))
+                })
+                .transpose()?;
+            put(&mut restored_settings, &["statusLine", field], original)?;
+        }
         restore_thresholds(&mut restored_settings, &snapshot.threshold_before)?;
         prune(&mut restored_models, &original_models, &[&["providers"]])?;
         prune(
             &mut restored_settings,
             &original_settings,
-            &[THRESHOLDS, &["compaction"], &["modelRoles"]],
+            &[
+                THRESHOLDS,
+                &["compaction"],
+                &["modelRoles"],
+                &["statusLine"],
+            ],
         )?;
         let models_after = if restored_models == original_models {
             snapshot.models.original.clone()
@@ -547,6 +591,7 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
                 settings.bytes.as_deref(),
                 settings_after.as_deref(),
             ),
+            (&plugin_path, plugin_before.as_deref(), None),
         ])?;
         fs::remove_file(snapshot_path(&state.state_dir))
             .context("OMP 已恢复，但连接快照未能移除")?;
@@ -607,6 +652,9 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
     if previous.is_none() && at(&models.value, PROVIDER).is_some() {
         bail!("OMP 已有名为 codexpress 的供应商，未覆盖");
     }
+    if previous.is_none() && plugin_before.is_some() {
+        bail!("OMP 已有同名状态栏插件，未覆盖");
+    }
     let mut models_after = models.value.clone();
     let mut settings_after = settings.value.clone();
     let mut snapshot = match previous.as_ref() {
@@ -617,6 +665,8 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
             models: attached_file(&models, Vec::new())?,
             settings: attached_file(&settings, Vec::new())?,
             threshold_before: BTreeMap::new(),
+            status_plugin: None,
+            footer_before: BTreeMap::new(),
         },
     };
     restore_thresholds(&mut settings_after, &snapshot.threshold_before)?;
@@ -650,7 +700,18 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
         DEFAULT_MODEL,
         Some(key(&format!("codexpress/{selected}"))),
     )?;
+    for (field, value) in footer::values(&settings_after)? {
+        if !snapshot.footer_before.contains_key(&field) {
+            let before = at(&settings.value, &["statusLine", &field])
+                .map(serde_yaml::to_string)
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("无法保存原 OMP 状态栏设置"))?;
+            snapshot.footer_before.insert(field.clone(), before);
+        }
+        put(&mut settings_after, &["statusLine", &field], Some(value))?;
+    }
     snapshot.models.applied = encode(&models_after)?;
+    snapshot.status_plugin = Some(STATUS_PLUGIN.to_vec());
     snapshot.settings.applied = encode(&settings_after)?;
     // Fully prepare both documents and verify both originals before the first mutation.
     if read(&models.path, FILE_LIMIT)? != models.bytes
@@ -662,6 +723,12 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
     fs::create_dir_all(&home).context("无法创建 OMP 配置目录")?;
     if !existed {
         fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
+    }
+    let extensions = plugin_path.parent().context("OMP 插件目录无效")?;
+    let extensions_existed = extensions.exists();
+    fs::create_dir_all(extensions).context("无法创建 OMP 插件目录")?;
+    if !extensions_existed {
+        fs::set_permissions(extensions, fs::Permissions::from_mode(0o700))?;
     }
     save_snapshot(&state.state_dir, &snapshot)?;
     if let Err(error) = write_files(&[
@@ -675,9 +742,11 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
             settings.bytes.as_deref(),
             Some(&snapshot.settings.applied),
         ),
+        (&plugin_path, plugin_before.as_deref(), Some(STATUS_PLUGIN)),
     ]) {
         if !read(&models.path, FILE_LIMIT).is_ok_and(|bytes| bytes == models.bytes)
             || !read(&settings.path, FILE_LIMIT).is_ok_and(|bytes| bytes == settings.bytes)
+            || !read(&plugin_path, FILE_LIMIT).is_ok_and(|bytes| bytes == plugin_before)
         {
             bail!("OMP 应用失败，文件未能完整恢复；连接快照已保留，请检查配置文件");
         }
