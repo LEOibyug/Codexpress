@@ -45,14 +45,17 @@ export function statusText(payload: unknown): string | undefined {
 	if (!name) return;
 	if (source.kind === "official") {
 		const quota = object(source.quota);
-		if (!quota || !percent(quota.short_remaining_percent) || !percent(quota.weekly_remaining_percent)) return;
-		return `${name} · 短期 ${Math.round(quota.short_remaining_percent)}% · 每周 ${Math.round(quota.weekly_remaining_percent)}%`;
+		if (!quota) return;
+		const windows = [quota.short_remaining_percent, quota.weekly_remaining_percent];
+		if (windows.some(value => value != null && !percent(value))) return;
+		const limits = windows.filter(percent).map(value => `${Math.round(value)}%`);
+		return limits.length ? `${name} ${limits.join("|")}` : undefined;
 	}
 	if (source.kind === "api") {
 		const balance = object(source.balance);
 		if (!balance || typeof balance.amount !== "number" || !Number.isFinite(balance.amount)
 			|| typeof balance.currency !== "string" || !/^[A-Za-z]{3}$/.test(balance.currency)) return;
-		return `${name} · 余额 ${balance.amount.toLocaleString("en-US", { maximumFractionDigits: 4 })} ${balance.currency.toUpperCase()}`;
+		return `${name} ${balance.amount.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1, useGrouping: false })}`;
 	}
 }
 

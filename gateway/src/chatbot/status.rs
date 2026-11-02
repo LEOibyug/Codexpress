@@ -241,27 +241,37 @@ fn main_quota(quota: &Value) -> Option<Value> {
         return None;
     }
     let windows = quota["windows"].as_array()?;
-    let remaining = |weekly: bool| {
-        windows
-            .iter()
-            .find(|window| {
-                matches!(window["name"].as_str(), Some("primary" | "secondary"))
-                    && window["window_seconds"].as_f64().is_some_and(|seconds| {
-                        if weekly {
-                            seconds == 604800.0
-                        } else {
-                            seconds > 0.0 && seconds < 604800.0
-                        }
-                    })
-            })
-            .and_then(|window| window["used_percent"].as_f64())
-            .filter(|n| n.is_finite() && (0.0..=100.0).contains(n))
-            .map(|used| 100.0 - used)
-    };
-    let short = remaining(false);
-    let weekly = remaining(true);
-    (short.is_some() && weekly.is_some())
-        .then(|| json!({"short_remaining_percent":short,"weekly_remaining_percent":weekly}))
+    let mut short = None;
+    let mut weekly = None;
+    let mut count = 0;
+    for window in windows
+        .iter()
+        .filter(|window| matches!(window["name"].as_str(), Some("primary" | "secondary")))
+    {
+        let seconds = window["window_seconds"]
+            .as_f64()
+            .filter(|value| value.is_finite() && *value > 0.0)?;
+        let used = window["used_percent"]
+            .as_f64()
+            .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))?;
+        let target = if seconds < 604800.0 {
+            &mut short
+        } else if seconds == 604800.0 {
+            &mut weekly
+        } else {
+            return None;
+        };
+        if target.replace(100.0 - used).is_some() {
+            return None;
+        }
+        count += 1;
+    }
+    // A complete authenticated snapshot can genuinely contain only one window.
+    // Partial header observations must not turn a missing limit into a plan perk.
+    if count == 0 || (count == 1 && quota["complete"] != true) {
+        return None;
+    }
+    Some(json!({"short_remaining_percent":short,"weekly_remaining_percent":weekly}))
 }
 
 #[cfg(test)]
@@ -378,6 +388,30 @@ mod tests {
         assert_eq!(
             reversed,
             json!({"short_remaining_percent":80.0,"weekly_remaining_percent":40.0})
+        );
+    }
+    #[test]
+    fn a_complete_single_window_plan_does_not_require_a_fabricated_second_limit() {
+        let single = json!({"plan_type":"pro","complete":true,"stale":false,
+            "windows":[{"name":"primary","window_seconds":604800,"used_percent":25}]});
+        assert_eq!(
+            main_quota(&single),
+            Some(json!({"short_remaining_percent":null,"weekly_remaining_percent":75.0}))
+        );
+        let mut incomplete = single.clone();
+        incomplete["complete"] = json!(false);
+        assert!(main_quota(&incomplete).is_none());
+        let mut unknown_second = single.clone();
+        unknown_second["windows"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"secondary","window_seconds":18000,"used_percent":null}));
+        assert!(main_quota(&unknown_second).is_none());
+        let mut short_only = single;
+        short_only["windows"][0]["window_seconds"] = json!(18000);
+        assert_eq!(
+            main_quota(&short_only),
+            Some(json!({"short_remaining_percent":75.0,"weekly_remaining_percent":null}))
         );
     }
     #[tokio::test]
