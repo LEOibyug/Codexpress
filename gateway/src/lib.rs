@@ -13,6 +13,7 @@ pub mod management;
 pub mod model;
 pub mod notifications;
 pub mod official;
+pub mod omp;
 pub mod pricing;
 pub mod relay;
 pub mod remote;

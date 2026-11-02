@@ -154,6 +154,7 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
                 payload.get("model").and_then(Value::as_str),
             )
         }
+        op if op.starts_with("omp.") => crate::omp::handle(state, op, payload).await,
         op if op.starts_with("config.") => config::handle(state, op, payload).await,
         op if op.starts_with("official.") => crate::official::handle(state, op, payload).await,
         _ => bail!("未知管理操作"),

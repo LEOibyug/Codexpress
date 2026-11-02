@@ -48,6 +48,7 @@ sources.json
 reset-operations.json
 balance-warnings.json
 config-attachment.json
+**/omp/attachment.json
 configuration-backups/
 model-catalogs/
 .metadata-*

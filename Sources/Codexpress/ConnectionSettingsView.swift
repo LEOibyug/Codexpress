@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum ConnectionSection: String, CaseIterable, Identifiable {
-    case codex = "Codex", chatbot = "聊天客户端", remote = "远端 SSH", images = "图片生成"
+    case codex = "Codex", omp = "OMP", chatbot = "聊天客户端", remote = "远端 SSH", images = "图片生成"
     var id: String { rawValue }
 }
 
@@ -21,6 +21,7 @@ struct ConnectionSettingsView: View {
             Group {
                 switch section {
                 case .codex: CodexSettingsView()
+                case .omp: OMPSettingsView()
                 case .chatbot: ChatbotSettingsView()
                 case .remote: SSHRemoteView()
                 case .images: ImageSettingsView()

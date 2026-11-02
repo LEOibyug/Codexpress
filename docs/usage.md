@@ -272,6 +272,14 @@ Responses 本身允许 `system` 消息。第三方代理若在 HTTP 400／422 �
 
 协议依据：[OpenAI Responses 迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses)、[流式事件指南](https://developers.openai.com/api/docs/guides/streaming-responses)和公开 Codex 客户端请求结构。
 
+## OMP 一键接入
+
+在「接入 → OMP」确认自动检测的配置目录，选择默认模型，点击「一键设置」。应用会新增 `codexpress` 供应商，自动填入聊天客户端入口的地址和独立 Key，并同步已保存的模型上下文窗口与压缩阈值。无需在 OMP 中重新登录官方账号。
+
+配置默认位于 `~/.omp/agent`；使用 profile 或自定义目录时可手动选择。支持 `models.yml`／`models.yaml` 和 `config.yml`／`config.yaml`，已有其他供应商、工具设置及会话保留。配置在新启动的 OMP 中生效；已有会话可重新选择 `codexpress` 下的模型。
+
+首次设置会备份原配置，后续重复设置保留最初的还原点。「还原原配置」撤回本应用管理的供应商、默认模型和模型压缩规则，同时保留之后对其他字段的修改。若受管字段已被其他程序改动，应用会提示冲突并停止覆盖。更改聊天客户端端口或 Key 后，此页会显示「待更新」，再次点击「一键设置」即可同步。
+
 ## SSH 远端接入
 
 此功能将远端 Codex 连接到当前 Mac 上的来源池网关，不提供远端直接官方登录。SSH 只用于探测、验证和配置；后续推理请求直接通过网络访问 Mac，不随 SSH 连接转发。

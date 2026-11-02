@@ -45,7 +45,7 @@ struct OverviewView: View {
                 }
                 SettingsCard("接入与服务", symbol: "point.3.connected.trianglepath.dotted") {
                     LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)], spacing: 12) {
-                        entry(.codex, symbol: "terminal")
+                        entry(.omp, symbol: "chevron.left.forwardslash.chevron.right")
                         entry(.chatbot, symbol: "bubble.left.and.bubble.right")
                         entry(.remote, symbol: "desktopcomputer")
                         entry(.images, symbol: "photo")
