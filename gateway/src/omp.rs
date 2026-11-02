@@ -1,6 +1,9 @@
 //! Reversible OMP connection setup. Authentication stores and sessions are never opened.
+mod configuration;
+mod document;
 mod footer;
-use crate::{compaction::ModelCompactionRule, config::secure_write, model::AppState};
+mod preferences;
+use crate::{config::secure_write, model::AppState};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
@@ -37,8 +40,13 @@ struct Snapshot {
     agent_dir: PathBuf,
     models: AttachedFile,
     settings: AttachedFile,
-    // A serialized YAML value distinguishes an absent key from an explicit null.
+    // Read once when migrating the original connection-only snapshot.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     threshold_before: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    native_before: Vec<configuration::Original>,
+    #[serde(default)]
+    added_models: Vec<Value>,
     #[serde(default)]
     status_plugin: Option<Vec<u8>>,
     #[serde(default)]
@@ -63,6 +71,9 @@ fn at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
 fn put(value: &mut Value, path: &[&str], replacement: Option<Value>) -> Result<()> {
     let (field, rest) = path.split_first().context("OMP 配置字段无效")?;
     if value.is_null() {
+        if replacement.is_none() {
+            return Ok(());
+        }
         *value = mapping();
     }
     let table = value
@@ -198,15 +209,16 @@ fn load_snapshot(state_dir: &Path) -> Result<Option<Snapshot>> {
     let Some(bytes) = read(&path, SNAPSHOT_LIMIT)? else {
         return Ok(None);
     };
-    let snapshot: Snapshot = serde_json::from_slice(&bytes)
+    let mut snapshot: Snapshot = serde_json::from_slice(&bytes)
         .map_err(|_| anyhow::anyhow!("OMP 连接快照损坏，停止覆盖配置"))?;
-    if snapshot.version != 1
+    if ![1, 2].contains(&snapshot.version)
         || !["models.yml", "models.yaml"].contains(&snapshot.models.name.as_str())
         || !["config.yml", "config.yaml"].contains(&snapshot.settings.name.as_str())
         || snapshot.threshold_before.len() > 200
     {
         bail!("OMP 连接快照无效，停止覆盖配置");
     }
+    configuration::migrate(&mut snapshot)?;
     Ok(Some(snapshot))
 }
 fn save_snapshot(state_dir: &Path, snapshot: &Snapshot) -> Result<()> {
@@ -246,14 +258,12 @@ fn owned_matches(snapshot: &Snapshot, models: &Value, settings: &Value) -> Resul
     let applied_settings = parse(&snapshot.settings.applied)?;
     // OMP saves model/thinking choices during normal use. They are user
     // preferences, not a connection or credential integrity boundary.
-    Ok(at(models, PROVIDER) == at(&applied_models, PROVIDER)
-        && snapshot.footer_before.keys().all(|field| {
-            at(settings, &["statusLine", field]) == at(&applied_settings, &["statusLine", field])
-        })
-        && snapshot.threshold_before.keys().all(|model| {
-            at(settings, &["compaction", "modelThresholds", model])
-                == at(&applied_settings, &["compaction", "modelThresholds", model])
-        }))
+    Ok(["api", "baseUrl", "apiKey", "auth"].iter().all(|field| {
+        at(models, &["providers", "codexpress", field])
+            == at(&applied_models, &["providers", "codexpress", field])
+    }) && snapshot.footer_before.keys().all(|field| {
+        at(settings, &["statusLine", field]) == at(&applied_settings, &["statusLine", field])
+    }))
 }
 fn verify(snapshot: &Snapshot, models: &Document, settings: &Document) -> Result<()> {
     if models.bytes.is_none()
@@ -272,21 +282,6 @@ fn plugin_file(home: &Path) -> Result<PathBuf> {
 fn verify_plugin(snapshot: &Snapshot, current: Option<&[u8]>) -> Result<()> {
     if snapshot.status_plugin.as_deref() != current {
         bail!("OMP 状态栏插件已存在或被其他程序修改，未覆盖或恢复");
-    }
-    Ok(())
-}
-fn restore_thresholds(
-    settings: &mut Value,
-    originals: &BTreeMap<String, Option<String>>,
-) -> Result<()> {
-    for (model, original) in originals {
-        let value = original
-            .as_ref()
-            .map(|value| {
-                serde_yaml::from_str(value).map_err(|_| anyhow::anyhow!("OMP 连接快照损坏"))
-            })
-            .transpose()?;
-        put(settings, &["compaction", "modelThresholds", model], value)?;
     }
     Ok(())
 }
@@ -344,7 +339,7 @@ fn verify_model_access(settings: &Value, selected: &str) -> Result<()> {
     }
     Ok(())
 }
-fn model_metadata(ids: &BTreeSet<String>, rules: &[ModelCompactionRule]) -> Result<Value> {
+fn model_metadata(ids: &BTreeSet<String>) -> Result<Value> {
     let catalog = crate::compaction::bundled_catalog()?;
     let models = catalog["models"].as_array().context("内置模型目录无效")?;
     let mut output = Vec::new();
@@ -386,17 +381,6 @@ fn model_metadata(ids: &BTreeSet<String>, rules: &[ModelCompactionRule]) -> Resu
                 }
             }
         }
-        if let Some(window) = rules
-            .iter()
-            .find(|rule| &rule.model == id)
-            .and_then(|rule| rule.context_window)
-        {
-            put(
-                &mut model,
-                &["contextWindow"],
-                Some(Value::Number(window.into())),
-            )?;
-        }
         output.push(model);
     }
     Ok(Value::Sequence(output))
@@ -424,6 +408,9 @@ fn write_files(changes: &[FileChange<'_>]) -> Result<()> {
         for (path, before, after) in changes {
             if read(path, FILE_LIMIT)?.as_deref() != *before {
                 bail!("OMP 配置在写入前发生变化，未覆盖");
+            }
+            if before == after {
+                continue;
             }
             match after {
                 Some(bytes) => {
@@ -501,12 +488,14 @@ fn status(
         "settings_file":settings.path,"model_id":default,
         "model_count":provider.and_then(|provider| at(provider, &["models"]))
             .and_then(Value::as_sequence).map_or(0,Vec::len),
-        "base_url":base_url,"needs_update":needs_update,"status_plugin_installed":plugin_installed}),
+        "base_url":base_url,"needs_update":needs_update,"status_plugin_installed":plugin_installed,
+        "configuration_revision":configuration::revision(models, settings),
+        "configuration":preferences::configuration(&settings.value, &models.value)?}),
     )
 }
 
 pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Json> {
-    if !["omp.status", "omp.attach", "omp.restore"].contains(&op) {
+    if !["omp.status", "omp.attach", "omp.restore", "omp.configure"].contains(&op) {
         bail!("未知 OMP 管理操作");
     }
     let _guard = state.config_lock.lock().await;
@@ -536,6 +525,21 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
             &local_key,
         );
     }
+    if op == "omp.configure" {
+        let snapshot = previous.as_ref().context("请先接入 OMP，再修改压缩配置")?;
+        let updated =
+            configuration::configure(&state.state_dir, snapshot, &models, &settings, &payload)?;
+        models = choose(&home, "models", "models.json")?;
+        settings = choose(&home, "config", "settings.json")?;
+        return status(
+            Some(&updated),
+            &home,
+            &models,
+            &settings,
+            base_url,
+            &local_key,
+        );
+    }
     if let Some(snapshot) = &previous {
         verify(snapshot, &models, &settings)?;
         verify_plugin(snapshot, plugin_before.as_deref())?;
@@ -550,11 +554,7 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
         let original_settings = parse(snapshot.settings.baseline.as_bytes())?;
         let mut restored_models = models.value.clone();
         let mut restored_settings = settings.value.clone();
-        put(
-            &mut restored_models,
-            PROVIDER,
-            at(&original_models, PROVIDER).cloned(),
-        )?;
+        configuration::restore(&snapshot, &mut restored_models, &mut restored_settings)?;
         let selected_codexpress = at(&settings.value, DEFAULT_MODEL)
             .and_then(Value::as_str)
             .and_then(|selection| selection.split_once('/'))
@@ -575,7 +575,7 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
                 .transpose()?;
             put(&mut restored_settings, &["statusLine", field], original)?;
         }
-        restore_thresholds(&mut restored_settings, &snapshot.threshold_before)?;
+        configuration::restore_provider(&snapshot, &mut restored_models, &original_models)?;
         prune(&mut restored_models, &original_models, &[&["providers"]])?;
         prune(
             &mut restored_settings,
@@ -590,12 +590,20 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
         let models_after = if restored_models == original_models {
             snapshot.models.original.clone()
         } else {
-            Some(encode(&restored_models)?)
+            Some(document::patch(
+                models.bytes.as_deref(),
+                &models.value,
+                &restored_models,
+            )?)
         };
         let settings_after = if restored_settings == original_settings {
             snapshot.settings.original.clone()
         } else {
-            Some(encode(&restored_settings)?)
+            Some(document::patch(
+                settings.bytes.as_deref(),
+                &settings.value,
+                &restored_settings,
+            )?)
         };
         write_files(&[
             (
@@ -630,17 +638,6 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
             Err(_) => bail!("无法检查 OMP 配置迁移状态"),
         }
     }
-    let rules: Vec<ModelCompactionRule> = serde_json::from_value(
-        payload
-            .get("model_rules")
-            .cloned()
-            .unwrap_or_else(|| json!([])),
-    )
-    .map_err(|_| anyhow::anyhow!("OMP 模型压缩规则格式无效"))?;
-    crate::compaction::validate(&rules)?;
-    if rules.iter().any(|rule| !valid_model(&rule.model)) {
-        bail!("OMP 模型 ID 不能包含空白或控制字符");
-    }
     let selected = payload["model_id"]
         .as_str()
         .filter(|model| valid_model(model))
@@ -662,7 +659,6 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
                 .cloned()
         })
         .collect();
-    ids.extend(rules.iter().map(|rule| rule.model.clone()));
     ids.insert(selected_model.into());
     if ids.len() > 10_000 {
         bail!("OMP 模型列表超过 10000 项");
@@ -678,40 +674,33 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
     let mut snapshot = match previous.as_ref() {
         Some(snapshot) => snapshot.clone(),
         None => Snapshot {
-            version: 1,
+            version: 2,
             agent_dir: home.clone(),
             models: attached_file(&models, Vec::new())?,
             settings: attached_file(&settings, Vec::new())?,
             threshold_before: BTreeMap::new(),
+            native_before: Vec::new(),
+            added_models: Vec::new(),
             status_plugin: None,
             footer_before: BTreeMap::new(),
         },
     };
-    restore_thresholds(&mut settings_after, &snapshot.threshold_before)?;
-    let mut threshold_before = BTreeMap::new();
-    for rule in &rules {
-        let model = format!("codexpress/{}", rule.model);
-        let original = at(&settings_after, &["compaction", "modelThresholds", &model])
-            .map(|value| {
-                serde_yaml::to_string(value)
-                    .map_err(|_| anyhow::anyhow!("无法保存原 OMP 模型压缩设置"))
-            })
-            .transpose()?;
-        threshold_before.insert(model.clone(), original);
+    for (field, value) in [
+        ("api", "openai-responses"),
+        ("baseUrl", base_url),
+        ("apiKey", local_key.as_str()),
+        ("auth", "apiKey"),
+    ] {
         put(
-            &mut settings_after,
-            &["compaction", "modelThresholds", &model],
-            Some(key(&format!("f{}", rule.auto_compact_token_limit))),
+            &mut models_after,
+            &["providers", "codexpress", field],
+            Some(key(value)),
         )?;
     }
-    snapshot.threshold_before = threshold_before;
-    let provider = serde_yaml::to_value(json!({"api":"openai-responses","baseUrl":base_url,
-        "apiKey":local_key,"auth":"apiKey"}))?;
-    put(&mut models_after, PROVIDER, Some(provider))?;
-    put(
+    configuration::merge_models(
         &mut models_after,
-        &["providers", "codexpress", "models"],
-        Some(model_metadata(&ids, &rules)?),
+        model_metadata(&ids)?,
+        &mut snapshot.added_models,
     )?;
     put(
         &mut settings_after,
@@ -728,9 +717,11 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
         }
         put(&mut settings_after, &["statusLine", &field], Some(value))?;
     }
-    snapshot.models.applied = encode(&models_after)?;
+    snapshot.models.applied =
+        document::patch(models.bytes.as_deref(), &models.value, &models_after)?;
     snapshot.status_plugin = Some(STATUS_PLUGIN.to_vec());
-    snapshot.settings.applied = encode(&settings_after)?;
+    snapshot.settings.applied =
+        document::patch(settings.bytes.as_deref(), &settings.value, &settings_after)?;
     // Fully prepare both documents and verify both originals before the first mutation.
     if read(&models.path, FILE_LIMIT)? != models.bytes
         || read(&settings.path, FILE_LIMIT)? != settings.bytes

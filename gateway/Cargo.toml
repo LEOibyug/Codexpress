@@ -1,6 +1,6 @@
 [package]
 name = "codexpress-gateway"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 rust-version = "1.85"
 
@@ -26,6 +26,7 @@ tokio = { version = "1", features = ["full"] }
 toml_edit = "0.22"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+yaml-edit = "=0.3.6"
 zstd = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]

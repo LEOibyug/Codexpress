@@ -48,16 +48,30 @@ fn yaml(path: &Path) -> Value {
     serde_yaml::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 async fn apply(state: &Arc<AppState>, home: &Path) -> Value {
+    let attached = call(state, "omp.attach", home, json!({"model_id":"gpt-6-astra"}))
+        .await
+        .unwrap();
+    configure(state, home, &attached, json!([
+        {"file":"config","path":["compaction","modelThresholds","codexpress/gpt-6-astra"],"value":"f180000"},
+        {"file":"models","path":["providers","codexpress","modelOverrides","gpt-6-astra","contextWindow"],"value":300000}
+    ])).await.unwrap()
+}
+
+async fn configure(
+    state: &Arc<AppState>,
+    home: &Path,
+    status: &Value,
+    edits: Value,
+) -> anyhow::Result<Value> {
     call(
         state,
-        "omp.attach",
+        "omp.configure",
         home,
-        json!({"model_id":"gpt-6-astra", "model_rules":[
-            {"model":"gpt-6-astra","auto_compact_token_limit":180000,"context_window":300000}
-        ]}),
+        json!({
+            "expected_revision":status["configuration_revision"], "edits":edits
+        }),
     )
     .await
-    .unwrap()
 }
 
 #[tokio::test]
@@ -101,15 +115,6 @@ async fn merge_preserves_providers_defaults_and_compression_and_never_returns_ke
         settings["compaction"]["modelThresholds"]["codexpress/gpt-6-astra"],
         "f180000"
     );
-    let metadata = models["providers"]["codexpress"]["models"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|model| model["id"] == "gpt-6-astra")
-        .unwrap();
-    assert_eq!(metadata["contextWindow"], 300000);
-    assert_eq!(metadata["reasoning"], true);
-    assert_eq!(metadata["input"], json!(["text", "image"]));
     assert_eq!(attached["model_count"], 2);
     assert_eq!(attached["needs_update"], false);
     assert!(!attached.to_string().contains(key["key"].as_str().unwrap()));
@@ -181,18 +186,20 @@ async fn repeated_apply_updates_local_key_and_rules_but_restores_first_bytes() {
         &state,
         "omp.attach",
         &home,
-        json!({"model_id":"explicit-model","model_rules":[
-            {"model":"added-model","auto_compact_token_limit":9999,"context_window":100000}
-        ]}),
+        json!({"model_id":"explicit-model"}),
     )
     .await
     .unwrap();
     assert_eq!(attached["model_id"], "explicit-model");
     assert_eq!(attached["needs_update"], false);
+    configure(&state, &home, &attached, json!([
+        {"file":"config","path":["compaction","modelThresholds","codexpress/gpt-6-astra"],"remove":true},
+        {"file":"config","path":["compaction","modelThresholds","codexpress/source-model"],"value":"f9999"}
+    ])).await.unwrap();
     let settings = yaml(&home.join("config.yml"));
     assert!(settings["compaction"]["modelThresholds"]["codexpress/gpt-6-astra"].is_null());
     assert_eq!(
-        settings["compaction"]["modelThresholds"]["codexpress/added-model"],
+        settings["compaction"]["modelThresholds"]["codexpress/source-model"],
         "f9999"
     );
     call(&state, "omp.restore", &home, json!({})).await.unwrap();
@@ -647,4 +654,84 @@ async fn restoring_gateway_keeps_a_later_non_codexpress_default_model() {
     );
     assert!(!home.join("models.yml").exists());
     assert!(!home.join("extensions/codexpress-status.ts").exists());
+}
+
+#[tokio::test]
+async fn precise_edits_reject_stale_views_and_preserve_unmanaged_provider_preferences() {
+    let (directory, state) = fixture().await;
+    let home = directory.path().join("agent");
+    fs::create_dir(&home).unwrap();
+    fs::write(
+        home.join("config.yml"),
+        "# retained\ncompaction:\n  modelThresholds:\n    codexpress/*: 80% # untouched selector\n",
+    )
+    .unwrap();
+    let attached = call(
+        &state,
+        "omp.attach",
+        &home,
+        json!({"model_id":"gpt-6-astra"}),
+    )
+    .await
+    .unwrap();
+    let status = configure(&state, &home, &attached, json!([
+        {"file":"config","path":["compaction","modelThresholds","codexpress/gpt-6-astra"],"value":null},
+        {"file":"models","path":["providers","codexpress","modelOverrides","gpt-6-astra","contextWindow"],"value":300000}
+    ])).await.unwrap();
+    let mut models = yaml(&home.join("models.yml"));
+    models["providers"]["codexpress"]["modelOverrides"]["gpt-6-astra"]["maxTokens"] = json!(8192);
+    fs::write(
+        home.join("models.yml"),
+        serde_yaml::to_string(&models).unwrap(),
+    )
+    .unwrap();
+    let before = fs::read(home.join("config.yml")).unwrap();
+    let model_bytes = fs::read(home.join("models.yml")).unwrap();
+    assert!(configure(
+        &state,
+        &home,
+        &status,
+        json!([
+            {"file":"config","path":["compaction","enabled"],"value":false}
+        ])
+    )
+    .await
+    .is_err());
+    assert_eq!(fs::read(home.join("config.yml")).unwrap(), before);
+    assert_eq!(fs::read(home.join("models.yml")).unwrap(), model_bytes);
+    let fresh = call(&state, "omp.status", &home, json!({})).await.unwrap();
+    configure(&state, &home, &fresh, json!([
+        {"file":"config","path":["compaction","modelThresholds","codexpress/gpt-6-astra"],"remove":true}
+    ])).await.unwrap();
+    let settings = yaml(&home.join("config.yml"));
+    assert!(settings["compaction"]["modelThresholds"]
+        .get("codexpress/gpt-6-astra")
+        .is_none());
+    assert_eq!(
+        settings["compaction"]["modelThresholds"]["codexpress/*"],
+        "80%"
+    );
+    call(
+        &state,
+        "omp.attach",
+        &home,
+        json!({"model_id":"gpt-6-astra"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        yaml(&home.join("models.yml"))["providers"]["codexpress"]["modelOverrides"]["gpt-6-astra"]
+            ["maxTokens"],
+        8192
+    );
+    call(&state, "omp.restore", &home, json!({})).await.unwrap();
+    let provider = yaml(&home.join("models.yml"))["providers"]["codexpress"].clone();
+    assert_eq!(provider["modelOverrides"]["gpt-6-astra"]["maxTokens"], 8192);
+    assert!(provider.get("apiKey").is_none());
+    assert!(provider["modelOverrides"]["gpt-6-astra"]
+        .get("contextWindow")
+        .is_none());
+    assert!(fs::read_to_string(home.join("config.yml"))
+        .unwrap()
+        .contains("codexpress/*: 80% # untouched selector"));
 }

@@ -319,6 +319,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/chat/completions", post(chat))
         .route("/v1/responses", post(responses))
         .route("/responses", post(responses))
+        .route("/v1/responses/compact", post(compact))
+        .route("/responses/compact", post(compact))
         .route("/v1/codexpress/status", get(status::get))
         .route("/v1/codexpress/refresh", post(status::refresh))
         .route("/v1/codexpress/events", get(status::events))
@@ -398,28 +400,14 @@ async fn infer(state: Arc<AppState>, request: Request, format: requests::Format)
         Ok(v) => v,
         Err(_) => return error(StatusCode::BAD_REQUEST, "请求须为 JSON 对象", None),
     };
-    // Plugin correlation is local-only metadata, never a vendor payload field.
-    let local_thread = match body
-        .as_object_mut()
-        .and_then(|body| body.remove("codexpress_session_id"))
-    {
-        None => None,
-        Some(value) => {
-            let header = value
-                .as_str()
-                .filter(|value| status::valid(value, 512))
-                .and_then(|value| HeaderValue::from_str(value).ok())
-                .filter(|value| value.to_str().is_ok());
-            match header {
-                Some(header) => Some(header),
-                None => {
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        "codexpress_session_id 须为有效非空会话标识",
-                        Some("codexpress_session_id"),
-                    )
-                }
-            }
+    let local_thread = match take_local_thread(&mut body) {
+        Ok(thread) => thread,
+        Err(problem) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                problem.message,
+                Some(problem.param),
+            )
         }
     };
     let session = body["session_id"]
@@ -434,27 +422,7 @@ async fn infer(state: Arc<AppState>, request: Request, format: requests::Format)
     for field in ["session_id", "conversation_id"] {
         body.as_object_mut().unwrap().remove(field);
     }
-    // Only the authenticated adapter can mint this internal request. Incoming
-    // headers are restricted so client keys/cookies and vendor account IDs never
-    // reach the upstream or another ingress's history namespace.
-    let mut headers = axum::http::HeaderMap::new();
-    for name in [
-        "thread-id",
-        "thread_id",
-        "session-id",
-        "x-session-id",
-        "session_id",
-        "x-request-id",
-    ] {
-        if let Some(value) = parts.headers.get(name) {
-            headers.insert(axum::http::HeaderName::from_static(name), value.clone());
-        }
-    }
-    if !headers.contains_key("thread-id") && !headers.contains_key("thread_id") {
-        if let Some(thread) = local_thread {
-            headers.insert("thread-id", thread);
-        }
-    }
+    let mut headers = relay_headers(&state, &parts.headers, local_thread, "text/event-stream");
     if !headers.contains_key("thread-id") && !headers.contains_key("session-id") {
         if let Some(session) = session {
             headers.insert("session-id", session.parse().unwrap());
@@ -470,6 +438,95 @@ async fn infer(state: Arc<AppState>, request: Request, format: requests::Format)
             .conversation_status
             .begin(&ingress.namespace, thread, model);
         parts.extensions.insert(tracking);
+    }
+    parts.headers = headers;
+    parts.uri = "/v1/responses".parse().unwrap();
+    let request = Request::from_parts(parts, Body::from(serde_json::to_vec(&body).unwrap()));
+    let response = crate::relay::forward(State(state), request).await;
+    responses::adapt(response, options).await
+}
+
+// V1 compaction is a native JSON exchange, not a generation request. Preserve
+// opaque history and return the relay body without a presentation adapter.
+async fn compact(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    let (mut parts, body) = request.into_parts();
+    let bytes = match crate::request_body::read(body, "chatbot").await {
+        Ok(bytes) => bytes,
+        Err(problem) => return error(problem.status, problem.message, None),
+    };
+    let mut body: Value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(body) if body.is_object() => body,
+        _ => return error(StatusCode::BAD_REQUEST, "请求须为 JSON 对象", None),
+    };
+    let has_local_thread = body.get("codexpress_session_id").is_some();
+    let local_thread = match take_local_thread(&mut body) {
+        Ok(thread) => thread,
+        Err(problem) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                problem.message,
+                Some(problem.param),
+            )
+        }
+    };
+    parts.headers = relay_headers(&state, &parts.headers, local_thread, "application/json");
+    parts.uri = match parts.uri.query() {
+        Some(query) => format!("/v1/responses/compact?{query}").parse().unwrap(),
+        None => "/v1/responses/compact".parse().unwrap(),
+    };
+    let bytes = if has_local_thread {
+        bytes::Bytes::from(serde_json::to_vec(&body).unwrap())
+    } else {
+        bytes
+    };
+    crate::relay::forward(State(state), Request::from_parts(parts, Body::from(bytes))).await
+}
+
+fn take_local_thread(body: &mut Value) -> std::result::Result<Option<HeaderValue>, Invalid> {
+    // Plugin correlation is local-only metadata, never a vendor payload field.
+    let Some(value) = body
+        .as_object_mut()
+        .and_then(|body| body.remove("codexpress_session_id"))
+    else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .filter(|value| status::valid(value, 512))
+        .and_then(|value| HeaderValue::from_str(value).ok())
+        .filter(|value| value.to_str().is_ok())
+        .map(Some)
+        .ok_or(Invalid {
+            message: "codexpress_session_id 须为有效非空会话标识",
+            param: "codexpress_session_id",
+        })
+}
+
+fn relay_headers(
+    state: &AppState,
+    incoming: &axum::http::HeaderMap,
+    local_thread: Option<HeaderValue>,
+    accept: &'static str,
+) -> axum::http::HeaderMap {
+    // Only this authenticated ingress can mint the internal relay request.
+    // Client keys, cookies and vendor account IDs never cross this boundary.
+    let mut headers = axum::http::HeaderMap::new();
+    for name in [
+        "thread-id",
+        "thread_id",
+        "session-id",
+        "x-session-id",
+        "session_id",
+        "x-request-id",
+    ] {
+        if let Some(value) = incoming.get(name) {
+            headers.insert(axum::http::HeaderName::from_static(name), value.clone());
+        }
+    }
+    if !headers.contains_key("thread-id") && !headers.contains_key("thread_id") {
+        if let Some(thread) = local_thread {
+            headers.insert("thread-id", thread);
+        }
     }
     headers.insert(
         header::HOST,
@@ -487,19 +544,12 @@ async fn infer(state: Arc<AppState>, request: Request, format: requests::Format)
         header::ACCEPT_ENCODING,
         HeaderValue::from_static("identity"),
     );
-    headers.insert(
-        header::ACCEPT,
-        HeaderValue::from_static("text/event-stream"),
-    );
+    headers.insert(header::ACCEPT, HeaderValue::from_static(accept));
     headers.insert(
         header::USER_AGENT,
         HeaderValue::from_static("Mozilla/5.0 Codexpress/0.1"),
     );
-    parts.headers = headers;
-    parts.uri = "/v1/responses".parse().unwrap();
-    let request = Request::from_parts(parts, Body::from(serde_json::to_vec(&body).unwrap()));
-    let response = crate::relay::forward(State(state), request).await;
-    responses::adapt(response, options).await
+    headers
 }
 
 pub(crate) use requests::repair;

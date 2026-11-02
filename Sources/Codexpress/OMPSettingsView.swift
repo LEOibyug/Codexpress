@@ -64,10 +64,6 @@ struct OMPSettingsView: View {
                                 .help("选择模型").accessibilityLabel("选择模型")
                         }
                     }
-                    SettingRow(title: "上下文压缩") {
-                        Text((model.settings.modelCompaction ?? []).isEmpty ? "OMP 默认" : "同步 \((model.settings.modelCompaction ?? []).count) 条模型规则")
-                            .foregroundStyle(.secondary)
-                    }
                     SettingRow(title: "状态栏扩展") {
                         Text(status["status_plugin_installed"].bool == true ? "已安装" : "随一键设置安装")
                             .foregroundStyle(.secondary)
@@ -90,6 +86,14 @@ struct OMPSettingsView: View {
                             .disabled(!canEdit || selectedModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
+                OMPCompactionSettingsView(
+                    configuration: status["configuration"],
+                    configurationRevision: status["configuration_revision"].string ?? "",
+                    agentDirectory: resolvedDirectory,
+                    canEdit: canEdit && attached,
+                    onSavingChange: { working = $0 },
+                    onSaved: { status = $0 }
+                )
             }.settingsPage()
         }
         .task { await detect() }
@@ -136,7 +140,7 @@ struct OMPSettingsView: View {
 
     private func apply() {
         let name = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        perform("omp.attach", additional: ["model_id": .string(name), "model_rules": (try? JSONValue.from(model.settings.modelCompaction ?? [])) ?? .array([])], message: "OMP 接入与状态栏扩展已设置，重新启动 OMP 后生效。")
+        perform("omp.attach", additional: ["model_id": .string(name)], message: "OMP 接入与状态栏扩展已设置，重新启动 OMP 后生效。")
     }
 
     private func restore() { perform("omp.restore", message: "OMP 原配置已还原。") }

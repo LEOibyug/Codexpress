@@ -1188,10 +1188,12 @@ async fn forward_once(
         } else {
             candidate
         };
+        // Native /responses/compact must not receive generation-only rewrites.
         let compatibility = parts
             .extensions
             .get::<crate::chatbot::ChatbotIngress>()
-            .is_some();
+            .is_some()
+            && parts.uri.path() == "/v1/responses";
         let mut payload = Payload::new(
             &parsed,
             &bytes,

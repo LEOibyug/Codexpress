@@ -167,6 +167,214 @@ async fn response_clients_accept_hybrid_fields_and_receive_buffered_response_obj
 }
 
 #[tokio::test]
+async fn localhost_native_compaction_preserves_json_and_keeps_generation_and_secrets_separate() {
+    const COMPACT: &str = "{\n  \"id\": \"cmp_fixture\", \"object\": \"response.compaction\", \"output\": [{\"type\":\"compaction\",\"encrypted_content\":\"opaque+/=\\u003d\"}], \"vendor_extension\": true\n}";
+    const NATIVE: &str = "{ \"model\":\"m\", \"instructions\":\"native policy\", \"input\":[{\"type\":\"reasoning\",\"encrypted_content\":\"opaque+/=\"}], \"prompt_cache_key\":\"native-cache\", \"max_output_tokens\":1 }";
+    const V2_NATIVE: &str = r#"{"model":"m","instructions":"native policy","input":[{"type":"reasoning","encrypted_content":"opaque+/="},{"type":"compaction_trigger"}],"stream":true,"store":false,"prompt_cache_key":"v2-cache","include":["reasoning.encrypted_content"]}"#;
+    const V2_STREAM: &str = "event: response.output_item.done\r\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"native-v2+/=\"}}\r\n\r\nevent: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_v2\",\"status\":\"completed\",\"output\":[{\"type\":\"compaction\",\"encrypted_content\":\"native-v2+/=\"}],\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\r\n\r\n";
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (upstream, upstream_task) = serve(
+        Router::new()
+            .route(
+                "/responses/compact",
+                post({
+                    let calls = calls.clone();
+                    move |request: Request| {
+                        let calls = calls.clone();
+                        async move {
+                            assert_eq!(
+                                request.headers()["authorization"],
+                                "Bearer PRIVATE-UPSTREAM-KEY"
+                            );
+                            assert_eq!(request.headers()["accept"], "application/json");
+                            assert_eq!(request.headers()["thread-id"], "compact-thread");
+                            assert_eq!(request.headers()["x-session-id"], "compact-session");
+                            for header in [
+                                "cookie",
+                                "origin",
+                                "chatgpt-account-id",
+                                "x-private-fixture",
+                            ] {
+                                assert!(!request.headers().contains_key(header));
+                            }
+                            let bytes = to_bytes(request.into_body(), 8192).await.unwrap();
+                            let body: Value = serde_json::from_slice(&bytes).unwrap();
+                            assert_eq!(body, serde_json::from_str::<Value>(NATIVE).unwrap());
+                            assert!(!body.to_string().contains("PRIVATE"));
+                            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                                assert_eq!(bytes.as_ref(), NATIVE.as_bytes());
+                            }
+                            Response::builder()
+                                .header("content-type", "application/json")
+                                .header("set-cookie", "PRIVATE-UPSTREAM-COOKIE")
+                                .header("authorization", "Bearer PRIVATE-UPSTREAM-KEY")
+                                .body(Body::from(COMPACT))
+                                .unwrap()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/responses",
+                post(|request: Request| async move {
+                    assert_eq!(
+                        request.headers()["authorization"],
+                        "Bearer PRIVATE-UPSTREAM-KEY"
+                    );
+                    for header in ["cookie", "origin", "x-private-fixture"] {
+                        assert!(!request.headers().contains_key(header));
+                    }
+                    let body: Value =
+                        serde_json::from_slice(&to_bytes(request.into_body(), 8192).await.unwrap())
+                            .unwrap();
+                    assert_eq!(body["stream"], true);
+                    assert!(!body.to_string().contains("PRIVATE"));
+                    if body["input"][0]["content"][0]["text"] == "seed native history" {
+                        let mut response = complete();
+                        response["id"] = json!("resp_native_origin");
+                        response["output"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!({"type":"reasoning","encrypted_content":"opaque+/="}));
+                        return sse_events(vec![
+                            json!({"type":"response.completed","response":response}),
+                        ]);
+                    }
+                    if body["input"][1]["type"] == "compaction_trigger" {
+                        let expected: Value = serde_json::from_str(V2_NATIVE).unwrap();
+                        assert_eq!(body, expected);
+                        return Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(V2_STREAM))
+                            .unwrap();
+                    }
+                    assert_eq!(body["input"][0]["role"], "user");
+                    assert!(body.get("messages").is_none());
+                    sse_events(vec![
+                        json!({"type":"response.completed","response":complete()}),
+                    ])
+                }),
+            ),
+    )
+    .await;
+    let (_dir, state, key, _) = state(&upstream).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    management::dispatch(
+        &state,
+        "chatbot.configure",
+        json!({"enabled":true,"port":port}),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    for path in ["/v1/responses/compact", "/responses/compact"] {
+        for secret in ["PRIVATE-NATIVE-KEY", "PRIVATE-UPSTREAM-KEY"] {
+            let response = client
+                .post(format!("{base}{path}"))
+                .bearer_auth(secret)
+                .body(NATIVE)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = client
+            .post(format!("{base}{path}"))
+            .bearer_auth(&key)
+            .header("host", "untrusted.invalid")
+            .body(NATIVE)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+    }
+    // Opaque history must first be observed from this source, not invented by
+    // the client: unknown ciphertext correctly takes the portable rebuild path.
+    let response = client
+        .post(format!("{base}/v1/responses"))
+        .bearer_auth(&key)
+        .header("x-session-id", "compact-session")
+        .json(
+            &json!({"model":"m","input":"seed native history","stream":false,
+            "codexpress_session_id":"compact-thread","include":["reasoning.encrypted_content"]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let history: Value = response.json().await.unwrap();
+    assert_eq!(
+        history["output"][1],
+        serde_json::from_str::<Value>(NATIVE).unwrap()["input"][0]
+    );
+    for (path, local) in [
+        ("/v1/responses/compact", true),
+        ("/responses/compact", false),
+    ] {
+        let mut request = client
+            .post(format!("{base}{path}"))
+            .bearer_auth(&key)
+            .header("content-type", "application/json")
+            .header("x-session-id", "compact-session")
+            .header("cookie", "PRIVATE-CLIENT-COOKIE")
+            .header("origin", "https://untrusted.invalid")
+            .header("chatgpt-account-id", "PRIVATE-CLIENT-ACCOUNT")
+            .header("x-private-fixture", "PRIVATE-CLIENT-HEADER");
+        if local {
+            let mut body: Value = serde_json::from_str(NATIVE).unwrap();
+            body["codexpress_session_id"] = json!("compact-thread");
+            request = request.json(&body);
+        } else {
+            request = request.header("thread-id", "compact-thread").body(NATIVE);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert!(!response.headers().contains_key("set-cookie"));
+        assert!(!response.headers().contains_key("authorization"));
+        assert_eq!(response.bytes().await.unwrap().as_ref(), COMPACT.as_bytes());
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // V2 uses the existing Responses stream, not a distinct compact endpoint.
+    for path in ["/v1/responses", "/responses"] {
+        let response = client
+            .post(format!("{base}{path}"))
+            .bearer_auth(&key)
+            .header("content-type", "application/json")
+            .header("cookie", "PRIVATE-CLIENT-COOKIE")
+            .header("origin", "https://untrusted.invalid")
+            .header("chatgpt-account-id", "PRIVATE-CLIENT-ACCOUNT")
+            .header("x-private-fixture", "PRIVATE-CLIENT-HEADER")
+            .body(V2_NATIVE)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.bytes().await.unwrap().as_ref(),
+            V2_STREAM.as_bytes()
+        );
+    }
+    let response = client
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(&key)
+        .json(&json!({"model":"m","messages":[{"role":"user","content":"fixture"}],"stream":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "你好");
+    management::dispatch(&state, "chatbot.configure", json!({"enabled":false}))
+        .await
+        .unwrap();
+    upstream_task.abort();
+}
+
+#[tokio::test]
 async fn models_authentication_browser_access_rotation_and_settings_are_independent() {
     let (_dir, state, key, port) = state("http://127.0.0.1:1").await;
     let router = chatbot::router(state.clone());
