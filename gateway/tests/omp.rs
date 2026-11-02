@@ -298,11 +298,11 @@ async fn external_unmanaged_changes_survive_restore_and_owned_changes_refuse() {
         "60%"
     );
     apply(&state, &home).await;
-    let mut settings = yaml(&home.join("config.yml"));
-    settings["modelRoles"]["default"] = json!("external/model");
+    let mut models = yaml(&home.join("models.yml"));
+    models["providers"]["codexpress"]["baseUrl"] = json!("http://127.0.0.1:1/v1");
     fs::write(
-        home.join("config.yml"),
-        serde_yaml::to_string(&settings).unwrap(),
+        home.join("models.yml"),
+        serde_yaml::to_string(&models).unwrap(),
     )
     .unwrap();
     let before_models = fs::read(home.join("models.yml")).unwrap();
@@ -583,4 +583,68 @@ async fn compact_context_preserves_user_segments_and_original_display_setting() 
         json!(["model", "path", "context_pct"])
     );
     assert_eq!(restored["theme"], "dark");
+}
+
+#[tokio::test]
+async fn saved_reasoning_preference_does_not_block_upgrade_or_become_an_upstream_model() {
+    let (directory, state) = fixture().await;
+    let home = directory.path().join("agent");
+    apply(&state, &home).await;
+    let mut settings = yaml(&home.join("config.yml"));
+    settings["modelRoles"]["default"] = json!("codexpress/gpt-6-astra:xhigh");
+    fs::write(
+        home.join("config.yml"),
+        serde_yaml::to_string(&settings).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        call(&state, "omp.status", &home, json!({})).await.unwrap()["needs_update"],
+        false
+    );
+    let result = call(
+        &state,
+        "omp.attach",
+        &home,
+        json!({"model_id":"gpt-6-astra:xhigh"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["status_plugin_installed"], true);
+    assert_eq!(result["model_id"], "gpt-6-astra:xhigh");
+    let ids: Vec<_> = yaml(&home.join("models.yml"))["providers"]["codexpress"]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|model| model["id"].as_str().map(str::to_owned))
+        .collect();
+    assert!(ids.contains(&"gpt-6-astra".to_owned()));
+    assert!(!ids.contains(&"gpt-6-astra:xhigh".to_owned()));
+    assert_eq!(
+        yaml(&home.join("config.yml"))["modelRoles"]["default"],
+        "codexpress/gpt-6-astra:xhigh"
+    );
+    call(&state, "omp.restore", &home, json!({})).await.unwrap();
+    assert!(!home.join("models.yml").exists());
+    assert!(!home.join("config.yml").exists());
+}
+
+#[tokio::test]
+async fn restoring_gateway_keeps_a_later_non_codexpress_default_model() {
+    let (directory, state) = fixture().await;
+    let home = directory.path().join("agent");
+    apply(&state, &home).await;
+    let mut settings = yaml(&home.join("config.yml"));
+    settings["modelRoles"]["default"] = json!("personal/other-model:high");
+    fs::write(
+        home.join("config.yml"),
+        serde_yaml::to_string(&settings).unwrap(),
+    )
+    .unwrap();
+    call(&state, "omp.restore", &home, json!({})).await.unwrap();
+    assert_eq!(
+        yaml(&home.join("config.yml"))["modelRoles"]["default"],
+        "personal/other-model:high"
+    );
+    assert!(!home.join("models.yml").exists());
+    assert!(!home.join("extensions/codexpress-status.ts").exists());
 }

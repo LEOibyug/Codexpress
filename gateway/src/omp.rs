@@ -244,8 +244,9 @@ fn same_home(
 fn owned_matches(snapshot: &Snapshot, models: &Value, settings: &Value) -> Result<bool> {
     let applied_models = parse(&snapshot.models.applied)?;
     let applied_settings = parse(&snapshot.settings.applied)?;
+    // OMP saves model/thinking choices during normal use. They are user
+    // preferences, not a connection or credential integrity boundary.
     Ok(at(models, PROVIDER) == at(&applied_models, PROVIDER)
-        && at(settings, DEFAULT_MODEL) == at(&applied_settings, DEFAULT_MODEL)
         && snapshot.footer_before.keys().all(|field| {
             at(settings, &["statusLine", field]) == at(&applied_settings, &["statusLine", field])
         })
@@ -259,7 +260,7 @@ fn verify(snapshot: &Snapshot, models: &Document, settings: &Document) -> Result
         || settings.bytes.is_none()
         || !owned_matches(snapshot, &models.value, &settings.value)?
     {
-        bail!("OMP 连接或模型压缩设置已被其他程序修改；为保留你的更改，未覆盖或恢复");
+        bail!("OMP 连接、压缩或状态栏设置已被其他程序修改；为保留你的更改，未覆盖或恢复");
     }
     Ok(())
 }
@@ -294,6 +295,16 @@ fn valid_model(model: &str) -> bool {
         && model.len() <= 256
         && !model.chars().any(char::is_whitespace)
         && !model.chars().any(char::is_control)
+}
+fn upstream_model(selection: &str) -> &str {
+    match selection.rsplit_once(':') {
+        Some((model, "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "auto"))
+            if !model.is_empty() =>
+        {
+            model
+        }
+        _ => selection,
+    }
 }
 fn verify_model_access(settings: &Value, selected: &str) -> Result<()> {
     let strings = |field| -> Result<Vec<&str>> {
@@ -544,11 +555,17 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
             PROVIDER,
             at(&original_models, PROVIDER).cloned(),
         )?;
-        put(
-            &mut restored_settings,
-            DEFAULT_MODEL,
-            at(&original_settings, DEFAULT_MODEL).cloned(),
-        )?;
+        let selected_codexpress = at(&settings.value, DEFAULT_MODEL)
+            .and_then(Value::as_str)
+            .and_then(|selection| selection.split_once('/'))
+            .is_some_and(|(provider, _)| provider.eq_ignore_ascii_case("codexpress"));
+        if selected_codexpress {
+            put(
+                &mut restored_settings,
+                DEFAULT_MODEL,
+                at(&original_settings, DEFAULT_MODEL).cloned(),
+            )?;
+        }
         for (field, original) in &snapshot.footer_before {
             let original = original
                 .as_ref()
@@ -628,7 +645,8 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
         .as_str()
         .filter(|model| valid_model(model))
         .context("请提供有效的 OMP 默认模型 ID")?;
-    verify_model_access(&settings.value, selected)?;
+    let selected_model = upstream_model(selected);
+    verify_model_access(&settings.value, selected_model)?;
     let mut ids: BTreeSet<String> = state
         .sources
         .read()
@@ -645,7 +663,7 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
         })
         .collect();
     ids.extend(rules.iter().map(|rule| rule.model.clone()));
-    ids.insert(selected.into());
+    ids.insert(selected_model.into());
     if ids.len() > 10_000 {
         bail!("OMP 模型列表超过 10000 项");
     }
