@@ -368,7 +368,7 @@ async fn refresh_quota(
             }
         }
     }
-    crate::routing::notify_quotas(state, &sources);
+    crate::routing::publish_quotas(state, &sources);
     Ok(())
 }
 

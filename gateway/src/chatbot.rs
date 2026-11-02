@@ -63,6 +63,9 @@ fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 impl ChatbotAccess {
+    pub(crate) fn account_updated(&self) {
+        self.conversation_status.notify();
+    }
     pub(crate) fn port(&self) -> Result<u16> {
         Ok(self.settings()?.port)
     }
@@ -179,6 +182,7 @@ pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
         .settings
         .lock()
         .map_err(|_| anyhow::anyhow!("聊天客户端接入忙碌"))? = next.clone();
+    state.chatbot.account_updated();
     if let Some(socket) = socket {
         let shared = state.clone();
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -316,6 +320,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/responses", post(responses))
         .route("/responses", post(responses))
         .route("/v1/codexpress/status", get(status::get))
+        .route("/v1/codexpress/refresh", post(status::refresh))
+        .route("/v1/codexpress/events", get(status::events))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, gate))
 }

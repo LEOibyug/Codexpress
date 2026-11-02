@@ -10,7 +10,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -19,9 +19,19 @@ use uuid::Uuid;
 const RETENTION: Duration = Duration::from_secs(30 * 60);
 const CAPACITY: usize = 4096;
 
-#[derive(Default)]
 pub(super) struct Store {
     entries: Mutex<HashMap<String, Entry>>,
+    changes: tokio::sync::watch::Sender<u64>,
+    pending: Mutex<HashSet<String>>,
+}
+impl Default for Store {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            changes: tokio::sync::watch::channel(0).0,
+            pending: Mutex::new(HashSet::new()),
+        }
+    }
 }
 struct Entry {
     request: Uuid,
@@ -34,6 +44,7 @@ struct ActualSource {
     active: bool,
     id: String,
     identity: String,
+    proxy: crate::model::ProxyPolicy,
 }
 
 // Keys contain only digests, not client session IDs or credentials. A generation
@@ -56,6 +67,10 @@ pub(super) fn valid(value: &str, limit: usize) -> bool {
     !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
 }
 impl Store {
+    pub(super) fn notify(&self) {
+        self.changes
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
     pub(super) fn begin(self: &Arc<Self>, namespace: &str, thread: &str, model: &str) -> Tracking {
         let key = key(namespace, thread, model);
         let request = Uuid::new_v4();
@@ -82,6 +97,7 @@ impl Store {
                 },
             );
         }
+        self.notify();
         Tracking {
             store: self.clone(),
             key,
@@ -111,6 +127,7 @@ impl Tracking {
             active: true,
             id: source.id.clone(),
             identity: source.identity(),
+            proxy: source.proxy.clone(),
         };
         if let Ok(mut entries) = self.store.entries.lock() {
             if let Some(entry) = entries
@@ -121,6 +138,7 @@ impl Tracking {
                 entry.updated = Instant::now();
             }
         }
+        self.store.notify();
         ActiveAttempt {
             tracking: self.clone(),
             attempt: actual.attempt,
@@ -150,6 +168,7 @@ impl ActiveAttempt {
                     }
                 }
             }
+            self.tracking.store.notify();
         } else if matches!(status, "failed" | "interrupted") {
             self.successful = false;
             self.clear();
@@ -165,6 +184,7 @@ impl ActiveAttempt {
                 entry.updated = Instant::now();
             }
         }
+        self.tracking.store.notify();
     }
 }
 impl Drop for ActiveAttempt {
@@ -200,6 +220,124 @@ pub(super) async fn get(
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
+fn authenticated(state: &AppState, namespace: &str) -> bool {
+    state
+        .chatbot
+        .settings()
+        .is_ok_and(|s| s.enabled && crate::continuity::digest("chatbot", &s.key) == namespace)
+}
+pub(super) async fn refresh(
+    State(state): State<Arc<AppState>>,
+    Extension(ingress): Extension<ChatbotIngress>,
+    Json(query): Json<StatusQuery>,
+) -> Response {
+    if !valid(&query.model, 512) || !valid(&query.session_id, 512) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "model 和 session_id 须为有效非空标识",
+            None,
+        );
+    }
+    let store = state.chatbot.conversation_status.clone();
+    let mut accepted = false;
+    if authenticated(&state, &ingress.namespace) {
+        if let Some(actual) = store.actual(&ingress.namespace, &query.session_id, &query.model) {
+            let sources = state.sources.read().await;
+            if !authenticated(&state, &ingress.namespace) {
+                return error(StatusCode::UNAUTHORIZED, "聊天客户端 API Key 无效", None);
+            }
+            if let Some(runtime) = sources.iter().find(|r| {
+                r.source.id == actual.id
+                    && r.source.identity() == actual.identity
+                    && r.source.proxy == actual.proxy
+                    && matches!(r.source.kind.as_str(), "api" | "official")
+            }) {
+                let source = runtime.source.clone();
+                let identity = crate::continuity::digest(
+                    "chatbot-refresh",
+                    &json!([source.id, source.identity(), source.proxy]).to_string(),
+                );
+                if let Ok(mut pending) = store.pending.lock() {
+                    accepted = true;
+                    if pending.insert(identity.clone()) {
+                        let state = state.clone();
+                        let store = store.clone();
+                        let namespace = ingress.namespace.clone();
+                        tokio::spawn(async move {
+                            let current = state.sources.read().await.iter().any(|r| {
+                                r.source.id == source.id
+                                    && r.source.identity() == source.identity()
+                                    && r.source.proxy == source.proxy
+                            });
+                            if current && authenticated(&state, &namespace) {
+                                let payload =
+                                    json!({"source_id":source.id,"include_credits":false});
+                                if source.kind == "official" {
+                                    let _ = crate::official::handle(
+                                        &state,
+                                        "official.refresh",
+                                        payload,
+                                    )
+                                    .await;
+                                } else {
+                                    let _ = crate::balance::refresh(&state, payload).await;
+                                }
+                            }
+                            if let Ok(mut pending) = store.pending.lock() {
+                                pending.remove(&identity);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+    (
+        StatusCode::ACCEPTED,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({"accepted":accepted})),
+    )
+        .into_response()
+}
+pub(super) async fn events(
+    State(state): State<Arc<AppState>>,
+    Extension(ingress): Extension<ChatbotIngress>,
+    Query(query): Query<StatusQuery>,
+) -> Response {
+    if !valid(&query.model, 512) || !valid(&query.session_id, 512) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "model 和 session_id 须为有效非空标识",
+            None,
+        );
+    }
+    let mut changes = state.chatbot.conversation_status.changes.subscribe();
+    let stream = async_stream::stream! {
+        let mut previous = None;
+        loop {
+            let value = if authenticated(&state, &ingress.namespace) { snapshot(&state, &ingress.namespace, &query.session_id, &query.model).await } else { json!({"source":null}) };
+            let valid_key = authenticated(&state, &ingress.namespace);
+            let value = if valid_key { value } else { json!({"source":null}) };
+            if previous.as_ref() != Some(&value) {
+                yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().event("status").data(value.to_string()));
+                previous = Some(value);
+            }
+            if !valid_key { break; }
+            tokio::select! {
+                result = changes.changed() => { if result.is_err() { break; } }
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {}
+            }
+        }
+    };
+    let mut response = axum::response::Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 async fn snapshot(state: &AppState, namespace: &str, thread: &str, model: &str) -> Value {
     let Some(actual) = state
         .chatbot
@@ -211,10 +349,11 @@ async fn snapshot(state: &AppState, namespace: &str, thread: &str, model: &str) 
     // Retain the read lock while consulting balance cache so an edit cannot
     // publish a prior identity's data. No network work or async wait occurs.
     let sources = state.sources.read().await;
-    let Some(runtime) = sources
-        .iter()
-        .find(|r| r.source.id == actual.id && r.source.identity() == actual.identity)
-    else {
+    let Some(runtime) = sources.iter().find(|r| {
+        r.source.id == actual.id
+            && r.source.identity() == actual.identity
+            && r.source.proxy == actual.proxy
+    }) else {
         return json!({"source":null});
     };
     let source = &runtime.source;

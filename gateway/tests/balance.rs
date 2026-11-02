@@ -240,3 +240,152 @@ async fn editing_a_key_during_query_discards_the_old_account_result() {
     assert!(!error.contains("PRIVATE"));
     task.abort();
 }
+
+#[tokio::test]
+async fn balance_publications_broadcast_to_other_sessions_and_hide_failed_refreshes() {
+    use axum::body::{to_bytes, Body};
+    use codexpress_gateway::chatbot;
+    use http_body_util::BodyExt;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    fn request(port: u16, key: &str, path: &str, body: Option<Value>) -> Request {
+        Request::builder()
+            .method(if body.is_some() { "POST" } else { "GET" })
+            .uri(path)
+            .header("host", format!("127.0.0.1:{port}"))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(
+                body.map(|v| Body::from(v.to_string()))
+                    .unwrap_or_else(Body::empty),
+            )
+            .unwrap()
+    }
+    async fn event(body: &mut Body) -> Value {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = body.frame().await.unwrap().unwrap();
+                if let Ok(bytes) = frame.into_data() {
+                    let text = std::str::from_utf8(&bytes).unwrap();
+                    if let Some(data) = text.lines().find_map(|line| line.strip_prefix("data: ")) {
+                        assert!(text.contains("event: status"));
+                        assert!(!text.contains("PRIVATE"));
+                        return serde_json::from_str(data).unwrap();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let used = Arc::new(AtomicUsize::new(10));
+    let generations = Arc::new(AtomicUsize::new(0));
+    let (address, task) = serve(Router::new()
+        .route("/api/v1/me/quota", get({
+            let hits = hits.clone();
+            let used = used.clone();
+            move || {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let used = used.load(Ordering::SeqCst);
+                async move {
+                    if used == usize::MAX {
+                        (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":"PRIVATE"})))
+                    } else {
+                        (StatusCode::OK, Json(json!({"userLimitTotalUsd":100,"userCurrentTotalUsd":used})))
+                    }
+                }
+            }
+        }))
+        .route("/v1/responses", post({
+            let generations = generations.clone();
+            move || {
+                generations.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Response::builder().header("content-type", "text/event-stream")
+                        .body(Body::from("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"m\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"))
+                        .unwrap()
+                }
+            }
+        }))).await;
+    let (_dir, state) = state(&format!("{address}/v1")).await;
+    let key = state.chatbot.key().unwrap()["key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let port = state.chatbot.status().await.unwrap()["port"]
+        .as_u64()
+        .unwrap() as u16;
+    let app = chatbot::router(state.clone());
+    let mut streams = Vec::new();
+    for session in ["balance-a", "balance-b"] {
+        let mut inference = request(
+            port,
+            &key,
+            "/v1/responses",
+            Some(json!({"model":"m","input":"fixture"})),
+        );
+        inference
+            .headers_mut()
+            .insert("thread-id", session.parse().unwrap());
+        let response = app.clone().oneshot(inference).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 8192).await.unwrap();
+        let path = format!("/v1/codexpress/events?model=m&session_id={session}");
+        let response = app
+            .clone()
+            .oneshot(request(port, &key, &path, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        assert_eq!(event(&mut body).await, json!({"source":null}));
+        streams.push(body);
+    }
+    assert_eq!(query(&state).await["amount"], 90.0);
+    for body in &mut streams {
+        assert_eq!(event(body).await["source"]["balance"]["amount"], 90.0);
+    }
+    assert_eq!(query(&state).await["amount"], 90.0);
+    for body in &mut streams {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), body.frame())
+                .await
+                .is_err()
+        );
+    }
+
+    for (used_amount, session, expected) in [
+        (20, "balance-a", Some(80.0)),
+        (usize::MAX, "balance-b", None),
+        (30, "balance-b", Some(70.0)),
+    ] {
+        used.store(used_amount, Ordering::SeqCst);
+        let response = app
+            .clone()
+            .oneshot(request(
+                port,
+                &key,
+                "/v1/codexpress/refresh",
+                Some(json!({"model":"m","session_id":session})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let accepted: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(accepted, json!({"accepted":true}));
+        for body in &mut streams {
+            let update = event(body).await;
+            match expected {
+                Some(amount) => assert_eq!(update["source"]["balance"]["amount"], amount),
+                None => assert_eq!(update, json!({"source":null})),
+            }
+        }
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    assert_eq!(generations.load(Ordering::SeqCst), 2);
+    task.abort();
+}

@@ -211,6 +211,9 @@ async fn install(
         }
         runtime.health_revision = runtime.health_revision.wrapping_add(1);
     }
+    if !changed_accounts.is_empty() {
+        crate::routing::publish_quotas(state, &sources);
+    }
     Ok(sources
         .iter()
         .find(|r| r.source.id == before.id)

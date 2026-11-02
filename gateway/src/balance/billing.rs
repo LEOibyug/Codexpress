@@ -72,7 +72,7 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
             // An explicit historical operation may discover the selected source.
             // Normal UI refreshes use only providers already recognized as CCH.
             if full && requested.is_some() {
-                let _ = state.balances.query(&source).await;
+                let _ = super::query(&state, json!({"source_id":source.id})).await;
             }
             let entry = state
                 .balances

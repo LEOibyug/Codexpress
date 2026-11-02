@@ -94,7 +94,8 @@ impl BalanceStore {
             .filter(|currency| !currency.trim().is_empty())?;
         Some((amount, currency.clone()))
     }
-    async fn query(&self, source: &Source) -> Result<Snapshot> {
+    async fn query(&self, source: &Source, force: bool) -> Result<(Snapshot, bool)> {
+        let started = Instant::now();
         let entry = {
             let mut entries = self
                 .entries
@@ -131,12 +132,13 @@ impl BalanceStore {
         } else {
             60
         };
-        if entry
-            .attempted
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(ttl))
-        {
+        if entry.attempted.is_some_and(|at| {
+            // A forced request bypasses completed-cache TTL, but callers that
+            // overlap discovery share its result rather than querying again.
+            at >= started || (!force && at.elapsed() < Duration::from_secs(ttl))
+        }) {
             if let Some(snapshot) = &entry.snapshot {
-                return Ok(snapshot.clone());
+                return Ok((snapshot.clone(), false));
             }
         }
         let found = tokio::time::timeout(Duration::from_secs(45), discover(source, &mut entry))
@@ -172,11 +174,20 @@ impl BalanceStore {
             }
         };
         entry.snapshot = Some(snapshot.clone());
-        Ok(snapshot)
+        Ok((snapshot, true))
     }
 }
 
 pub async fn query(state: &Arc<AppState>, payload: Value) -> Result<Value> {
+    query_inner(state, payload, false).await
+}
+
+/// Refresh only the read-only balance snapshot, even within the normal cache TTL.
+pub(crate) async fn refresh(state: &Arc<AppState>, payload: Value) -> Result<Value> {
+    query_inner(state, payload, true).await
+}
+
+async fn query_inner(state: &Arc<AppState>, payload: Value, force: bool) -> Result<Value> {
     let id = payload["source_id"].as_str().context("缺少来源标识")?;
     let source = state
         .sources
@@ -193,7 +204,7 @@ pub async fn query(state: &Arc<AppState>, payload: Value) -> Result<Value> {
     if source.secret["api_key"].as_str().is_none_or(str::is_empty) {
         bail!("来源未配置密钥");
     }
-    let snapshot = state.balances.query(&source).await?;
+    let (snapshot, published) = state.balances.query(&source, force).await?;
     // Never publish another key's result after an edit/deletion while awaiting HTTP.
     let sources = state.sources.read().await;
     if !sources.iter().any(|r| {
@@ -202,6 +213,10 @@ pub async fn query(state: &Arc<AppState>, payload: Value) -> Result<Value> {
             && r.source.proxy == source.proxy
     }) {
         bail!("来源已变化，请重新查询余额");
+    }
+    drop(sources);
+    if published {
+        state.chatbot.account_updated();
     }
     Ok(serde_json::to_value(snapshot)?)
 }
@@ -567,5 +582,98 @@ mod cache_tests {
         }
         assert!(store.cached_amount(&source).is_none());
         assert!(entry.lock().await.attempted.is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_refresh_bypasses_success_and_failure_ttls_and_joins_normal_queries() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let used = Arc::new(AtomicUsize::new(10));
+        let router = Router::new().route(
+            "/api/v1/me/quota",
+            get({
+                let hits = hits.clone();
+                let used = used.clone();
+                move || {
+                    let hits = hits.clone();
+                    let used = used.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        let used = used.load(Ordering::SeqCst);
+                        if used == usize::MAX {
+                            return (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                Json(json!({"error":"PRIVATE"})),
+                            );
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(json!({"userLimitTotalUsd":100,"userCurrentTotalUsd":used})),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().into(), 0, "native-fixture".into()).unwrap();
+        let source: Source = serde_json::from_value(json!({"id":"api","name":"API","kind":"api","base_url":format!("http://{address}/v1"),"enabled":true,"priority":1,"proxy":{"mode":"direct"},"secret":{"api_key":"PRIVATE-KEY"}})).unwrap();
+        state
+            .sources
+            .write()
+            .await
+            .push(crate::model::SourceRuntime::new(source));
+        let payload = || json!({"source_id":"api"});
+
+        let (normal, first, second) = tokio::join!(
+            query(&state, payload()),
+            refresh(&state, payload()),
+            refresh(&state, payload()),
+        );
+        let initial = normal.unwrap();
+        assert_eq!(initial["amount"], 90.0);
+        assert_eq!(first.unwrap(), initial);
+        assert_eq!(second.unwrap(), initial);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        used.store(20, Ordering::SeqCst);
+        assert_eq!(query(&state, payload()).await.unwrap(), initial);
+        assert_eq!(refresh(&state, payload()).await.unwrap()["amount"], 80.0);
+        used.store(30, Ordering::SeqCst);
+        assert_eq!(refresh(&state, payload()).await.unwrap()["amount"], 70.0);
+        assert_eq!(query(&state, payload()).await.unwrap()["amount"], 70.0);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        used.store(40, Ordering::SeqCst);
+        let (first, normal, second) = tokio::join!(
+            refresh(&state, payload()),
+            query(&state, payload()),
+            refresh(&state, payload()),
+        );
+        let refreshed = first.unwrap();
+        assert_eq!(refreshed["amount"], 60.0);
+        assert_eq!(normal.unwrap(), refreshed);
+        assert_eq!(second.unwrap(), refreshed);
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+
+        used.store(usize::MAX, Ordering::SeqCst);
+        let stale = refresh(&state, payload()).await.unwrap();
+        assert_eq!(stale["stale"], true);
+        assert_eq!(stale["amount"], 60.0);
+        assert!(!stale.to_string().contains("PRIVATE"));
+        assert_eq!(query(&state, payload()).await.unwrap(), stale);
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
+        assert_eq!(refresh(&state, payload()).await.unwrap()["stale"], true);
+        assert_eq!(hits.load(Ordering::SeqCst), 6);
+        assert!(state.usage.summary(1).unwrap()["recent"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        server.abort();
     }
 }

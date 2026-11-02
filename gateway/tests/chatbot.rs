@@ -495,6 +495,158 @@ async fn status_is_authenticated_exact_thread_cache_only_and_tracks_actual_attem
 }
 
 #[tokio::test]
+async fn localhost_refresh_events_are_authenticated_scoped_and_join_overlap() {
+    use futures_util::StreamExt;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let (upstream, upstream_task) = serve(Router::new()
+        .route("/responses", post(|| async { sse_events(vec![json!({"type":"response.completed","response":complete()})]) }))
+        .route("/api/v1/me/quota", axum::routing::get({
+            let calls = calls.clone(); let release = release.clone(); let started = started.clone();
+            move || { let calls = calls.clone(); let release = release.clone(); let started = started.clone(); async move {
+                calls.fetch_add(1, Ordering::SeqCst); started.notify_one(); release.notified().await;
+                axum::Json(json!({"data":{"userLimitTotalUsd":100,"userCurrentTotalUsd":12.5}}))
+            }}
+        }))).await;
+    let (_dir, state, key, _) = state(&upstream).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    management::dispatch(
+        &state,
+        "chatbot.configure",
+        json!({"enabled":true,"port":port}),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    for path in [
+        "/v1/codexpress/events?model=m&session_id=a",
+        "/v1/codexpress/refresh",
+    ] {
+        let response = if path.contains("events") {
+            client.get(format!("{base}{path}")).send().await.unwrap()
+        } else {
+            client
+                .post(format!("{base}{path}"))
+                .json(&json!({"model":"m","session_id":"a"}))
+                .send()
+                .await
+                .unwrap()
+        };
+        assert_eq!(response.status(), 401);
+    }
+    let response = client
+        .get(format!("{base}/v1/codexpress/events?model=m&session_id=a"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut events = response.bytes_stream();
+    let initial = events.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&initial).contains("\"source\":null"));
+    let other_response = client
+        .get(format!("{base}/v1/codexpress/events?model=m&session_id=b"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    let mut other_events = other_response.bytes_stream();
+    assert!(
+        String::from_utf8_lossy(&other_events.next().await.unwrap().unwrap())
+            .contains("\"source\":null")
+    );
+    let refresh = |session: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        let key = key.clone();
+        async move {
+            client
+                .post(format!("{base}/v1/codexpress/refresh"))
+                .bearer_auth(key)
+                .json(&json!({"model":"m","session_id":session}))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        refresh("a").await.json::<Value>().await.unwrap(),
+        json!({"accepted":false})
+    );
+    let generated = client
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(&key)
+        .header("thread-id", "a")
+        .json(&json!({"model":"m","messages":[{"role":"user","content":"fixture"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(generated.status(), 200);
+    generated.bytes().await.unwrap();
+    let other_generated = client
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(&key)
+        .header("thread-id", "b")
+        .json(&json!({"model":"m","messages":[{"role":"user","content":"fixture"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_generated.status(), 200);
+    other_generated.bytes().await.unwrap();
+    assert_eq!(
+        refresh("other").await.json::<Value>().await.unwrap(),
+        json!({"accepted":false})
+    );
+    assert_eq!(refresh("a").await.status(), 202);
+    started.notified().await;
+    assert_eq!(
+        refresh("a").await.json::<Value>().await.unwrap(),
+        json!({"accepted":true})
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    release.notify_one();
+    let update = tokio::time::timeout(Duration::from_secs(3), events.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let update = String::from_utf8_lossy(&update);
+    assert!(update.contains("event: status"));
+    assert!(update.contains("87.5"));
+    let other_update = tokio::time::timeout(Duration::from_secs(3), other_events.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&other_update).contains("87.5"));
+    management::dispatch(&state, "chatbot.configure", json!({"regenerate_key":true}))
+        .await
+        .unwrap();
+    let cleared = tokio::time::timeout(Duration::from_secs(3), events.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&cleared).contains("\"source\":null"));
+    assert!(tokio::time::timeout(Duration::from_secs(3), events.next())
+        .await
+        .unwrap()
+        .is_none());
+    management::dispatch(&state, "chatbot.configure", json!({"enabled":false}))
+        .await
+        .unwrap();
+    upstream_task.abort();
+}
+
+#[tokio::test]
 async fn local_plugin_session_is_consumed_preserves_cache_key_and_defers_to_explicit_thread() {
     let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (base, task) = serve(
