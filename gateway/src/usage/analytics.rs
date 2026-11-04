@@ -293,7 +293,7 @@ fn load_snapshot(data: &StoreData, query: &Query) -> Result<Snapshot> {
     let mut daily = vec![zero_day; query.days.len() - 1];
     let mut bindings = query.bindings();
     bindings.push(SqlValue::Text(serde_json::to_string(&query.days)?));
-    let sql = format!("{ATTEMPTS} SELECT CAST(days.key AS INTEGER),{aggregate} FROM json_each(?6) days JOIN attempts ON started_at>=days.value AND started_at<json_extract(?6,'$['||(CAST(days.key AS INTEGER)+1)||']') WHERE {FILTERS} GROUP BY days.key ORDER BY CAST(days.key AS INTEGER)");
+    let sql = format!("{ATTEMPTS} SELECT CAST(days.key AS INTEGER),{aggregate} FROM json_each(?8) days JOIN attempts ON started_at>=days.value AND started_at<json_extract(?8,'$['||(CAST(days.key AS INTEGER)+1)||']') WHERE {FILTERS} GROUP BY days.key ORDER BY CAST(days.key AS INTEGER)");
     let mut statement = data.connection.prepare(&sql)?;
     for row in statement.query_map(rusqlite::params_from_iter(bindings), |row| {
         Ok((row.get::<_, usize>(0)?, row.get::<_, String>(1)?))
@@ -351,7 +351,7 @@ pub(super) fn build(data: &mut StoreData, payload: &Value) -> Result<Value> {
     } = stored;
     let active = requests::active_records(data, &query)?;
     let options = options.with_active(&active)?;
-    for record in active.iter().filter(|record| query.matches(record)) {
+    for record in active.iter().filter(|record| requests::log_matches(&query, record)) {
         let key = (
             record["source_id"].as_str().unwrap_or("").to_owned(),
             record["model"].as_str().unwrap_or("").to_owned(),

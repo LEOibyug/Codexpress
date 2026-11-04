@@ -98,6 +98,10 @@ async fn run() -> Result<()> {
     if codexpress_gateway::images::resume(&state).await.is_err() {
         eprintln!("图片生成入口未能启动，请在应用中检查其独立端口");
     }
+    if codexpress_gateway::control::resume(&state).await.is_err() {
+        eprintln!("管理 API 未能启动，请在应用中检查其独立端口");
+    }
+    codexpress_gateway::balance::billing::start(&state);
     let server = axum::serve(
         listener,
         codexpress_gateway::remote::router(state)

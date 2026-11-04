@@ -18,7 +18,7 @@ struct SourceRoutingActions: View {
             }
             action("立即抢占", symbol: "bolt.fill") { model.startSourceTakeover(source.id) }
                 .help(exhausted ? "额度已耗尽" : takingOver ? "正在抢占" : "立即抢占")
-                .disabled(takingOver || exhausted || !source.enabled || model.connectionMode == "official")
+                .disabled(takingOver || exhausted || !source.enabled)
             if takingOver {
                 if !compact {
                     Label("正在抢占", systemImage: "clock")

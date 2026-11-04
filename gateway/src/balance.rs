@@ -1,6 +1,6 @@
-//! Read-only balance discovery. All credentials and login sessions stay in
-//! memory; only the normalized remaining amount crosses the management socket.
-pub(crate) mod billing;
+//! Read-only balance discovery and locally settled balance projection. Credentials
+//! and login sessions never cross the management socket.
+pub mod billing;
 mod parsers;
 
 use crate::{
@@ -23,15 +23,19 @@ use tokio::sync::Mutex as AsyncMutex;
 
 const BODY_LIMIT: usize = 256 * 1024;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct Snapshot {
-    status: &'static str,
-    amount: Option<f64>,
-    currency: Option<String>,
-    scope: Option<&'static str>,
-    stale: bool,
-    checked_at: u64,
-    updated_at: Option<u64>,
+    pub(crate) status: &'static str,
+    pub(crate) amount: Option<f64>,
+    pub(crate) currency: Option<String>,
+    pub(crate) scope: Option<&'static str>,
+    pub(crate) stale: bool,
+    pub(crate) checked_at: u64,
+    pub(crate) updated_at: Option<u64>,
+    pub(crate) estimated: bool,
+    pub(crate) local_spend: Option<f64>,
+    pub(crate) unknown_spend_requests: u64,
+    pub(crate) projection_supported: bool,
 }
 
 #[derive(Clone)]
@@ -75,27 +79,7 @@ pub struct BalanceStore {
 }
 
 impl BalanceStore {
-    /// Read a normalized snapshot without querying, waiting for discovery, or
-    /// exposing credentials/session material. Busy or invalid caches are hidden.
-    pub(crate) fn cached_amount(&self, source: &Source) -> Option<(f64, String)> {
-        let entry = self.entries.lock().ok()?.get(&source.id)?.clone();
-        let entry = entry.try_lock().ok()?;
-        if entry.identity != source.identity() || entry.proxy.as_ref() != Some(&source.proxy) {
-            return None;
-        }
-        let snapshot = entry.snapshot.as_ref()?;
-        if snapshot.status != "available" || snapshot.stale {
-            return None;
-        }
-        let amount = snapshot.amount.filter(|amount| amount.is_finite())?;
-        let currency = snapshot
-            .currency
-            .as_ref()
-            .filter(|currency| !currency.trim().is_empty())?;
-        Some((amount, currency.clone()))
-    }
-    async fn query(&self, source: &Source, force: bool) -> Result<(Snapshot, bool)> {
-        let started = Instant::now();
+    async fn query(&self, state: &Arc<AppState>, source: &Source, force: bool) -> Result<Snapshot> {
         let entry = {
             let mut entries = self
                 .entries
@@ -123,6 +107,13 @@ impl BalanceStore {
                 ..Default::default()
             };
         }
+        // An evicted settlement ledger invalidates the cached spend watermark.
+        if entry.snapshot.as_ref().is_some_and(|s| s.amount.is_some())
+            && state.usage.cached_balance(source)?.is_none()
+        {
+            entry.snapshot = None;
+            entry.attempted = None;
+        }
         let ttl = if entry
             .snapshot
             .as_ref()
@@ -132,13 +123,13 @@ impl BalanceStore {
         } else {
             60
         };
-        if entry.attempted.is_some_and(|at| {
-            // A forced request bypasses completed-cache TTL, but callers that
-            // overlap discovery share its result rather than querying again.
-            at >= started || (!force && at.elapsed() < Duration::from_secs(ttl))
-        }) {
+        if !force
+            && entry
+                .attempted
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(ttl))
+        {
             if let Some(snapshot) = &entry.snapshot {
-                return Ok((snapshot.clone(), false));
+                return Ok(snapshot.clone());
             }
         }
         let found = tokio::time::timeout(Duration::from_secs(45), discover(source, &mut entry))
@@ -152,9 +143,9 @@ impl BalanceStore {
                 amount: Some(amount.value),
                 currency: Some(amount.currency),
                 scope: Some(amount.scope),
-                stale: false,
                 checked_at: now(),
                 updated_at: Some(now()),
+                ..Default::default()
             }
         } else if let Some(previous) = &entry.snapshot {
             Snapshot {
@@ -165,29 +156,31 @@ impl BalanceStore {
         } else {
             Snapshot {
                 status: "unavailable",
-                amount: None,
-                currency: None,
-                scope: None,
-                stale: false,
                 checked_at: now(),
-                updated_at: None,
+                ..Default::default()
             }
         };
+        let sources = state.sources.read().await;
+        if !sources.iter().any(|r| {
+            r.source.id == source.id
+                && r.source.identity() == source.identity()
+                && r.source.proxy == source.proxy
+        }) {
+            bail!("来源已变化，请重新查询余额");
+        }
+        // Keep the entry lock through the settlement watermark update: a later
+        // queued query cannot publish its result and then be reset by this one.
+        if snapshot.amount.is_some() && !snapshot.stale {
+            state.usage.reset_balance(source, snapshot.clone())?;
+        } else {
+            state.usage.failed_balance(source, snapshot.checked_at)?;
+        }
         entry.snapshot = Some(snapshot.clone());
-        Ok((snapshot, true))
+        Ok(snapshot)
     }
 }
 
 pub async fn query(state: &Arc<AppState>, payload: Value) -> Result<Value> {
-    query_inner(state, payload, false).await
-}
-
-/// Refresh only the read-only balance snapshot, even within the normal cache TTL.
-pub(crate) async fn refresh(state: &Arc<AppState>, payload: Value) -> Result<Value> {
-    query_inner(state, payload, true).await
-}
-
-async fn query_inner(state: &Arc<AppState>, payload: Value, force: bool) -> Result<Value> {
     let id = payload["source_id"].as_str().context("缺少来源标识")?;
     let source = state
         .sources
@@ -204,7 +197,10 @@ async fn query_inner(state: &Arc<AppState>, payload: Value, force: bool) -> Resu
     if source.secret["api_key"].as_str().is_none_or(str::is_empty) {
         bail!("来源未配置密钥");
     }
-    let (snapshot, published) = state.balances.query(&source, force).await?;
+    let snapshot = state
+        .balances
+        .query(state, &source, payload["force"] == true)
+        .await?;
     // Never publish another key's result after an edit/deletion while awaiting HTTP.
     let sources = state.sources.read().await;
     if !sources.iter().any(|r| {
@@ -214,11 +210,14 @@ async fn query_inner(state: &Arc<AppState>, payload: Value, force: bool) -> Resu
     }) {
         bail!("来源已变化，请重新查询余额");
     }
-    drop(sources);
-    if published {
-        state.chatbot.account_updated();
-    }
-    Ok(serde_json::to_value(snapshot)?)
+    Ok(serde_json::to_value(
+        state.usage.cached_balance(&source)?.unwrap_or(snapshot),
+    )?)
+}
+
+/// Cached local state only; this path never discovers or refreshes an upstream.
+pub async fn cached(state: &Arc<AppState>, source: &Source) -> Result<Value> {
+    Ok(serde_json::to_value(state.usage.cached_balance(source)?)?)
 }
 
 struct Reply {
@@ -534,146 +533,4 @@ async fn discover(source: &Source, entry: &mut Entry) -> Option<Amount> {
         }
     }
     None
-}
-
-#[cfg(test)]
-mod cache_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn cached_amount_never_discovers_and_rejects_busy_stale_or_changed_identity() {
-        let source: Source = serde_json::from_value(json!({"id":"api","name":"API","kind":"api","base_url":"http://127.0.0.1:1","enabled":true,"priority":1,"proxy":{"mode":"direct"},"secret":{"api_key":"fixture-private-key"}})).unwrap();
-        let store = BalanceStore::default();
-        assert!(store.cached_amount(&source).is_none());
-        assert!(store.entries.lock().unwrap().is_empty());
-        let entry = Arc::new(AsyncMutex::new(Entry {
-            identity: source.identity(),
-            proxy: Some(source.proxy.clone()),
-            snapshot: Some(Snapshot {
-                status: "available",
-                amount: Some(0.0),
-                currency: Some("USD".into()),
-                scope: Some("account"),
-                stale: false,
-                checked_at: now(),
-                updated_at: Some(now()),
-            }),
-            ..Default::default()
-        }));
-        store
-            .entries
-            .lock()
-            .unwrap()
-            .insert(source.id.clone(), entry.clone());
-        assert_eq!(store.cached_amount(&source), Some((0.0, "USD".into())));
-        let mut changed = source.clone();
-        changed.secret["api_key"] = json!("another-private-key");
-        assert!(store.cached_amount(&changed).is_none());
-        changed = source.clone();
-        changed.proxy = ProxyPolicy {
-            mode: "explicit".into(),
-            url: Some("http://127.0.0.1:9".into()),
-        };
-        assert!(store.cached_amount(&changed).is_none());
-        {
-            let mut locked = entry.lock().await;
-            assert!(store.cached_amount(&source).is_none());
-            locked.snapshot.as_mut().unwrap().stale = true;
-        }
-        assert!(store.cached_amount(&source).is_none());
-        assert!(entry.lock().await.attempted.is_none());
-    }
-
-    #[tokio::test]
-    async fn turn_refresh_bypasses_success_and_failure_ttls_and_joins_normal_queries() {
-        use axum::{http::StatusCode, routing::get, Json, Router};
-        use std::sync::atomic::AtomicUsize;
-
-        let hits = Arc::new(AtomicUsize::new(0));
-        let used = Arc::new(AtomicUsize::new(10));
-        let router = Router::new().route(
-            "/api/v1/me/quota",
-            get({
-                let hits = hits.clone();
-                let used = used.clone();
-                move || {
-                    let hits = hits.clone();
-                    let used = used.clone();
-                    async move {
-                        hits.fetch_add(1, Ordering::SeqCst);
-                        tokio::task::yield_now().await;
-                        let used = used.load(Ordering::SeqCst);
-                        if used == usize::MAX {
-                            return (
-                                StatusCode::TOO_MANY_REQUESTS,
-                                Json(json!({"error":"PRIVATE"})),
-                            );
-                        }
-                        (
-                            StatusCode::OK,
-                            Json(json!({"userLimitTotalUsd":100,"userCurrentTotalUsd":used})),
-                        )
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let dir = tempfile::tempdir().unwrap();
-        let state = AppState::new(dir.path().into(), 0, "native-fixture".into()).unwrap();
-        let source: Source = serde_json::from_value(json!({"id":"api","name":"API","kind":"api","base_url":format!("http://{address}/v1"),"enabled":true,"priority":1,"proxy":{"mode":"direct"},"secret":{"api_key":"PRIVATE-KEY"}})).unwrap();
-        state
-            .sources
-            .write()
-            .await
-            .push(crate::model::SourceRuntime::new(source));
-        let payload = || json!({"source_id":"api"});
-
-        let (normal, first, second) = tokio::join!(
-            query(&state, payload()),
-            refresh(&state, payload()),
-            refresh(&state, payload()),
-        );
-        let initial = normal.unwrap();
-        assert_eq!(initial["amount"], 90.0);
-        assert_eq!(first.unwrap(), initial);
-        assert_eq!(second.unwrap(), initial);
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-
-        used.store(20, Ordering::SeqCst);
-        assert_eq!(query(&state, payload()).await.unwrap(), initial);
-        assert_eq!(refresh(&state, payload()).await.unwrap()["amount"], 80.0);
-        used.store(30, Ordering::SeqCst);
-        assert_eq!(refresh(&state, payload()).await.unwrap()["amount"], 70.0);
-        assert_eq!(query(&state, payload()).await.unwrap()["amount"], 70.0);
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
-
-        used.store(40, Ordering::SeqCst);
-        let (first, normal, second) = tokio::join!(
-            refresh(&state, payload()),
-            query(&state, payload()),
-            refresh(&state, payload()),
-        );
-        let refreshed = first.unwrap();
-        assert_eq!(refreshed["amount"], 60.0);
-        assert_eq!(normal.unwrap(), refreshed);
-        assert_eq!(second.unwrap(), refreshed);
-        assert_eq!(hits.load(Ordering::SeqCst), 4);
-
-        used.store(usize::MAX, Ordering::SeqCst);
-        let stale = refresh(&state, payload()).await.unwrap();
-        assert_eq!(stale["stale"], true);
-        assert_eq!(stale["amount"], 60.0);
-        assert!(!stale.to_string().contains("PRIVATE"));
-        assert_eq!(query(&state, payload()).await.unwrap(), stale);
-        assert_eq!(hits.load(Ordering::SeqCst), 5);
-        assert_eq!(refresh(&state, payload()).await.unwrap()["stale"], true);
-        assert_eq!(hits.load(Ordering::SeqCst), 6);
-        assert!(state.usage.summary(1).unwrap()["recent"]
-            .as_array()
-            .unwrap()
-            .is_empty());
-        server.abort();
-    }
 }

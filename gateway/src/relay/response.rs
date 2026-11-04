@@ -126,7 +126,6 @@ pub(super) struct Attempt {
     captured_transport_error: bool,
     saved_failure: Option<Value>,
     pub(super) manual_trial: Option<routing::manual::Trial>,
-    pub(super) conversation_status: Option<crate::chatbot::status::ActiveAttempt>,
 }
 impl Attempt {
     pub(super) fn new(
@@ -161,7 +160,7 @@ impl Attempt {
             first_token_latency_ms: None,
             generation_ms: None,
         };
-        state.usage.start(&record);
+        state.usage.start_for_source(&record, source);
         let diagnostic = Capture::new(
             &record.attempt_id,
             record.started_at,
@@ -179,7 +178,6 @@ impl Attempt {
             captured_transport_error: false,
             saved_failure: None,
             manual_trial: None,
-            conversation_status: None,
         }
     }
     pub(super) fn save_diagnostic(&self, body: bool) {
@@ -238,9 +236,6 @@ impl Attempt {
         self.save_diagnostic(true);
     }
     pub(super) fn finish(&mut self, status: &str, observer: Option<&Observer>) {
-        if let Some(tracking) = &mut self.conversation_status {
-            tracking.finish(status);
-        }
         if matches!(status, "failed" | "interrupted") {
             if let Some(trial) = &self.manual_trial {
                 self.state.manual_routing.stop(trial);
@@ -727,14 +722,18 @@ async fn bind_ids(state: &Arc<AppState>, source: &Source, observer: &mut Observe
 
 async fn persist_history(state: &Arc<AppState>, observer: &mut Observer) {
     if let Some(response) = observer.history_response.take() {
-        if let Some(capture) = observer.history_request.take() {
+        if let Some(mut capture) = observer.history_request.take() {
+            if let Some(metadata) = &mut capture.metadata {
+                metadata.captured_at = now();
+            }
             let history = state.history.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                history.capture_at(
+                history.capture_with_metadata_at(
                     &capture.scope,
                     &capture.request,
                     &response,
                     capture.generation,
+                    capture.metadata.as_ref(),
                 )
             })
             .await;
@@ -997,6 +996,7 @@ mod observation_tests {
                 scope: "scope".into(),
                 request: json!({"input":[]}),
                 generation: 0,
+                metadata: None,
             }),
             ..Default::default()
         };

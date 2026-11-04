@@ -252,17 +252,20 @@ fn aliases(body: &mut Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn model(value: &Value) -> Result<&str> {
+    value
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_whitespace))
+        .ok_or_else(|| invalid("model", "请提供有效模型 ID"))
+}
+
 pub(super) fn normalize(value: Value, format: Format) -> Result<(Value, OutputOptions)> {
     let mut original = value
         .as_object()
         .ok_or_else(|| invalid("body", "请求须为 JSON 对象"))?
         .clone();
-    let model = original
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_whitespace))
-        .ok_or_else(|| invalid("model", "请提供有效模型 ID"))?
-        .to_owned();
+    let model = model(&value)?.to_owned();
     let stream = match original.get("stream") {
         Some(value) => value
             .as_bool()

@@ -25,12 +25,6 @@ pub fn notify_quotas(state: &Arc<AppState>, sources: &[crate::model::SourceRunti
     }
 }
 
-/// Publish changed quota state; ordinary status reads only notify_quotas.
-pub fn publish_quotas(state: &Arc<AppState>, sources: &[crate::model::SourceRuntime]) {
-    notify_quotas(state, sources);
-    state.chatbot.account_updated();
-}
-
 pub async fn candidates(state: &Arc<AppState>, model: &str, binding: Option<&str>) -> Vec<Source> {
     candidates_with_session(state, model, binding, None).await
 }

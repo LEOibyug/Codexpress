@@ -1,7 +1,7 @@
 import SwiftUI
 
 enum ConnectionSection: String, CaseIterable, Identifiable {
-    case codex = "Codex", omp = "OMP", chatbot = "聊天客户端", remote = "远端 SSH", images = "图片生成"
+    case codex = "Codex", omp = "OMP", chatbot = "聊天客户端", remote = "远端 SSH", images = "图片生成", control = "管理 API"
     var id: String { rawValue }
 }
 
@@ -15,7 +15,7 @@ struct ConnectionSettingsView: View {
                 Spacer(minLength: 16)
                 Picker("接入方式", selection: $section) {
                     ForEach(ConnectionSection.allCases) { Text($0.rawValue).tag($0) }
-                }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 480)
+                }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 590)
             }.padding(.horizontal, AppMetrics.pageInset).padding(.vertical, 16)
             Divider()
             Group {
@@ -25,6 +25,7 @@ struct ConnectionSettingsView: View {
                 case .chatbot: ChatbotSettingsView()
                 case .remote: SSHRemoteView()
                 case .images: ImageSettingsView()
+                case .control: ControlSettingsView()
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }

@@ -1,6 +1,11 @@
 import Foundation
 import Darwin
 
+enum SSHRemoteKind: String, Codable, CaseIterable, Sendable {
+    case codex, omp
+    var title: String { self == .omp ? "OMP" : "Codex" }
+}
+
 struct SSHRemoteProfile: Codable, Equatable, Identifiable, Sendable {
     var id = UUID().uuidString
     var destination = ""
@@ -12,6 +17,11 @@ struct SSHRemoteProfile: Codable, Equatable, Identifiable, Sendable {
     var backupID: String? = nil
     var originalBackupID: String? = nil
     var mapExistingProviders = false
+    var clientKind: SSHRemoteKind? = nil
+    var ompAgentDirectory: String? = nil
+    var ompDefaultModel: String? = nil
+    var kind: SSHRemoteKind { clientKind ?? .codex }
+    var directory: String { kind == .omp ? (ompAgentDirectory ?? "") : codexHome }
 
     func arguments() throws -> [String] {
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:")
@@ -27,7 +37,7 @@ struct SSHRemoteProfile: Codable, Equatable, Identifiable, Sendable {
             guard identityFile.hasPrefix("/"), !identityFile.contains("\n") else { throw AppError.message("私钥文件须为绝对路径。") }
             args += ["-i", identityFile, "-o", "IdentitiesOnly=yes"]
         }
-        args += ["--", destination, "python3 -c " + Self.shellQuote(SSHRemoteAgent.script)]
+        args += ["--", destination, "python3 -c " + Self.shellQuote(kind == .omp ? SSHRemoteOMPAgent.script : SSHRemoteAgent.script)]
         return args
     }
     static func shellQuote(_ text: String) -> String { "'" + text.replacingOccurrences(of: "'", with: "'\"'\"'") + "'" }
@@ -45,7 +55,8 @@ struct SSHRemoteClient: Sendable {
     let profile: SSHRemoteProfile
     func call(_ action: String, fields: [String: JSONValue] = [:]) async throws -> JSONValue {
         let args = try profile.arguments()
-        var payload = fields; payload["action"] = .string(action); payload["codex_home"] = .string(profile.codexHome)
+        var payload = fields; payload["action"] = .string(action)
+        payload[profile.kind == .omp ? "agent_dir" : "codex_home"] = .string(profile.directory)
         let input = try JSONEncoder().encode(JSONValue.object(payload))
         return try await Task.detached(priority: .utility) { try Self.execute(arguments: args, input: input) }.value
     }

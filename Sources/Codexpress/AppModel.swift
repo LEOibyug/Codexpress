@@ -50,6 +50,9 @@ import ServiceManagement
     @Published var operations: [String: ResetOperation] = [:]
     var officialRefreshSchedule = OfficialRefreshSchedule()
     var officialQueries: [String: (includeCredits: Bool, task: Task<Void, Error>)] = [:]
+    var controlResetPollTask: Task<Void, Never>?
+    var controlResetPollingError: String?
+    var presentedControlResetRequest: CreditResetRequest?
     private var startInProgress = false
     private var starting = false
     var lastModelRefresh: [String: Date] = [:]
@@ -189,7 +192,7 @@ import ServiceManagement
         }
         return Int(count)
     }
-    func stop() { shuttingDown = true; timerTask?.cancel(); accountTimerTask?.cancel(); modelRefreshTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
+    func stop() { shuttingDown = true; timerTask?.cancel(); accountTimerTask?.cancel(); modelRefreshTask?.cancel(); controlResetPollTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
     func retry() { restartCount = 0; Task { await startHelper() } }
     func requireWritableMetadata() throws {
         guard !metadataLoadFailed else { throw AppError.message("来源文件无法读取，已禁止保存。请先从备份修复 sources.json，再重新启动应用；原文件保持不变。") }
@@ -197,6 +200,9 @@ import ServiceManagement
     func persistSettings(_ next: AppSettings) throws {
         try requireWritableMetadata()
         try metadata.save(next)
+        for source in settings.sources where !next.sources.contains(where: { $0.id == source.id && $0.sameConfiguration(as: source) }) {
+            apiBalances[source.id] = nil
+        }
         settings = next
         do { try balanceWarnings?.retain(sources: next.sources) }
         catch { notice = "无法更新余额预警记录，请检查应用数据目录的写入权限。" }
@@ -227,8 +233,10 @@ import ServiceManagement
     }
     func loadCredentialSnapshot(_ ids: [String]) async throws {
         guard !ids.isEmpty else { return }
+        let previous = credentialSnapshot
         let response = try await client.call("credentials.read", .object(["source_ids": .array(ids.map(JSONValue.string))]))
         try credentialSnapshot.apply(response, requested: ids)
+        for id in ids where (try? previous.load(id)) != (try? credentialSnapshot.load(id)) { apiBalances[id] = nil }
     }
     private func mergeCredentials(_ data: JSONValue) async throws {
         try requireWritableMetadata()
@@ -247,6 +255,8 @@ import ServiceManagement
         return notification
     }
     func updateStatus() async throws {
+        let balanceSources = settings.sources
+        let balanceCredentials = credentialSnapshot
         let fresh = try await client.call("status")
         guard let child = helper, child.isRunning, fresh["process_id"].number == Double(child.processIdentifier) else { running = false; throw AppError.message("网关实例已改变，停止发送管理请求。") }
         if status != fresh { status = fresh }
@@ -262,6 +272,20 @@ import ServiceManagement
             else if let live = fresh["sources"].array.first(where: { $0["id"].string == next.sources[i].id }), let account = live["account_id"].string, !account.isEmpty { next.sources[i].account_id = account }
         }
         if next.sources != settings.sources { try persistSettings(next) }
+        for before in balanceSources where !before.official {
+            guard let current = settings.sources.first(where: { $0.id == before.id }), current.sameConfiguration(as: before),
+                  (try? balanceCredentials.load(before.id)) == (try? credentialSnapshot.load(before.id)) else { continue }
+            let live = fresh["sources"].array.first(where: { $0["id"].string == before.id }) ?? .null
+            guard live == .null || (live["base_url"].string == current.base_url
+                && live["proxy"]["mode"].string == current.proxy.mode && live["proxy"]["url"].string == current.proxy.url) else {
+                apiBalances[before.id] = nil
+                continue
+            }
+            let balance = live["balance"]
+            guard (apiBalances[before.id] ?? .null) != balance else { continue }
+            apiBalances[before.id] = balance == .null ? nil : balance
+            await checkBalanceWarning(source: current, balance: balance, credential: try? credentialSnapshot.load(current.id))
+        }
     }
     func setSettingsWindowActive(_ active: Bool) {
         if settingsWindowActive != active { settingsWindowActive = active }
@@ -307,6 +331,7 @@ import ServiceManagement
                 scheduleModelRefresh()
             }
             reportPollingError(nil)
+            scheduleControlResetPoll()
         } catch { reportPollingError(error.localizedDescription) }
     }
     func reportPollingError(_ message: String?) {

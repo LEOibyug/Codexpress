@@ -279,6 +279,7 @@ pub struct AppState {
     pub balances: crate::balance::BalanceStore,
     pub chatbot: crate::chatbot::ChatbotAccess,
     pub images: crate::images::ImageAccess,
+    pub control: crate::control::ControlAccess,
     pub gateway_key: String,
     pub port: u16,
     pub state_dir: PathBuf,
@@ -302,6 +303,8 @@ impl AppState {
         let usage = crate::usage::UsageStore::open(&state_dir.join("usage.sqlite"))?;
         let chatbot = crate::chatbot::ChatbotAccess::open(&state_dir, port, &gateway_key)?;
         let images = crate::images::ImageAccess::open(&state_dir, port, &gateway_key, &chatbot)?;
+        let control =
+            crate::control::ControlAccess::open(&state_dir, port, &gateway_key, &chatbot, &images)?;
         Ok(Arc::new(Self {
             routing_revision: AtomicU64::new(0),
             routing_sync: Mutex::new(()),
@@ -332,6 +335,7 @@ impl AppState {
             balances: Default::default(),
             chatbot,
             images,
+            control,
             gateway_key,
             port,
             state_dir,

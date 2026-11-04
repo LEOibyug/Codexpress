@@ -167,6 +167,119 @@ struct OMPConfiguration {
         }
         return errors.isEmpty ? result : nil
     }
+    /// Replaces editable compression settings, never provider credentials or catalog metadata.
+    /// Only model IDs present in both catalogs receive model overrides.
+    mutating func importSaved(_ configuration: JSONValue) -> [String] {
+        let local = OMPConfiguration(stored: configuration)
+        func copy(_ fields: [Field], into draft: inout Self) {
+            for field in fields { draft.set(field, Self.text(local.value(field))) }
+        }
+        copy(Self.compactionFields, into: &self)
+        copy(Self.remoteFields(), into: &self)
+
+        for selector in selectors where selector.hasPrefix("codexpress/") {
+            set(.selector(selector), "")
+        }
+        for selector in local.selectors where selector.hasPrefix("codexpress/") {
+            if !selectors.contains(selector) { addedSelectors.append(selector) }
+            set(.selector(selector), local.text(.selector(selector)))
+        }
+
+        let remoteIDs = Set(modelIDs)
+        for id in local.modelIDs where remoteIDs.contains(id) {
+            copy(Self.modelFields(id) + Self.remoteFields(model: id), into: &self)
+        }
+        return local.modelIDs.filter { !remoteIDs.contains($0) }.sorted()
+    }
+
+    private static let compactionFields: [Field] = [
+        .config("enabled", "自动压缩", .boolean),
+        .config("midTurnEnabled", "轮次中压缩", .boolean),
+        .config("autoContinue", "压缩后自动继续", .boolean),
+        .config("thresholdTokens", "固定阈值", .integer),
+        .config("thresholdPercent", "阈值百分比", .number),
+        .config("reserveTokens", "预留预算", .number),
+        .config("keepRecentTokens", "保留近期预算", .number),
+        .config("methodOrder", "压缩方法顺序", .methods),
+        .config("modelThresholdsEnabled", "模型阈值规则", .boolean),
+        .config("asyncEnabled", "异步压缩", .boolean),
+        .config("idleEnabled", "空闲压缩", .boolean),
+        .config("idleThresholdTokens", "空闲触发预算", .number),
+        .config("idleTimeoutSeconds", "空闲超时（秒）", .number),
+        .config("remoteStreamingV2Enabled", "允许远程流式 V2", .boolean),
+        .config("v2RetainedMessageBudget", "V2 保留消息预算", .number),
+        .config("handoffSaveToDisk", "Handoff 写入磁盘", .boolean),
+        .config("supersedeReads", "替代重复读取", .boolean),
+        .config("dropUseless", "移除无用内容", .boolean),
+        .config("experimentalContextManagement", "实验性上下文管理", .boolean)
+    ]
+
+    private static func modelFields(_ id: String) -> [Field] {
+        [
+            .model(id, "contextWindow", "上下文窗口"),
+            .model(id, "maxContextWindow", "扩展窗口"),
+            .model(id, "maxTokens", "输出上限"),
+            .model(id, "omitMaxOutputTokens", "省略输出上限参数", .boolean),
+            .model(id, "compactionModel", "压缩模型", .text)
+        ]
+    }
+
+    private static func remoteFields(model id: String? = nil) -> [Field] {
+        [
+            .remote("enabled", "原生远程压缩", model: id, .boolean),
+            .remote("api", "API", model: id),
+            .remote("model", "远程压缩模型", model: id),
+            .remote("endpoint", "V1 压缩端点", model: id),
+            .remote("v2Endpoint", "V2 压缩端点", model: id),
+            .remote("streamingEndpoint", "流式端点", model: id),
+            .remote("v2StreamingEnabled", "流式 V2", model: id, .boolean)
+        ]
+    }
+
+    mutating func applyOpenAIPreset() {
+        for key in ["enabled", "midTurnEnabled", "autoContinue", "modelThresholdsEnabled",
+                    "asyncEnabled", "supersedeReads", "dropUseless", "remoteStreamingV2Enabled"] {
+            set(.config(key, key, .boolean), "true")
+        }
+        for key in ["idleEnabled", "experimentalContextManagement"] {
+            set(.config(key, key, .boolean), "false")
+        }
+        set(.config("methodOrder", "压缩方法顺序", .methods), "remote,handoff,soft")
+        for key in ["thresholdTokens", "thresholdPercent", "reserveTokens", "keepRecentTokens"] {
+            set(.config(key, key, .number), "")
+        }
+        // Exact selectors outrank prefixes; remove only this provider's old rules.
+        for selector in selectors where selector.hasPrefix("codexpress/") {
+            set(.selector(selector), "")
+        }
+        if !selectors.contains("codexpress/*") { addedSelectors.append("codexpress/*") }
+        set(.selector("codexpress/*"), "80%")
+        set(.remote("enabled", "原生远程压缩", .boolean), "true")
+        set(.remote("api", "API"), "openai-responses")
+        set(.remote("v2StreamingEnabled", "流式 V2", .boolean), "true")
+        for key in ["endpoint", "model", "v2Endpoint", "streamingEndpoint"] {
+            set(.remote(key, key), "")
+        }
+        for id in modelIDs {
+            for key in ["enabled", "api", "endpoint", "model", "v2Endpoint", "streamingEndpoint", "v2StreamingEnabled"] {
+                set(.remote(key, key, model: id), "")
+            }
+            set(.model(id, "omitMaxOutputTokens", "省略输出上限参数", .boolean), "false")
+            set(.model(id, "compactionModel", "压缩模型", .text), "")
+        }
+        // Official Sol: 922K maximum input / 128K output. Leave other capacities intact.
+        // https://developers.openai.com/api/docs/models/gpt-6.1-sol
+        if modelIDs.contains("gpt-6.1-sol") {
+            let id = "gpt-6.1-sol"
+            let selector = "codexpress/" + id
+            if !selectors.contains(selector) { addedSelectors.append(selector) }
+            set(.selector(selector), "f600000")
+            set(.model(id, "contextWindow", "上下文窗口"), "900000")
+            let inheritedMaximum = base(id, "maxContextWindow")?.number
+            set(.model(id, "maxContextWindow", "扩展窗口"), inheritedMaximum.map { $0 < 900000 } == true ? "900000" : "")
+            set(.model(id, "maxTokens", "输出上限"), "128000")
+        }
+    }
 
     mutating func importCodex(_ rules: [ModelCompactionRule]) -> [String] {
         var skipped: [String] = []

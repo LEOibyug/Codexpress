@@ -156,6 +156,8 @@ final class AppModelSyncTests: XCTestCase {
                 data = dict(updated_secrets=[])
             elif operation == 'notifications.list':
                 data = dict(events=[])
+            elif operation == 'control.reset.pending':
+                data = dict(requests=[])
             elif operation in ('sync', 'history.configure'):
                 data = {}
             else:

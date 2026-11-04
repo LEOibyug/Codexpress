@@ -26,37 +26,41 @@ async fn credentials(state: &Arc<AppState>) -> Value {
     json!({"updated_secrets":sources.iter().filter(|r|r.source.kind=="official" && r.source.secret.get("access_token").and_then(Value::as_str).is_some_and(|s|!s.is_empty())).map(|r|json!({"source_id":r.source.id,"secret":r.source.secret})).collect::<Vec<_>>()})
 }
 
+pub async fn status(state: &Arc<AppState>) -> Result<Value> {
+    let settings = state.settings.read().await.clone();
+    let sources = state.sources.read().await.clone();
+    state.manual_routing.refresh(&sources, &state.affinity);
+    crate::routing::notify_quotas(state, &sources);
+    let active = state.usage.active_by_source();
+    let mut source_statuses = Vec::with_capacity(sources.len());
+    for runtime in &sources {
+        let mut value = serde_json::to_value(runtime).expect("source status");
+        if crate::routing::official_exhausted(runtime, &sources) {
+            value["health"] = json!("exhausted");
+            value["last_error"] = json!("官方额度已耗尽，等待额度恢复");
+        }
+        value["active_requests"] = json!(active.get(&runtime.source.id).copied().unwrap_or(0));
+        value["identity_digest"] = json!(runtime.source.identity());
+        value["system_role_as_developer"] =
+            json!(state.role_capabilities.requires_developer(&runtime.source));
+        value["admission"] =
+            crate::routing::admission_with_settings(state, runtime, &sources, &settings);
+        value["balance"] = if runtime.source.kind == "api" {
+            crate::balance::cached(state, &runtime.source).await?
+        } else {
+            Value::Null
+        };
+        source_statuses.push(value);
+    }
+    let sources = source_statuses;
+    Ok(
+        json!({"running":true,"process_id":std::process::id(),"port":state.port,"base_url":format!("http://127.0.0.1:{}/v1",state.port),"mode":settings.mode,"fixed_source_id":settings.fixed_source_id,"load_balance":settings.load_balance,"manual_route":state.manual_routing.status(),"official_low_quota_percent":settings.official_low_quota_percent,"degraded_context_fallback":settings.degraded_context_fallback,"idle_return_minutes":settings.idle_return_minutes,"upstream_attempts":settings.upstream_attempts,"upstream_retry_delay_seconds":settings.upstream_retry_delay_seconds,"sources":sources,"inflight":state.inflight.load(Ordering::Relaxed),"connection_mode":config::connection_mode(&state.state_dir).unwrap_or("unknown")}),
+    )
+}
+
 pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result<Value> {
     match op {
-        "status" => {
-            let settings = state.settings.read().await.clone();
-            let sources = state.sources.read().await.clone();
-            state.manual_routing.refresh(&sources, &state.affinity);
-            crate::routing::notify_quotas(state, &sources);
-            let active = state.usage.active_by_source();
-            let sources: Vec<_> = sources
-                .iter()
-                .map(|runtime| {
-                    let mut value = serde_json::to_value(runtime).expect("source status");
-                    if crate::routing::official_exhausted(runtime, &sources) {
-                        value["health"] = json!("exhausted");
-                        value["last_error"] = json!("官方额度已耗尽，等待额度恢复");
-                    }
-                    value["active_requests"] =
-                        json!(active.get(&runtime.source.id).copied().unwrap_or(0));
-                    value["identity_digest"] = json!(runtime.source.identity());
-                    value["system_role_as_developer"] =
-                        json!(state.role_capabilities.requires_developer(&runtime.source));
-                    value["admission"] = crate::routing::admission_with_settings(
-                        state, runtime, &sources, &settings,
-                    );
-                    value
-                })
-                .collect();
-            Ok(
-                json!({"running":true,"process_id":std::process::id(),"port":state.port,"base_url":format!("http://127.0.0.1:{}/v1",state.port),"mode":settings.mode,"fixed_source_id":settings.fixed_source_id,"load_balance":settings.load_balance,"manual_route":state.manual_routing.status(),"official_low_quota_percent":settings.official_low_quota_percent,"degraded_context_fallback":settings.degraded_context_fallback,"idle_return_minutes":settings.idle_return_minutes,"upstream_attempts":settings.upstream_attempts,"upstream_retry_delay_seconds":settings.upstream_retry_delay_seconds,"sources":sources,"inflight":state.inflight.load(Ordering::Relaxed),"connection_mode":config::connection_mode(&state.state_dir).unwrap_or("unknown")}),
-            )
-        }
+        "status" => status(state).await,
         "credentials" => Ok(credentials(state).await),
         "routing.recover" | "routing.try" | "routing.cancel" => {
             crate::routing::manual::handle(state, op, payload).await
@@ -131,7 +135,6 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
         "usage.reconcile.status" => Ok(crate::balance::billing::status(state)),
         "sync" => sync::handle(state, payload).await,
         "usage.analytics" | "usage.requests" | "usage.detail" => {
-            crate::balance::billing::schedule(state, false, None);
             let usage = state.usage.clone();
             let operation = op.to_owned();
             tokio::task::spawn_blocking(move || match operation.as_str() {
@@ -142,18 +145,16 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             .await
             .context("用量查询失败")?
         }
-        "usage" => {
-            crate::balance::billing::schedule(state, false, None);
-            state.usage.summary_filtered(
-                payload
-                    .get("days")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(30)
-                    .clamp(1, 3660) as u32,
-                payload.get("source_id").and_then(Value::as_str),
-                payload.get("model").and_then(Value::as_str),
-            )
-        }
+        "usage" => state.usage.summary_filtered(
+            payload
+                .get("days")
+                .and_then(Value::as_u64)
+                .unwrap_or(30)
+                .clamp(1, 3660) as u32,
+            payload.get("source_id").and_then(Value::as_str),
+            payload.get("model").and_then(Value::as_str),
+        ),
+        op if op.starts_with("control.") => crate::control::handle(state, op, payload).await,
         op if op.starts_with("omp.") => crate::omp::handle(state, op, payload).await,
         op if op.starts_with("config.") => config::handle(state, op, payload).await,
         op if op.starts_with("official.") => crate::official::handle(state, op, payload).await,

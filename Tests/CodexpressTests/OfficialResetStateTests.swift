@@ -194,6 +194,102 @@ final class OfficialResetStateTests: XCTestCase {
         XCTAssertTrue(reloaded.resetResult(for: source, creditID: "card")?.contains("待核实") == true)
     }
 
+    @MainActor func testManagementResetWaitsForConfirmationAndPersistsTheBoundOperationBeforeSending() async throws {
+        let source = Self.source("account-A")
+        let fixture = try OfficialResetFixture(sources: [source])
+        defer { fixture.stop() }
+        let id = UUID().uuidString
+        try fixture.queueReset(id: id, source: source, card: "card")
+        try await fixture.start()
+        try await fixture.waitUntil { fixture.model.creditResetRequest != nil }
+        let model = fixture.model
+        let request = try XCTUnwrap(model.creditResetRequest)
+        XCTAssertEqual(request.managementRequestID, id)
+        XCTAssertEqual(request.creditID, "card")
+        XCTAssertTrue(try fixture.requests().isEmpty)
+        XCTAssertTrue(try ResetOperationStore(directory: fixture.directory).load().isEmpty)
+        await model.poll()
+        if let polling = model.controlResetPollTask { await polling.value }
+        XCTAssertEqual(model.creditResetRequest?.id, request.id, "Polling must not replace an already presented confirmation")
+
+        XCTAssertFalse(model.consume(try fixture.confirmation(source, card: "other-card"), managementRequestID: id))
+        XCTAssertTrue(try fixture.requests().isEmpty)
+        model.error = nil
+        let store = ResetOperationStore(directory: fixture.directory)
+        try FileManager.default.createDirectory(at: store.file, withIntermediateDirectories: false)
+        XCTAssertFalse(model.consume(try fixture.confirmation(source, card: "card"), managementRequestID: id))
+        XCTAssertTrue(try fixture.requests().isEmpty)
+        try FileManager.default.removeItem(at: store.file)
+        model.error = nil
+        XCTAssertTrue(model.consume(try fixture.confirmation(source, card: "card"), managementRequestID: id))
+        XCTAssertEqual(try store.load().values.first?.operationID, id)
+        try await fixture.waitUntil { try fixture.requests().count == 1 }
+        let sent = try XCTUnwrap(fixture.requests().first)
+        XCTAssertEqual(sent["id"].string, id)
+        XCTAssertEqual(sent["operation_id"].string, id)
+        XCTAssertEqual(sent["expected_account_id"].string, "account-A")
+        XCTAssertEqual(sent["credit_id"].string, "card")
+        XCTAssertEqual(sent["confirmed"].bool, true)
+        await model.poll()
+        XCTAssertTrue(model.running, "A pending consume must not block local status polling")
+        XCTAssertFalse(model.consuming.isEmpty)
+        try fixture.release()
+        try await fixture.waitUntil { model.consuming.isEmpty }
+        XCTAssertTrue(model.resetResult(for: source, creditID: "card")?.contains("已重置") == true)
+        XCTAssertFalse(AppModel(stateDirectory: fixture.directory).canSubmitCredit(for: source, creditID: "card"))
+    }
+
+    @MainActor func testDismissedWrongAccountAndUnclaimedManagementRequestsNeverConsumeOrReappear() async throws {
+        let source = Self.source("account-A")
+        let fixture = try OfficialResetFixture(sources: [source])
+        defer { fixture.stop() }
+        let id = UUID().uuidString
+        try fixture.queueReset(id: id, source: source, card: nil)
+        try await fixture.start()
+        try await fixture.waitUntil { fixture.model.creditResetRequest != nil }
+        // System sheet dismissal can clear the binding before content disappears.
+        fixture.model.creditResetRequest = nil
+        fixture.model.controlResetDismissed()
+        try await fixture.waitUntil { try fixture.operations().contains("control.reset.cancel") }
+        fixture.model.scheduleControlResetPoll()
+        if let polling = fixture.model.controlResetPollTask { await polling.value }
+        XCTAssertNil(fixture.model.creditResetRequest)
+        var oldAccount = source; oldAccount.account_id = "account-before-switch"
+        try fixture.queueReset(id: UUID().uuidString, source: oldAccount, card: "card")
+        fixture.model.scheduleControlResetPoll()
+        if let polling = fixture.model.controlResetPollTask { await polling.value }
+        XCTAssertNil(fixture.model.creditResetRequest)
+        try fixture.queueReset(id: UUID().uuidString, source: source, card: "card")
+        try Data().write(to: fixture.directory.appendingPathComponent("reject-present"))
+        fixture.model.scheduleControlResetPoll()
+        if let polling = fixture.model.controlResetPollTask { await polling.value }
+        XCTAssertNil(fixture.model.creditResetRequest, "A lost atomic claim must never open a confirmation")
+        XCTAssertTrue(try fixture.requests().isEmpty)
+        XCTAssertTrue(try ResetOperationStore(directory: fixture.directory).load().isEmpty)
+    }
+
+    @MainActor func testStatusBalancesTrackLocalSpendWithoutUpstreamQueriesAndClearAfterIdentityChange() async throws {
+        var source = Source(); source.name = "本地余额"; source.automaticModelDiscovery = false
+        let fixture = try OfficialResetFixture(sources: [source])
+        defer { fixture.stop() }
+        let initial: JSONValue = .object(["amount": .number(10), "currency": .string("USD"), "updated_at": .number(100), "estimated": .bool(false)])
+        try fixture.setSources([source], balances: [source.id: initial])
+        try await fixture.start()
+        XCTAssertEqual(fixture.model.apiBalances[source.id], initial)
+        let spent: JSONValue = .object(["amount": .number(8.5), "currency": .string("USD"), "updated_at": .number(100), "estimated": .bool(true)])
+        try fixture.setSources([source], balances: [source.id: spent])
+        await fixture.model.poll()
+        XCTAssertEqual(fixture.model.apiBalances[source.id], spent)
+        source.base_url = "http://127.0.0.1:19876/v1"
+        var changed = fixture.model.settings; changed.sources = [source]
+        try fixture.model.persistSettings(changed)
+        XCTAssertNil(fixture.model.apiBalances[source.id], "A different provider must not inherit an old balance")
+        try fixture.setSources([source])
+        await fixture.model.poll()
+        XCTAssertNil(fixture.model.apiBalances[source.id])
+        XCTAssertFalse(try fixture.operations().contains("balance.query"))
+    }
+
     @MainActor func testUnreadableOperationHistoryBlocksEveryAccount() throws {
         let directory = URL(fileURLWithPath: "/tmp/cx-reset-corrupt-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -241,6 +337,7 @@ final class OfficialResetStateTests: XCTestCase {
         await model.startHelper()
         XCTAssertTrue(model.running, model.error ?? "Fixture did not start")
         guard model.running else { throw AppError.message("Fixture did not start") }
+        if let polling = model.controlResetPollTask { await polling.value }
     }
 
     func stop() {
@@ -248,16 +345,22 @@ final class OfficialResetStateTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    func setSources(_ sources: [Source]) throws {
+    func setSources(_ sources: [Source], balances: [String: JSONValue] = [:]) throws {
         let cards: [JSONValue] = ["card", "other-card"].map { id in
             .object(["id": .string(id), "status": .string("available"), "expiry_known": .bool(true), "expires_at": .number(4_000_000_000)])
         }
         let live: [JSONValue] = try sources.map { source in
             guard case .object(var value) = try JSONValue.from(source) else { throw AppError.message("Invalid fixture source") }
             value["credits"] = .object(["stale": .bool(false), "error": .null, "credits": .array(cards)])
+            value["balance"] = balances[source.id] ?? .null
             return .object(value)
         }
         try JSONEncoder().encode(JSONValue.object(["sources": .array(live), "disconnect_consume": .bool(disconnectConsume), "reject_duplicate_sync": .bool(rejectDuplicateSync)])).write(to: directory.appendingPathComponent("fixture-state.json"), options: .atomic)
+    }
+
+    func queueReset(id: String, source: Source, card: String?) throws {
+        let request: JSONValue = .object(["id": .string(id), "source_id": .string(source.id), "account_id": source.account_id.map(JSONValue.string) ?? .null, "credit_id": card.map(JSONValue.string) ?? .null, "created_at": .number(Date().timeIntervalSince1970)])
+        try JSONEncoder().encode(JSONValue.array([request])).write(to: directory.appendingPathComponent("reset-queue.json"), options: .atomic)
     }
 
     func confirmation(_ source: Source, card: String) throws -> CreditConfirmation {
@@ -298,6 +401,8 @@ final class OfficialResetStateTests: XCTestCase {
     server.bind(str(directory / 'control.sock'))
     server.listen()
     record_lock = threading.Lock()
+    presented_resets = set()
+    cancelled_resets = set()
     def handle(connection):
         with connection:
             request = json.loads(connection.makefile('rb').readline())
@@ -308,7 +413,7 @@ final class OfficialResetStateTests: XCTestCase {
             state = json.loads((directory / 'fixture-state.json').read_text())
             sources = state['sources']
             def secret(source):
-                return dict(account_id=source['account_id'], access_token='fixture-token')
+                return dict(account_id=source['account_id'], access_token='fixture-token') if source['kind'] == 'official' else dict(api_key='fixture-api-key')
             if operation == 'status':
                 data = dict(process_id=os.getpid(), port=17863, sources=sources)
             elif operation == 'credentials.storage.status':
@@ -326,6 +431,22 @@ final class OfficialResetStateTests: XCTestCase {
                 data = dict(updated_secrets=[dict(source_id=source['id'], secret=secret(source)) for source in sources])
             elif operation == 'notifications.list':
                 data = dict(events=[])
+            elif operation == 'control.reset.pending':
+                queue = directory / 'reset-queue.json'
+                jobs = json.loads(queue.read_text()) if queue.exists() else []
+                with record_lock:
+                    data = dict(requests=[job for job in jobs if job['id'] not in presented_resets and job['id'] not in cancelled_resets])
+            elif operation == 'control.reset.present':
+                job_id = request['payload']['id']
+                with record_lock:
+                    claimed = job_id not in presented_resets and job_id not in cancelled_resets and not (directory / 'reject-present').exists()
+                    if claimed:
+                        presented_resets.add(job_id)
+                    data = dict(claimed=claimed)
+            elif operation == 'control.reset.cancel':
+                with record_lock:
+                    cancelled_resets.add(request['payload']['id'])
+                data = dict(status='cancelled')
             elif operation == 'official.refresh':
                 with record_lock:
                     with (directory / 'refresh-requests').open('a') as record:
@@ -336,7 +457,7 @@ final class OfficialResetStateTests: XCTestCase {
                     while not (directory / release).exists() and time.monotonic() < deadline:
                         time.sleep(0.01)
                 data = {}
-            elif operation == 'official.credits.consume':
+            elif operation in ('official.credits.consume', 'control.reset.confirm'):
                 with record_lock:
                     with (directory / 'consume-requests').open('a') as record:
                         record.write(json.dumps(request['payload']) + '\n')

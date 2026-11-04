@@ -140,7 +140,10 @@ pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
             .filter(|p| (1..=65535).contains(p))
             .context("图片生成端口须为 1–65535")? as u16;
     }
-    if next.port == state.port || next.port == state.chatbot.port()? {
+    if next.port == state.port
+        || next.port == state.chatbot.port()?
+        || next.port == state.control.port()?
+    {
         bail!("图片生成端口不能与其他入口相同");
     }
     if payload["regenerate_key"] == true {
@@ -152,6 +155,7 @@ pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
     if next.key == state.gateway_key
         || state.chatbot.uses_key(&next.key)?
         || state.remote.uses_key(&next.key)?
+        || state.control.uses_key(&next.key)?
         || state
             .sources
             .read()
@@ -339,7 +343,7 @@ impl Attempt {
             generation_ms: None,
         };
         state.inflight.fetch_add(1, Ordering::Relaxed);
-        state.usage.start(&record);
+        state.usage.start_for_source(&record, source);
         let diagnostic = Capture::new(
             &record.attempt_id,
             record.started_at,

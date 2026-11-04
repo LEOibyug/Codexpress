@@ -141,7 +141,7 @@ fn invalid_days_are_read_only_and_active_timings_never_become_completed_samples(
         json!({"from":from,"to":from+86_400,"day_starts":[from+1,from+86_400]}),
         json!({"from":from,"to":from+86_400,"day_starts":[from,from+10,from+86_400]}),
         json!({"from":from,"to":from+86_400,"day_starts":[from,from,from+86_400]}),
-        json!({"from":from,"to":from+86_400,"day_starts":[from,from+86_400],"status":"success"}),
+        json!({"from":from,"to":from+86_400,"day_starts":[from,from+86_400],"status":"bogus"}),
     ] {
         assert!(build(&mut data, &invalid).is_err(), "accepted {invalid}");
     }

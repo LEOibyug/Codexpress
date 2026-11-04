@@ -66,7 +66,7 @@ pub(super) fn migrate(snapshot: &mut Snapshot) -> Result<()> {
 pub(super) fn merge_models(
     models: &mut Value,
     generated: Value,
-    added: &mut Vec<Value>,
+    mut added: Option<&mut Vec<Value>>,
 ) -> Result<()> {
     let provider = provider_mut(models)?;
     let rows = provider
@@ -89,7 +89,7 @@ pub(super) fn merge_models(
             .and_then(Value::as_str)
             .context("OMP 模型 ID 无效")?;
         if !ids.contains(id) {
-            added.push(row.clone());
+            if let Some(added) = added.as_mut() { added.push(row.clone()); }
             rows.push(row);
         }
     }
@@ -120,11 +120,43 @@ pub(super) fn configure(
     let mut updated = snapshot.clone();
     let mut models_after = models.value.clone();
     let mut settings_after = settings.value.clone();
+    preserve_raw_edits(&mut updated, models, settings)?;
+    apply_edits(&mut updated, &mut models_after, &mut settings_after, edits)?;
+    updated.models.applied =
+        document::patch(models.bytes.as_deref(), &models.value, &models_after)?;
+    updated.settings.applied =
+        document::patch(settings.bytes.as_deref(), &settings.value, &settings_after)?;
+    if read(&models.path, FILE_LIMIT)? != models.bytes
+        || read(&settings.path, FILE_LIMIT)? != settings.bytes
+    {
+        bail!("OMP 配置在保存前发生变化，未修改文件");
+    }
+    write_files(&[
+        (&models.path, models.bytes.as_deref(), Some(updated.models.applied.as_slice())),
+        (&settings.path, settings.bytes.as_deref(), Some(updated.settings.applied.as_slice())),
+    ])?;
+    if let Err(error) = save_snapshot(state_dir, &updated) {
+        write_files(&[
+            (&models.path, Some(updated.models.applied.as_slice()), models.bytes.as_deref()),
+            (&settings.path, Some(updated.settings.applied.as_slice()), settings.bytes.as_deref()),
+        ])
+        .context("OMP 压缩配置保存失败，且无法回滚")?;
+        return Err(error);
+    }
+    Ok(updated)
+}
+
+pub(super) fn apply_edits(
+    snapshot: &mut Snapshot,
+    models: &mut Value,
+    settings: &mut Value,
+    edits: Vec<preferences::Edit>,
+) -> Result<()> {
     for edit in edits {
         let document = if edit.file == "config" {
-            &mut settings_after
+            &mut *settings
         } else {
-            &mut models_after
+            &mut *models
         };
         let path: Vec<_> = edit.path.iter().map(String::as_str).collect();
         let original = stored(at(document, &path))?;
@@ -140,14 +172,14 @@ pub(super) fn configure(
         }
         put(document, &path, value)?;
         let applied = stored(at(document, &path))?;
-        if let Some(owned) = updated
+        if let Some(owned) = snapshot
             .native_before
             .iter_mut()
             .find(|owned| owned.file == edit.file && owned.path == edit.path)
         {
             owned.applied = applied;
         } else {
-            updated.native_before.push(Original {
+            snapshot.native_before.push(Original {
                 file: edit.file,
                 path: edit.path,
                 before: original,
@@ -155,61 +187,29 @@ pub(super) fn configure(
             });
         }
     }
-    updated.models.applied =
-        document::patch(models.bytes.as_deref(), &models.value, &models_after)?;
-    updated.settings.applied =
-        document::patch(settings.bytes.as_deref(), &settings.value, &settings_after)?;
-    if read(&models.path, FILE_LIMIT)? != models.bytes
-        || read(&settings.path, FILE_LIMIT)? != settings.bytes
-    {
-        bail!("OMP 配置在保存前发生变化，未修改文件");
-    }
-    write_files(&[
-        (
-            &models.path,
-            models.bytes.as_deref(),
-            Some(updated.models.applied.as_slice()),
-        ),
-        (
-            &settings.path,
-            settings.bytes.as_deref(),
-            Some(updated.settings.applied.as_slice()),
-        ),
-    ])?;
-    if let Err(error) = save_snapshot(state_dir, &updated) {
-        write_files(&[
-            (
-                &models.path,
-                Some(updated.models.applied.as_slice()),
-                models.bytes.as_deref(),
-            ),
-            (
-                &settings.path,
-                Some(updated.settings.applied.as_slice()),
-                settings.bytes.as_deref(),
-            ),
-        ])
-        .context("OMP 压缩配置保存失败，且无法回滚")?;
-        return Err(error);
-    }
-    Ok(updated)
+    Ok(())
 }
 
-pub(super) fn restore(snapshot: &Snapshot, models: &mut Value, settings: &mut Value) -> Result<()> {
-    // Check every managed leaf before changing anything; unrelated preferences remain user-owned.
-    let original_models = parse(snapshot.models.baseline.as_bytes())?;
-    let original_settings = parse(snapshot.settings.baseline.as_bytes())?;
+pub(super) fn verify_native(snapshot: &Snapshot, models: &Value, settings: &Value) -> Result<()> {
     for original in &snapshot.native_before {
         let document = if original.file == "config" {
-            &*settings
+            settings
         } else {
-            &*models
+            models
         };
         let path: Vec<_> = original.path.iter().map(String::as_str).collect();
         if at(document, &path) != decoded(&original.applied)?.as_ref() {
             bail!("OMP 压缩配置已被其他程序修改；为保留更改，未恢复");
         }
     }
+    Ok(())
+}
+
+pub(super) fn restore(snapshot: &Snapshot, models: &mut Value, settings: &mut Value) -> Result<()> {
+    // Check every managed leaf before changing anything; unrelated preferences remain user-owned.
+    verify_native(snapshot, models, settings)?;
+    let original_models = parse(snapshot.models.baseline.as_bytes())?;
+    let original_settings = parse(snapshot.settings.baseline.as_bytes())?;
     for original in &snapshot.native_before {
         let document = if original.file == "config" {
             &mut *settings

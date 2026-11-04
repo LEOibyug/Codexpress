@@ -18,7 +18,7 @@ struct ChatbotSettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 PageHeading("聊天客户端")
-                SettingsCard("本地 API", symbol: "bubble.left.and.bubble.right", accessory: {
+                SettingsCard("客户端 API", symbol: "bubble.left.and.bubble.right", accessory: {
                     StatusPill(text: status["running"].bool == true ? "运行中" : status["enabled"].bool == false ? "已关闭" : "未启动", color: status["running"].bool == true ? .green : .secondary)
                 }) {
                     SettingRow(title: "启用接入") {
@@ -57,6 +57,8 @@ struct ChatbotSettingsView: View {
                     }
                     Divider()
                     LabeledContent("接口", value: "Chat Completions / Responses")
+                    Text("OMP 与聊天客户端共用此端口，允许局域网访问。远端请将 127.0.0.1 替换为这台 Mac 的局域网或 VPN 地址，并使用独立 Key。不要将 HTTP 端口直接暴露到公网。")
+                        .foregroundStyle(.secondary)
                 }
             }.settingsPage()
         }.task(id: model.running) { await load() }

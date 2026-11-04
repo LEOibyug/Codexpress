@@ -8,6 +8,7 @@ struct ResetCreditsSheet: View {
     @State private var refreshing = false
     @State private var localError: String?
     @State private var quotaRecovered = false
+    @State private var submitted = false
 
     // A sheet never follows a source into a different account after it has opened.
     private var source: Source? {
@@ -37,6 +38,9 @@ struct ResetCreditsSheet: View {
                 }
             }
             Divider()
+            if request.managementRequestID != nil {
+                InfoNote(text: "来自管理 API 的请求。只有点击“确认使用”才会消耗重置卡。", symbol: "hand.raised", color: .secondary)
+            }
             if let source {
                 if let confirmation { confirmationContent(confirmation) }
                 else { inventoryContent(source) }
@@ -51,11 +55,13 @@ struct ResetCreditsSheet: View {
                     Button("返回卡片") { confirmation = nil }.disabled(refreshing)
                 }
                 Spacer()
-                Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("关闭") { model.cancelControlReset(request); dismiss() }.keyboardShortcut(.cancelAction)
                 if let confirmation {
                     Button("确认使用") {
-                        model.consume(confirmation)
-                        self.confirmation = nil
+                        if model.consume(confirmation, managementRequestID: request.managementRequestID) {
+                            self.confirmation = nil
+                            if request.managementRequestID != nil { submitted = true; dismiss() }
+                        }
                     }.buttonStyle(.borderedProminent)
                         .disabled(source == nil || !model.canSubmitCredit(for: confirmation.source, creditID: confirmation.credit["id"].string ?? ""))
                 }
@@ -66,6 +72,7 @@ struct ResetCreditsSheet: View {
                 guard let source else { return }
                 await refresh(source: source, quick: request.quickReset)
             }
+            .onDisappear { if !submitted { model.cancelControlReset(request) } }
     }
 
     private func inventoryContent(_ source: Source) -> some View {
@@ -116,7 +123,8 @@ struct ResetCreditsSheet: View {
                 Task { await prepare(credit, source: source) }
             }.buttonStyle(.bordered).controlSize(.small)
                 .disabled(refreshing || model.busy || model.refreshingQuotas.contains(source.id) || !inventory.isFresh
-                          || !CreditInventory.isUsable(credit) || !model.canSubmitCredit(for: source, creditID: creditID))
+                          || !CreditInventory.isUsable(credit) || !model.canSubmitCredit(for: source, creditID: creditID)
+                          || (request.creditID != nil && request.creditID != creditID))
         }
     }
 
@@ -137,6 +145,10 @@ struct ResetCreditsSheet: View {
         do {
             try await model.queryOfficial(source.id, includeCredits: true)
             guard !Task.isCancelled, let current = self.source else { return }
+            if let creditID = request.creditID {
+                confirmation = try CreditConfirmation.make(source: current, live: model.state(current.id), creditID: creditID)
+                return
+            }
             if quick {
                 let live = model.state(current.id)
                 let quota = QuotaOverview(live["quota"])

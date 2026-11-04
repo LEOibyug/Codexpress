@@ -241,151 +241,274 @@ async fn editing_a_key_during_query_discards_the_old_account_result() {
     task.abort();
 }
 
-#[tokio::test]
-async fn balance_publications_broadcast_to_other_sessions_and_hide_failed_refreshes() {
-    use axum::body::{to_bytes, Body};
-    use codexpress_gateway::chatbot;
-    use http_body_util::BodyExt;
-    use std::time::Duration;
-    use tower::ServiceExt;
-
-    fn request(port: u16, key: &str, path: &str, body: Option<Value>) -> Request {
-        Request::builder()
-            .method(if body.is_some() { "POST" } else { "GET" })
-            .uri(path)
-            .header("host", format!("127.0.0.1:{port}"))
-            .header("authorization", format!("Bearer {key}"))
-            .header("content-type", "application/json")
-            .body(
-                body.map(|v| Body::from(v.to_string()))
-                    .unwrap_or_else(Body::empty),
-            )
-            .unwrap()
+fn settled_record(
+    source: &codexpress_gateway::model::Source,
+    id: &str,
+    input: u64,
+) -> codexpress_gateway::usage::UsageRecord {
+    codexpress_gateway::usage::UsageRecord {
+        attempt_id: id.into(),
+        request_id: id.into(),
+        source_id: source.id.clone(),
+        source_name: source.name.clone(),
+        model: "gpt-6.1-terra".into(),
+        started_at: 1_790_000_000,
+        status: "success".into(),
+        input_tokens: input,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        token_details: codexpress_gateway::usage::TokenDetails {
+            source_kind: Some("api".into()),
+            source_identity: Some(source.identity()),
+            output_available: true,
+            ..Default::default()
+        },
+        complete: true,
+        latency_ms: 1000,
+        first_token_latency_ms: None,
+        generation_ms: None,
     }
-    async fn event(body: &mut Body) -> Value {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let frame = body.frame().await.unwrap().unwrap();
-                if let Ok(bytes) = frame.into_data() {
-                    let text = std::str::from_utf8(&bytes).unwrap();
-                    if let Some(data) = text.lines().find_map(|line| line.strip_prefix("data: ")) {
-                        assert!(text.contains("event: status"));
-                        assert!(!text.contains("PRIVATE"));
-                        return serde_json::from_str(data).unwrap();
-                    }
-                }
-            }
-        })
+}
+fn settle(state: &Arc<AppState>, source: &codexpress_gateway::model::Source, id: &str, input: u64) {
+    let record = settled_record(source, id, input);
+    state.usage.start_for_source(&record, source);
+    state.usage.record(record).unwrap();
+}
+async fn reconcile(state: &Arc<AppState>) {
+    management::dispatch(state, "usage.reconcile", json!({"source_id":"balance-api"}))
         .await
-        .unwrap()
+        .unwrap();
+    for _ in 0..500 {
+        let status = management::dispatch(state, "usage.reconcile.status", json!({}))
+            .await
+            .unwrap();
+        if status["running"] == false {
+            assert_eq!(status["errors"], 0);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    panic!("账单核对未结束");
+}
 
-    let hits = Arc::new(AtomicUsize::new(0));
-    let used = Arc::new(AtomicUsize::new(10));
-    let generations = Arc::new(AtomicUsize::new(0));
+#[tokio::test]
+async fn projection_replaces_estimates_and_authoritative_watermark_prevents_old_charge_deduction() {
+    let amount = Arc::new(AtomicUsize::new(100));
+    let quota_hits = Arc::new(AtomicUsize::new(0));
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let invoices = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let (remaining, hits, fail, arrived, resume, ledger) = (
+        amount.clone(),
+        quota_hits.clone(),
+        failing.clone(),
+        entered.clone(),
+        release.clone(),
+        invoices.clone(),
+    );
     let (address, task) = serve(Router::new()
-        .route("/api/v1/me/quota", get({
-            let hits = hits.clone();
-            let used = used.clone();
-            move || {
-                hits.fetch_add(1, Ordering::SeqCst);
-                let used = used.load(Ordering::SeqCst);
-                async move {
-                    if used == usize::MAX {
-                        (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":"PRIVATE"})))
-                    } else {
-                        (StatusCode::OK, Json(json!({"userLimitTotalUsd":100,"userCurrentTotalUsd":used})))
-                    }
+        .route("/api/v1/me/quota", get(move || {
+            let (remaining, hits, fail, arrived, resume) =
+                (remaining.clone(), hits.clone(), fail.clone(), arrived.clone(), resume.clone());
+            async move {
+                let index = hits.fetch_add(1, Ordering::SeqCst);
+                if index == 1 { arrived.notify_one(); resume.notified().await; }
+                if fail.load(Ordering::SeqCst) {
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
                 }
+                (StatusCode::OK, Json(json!({"userLimitTotalUsd":remaining.load(Ordering::SeqCst),"userCurrentTotalUsd":0})))
             }
         }))
-        .route("/v1/responses", post({
-            let generations = generations.clone();
-            move || {
-                generations.fetch_add(1, Ordering::SeqCst);
-                async {
-                    Response::builder().header("content-type", "text/event-stream")
-                        .body(Body::from("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"m\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"))
-                        .unwrap()
-                }
-            }
-        }))).await;
-    let (_dir, state) = state(&format!("{address}/v1")).await;
-    let key = state.chatbot.key().unwrap()["key"]
-        .as_str()
+        .route("/api/v1/me/usage-logs", get(move || {
+            let rows = ledger.lock().unwrap().clone();
+            async move { Json(json!({"items":rows,"pageInfo":{"hasMore":false}})) }
+        }))
+        .fallback(|| async { StatusCode::NOT_FOUND })).await;
+    let (dir, state) = state(&format!("{address}/v1")).await;
+    let source = state.sources.read().await[0].source.clone();
+    assert!(codexpress_gateway::balance::cached(&state, &source)
+        .await
         .unwrap()
-        .to_owned();
-    let port = state.chatbot.status().await.unwrap()["port"]
-        .as_u64()
-        .unwrap() as u16;
-    let app = chatbot::router(state.clone());
-    let mut streams = Vec::new();
-    for session in ["balance-a", "balance-b"] {
-        let mut inference = request(
-            port,
-            &key,
-            "/v1/responses",
-            Some(json!({"model":"m","input":"fixture"})),
-        );
-        inference
-            .headers_mut()
-            .insert("thread-id", session.parse().unwrap());
-        let response = app.clone().oneshot(inference).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        to_bytes(response.into_body(), 8192).await.unwrap();
-        let path = format!("/v1/codexpress/events?model=m&session_id={session}");
-        let response = app
-            .clone()
-            .oneshot(request(port, &key, &path, None))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let mut body = response.into_body();
-        assert_eq!(event(&mut body).await, json!({"source":null}));
-        streams.push(body);
-    }
-    assert_eq!(query(&state).await["amount"], 90.0);
-    for body in &mut streams {
-        assert_eq!(event(body).await["source"]["balance"]["amount"], 90.0);
-    }
-    assert_eq!(query(&state).await["amount"], 90.0);
-    for body in &mut streams {
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), body.frame())
-                .await
-                .is_err()
-        );
-    }
+        .is_null());
+    let original = query(&state).await;
+    assert_eq!(original["amount"], 100.0);
+    // Catalog reference price is $1/million input tokens for terra.
+    settle(&state, &source, "estimated", 100_000);
+    let projected = codexpress_gateway::balance::cached(&state, &source)
+        .await
+        .unwrap();
+    assert_eq!(projected["amount"], 99.9);
+    assert_eq!(projected["estimated"], true);
+    assert_eq!(projected["updated_at"], original["updated_at"]);
+    assert_eq!(query(&state).await["amount"], 99.9);
+    assert_eq!(
+        quota_hits.load(Ordering::SeqCst),
+        1,
+        "动态缓存不能绕过原TTL"
+    );
+    let invoice = |id: u64, input: u64, cost: f64| {
+        json!({"id":id,"createdAt":"2026-09-21T14:13:49Z",
+        "model":"gpt-6.1-terra","inputTokens":input,"outputTokens":0,"cost":cost,
+        "statusCode":200,"duration":1000,"endpoint":"/v1/responses"})
+    };
+    invoices.lock().unwrap().push(invoice(1, 100_000, 0.25));
+    reconcile(&state).await;
+    let actual = codexpress_gateway::balance::cached(&state, &source)
+        .await
+        .unwrap();
+    assert_eq!(actual["amount"], 99.75);
+    assert_eq!(actual["local_spend"], 0.25);
+    assert_eq!(actual["estimated"], false);
+    amount.store(80, Ordering::SeqCst);
+    let copy = state.clone();
+    let pending = tokio::spawn(async move {
+        management::dispatch(
+            &copy,
+            "balance.query",
+            json!({"source_id":"balance-api","force":true}),
+        )
+        .await
+        .unwrap()
+    });
+    entered.notified().await;
+    // Cached status is independent of the network-held discovery lock.
+    settle(&state, &source, "during-authoritative-query", 200_000);
+    let during = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        codexpress_gateway::balance::cached(&state, &source),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!((during["amount"].as_f64().unwrap() - 99.55).abs() < 1e-9);
+    release.notify_one();
+    assert_eq!(
+        pending.await.unwrap()["amount"],
+        80.0,
+        "权威返回优先于查询期间的本机估算"
+    );
+    invoices.lock().unwrap().push(invoice(2, 200_000, 2.0));
+    reconcile(&state).await;
+    let reset = codexpress_gateway::balance::cached(&state, &source)
+        .await
+        .unwrap();
+    assert_eq!(reset["amount"], 80.0, "基底水位前的后到实耗不能重复扣减");
+    assert_eq!(reset["local_spend"], 0.0);
+    let mut unknown = settled_record(&source, "unpriced-usd", 123);
+    unknown.model = "unpriced-model".into();
+    state.usage.start_for_source(&unknown, &source);
+    state.usage.record(unknown).unwrap();
+    let incomplete = codexpress_gateway::balance::cached(&state, &source)
+        .await
+        .unwrap();
+    assert_eq!(incomplete["amount"], 80.0);
+    assert_eq!(incomplete["unknown_spend_requests"], 1);
+    assert_eq!(incomplete["estimated"], true);
+    failing.store(true, Ordering::SeqCst);
+    let failed = management::dispatch(
+        &state,
+        "balance.query",
+        json!({"source_id":"balance-api","force":true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(failed["amount"], 80.0);
+    assert_eq!(failed["stale"], true);
+    assert_eq!(failed["updated_at"], reset["updated_at"]);
+    state.sources.write().await[0].source.proxy.mode = "system".into();
+    let changed = state.sources.read().await[0].source.clone();
+    assert!(codexpress_gateway::balance::cached(&state, &changed)
+        .await
+        .unwrap()
+        .is_null());
+    let reopened = AppState::new(dir.path().into(), 0, "local".into()).unwrap();
+    assert!(codexpress_gateway::balance::cached(&reopened, &source)
+        .await
+        .unwrap()
+        .is_null());
+    task.abort();
+}
 
-    for (used_amount, session, expected) in [
-        (20, "balance-a", Some(80.0)),
-        (usize::MAX, "balance-b", None),
-        (30, "balance-b", Some(70.0)),
-    ] {
-        used.store(used_amount, Ordering::SeqCst);
-        let response = app
-            .clone()
-            .oneshot(request(
-                port,
-                &key,
-                "/v1/codexpress/refresh",
-                Some(json!({"model":"m","session_id":session})),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let accepted: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
-        assert_eq!(accepted, json!({"accepted":true}));
-        for body in &mut streams {
-            let update = event(body).await;
-            match expected {
-                Some(amount) => assert_eq!(update["source"]["balance"]["amount"], amount),
-                None => assert_eq!(update, json!({"source":null})),
-            }
-        }
-    }
-    assert_eq!(hits.load(Ordering::SeqCst), 4);
-    assert_eq!(generations.load(Ordering::SeqCst), 2);
+#[tokio::test]
+async fn non_usd_and_unknown_costs_never_invent_zero_cost_or_convert_currency() {
+    let (address, task) = serve(Router::new()
+        .route("/user/balance", get(|| async { Json(json!({"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"24.35"}]})) }))
+        .fallback(|| async { StatusCode::NOT_FOUND })).await;
+    let (_dir, state) = state(&format!("{address}/v1")).await;
+    let source = state.sources.read().await[0].source.clone();
+    settle(&state, &source, "before-baseline", 100_000);
+    assert!(codexpress_gateway::balance::cached(&state, &source)
+        .await
+        .unwrap()
+        .is_null());
+    assert_eq!(query(&state).await["amount"], 24.35);
+    settle(&state, &source, "usd-reference", 100_000);
+    let mut unknown = settled_record(&source, "unpriced", 123);
+    unknown.model = "unpriced-model".into();
+    state.usage.start_for_source(&unknown, &source);
+    state.usage.record(unknown).unwrap();
+    let result = codexpress_gateway::balance::cached(&state, &source)
+        .await
+        .unwrap();
+    assert_eq!(result["amount"], 24.35);
+    assert_eq!(result["currency"], "CNY");
+    assert_eq!(result["projection_supported"], false);
+    assert!(result["local_spend"].is_null());
+    assert_eq!(result["unknown_spend_requests"], 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn completed_forwarding_projects_the_response_charge_without_a_balance_refresh() {
+    use tower::ServiceExt;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let copy = hits.clone();
+    let (address, task) = serve(
+        Router::new()
+            .route(
+                "/api/v1/me/quota",
+                get(move || {
+                    copy.fetch_add(1, Ordering::SeqCst);
+                    async { Json(json!({"userLimitTotalUsd":100,"userCurrentTotalUsd":0})) }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(|| async {
+                    Json(json!({"id":"local-fixture","model":"custom-model","usage":{
+                "input_tokens":100,"output_tokens":9,"cost_usd":0.3}}))
+                }),
+            ),
+    )
+    .await;
+    let (_dir, state) = state(&format!("{address}/v1")).await;
+    let source = state.sources.read().await[0].source.clone();
+    assert_eq!(query(&state).await["amount"], 100.0);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("host", "127.0.0.1:0")
+        .header("authorization", "Bearer local")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            r#"{"model":"custom-model","input":"local fixture","stream":false}"#,
+        ))
+        .unwrap();
+    let response = codexpress_gateway::relay::router(state.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let balance = codexpress_gateway::balance::cached(&state, &source)
+        .await
+        .unwrap();
+    assert_eq!(balance["amount"], 99.7);
+    assert_eq!(balance["local_spend"], 0.3);
+    assert_eq!(balance["estimated"], false);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
     task.abort();
 }

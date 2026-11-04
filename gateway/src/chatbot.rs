@@ -1,8 +1,7 @@
-//! Separate, loopback-only OpenAI-compatible ingress. Native Codex traffic
-//! never enters this adapter and keeps its original request/response bytes.
+//! Separate OpenAI-compatible ingress for local and LAN clients. Native Codex
+//! traffic never enters this adapter and keeps its original request/response bytes.
 mod requests;
 mod responses;
-pub(crate) mod status;
 
 use crate::{config::secure_write, model::AppState};
 use anyhow::{bail, Context, Result};
@@ -46,7 +45,6 @@ pub struct ChatbotAccess {
     settings: Mutex<Settings>,
     path: PathBuf,
     listener: AsyncMutex<Option<Listener>>,
-    conversation_status: Arc<status::Store>,
 }
 
 fn generate_key() -> String {
@@ -63,9 +61,6 @@ fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 impl ChatbotAccess {
-    pub(crate) fn account_updated(&self) {
-        self.conversation_status.notify();
-    }
     pub(crate) fn port(&self) -> Result<u16> {
         Ok(self.settings()?.port)
     }
@@ -101,7 +96,6 @@ impl ChatbotAccess {
             settings: Mutex::new(settings),
             path,
             listener: AsyncMutex::new(None),
-            conversation_status: Arc::new(status::Store::default()),
         })
     }
     fn settings(&self) -> Result<Settings> {
@@ -114,7 +108,7 @@ impl ChatbotAccess {
         let listener = self.listener.lock().await;
         let settings = self.settings()?;
         Ok(
-            json!({"enabled":settings.enabled,"running":listener.as_ref().is_some_and(|l|!l.task.is_finished()),"port":settings.port,"base_url":format!("http://127.0.0.1:{}/v1",settings.port),"key_set":true}),
+            json!({"enabled":settings.enabled,"running":listener.as_ref().is_some_and(|l|!l.task.is_finished()),"port":settings.port,"base_url":format!("http://127.0.0.1:{}/v1",settings.port),"listen_address":"0.0.0.0","lan_enabled":true,"key_set":true}),
         )
     }
     pub fn key(&self) -> Result<Value> {
@@ -142,6 +136,9 @@ pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
     if next.port == state.images.port()? {
         bail!("此端口已用于图片生成，请选择不同端口");
     }
+    if next.port == state.control.port()? {
+        bail!("此端口已用于管理 API，请选择不同端口");
+    }
     if payload["regenerate_key"] == true {
         next.key = generate_key();
     } else if let Some(value) = payload.get("key") {
@@ -153,6 +150,9 @@ pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
     }
     if state.images.uses_key(&next.key)? {
         bail!("聊天客户端与图片生成须使用不同 Key");
+    }
+    if state.control.uses_key(&next.key)? {
+        bail!("聊天客户端与管理 API 须使用不同 Key");
     }
     if state.remote.uses_key(&next.key)?
         || state
@@ -169,7 +169,7 @@ pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
         .is_some_and(|l| l.port == next.port && !l.task.is_finished());
     let socket = if next.enabled && !current {
         Some(
-            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, next.port))
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, next.port))
                 .await
                 .context("聊天客户端端口被占用，请更换端口")?,
         )
@@ -182,7 +182,6 @@ pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
         .settings
         .lock()
         .map_err(|_| anyhow::anyhow!("聊天客户端接入忙碌"))? = next.clone();
-    state.chatbot.account_updated();
     if let Some(socket) = socket {
         let shared = state.clone();
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
@@ -244,16 +243,16 @@ async fn gate(State(state): State<Arc<AppState>>, mut request: Request, next: Ne
             )
         }
     };
-    let expected = [
-        format!("127.0.0.1:{}", settings.port),
-        format!("localhost:{}", settings.port),
-    ];
+    // LAN callers use the Mac's reachable IP or DNS name. Authentication remains
+    // the independent Bearer key; neither Host nor forwarded headers grant trust.
     let hosts: Vec<_> = request.headers().get_all(header::HOST).iter().collect();
     if hosts.len() != 1
-        || !hosts[0]
-            .to_str()
-            .ok()
-            .is_some_and(|h| expected.iter().any(|e| e.eq_ignore_ascii_case(h)))
+        || !hosts[0].to_str().ok().is_some_and(|value| {
+            !value.contains('@') && value.parse::<http::uri::Authority>().ok().is_some_and(|authority| {
+                authority.port_u16() == Some(settings.port)
+                    && crate::remote::validate_host(authority.host().trim_matches(['[', ']'])).is_ok()
+            })
+        })
     {
         return error(
             StatusCode::MISDIRECTED_REQUEST,
@@ -313,6 +312,7 @@ async fn gate(State(state): State<Arc<AppState>>, mut request: Request, next: Ne
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/v1/remote-check", get(remote_check))
         .route("/v1/models", get(models))
         .route("/models", get(models))
         .route("/v1/chat/completions", post(chat))
@@ -321,11 +321,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/responses", post(responses))
         .route("/v1/responses/compact", post(compact))
         .route("/responses/compact", post(compact))
-        .route("/v1/codexpress/status", get(status::get))
-        .route("/v1/codexpress/refresh", post(status::refresh))
-        .route("/v1/codexpress/events", get(status::events))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, gate))
+}
+async fn remote_check() -> Json<Value> {
+    Json(json!({"service":"codexpress","mode":"chatbot","version":1}))
 }
 async fn models(State(state): State<Arc<AppState>>) -> Response {
     use futures_util::StreamExt;
@@ -396,20 +396,21 @@ async fn infer(state: Arc<AppState>, request: Request, format: requests::Format)
         Ok(b) => b,
         Err(problem) => return error(problem.status, problem.message, None),
     };
-    let mut body: Value = match serde_json::from_slice(&bytes) {
+    let body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(_) => return error(StatusCode::BAD_REQUEST, "请求须为 JSON 对象", None),
     };
-    let local_thread = match take_local_thread(&mut body) {
-        Ok(thread) => thread,
-        Err(problem) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                problem.message,
-                Some(problem.param),
-            )
-        }
-    };
+    if format == requests::Format::Responses && is_compaction_v2(&body) {
+        return forward_native_compaction(
+            state,
+            parts,
+            bytes,
+            body,
+            "/v1/responses",
+            "text/event-stream",
+        )
+        .await;
+    }
     let session = body["session_id"]
         .as_str()
         .or_else(|| body["conversation_id"].as_str())
@@ -422,22 +423,11 @@ async fn infer(state: Arc<AppState>, request: Request, format: requests::Format)
     for field in ["session_id", "conversation_id"] {
         body.as_object_mut().unwrap().remove(field);
     }
-    let mut headers = relay_headers(&state, &parts.headers, local_thread, "text/event-stream");
+    let mut headers = relay_headers(&state, &parts.headers, "text/event-stream");
     if !headers.contains_key("thread-id") && !headers.contains_key("session-id") {
         if let Some(session) = session {
             headers.insert("session-id", session.parse().unwrap());
         }
-    }
-    if let (Some(ingress), Some(model), Some(thread)) = (
-        parts.extensions.get::<ChatbotIngress>(),
-        body["model"].as_str(),
-        status::thread(&headers),
-    ) {
-        let tracking = state
-            .chatbot
-            .conversation_status
-            .begin(&ingress.namespace, thread, model);
-        parts.extensions.insert(tracking);
     }
     parts.headers = headers;
     parts.uri = "/v1/responses".parse().unwrap();
@@ -449,63 +439,73 @@ async fn infer(state: Arc<AppState>, request: Request, format: requests::Format)
 // V1 compaction is a native JSON exchange, not a generation request. Preserve
 // opaque history and return the relay body without a presentation adapter.
 async fn compact(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    let (mut parts, body) = request.into_parts();
+    let (parts, body) = request.into_parts();
     let bytes = match crate::request_body::read(body, "chatbot").await {
         Ok(bytes) => bytes,
         Err(problem) => return error(problem.status, problem.message, None),
     };
-    let mut body: Value = match serde_json::from_slice::<Value>(&bytes) {
+    let body: Value = match serde_json::from_slice::<Value>(&bytes) {
         Ok(body) if body.is_object() => body,
         _ => return error(StatusCode::BAD_REQUEST, "请求须为 JSON 对象", None),
     };
-    let has_local_thread = body.get("codexpress_session_id").is_some();
-    let local_thread = match take_local_thread(&mut body) {
-        Ok(thread) => thread,
-        Err(problem) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                problem.message,
-                Some(problem.param),
-            )
-        }
-    };
-    parts.headers = relay_headers(&state, &parts.headers, local_thread, "application/json");
-    parts.uri = match parts.uri.query() {
-        Some(query) => format!("/v1/responses/compact?{query}").parse().unwrap(),
-        None => "/v1/responses/compact".parse().unwrap(),
-    };
-    let bytes = if has_local_thread {
-        bytes::Bytes::from(serde_json::to_vec(&body).unwrap())
-    } else {
-        bytes
-    };
-    crate::relay::forward(State(state), Request::from_parts(parts, Body::from(bytes))).await
+    forward_native_compaction(
+        state,
+        parts,
+        bytes,
+        body,
+        "/v1/responses/compact",
+        "application/json",
+    )
+    .await
 }
 
-fn take_local_thread(body: &mut Value) -> std::result::Result<Option<HeaderValue>, Invalid> {
-    // Plugin correlation is local-only metadata, never a vendor payload field.
-    let Some(value) = body
-        .as_object_mut()
-        .and_then(|body| body.remove("codexpress_session_id"))
-    else {
-        return Ok(None);
+pub(crate) fn is_compaction_v2(body: &Value) -> bool {
+    body["input"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["type"] == "compaction_trigger")
+    })
+}
+
+async fn forward_native_compaction(
+    state: Arc<AppState>,
+    mut parts: axum::http::request::Parts,
+    bytes: bytes::Bytes,
+    body: Value,
+    path: &'static str,
+    accept: &'static str,
+) -> Response {
+    if let Err(problem) = requests::model(&body) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            problem.message,
+            Some(problem.param),
+        );
+    }
+    let mut headers = relay_headers(&state, &parts.headers, accept);
+    for name in [
+        "openai-beta",
+        "x-codex-beta-features",
+        "x-codex-turn-state",
+        "x-codex-routing-hint",
+        "x-openai-internal-codex-responses-lite",
+        "x-client-request-id",
+    ] {
+        if let Some(value) = parts.headers.get(name) {
+            headers.insert(axum::http::HeaderName::from_static(name), value.clone());
+        }
+    }
+    parts.headers = headers;
+    parts.uri = match parts.uri.query() {
+        Some(query) => format!("{path}?{query}").parse().unwrap(),
+        None => path.parse().unwrap(),
     };
-    value
-        .as_str()
-        .filter(|value| status::valid(value, 512))
-        .and_then(|value| HeaderValue::from_str(value).ok())
-        .filter(|value| value.to_str().is_ok())
-        .map(Some)
-        .ok_or(Invalid {
-            message: "codexpress_session_id 须为有效非空会话标识",
-            param: "codexpress_session_id",
-        })
+    crate::relay::forward(State(state), Request::from_parts(parts, Body::from(bytes))).await
 }
 
 fn relay_headers(
     state: &AppState,
     incoming: &axum::http::HeaderMap,
-    local_thread: Option<HeaderValue>,
     accept: &'static str,
 ) -> axum::http::HeaderMap {
     // Only this authenticated ingress can mint the internal relay request.
@@ -521,11 +521,6 @@ fn relay_headers(
     ] {
         if let Some(value) = incoming.get(name) {
             headers.insert(axum::http::HeaderName::from_static(name), value.clone());
-        }
-    }
-    if !headers.contains_key("thread-id") && !headers.contains_key("thread_id") {
-        if let Some(thread) = local_thread {
-            headers.insert("thread-id", thread);
         }
     }
     headers.insert(

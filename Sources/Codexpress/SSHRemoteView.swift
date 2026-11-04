@@ -11,14 +11,19 @@ struct SSHRemoteView: View {
                 PageHeading("远端接入") {
                     if remote.busy { ProgressView().controlSize(.small); Text(remote.phase).font(.system(size: 12)).foregroundStyle(.secondary) }
                 }
+                Picker("远端客户端", selection: Binding(get: { remote.profile.kind }, set: { remote.selectKind($0) })) {
+                    ForEach(SSHRemoteKind.allCases, id: \.self) { kind in Text(kind.title).tag(kind) }
+                }.pickerStyle(.segmented)
                 ingress
                 connection
                 destination
+                if remote.profile.kind == .omp { ompConfiguration }
                 if !remote.summary.isEmpty { preview }
-                if !remote.status["peers"].array.isEmpty { peers }
+                if remote.profile.kind == .codex && !remote.status["peers"].array.isEmpty { peers }
             }.settingsPage()
         }
-        .task { await remote.loadSSHConfig(); await remote.refresh(model) }
+        .task { await remote.loadSSHConfig(); await remote.detectLocalOMPDirectory() }
+        .task(id: "\(model.running):\(remote.profile.kind)") { await remote.refresh(model) }
         .onChange(of: remote.error) { _, error in model.error = error }
         .onChange(of: remote.notice) { _, notice in model.notice = notice }
         .disabled(remote.busy || model.busy || !model.running)
@@ -33,16 +38,19 @@ struct SSHRemoteView: View {
                 };confirmation=nil
             }
         } message: {
-            Text(confirmation == "apply" ? "将先从远端验证网关连通性，再备份配置、文件认证与模型目录，并应用本机已保存的模型压缩规则。请先结束远端 Codex 的运行任务，应用后重启远端 Codex。" : confirmation == "restore" ? "将恢复此 Codex 目录首次接入前的配置、文件认证与模型目录，接入后自行修改的这些设置也会还原。当前状态会另行备份。请先结束远端 Codex 任务，还原后重启。" : "此机器的旧 Key 将无法发起新请求，远端配置和对话记录保留。")
+            Text(confirmationMessage)
         }
     }
     private var ingress: some View {
         SettingsCard("网关连接", symbol: "network", accessory: {
-            StatusPill(text: model.running ? "运行中" : "未连接", color: model.running ? .green : .secondary)
+            StatusPill(text: remote.running ? "运行中" : "未连接", color: remote.running ? .green : .secondary)
         }) {
-            LabeledContent("与本机共用端口") {
+            LabeledContent(remote.profile.kind == .omp ? "与聊天客户端共用端口" : "与本机共用端口") {
                 Text(remote.port.isEmpty ? "—" : remote.port)
                     .font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
+            }
+            if remote.profile.kind == .omp {
+                InfoNote(text: "OMP 使用聊天客户端共享 Key，不是每台机器独立的 Key。请先启用聊天客户端接入；更换共享 Key 会影响所有已接入的 OMP。此 HTTP 入口不开放管理 API。")
             }
             if let old = remote.status["previous_port"].number {
                 InfoNote(text: "原远端端口为 \(Int(old))，请重新预览并应用连接以使用当前端口。", color: .orange)
@@ -71,7 +79,7 @@ struct SSHRemoteView: View {
                 if let message = remote.sshConfigMessage {
                     Text(message).font(.system(size: 12)).foregroundStyle(.secondary)
                 }
-                if let profiles = model.settings.sshRemoteProfiles, !profiles.isEmpty {
+                if let profiles = model.settings.sshRemoteProfiles?.filter({ $0.kind == remote.profile.kind }), !profiles.isEmpty {
                     HStack {
                         Menu("已保存的机器") {
                             ForEach(profiles) { profile in
@@ -81,7 +89,7 @@ struct SSHRemoteView: View {
                             }
                         }
                         Spacer()
-                        Button("新增机器") { remote.select(SSHRemoteProfile()) }
+                        Button("新增机器") { var profile = SSHRemoteProfile(); profile.clientKind = remote.profile.kind; remote.select(profile) }
                     }
                 }
                 Divider()
@@ -105,21 +113,65 @@ struct SSHRemoteView: View {
     }
 
     private var destination: some View {
-        SettingsCard("远端 Codex", symbol: "desktopcomputer") {
+        SettingsCard("远端 \(remote.profile.kind.title)", symbol: "desktopcomputer") {
             VStack(alignment: .leading, spacing: 18) {
-                field("Codex 配置目录", placeholder: "/home/user/.codex", text: $remote.profile.codexHome)
+                if remote.profile.kind == .omp {
+                    field("OMP Agent 配置目录", placeholder: "/home/user/.omp/agent", text: Binding(get: { remote.profile.ompAgentDirectory ?? "" }, set: { remote.profile.ompAgentDirectory = $0 }))
+                    field("默认模型（预览连接时必填）", placeholder: "模型 ID", text: Binding(get: { remote.profile.ompDefaultModel ?? "" }, set: { remote.profile.ompDefaultModel = $0 }))
+                    Text("新安装尚无配置文件时，会在应用后自动创建。OpenAI 推荐设置仅适用于与官方 Responses 一致的上游。")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                } else {
+                    field("Codex 配置目录", placeholder: "/home/user/.codex", text: $remote.profile.codexHome)
+                }
                 if remote.candidates.count > 1 {
                     Menu("选择发现的目录") {
                         ForEach(remote.candidates, id: \.self) { path in
-                            Button(path) { remote.profile.codexHome = path }
+                            Button(path) {
+                                if remote.profile.kind == .omp { remote.profile.ompAgentDirectory = path }
+                                else { remote.profile.codexHome = path }
+                            }
                         }
                     }
                 }
-                field("远端可访问的本机地址", placeholder: "自动探测或填写局域网／VPN IP", text: $remote.profile.gatewayHost)
+                field(remote.profile.kind == .omp ? "远端可访问的本机地址（预览连接时必填）" : "远端可访问的本机地址", placeholder: "自动探测或填写局域网／VPN IP", text: $remote.profile.gatewayHost)
                 Divider()
-                Toggle("同时接入已有自定义供应商 ID", isOn: $remote.profile.mapExistingProviders)
+                if remote.profile.kind == .codex { Toggle("同时接入已有自定义供应商 ID", isOn: $remote.profile.mapExistingProviders) }
                 HStack {
                     Button("还原接入前设置…") { confirmation = "restore" }.disabled(!remote.canRestore)
+                    Spacer()
+                    Button(remote.profile.kind == .omp && !remote.hasOMPConfiguration ? "读取远端 OMP 配置" : "预览连接配置") { remote.preview(model) }.buttonStyle(.borderedProminent)
+                }
+            }
+        }
+    }
+
+    private var ompConfiguration: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            SettingsCard("远端 OMP 配置", symbol: "slider.horizontal.3") {
+                HStack {
+                    Text(remote.hasOMPConfiguration ? "编辑当前远端配置" : "填写连接信息后，先读取远端配置。")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("重新读取远端配置") { remote.loadOMPConfiguration(model) }
+                }
+                field("导入用的本地 OMP 配置目录", placeholder: "~/.omp/agent", text: $remote.localOMPDirectory)
+                HStack(spacing: 12) {
+                    Button("应用本地配置") { remote.importLocalOMPConfiguration(model) }
+                    Button("应用 OpenAI 推荐配置") { remote.useOpenAIOMPConfiguration() }
+                }.disabled(!remote.hasOMPConfiguration)
+                Text("仅填入压缩与模型覆盖，不复制本机网关地址、Key、工具或扩展。自定义压缩端点将由远端访问。修改后预览，再备份并应用；不会改动本地配置。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
+            }
+            if remote.hasOMPConfiguration {
+                OMPCompactionSettingsView(
+                    draft: $remote.ompDraft,
+                    configuration: remote.ompConfiguration,
+                    configurationRevision: remote.ompConfigurationRevision,
+                    agentDirectory: remote.profile.directory,
+                    canEdit: !remote.busy && model.running && !model.busy,
+                    draftRevisionRequest: remote.ompDraftRefresh
+                )
+                HStack {
                     Spacer()
                     Button("预览连接配置") { remote.preview(model) }.buttonStyle(.borderedProminent)
                 }
@@ -140,7 +192,7 @@ struct SSHRemoteView: View {
                 if !remote.canApply(model) {
                     Text("设置已变化，请重新预览。").font(.system(size: 12)).foregroundStyle(.secondary)
                 } else if !remote.running {
-                    Text("请先启动本地网关。").font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text(remote.profile.kind == .omp ? "请先启用聊天客户端接入。" : "请先启动本地网关。").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("备份并应用…") { confirmation = "apply" }
@@ -163,6 +215,15 @@ struct SSHRemoteView: View {
                 }
             }
         }
+    }
+
+    private var confirmationMessage: String {
+        if remote.profile.kind == .omp {
+            return confirmation == "apply"
+                ? "将从远端验证聊天客户端入口和共享 Key，备份 OMP 配置后应用连接。不会读取认证、数据库或历史；请先结束远端 OMP 任务，应用后重启 OMP。"
+                : "将撤回此 OMP 目录中的 Codexpress 供应商、默认模型和已应用的 OMP 配置，保留无关修改。当前配置会另行备份；请先结束远端 OMP 任务，还原后重启。"
+        }
+        return confirmation == "apply" ? "将先从远端验证网关连通性，再备份配置、文件认证与模型目录，并应用本机已保存的模型压缩规则。请先结束远端 Codex 的运行任务，应用后重启远端 Codex。" : confirmation == "restore" ? "将恢复此 Codex 目录首次接入前的配置、文件认证与模型目录，接入后自行修改的这些设置也会还原。当前状态会另行备份。请先结束远端 Codex 任务，还原后重启。" : "此机器的旧 Key 将无法发起新请求，远端配置和对话记录保留。"
     }
 
     private func field(_ title: String, placeholder: String, text: Binding<String>) -> some View {

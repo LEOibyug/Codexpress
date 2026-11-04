@@ -1,15 +1,12 @@
-//! On-demand CCH ledger synchronization, independent of forwarding and balances.
+//! Per-source settled-request and idle-triggered CCH ledger synchronization.
 use super::{Auth, Entry, Probe, Protocol};
-use crate::{
-    model::{now, AppState},
-    usage::billing::ChargeMatch,
-};
+use crate::{model::AppState, usage::billing::ChargeMatch};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -18,7 +15,7 @@ use std::{
 #[derive(Default)]
 pub(super) struct Sync {
     running: AtomicBool,
-    last_started: AtomicU64,
+    started: AtomicBool,
     progress: Mutex<Value>,
 }
 pub(crate) fn status(state: &AppState) -> Value {
@@ -39,11 +36,27 @@ fn progress(state: &AppState, pages: usize, updated: usize, errors: usize) {
         *p = json!({"pages":pages,"updated":updated,"errors":errors});
     }
 }
+
+/// Poll idle settlement boundaries; provider access starts only when a source is due.
+pub fn start(state: &Arc<AppState>) {
+    if state.balances.billing.started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let weak = Arc::downgrade(state);
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(Duration::from_secs(1));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            let Some(state) = weak.upgrade() else {
+                break;
+            };
+            schedule(&state, false, None);
+        }
+    });
+}
 pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str>) -> Value {
     let sync = &state.balances.billing;
-    if !full && now().saturating_sub(sync.last_started.load(Ordering::Relaxed)) < 60 {
-        return status(state);
-    }
     if sync
         .running
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -51,8 +64,6 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
     {
         return status(state);
     }
-    sync.last_started.store(now(), Ordering::Relaxed);
-    progress(state, 0, 0, 0);
     let worker = state.clone();
     let requested = source_id.map(str::to_owned);
     tokio::spawn(async move {
@@ -63,15 +74,39 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
             .await
             .iter()
             .filter(|s| {
-                s.source.kind == "api" && requested.as_ref().is_none_or(|id| id == &s.source.id)
+                s.source.kind == "api"
+                    && requested.as_ref().is_none_or(|id| id == &s.source.id)
+                    && state.usage.billing_claim(&s.source, full)
             })
             .map(|s| s.source.clone())
             .collect();
+        if sources.is_empty() {
+            state
+                .balances
+                .billing
+                .running
+                .store(false, Ordering::Release);
+            return;
+        }
+        progress(&state, 0, 0, 0);
         let (mut pages, mut updated, mut errors) = (0, 0, 0);
         for source in sources {
-            // An explicit historical operation may discover the selected source.
-            // Normal UI refreshes use only providers already recognized as CCH.
-            if full && requested.is_some() {
+            let recognized = state
+                .balances
+                .entries
+                .lock()
+                .ok()
+                .and_then(|e| e.get(&source.id).cloned());
+            let recognized = if let Some(entry) = recognized {
+                let saved = entry.lock().await;
+                saved.preferred.is_some()
+                    && saved.identity == source.identity()
+                    && saved.proxy.as_ref() == Some(&source.proxy)
+            } else {
+                false
+            };
+            // First automatic reconciliation must not depend on a UI balance query.
+            if !recognized || (full && requested.is_some()) {
                 let _ = super::query(&state, json!({"source_id":source.id})).await;
             }
             let entry = state
@@ -95,8 +130,11 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
             let usage = state.usage.clone();
             let id = source.id.clone();
             let identity = source.identity();
-            let plan =
-                tokio::task::spawn_blocking(move || usage.billing_plan(&id, &identity, full)).await;
+            let billing_identity = crate::usage::billing_identity(&source);
+            let plan = tokio::task::spawn_blocking(move || {
+                usage.billing_plan(&id, &identity, &billing_identity, full)
+            })
+            .await;
             let Ok(Ok(Some(plan))) = plan else {
                 continue;
             };
@@ -136,9 +174,10 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
                 let usage = state.usage.clone();
                 let id = source.id.clone();
                 let identity = source.identity();
+                let billing_identity = crate::usage::billing_identity(&source);
                 let rows = rows.clone();
                 let candidates = tokio::task::spawn_blocking(move || {
-                    usage.billing_matches(&id, &identity, &rows)
+                    usage.billing_matches(&id, &identity, &billing_identity, &rows)
                 })
                 .await;
                 let Ok(Ok(candidates)) = candidates else {
@@ -204,8 +243,9 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
                     let usage = state.usage.clone();
                     let identity = source.identity();
                     let id = source.id.clone();
+                    let billing_identity = crate::usage::billing_identity(&source);
                     match tokio::task::spawn_blocking(move || {
-                        usage.apply_billing(&id, &identity, &plan, matches)
+                        usage.apply_billing(&id, &identity, &billing_identity, &plan, matches)
                     })
                     .await
                     {

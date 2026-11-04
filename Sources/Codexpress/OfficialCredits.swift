@@ -5,11 +5,15 @@ struct CreditResetRequest: Identifiable {
     let sourceID: String
     let accountID: String?
     let quickReset: Bool
+    let managementRequestID: String?
+    let creditID: String?
 
-    init(source: Source, quickReset: Bool) {
+    init(source: Source, quickReset: Bool, managementRequestID: String? = nil, creditID: String? = nil) {
         sourceID = source.id
         accountID = source.account_id
         self.quickReset = quickReset
+        self.managementRequestID = managementRequestID
+        self.creditID = creditID
     }
 }
 
@@ -91,8 +95,10 @@ struct CreditConfirmation: Identifiable {
         }
         return Self(source: source, accountID: account, credit: card, quota: live["quota"])
     }
-    func consumePayload(operationID: String) -> JSONValue {
-        .object(["source_id": .string(source.id), "credit_id": credit["id"], "operation_id": .string(operationID), "expected_account_id": .string(accountID), "confirmed": .bool(true)])
+    func consumePayload(operationID: String, managementRequestID: String? = nil) -> JSONValue {
+        var fields: [String: JSONValue] = ["source_id": .string(source.id), "credit_id": credit["id"], "operation_id": .string(operationID), "expected_account_id": .string(accountID), "confirmed": .bool(true)]
+        if let managementRequestID { fields["id"] = .string(managementRequestID) }
+        return .object(fields)
     }
     func validate(live: JSONValue) throws {
         let current = try Self.make(source: source, live: live, creditID: credit["id"].string)

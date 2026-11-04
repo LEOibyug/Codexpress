@@ -2,14 +2,17 @@ import SwiftUI
 
 struct OMPCompactionSettingsView: View {
     @EnvironmentObject var model: AppModel
+    @Binding var draft: OMPConfiguration
     let configuration: JSONValue
     let configurationRevision: String
     let agentDirectory: String
     let canEdit: Bool
-    let onSavingChange: (Bool) -> Void
-    let onSaved: (JSONValue) -> Void
+    var openAIPresetRequest = 0
+    var draftRevisionRequest = 0
+    var onSavingChange: ((Bool) -> Void)? = nil
+    var onSaved: ((JSONValue) -> Void)? = nil
+    var saveEdits: (([JSONValue]) async throws -> JSONValue)? = nil
 
-    @State private var draft = OMPConfiguration()
     @State private var saving = false
     @State private var saveError: String?
     @State private var importMessage: String?
@@ -25,8 +28,8 @@ struct OMPCompactionSettingsView: View {
     private var editable: Bool { canEdit && draft.available && !configurationRevision.isEmpty && !saving }
     private var pending: Bool { draft.hasChanges }
     private var initialThresholdMode: String {
-        if (draft.value(.config("thresholdTokens", "固定阈值", .integer))?.number ?? 0) > 0 { return "fixed" }
-        if (draft.value(.config("thresholdPercent", "阈值百分比", .number))?.number ?? 0) > 0 { return "percent" }
+        if (Double(draft.text(.config("thresholdTokens", "固定阈值", .integer))) ?? 0) > 0 { return "fixed" }
+        if (Double(draft.text(.config("thresholdPercent", "阈值百分比", .number))) ?? 0) > 0 { return "percent" }
         return "default"
     }
 
@@ -46,17 +49,19 @@ struct OMPCompactionSettingsView: View {
             SettingsCard("模型阈值", symbol: "slider.horizontal.3") {
                 booleanField(.config("modelThresholdsEnabled", "模型阈值规则", .boolean))
                 selectorControls
-                HStack {
-                    Button("导入 Codex 规则") {
-                        let skipped = draft.importCodex(model.settings.modelCompaction ?? [])
-                        selectorModes = [:]
-                        if !skipped.isEmpty { importMessage = "规则已填入；未导入：" + skipped.joined(separator: "、") }
-                        else { importMessage = draft.hasChanges ? "规则已填入，保存压缩设置后生效。" : "规则与当前配置一致。" }
+                if saveEdits != nil {
+                    HStack {
+                        Button("导入 Codex 规则") {
+                            let skipped = draft.importCodex(model.settings.modelCompaction ?? [])
+                            selectorModes = [:]
+                            if !skipped.isEmpty { importMessage = "规则已填入；未导入：" + skipped.joined(separator: "、") }
+                            else { importMessage = draft.hasChanges ? "规则已填入，保存压缩设置后生效。" : "规则与当前配置一致。" }
+                        }
+                        .disabled((model.settings.modelCompaction ?? []).isEmpty)
+                        .help("显式导入固定触发阈值和可匹配模型的上下文窗口；不会自动保存。")
                     }
-                    .disabled((model.settings.modelCompaction ?? []).isEmpty)
-                    .help("显式导入固定触发阈值和可匹配模型的上下文窗口；不会自动保存。")
-                    if let importMessage { Text(importMessage).font(AppTypography.caption).foregroundStyle(.secondary) }
                 }
+                if let importMessage { Text(importMessage).font(AppTypography.caption).foregroundStyle(.secondary) }
             }
 
             SettingsCard("模型覆盖", symbol: "square.stack.3d.up") {
@@ -72,17 +77,31 @@ struct OMPCompactionSettingsView: View {
             }
 
             if let saveError { InfoNote(text: saveError, symbol: "exclamationmark.triangle", color: .orange) }
-            HStack {
-                Button("放弃更改") { load() }.disabled(!pending || saving)
-                Spacer()
-                if saving { ProgressView().controlSize(.small) }
-                Button("保存压缩设置") { save() }.buttonStyle(.borderedProminent).disabled(!editable || !pending)
+            if saveEdits != nil {
+                HStack {
+                    Button("放弃更改") { load() }.disabled(!pending || saving)
+                    Spacer()
+                    if saving { ProgressView().controlSize(.small) }
+                    Button("保存压缩设置") { save() }.buttonStyle(.borderedProminent).disabled(!editable || !pending)
+                }
             }
         }
         .disabled(!canEdit || saving || !draft.available)
-        .onAppear { load() }
+        .onAppear {
+            if draft.available { synchronizeDraftControls() }
+            else { load() }
+        }
         .onChange(of: configuration) { _, _ in load() }
         .onChange(of: agentDirectory) { _, _ in load() }
+        .onChange(of: draftRevisionRequest) { _, _ in synchronizeDraftControls() }
+        .onChange(of: draft.errors) { _, _ in revealFirstError() }
+        .onChange(of: openAIPresetRequest) { _, _ in
+            draft.applyOpenAIPreset()
+            synchronizeDraftControls()
+            importMessage = saveEdits == nil
+                ? "已填入 OpenAI 推荐值；请预览连接，再备份并应用。"
+                : "已填入 OpenAI 推荐值；点击「保存压缩设置」后生效。"
+        }
     }
 
     private var automaticControls: some View {
@@ -302,10 +321,15 @@ struct OMPCompactionSettingsView: View {
 
     private func load(_ current: JSONValue? = nil) {
         draft = OMPConfiguration(stored: current ?? configuration)
+        synchronizeDraftControls()
+    }
+
+    private func synchronizeDraftControls() {
         thresholdMode = initialThresholdMode
         selectorModes = [:]
         selector = ""; selectorError = nil; saveError = nil; importMessage = nil
         if !draft.modelIDs.contains(selectedModel) { selectedModel = draft.modelIDs.first ?? "" }
+        revealFirstError()
     }
 
     private func changeThresholdMode(_ mode: String) {
@@ -366,7 +390,7 @@ struct OMPCompactionSettingsView: View {
     }
 
     private func save() {
-        guard editable else { return }
+        guard editable, let saveEdits else { return }
         saveError = nil
         let edits = draft.edits()
         guard let edits, draft.errors.isEmpty else {
@@ -377,19 +401,14 @@ struct OMPCompactionSettingsView: View {
         guard !edits.isEmpty else { load(); return }
         let directory = agentDirectory
         saving = true
-        onSavingChange(true)
+        onSavingChange?(true)
         Task {
-            defer { saving = false; onSavingChange(false) }
+            defer { saving = false; onSavingChange?(false) }
             do {
-                let status = try await model.remoteCall("omp.configure", .object([
-                    "agent_dir": .string(directory),
-                    "expected_revision": .string(configurationRevision),
-                    "edits": .array(edits)
-                ]))
+                let status = try await saveEdits(edits)
                 guard directory == agentDirectory else { return }
-                onSaved(status)
+                onSaved?(status)
                 load(status["configuration"])
-                model.notice = "OMP 压缩设置已保存。"
             } catch {
                 guard directory == agentDirectory else { return }
                 let message = error.localizedDescription

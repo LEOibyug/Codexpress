@@ -5,6 +5,7 @@ pub mod chatbot;
 pub mod compaction;
 pub mod config;
 pub mod continuity;
+pub mod control;
 pub mod credentials;
 pub mod discovery;
 pub mod history;

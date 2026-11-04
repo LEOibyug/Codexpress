@@ -440,6 +440,7 @@ struct HistoryCapture {
     scope: String,
     request: Value,
     generation: u64,
+    metadata: Option<crate::history::CaptureMetadata>,
 }
 struct ResponseContext {
     discovery: bool,
@@ -612,12 +613,14 @@ async fn forward_once(
             _ => return error(StatusCode::BAD_REQUEST, "Responses 请求需要 JSON 对象"),
         }
     };
+    let native_compaction =
+        parts.uri.path() == "/v1/responses/compact" || crate::chatbot::is_compaction_v2(&parsed);
     // Each client request can join the same takeover. Internal replans retain
     // their marker and cannot pick up a newer operation or retry a failed probe.
     let mut manual = match parts.extensions.get::<ManualRequest>().cloned() {
         Some(manual) => manual,
         None => ManualRequest {
-            trial: if !discovery && parts.uri.path() == "/v1/responses" {
+            trial: if !discovery && !native_compaction && parts.uri.path() == "/v1/responses" {
                 routing::manual::claim(&state, parsed["model"].as_str().unwrap_or("")).await
             } else {
                 None
@@ -643,6 +646,8 @@ async fn forward_once(
     parts.extensions.insert(manual.clone());
     let route_settings = state.settings.read().await.clone();
     let priority_probe = !discovery
+        && !native_compaction
+        && parts.uri.path() == "/v1/responses"
         && route_settings.strict_priority
         && route_settings.mode == "auto"
         && !route_settings.load_balance;
@@ -761,6 +766,7 @@ async fn forward_once(
         });
     if !degraded
         && !discovery
+        && !native_compaction
         && parts.uri.path() == "/v1/responses"
         && !tool_result
         && manual_target.is_none()
@@ -1086,6 +1092,7 @@ async fn forward_once(
                 scope,
                 request,
                 generation,
+                metadata: None,
             })
         } else {
             None
@@ -1188,12 +1195,13 @@ async fn forward_once(
         } else {
             candidate
         };
-        // Native /responses/compact must not receive generation-only rewrites.
+        // Native V1/V2 compaction must not receive generation-only rewrites.
         let compatibility = parts
             .extensions
             .get::<crate::chatbot::ChatbotIngress>()
             .is_some()
-            && parts.uri.path() == "/v1/responses";
+            && parts.uri.path() == "/v1/responses"
+            && !native_compaction;
         let mut payload = Payload::new(
             &parsed,
             &bytes,
@@ -1325,7 +1333,11 @@ async fn forward_once(
             };
             headers.insert("authorization", value);
             if source.kind == "official" {
-                if compatibility {
+                if parts
+                    .extensions
+                    .get::<crate::chatbot::ChatbotIngress>()
+                    .is_some()
+                {
                     headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
                     headers.insert("version", HeaderValue::from_static("0.162.1"));
                 }
@@ -1382,10 +1394,6 @@ async fn forward_once(
                 manual.attempted = true;
                 parts.extensions.insert(manual.clone());
             }
-            attempt.conversation_status = parts
-                .extensions
-                .get::<crate::chatbot::status::Tracking>()
-                .map(|tracking| tracking.submit(&source));
             let upstream = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
                 client
@@ -1901,6 +1909,18 @@ async fn forward_once(
             } else {
                 None
             };
+            let history_capture = history_capture.map(|mut capture| {
+                capture.metadata = attempt.record.as_ref().map(|record| crate::history::CaptureMetadata {
+                    captured_at: crate::model::now(),
+                    source_id: record.source_id.clone(),
+                    source_name: record.source_name.clone(),
+                    model: record.model.clone(),
+                    ingress: ingress.into(),
+                    request_id: record.request_id.clone(),
+                    attempt_id: record.attempt_id.clone(),
+                });
+                capture
+            });
             let mut response = stream_response(
                 state,
                 source.clone(),

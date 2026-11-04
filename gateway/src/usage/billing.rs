@@ -1,6 +1,6 @@
 //! Reconcile CCH's USD ledger using mutually unique numeric request signatures.
 //! No prompts, response text, cookies or provider credentials enter this module.
-use super::UsageStore;
+use super::{settlement::Cost, UsageStore};
 use anyhow::Result;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
@@ -21,6 +21,7 @@ impl UsageStore {
         &self,
         source: &str,
         identity: &str,
+        billing_identity: &str,
         full: bool,
     ) -> Result<Option<Plan>> {
         let data = self
@@ -30,9 +31,10 @@ impl UsageStore {
         let (since, max_attempt): (Option<u64>, Option<i64>) = data.connection.query_row(
             "SELECT MIN(started_at), MAX(attempt) FROM usage WHERE source_id=?1
              AND (json_extract(metadata,'$.token_details.source_identity') IS NULL OR json_extract(metadata,'$.token_details.source_identity')=?2)
+             AND (json_extract(metadata,'$.billing_identity') IS NULL OR json_extract(metadata,'$.billing_identity')=?5)
              AND COALESCE(json_extract(metadata,'$.cost.billing_basis'),'')!='upstream_charge'
              AND (?3 OR json_extract(metadata,'$.billing_checked_identity') IS NOT ?2 OR started_at+latency_ms/1000>=?4)",
-            params![source, identity, full, crate::model::now().saturating_sub(600)],
+            params![source, identity, full, crate::model::now().saturating_sub(600), billing_identity],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         Ok(since.zip(max_attempt).map(|(since, max_attempt)| Plan {
@@ -45,6 +47,7 @@ impl UsageStore {
         &self,
         source: &str,
         identity: &str,
+        billing_identity: &str,
         rows: &[Value],
     ) -> Result<Vec<ChargeMatch>> {
         let data = self
@@ -60,6 +63,7 @@ impl UsageStore {
              AND (json_extract(metadata,'$.token_details.input_estimated')=0 OR json_type(metadata,'$.token_details') IS NULL)
              AND (json_extract(metadata,'$.token_details.output_estimated')=0 OR json_type(metadata,'$.token_details') IS NULL)
              AND (json_extract(metadata,'$.token_details.source_identity') IS NULL OR json_extract(metadata,'$.token_details.source_identity')=?10)
+             AND (json_extract(metadata,'$.billing_identity') IS NULL OR json_extract(metadata,'$.billing_identity')=?11)
              LIMIT 2")?;
         let mut matches = Vec::new();
         for row in rows {
@@ -120,7 +124,8 @@ impl UsageStore {
                         duration,
                         model,
                         billing_model,
-                        identity
+                        identity,
+                        billing_identity
                     ],
                     |r| r.get::<_, i64>(0),
                 )?
@@ -140,6 +145,7 @@ impl UsageStore {
         &self,
         source: &str,
         identity: &str,
+        billing_identity: &str,
         plan: &Plan,
         matches: HashMap<i64, Option<ChargeMatch>>,
     ) -> Result<usize> {
@@ -149,6 +155,7 @@ impl UsageStore {
             .map_err(|_| anyhow::anyhow!("用量数据库不可用"))?;
         let tx = data.connection.transaction()?;
         let mut updated = 0;
+        let mut corrections = Vec::new();
         for item in matches.into_values().flatten() {
             let raw: Option<String> = tx
                 .query_row(
@@ -168,6 +175,13 @@ impl UsageStore {
             if recorded.is_some_and(|v| v != identity) {
                 continue;
             }
+            if metadata["billing_identity"]
+                .as_str()
+                .is_some_and(|v| v != billing_identity)
+            {
+                continue;
+            }
+            let previous = Cost::read(&metadata["cost"]);
             metadata["token_details"]["source_kind"] = json!("api");
             metadata["token_details"]["upstream_cost"] =
                 json!({"usd":item.usd,"method":"cch_usage","record_id":item.record_id});
@@ -175,6 +189,7 @@ impl UsageStore {
                 &json!({"token_details":metadata["token_details"]}),
                 false,
             );
+            corrections.push((item.attempt, previous, Cost::read(&metadata["cost"])));
             updated += tx.execute(
                 "UPDATE usage SET metadata=?1 WHERE attempt=?2",
                 params![metadata.to_string(), item.attempt],
@@ -185,8 +200,15 @@ impl UsageStore {
         tx.execute("UPDATE usage SET metadata=json_set(metadata,'$.billing_checked_identity',?1)
             WHERE source_id=?2 AND attempt<=?3 AND COALESCE(json_extract(metadata,'$.cost.billing_basis'),'')!='upstream_charge'
             AND (json_extract(metadata,'$.token_details.source_identity') IS NULL OR json_extract(metadata,'$.token_details.source_identity')=?1)
-            AND json_extract(metadata,'$.billing_checked_identity') IS NOT ?1",params![identity,source,plan.max_attempt])?;
+            AND (json_extract(metadata,'$.billing_identity') IS NULL OR json_extract(metadata,'$.billing_identity')=?4)
+            AND json_extract(metadata,'$.billing_checked_identity') IS NOT ?1",params![identity,source,plan.max_attempt,billing_identity])?;
+        // Metadata and the local projection become visible under the same lock.
         tx.commit()?;
+        for (attempt, previous, current) in corrections {
+            data.settlements
+                .correct(source, billing_identity, attempt, previous, current);
+        }
+        data.analytics_cache.clear();
         Ok(updated)
     }
 }

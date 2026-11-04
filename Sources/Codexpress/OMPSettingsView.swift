@@ -12,6 +12,8 @@ struct OMPSettingsView: View {
     @State private var detecting = false
     @State private var error: String?
     @State private var confirmRestore = false
+    @State private var openAIPresetRequest = 0
+    @State private var compactionDraft = OMPConfiguration()
 
     private var models: [String] {
         Array(Set(model.sources.filter(\.enabled).flatMap(\.models) + (model.settings.modelCompaction ?? []).map(\.model)
@@ -64,14 +66,12 @@ struct OMPSettingsView: View {
                                 .help("选择模型").accessibilityLabel("选择模型")
                         }
                     }
-                    SettingRow(title: "状态栏扩展") {
-                        Text(status["status_plugin_installed"].bool == true ? "已安装" : "随一键设置安装")
-                            .foregroundStyle(.secondary)
-                    }
                     Divider()
                     LabeledContent("网关", value: chatbot["base_url"].string ?? status["base_url"].string ?? "—")
                         .font(.system(size: 12, design: .monospaced)).textSelection(.enabled)
                     LabeledContent("协议", value: "OpenAI Responses")
+                    Text("服务器上的 OMP 请在「远端 SSH」中选择 OMP，配置备份和接入。此端口允许局域网访问；云服务器需能通过 VPN 等方式连接这台 Mac。")
+                        .foregroundStyle(.secondary)
                     if chatbot["enabled"].bool == false || (chatbot != .null && chatbot["running"].bool == false) {
                         InfoNote(text: "请先启用聊天客户端接入。", color: .orange)
                     }
@@ -82,17 +82,31 @@ struct OMPSettingsView: View {
                         }
                         Spacer()
                         if working { ProgressView().controlSize(.small) }
+                        Button("OpenAI 推荐设置") { openAIPresetRequest += 1 }
+                            .disabled(!canEdit || !attached || status["configuration_revision"].string == nil)
+                            .help("接入后按全部上游兼容 OpenAI Responses 填入推荐值，再保存压缩设置。")
                         Button("一键设置") { apply() }.buttonStyle(.borderedProminent)
                             .disabled(!canEdit || selectedModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
                 OMPCompactionSettingsView(
+                    draft: $compactionDraft,
                     configuration: status["configuration"],
                     configurationRevision: status["configuration_revision"].string ?? "",
                     agentDirectory: resolvedDirectory,
                     canEdit: canEdit && attached,
+                    openAIPresetRequest: openAIPresetRequest,
                     onSavingChange: { working = $0 },
-                    onSaved: { status = $0 }
+                    onSaved: { status = $0 },
+                    saveEdits: { edits in
+                        let result = try await model.remoteCall("omp.configure", .object([
+                            "agent_dir": .string(resolvedDirectory),
+                            "expected_revision": .string(status["configuration_revision"].string ?? ""),
+                            "edits": .array(edits)
+                        ]))
+                        model.notice = "OMP 压缩设置已保存。"
+                        return result
+                    }
                 )
             }.settingsPage()
         }
@@ -106,7 +120,7 @@ struct OMPSettingsView: View {
         .alert("还原 OMP 原配置？", isPresented: $confirmRestore) {
             Button("取消", role: .cancel) {}
             Button("还原") { restore() }
-        } message: { Text("撤回 Codexpress 的供应商、默认模型、压缩规则和状态栏扩展。") }
+        } message: { Text("撤回 Codexpress 的供应商、默认模型和压缩规则。") }
     }
 
     private func detect() async {
@@ -140,7 +154,7 @@ struct OMPSettingsView: View {
 
     private func apply() {
         let name = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        perform("omp.attach", additional: ["model_id": .string(name)], message: "OMP 接入与状态栏扩展已设置，重新启动 OMP 后生效。")
+        perform("omp.attach", additional: ["model_id": .string(name)], message: "OMP 接入已设置，重新启动 OMP 后生效。")
     }
 
     private func restore() { perform("omp.restore", message: "OMP 原配置已还原。") }

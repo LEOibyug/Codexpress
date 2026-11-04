@@ -102,28 +102,36 @@ extension AppModel {
         }
     }
 
-    func consume(_ confirmation: CreditConfirmation) {
+    @discardableResult func consume(_ confirmation: CreditConfirmation, managementRequestID: String? = nil) -> Bool {
         let source = confirmation.source
         guard let creditID = confirmation.credit["id"].string,
-              canSubmitCredit(for: source, creditID: creditID) else { return }
+              canSubmitCredit(for: source, creditID: creditID) else { return false }
         do {
             try requireWritableMetadata()
             guard let currentSource = settings.sources.first(where: { $0.id == source.id }), currentSource == source else { throw AppError.message("来源或账号已变化，请重新确认。") }
             try confirmation.validate(live: state(source.id))
-        } catch { self.error = error.localizedDescription; return }
+            if let managementRequestID {
+                guard let request = creditResetRequest, request.managementRequestID == managementRequestID,
+                      request.sourceID == source.id, request.accountID == confirmation.accountID,
+                      request.creditID == nil || request.creditID == creditID else {
+                    throw AppError.message("管理请求与当前账号或卡片不匹配，请关闭后重新选择。")
+                }
+            }
+        } catch { self.error = error.localizedDescription; return false }
 
         // Length-prefix the account so arbitrary account/card IDs cannot collide.
         let key = "account:\(confirmation.accountID.utf8.count):\(confirmation.accountID):\(creditID)"
-        let operationID = UUID().uuidString
+        let operationID = managementRequestID ?? UUID().uuidString
         let intent = ResetOperation(sourceID: source.id, creditID: creditID, operationID: operationID, createdAt: Date().timeIntervalSince1970, result: "结果待核实，请刷新额度和卡片。", accountID: confirmation.accountID)
         var next = operations
         next[key] = intent
         // A failed intent write must leave both memory and disk unchanged: no
         // request has been sent, and retrying after repairing storage is safe.
         do { try ResetOperationStore(directory: directory).save(next) }
-        catch { self.error = error.localizedDescription; return }
+        catch { self.error = error.localizedDescription; return false }
         operations = next
         consuming.insert(key)
+        if managementRequestID != nil { presentedControlResetRequest = nil }
         Task {
             defer {
                 consuming.remove(key)
@@ -131,8 +139,9 @@ extension AppModel {
                 catch { self.error = error.localizedDescription }
             }
             do {
-                let result = try await client.call("official.credits.consume", confirmation.consumePayload(operationID: operationID))
-                let labels = ["reset": "已重置；以刷新后的窗口为准", "nothing_to_reset": "当前无需重置", "no_credit": "无可用重置卡", "already_redeemed": "卡片已使用", "unknown": "结果待核实，请刷新，勿重复提交", "pending_verification": "结果待核实，请刷新，勿重复提交"]
+                let payload = confirmation.consumePayload(operationID: operationID, managementRequestID: managementRequestID)
+                let result = try await client.call(managementRequestID == nil ? "official.credits.consume" : "control.reset.confirm", payload)
+                let labels = ["reset": "已重置；以刷新后的窗口为准", "nothing_to_reset": "当前无需重置", "no_credit": "无可用重置卡", "already_redeemed": "卡片已使用", "failed": "提交失败，请刷新额度和卡片核实", "unknown": "结果待核实，请刷新，勿重复提交", "pending_verification": "结果待核实，请刷新，勿重复提交"]
                 operations[key]?.result = labels[result["code"].string ?? "unknown"] ?? "结果待核实，请刷新"
                 try await updateStatus()
             } catch {
@@ -142,5 +151,6 @@ extension AppModel {
                 self.error = error.localizedDescription
             }
         }
+        return true
     }
 }

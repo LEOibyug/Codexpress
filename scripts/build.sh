@@ -18,8 +18,6 @@ cp gateway/resources/CODEX-LICENSE "$app/Contents/Resources/CODEX-LICENSE"
 cp gateway/resources/CODEX-NOTICE "$app/Contents/Resources/CODEX-NOTICE"
 mkdir -p "$app/Contents/Resources/skills"
 cp -R Resources/skills/codexpress-image "$app/Contents/Resources/skills/"
-mkdir -p "$app/Contents/Resources/omp"
-cp -R Resources/omp/codexpress-status "$app/Contents/Resources/omp/"
 icon_directory="$(mktemp -d "${TMPDIR:-/tmp}/codexpress-icon.XXXXXX")"
 trap 'rm -rf "$icon_directory"' EXIT
 swift scripts/make-icon.swift "$icon_directory/AppIcon.iconset"

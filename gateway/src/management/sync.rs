@@ -188,6 +188,7 @@ fn validate_official_accounts(sources: &[SourceRuntime]) -> Result<()> {
 }
 
 pub(super) async fn handle(state: &Arc<AppState>, payload: Value) -> Result<Value> {
+    let _configuration = state.config_lock.lock().await;
     let _routing_sync = state.routing_sync.lock().await;
     let SyncRequest {
         sources,
@@ -196,6 +197,14 @@ pub(super) async fn handle(state: &Arc<AppState>, payload: Value) -> Result<Valu
     } = SyncRequest::parse(&payload)?;
     let mut current = state.sources.write().await;
     let (next, invalidated) = prepare_sources(sources, &current);
+    for runtime in &next {
+        if runtime.source.secret["api_key"]
+            .as_str()
+            .is_some_and(|key| state.control.uses_key(key).unwrap_or(true))
+        {
+            bail!("来源不能复用管理 API 密钥");
+        }
+    }
     // Refresh credentials are helper-owned; validate the effective accounts
     // before affinity, billing or routing state can change.
     validate_official_accounts(&next)?;

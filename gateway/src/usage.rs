@@ -2,12 +2,14 @@ mod analytics;
 pub(crate) mod billing;
 pub mod diagnostics;
 mod requests;
+mod settlement;
 mod summary;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+pub(crate) use settlement::identity as billing_identity;
 use std::{collections::HashMap, path::Path, sync::Mutex, time::Instant};
 use summary::stored_record;
 
@@ -64,6 +66,8 @@ struct StoreData {
     connection: Connection,
     active: HashMap<String, (UsageRecord, Instant)>,
     analytics_cache: std::collections::VecDeque<analytics::Cached>,
+    settlements: settlement::Settlements,
+    last_attempt: i64,
 }
 pub struct UsageStore {
     data: Mutex<StoreData>,
@@ -134,11 +138,17 @@ impl UsageStore {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
+        let last_attempt =
+            connection.query_row("SELECT COALESCE(MAX(attempt),0) FROM usage", [], |row| {
+                row.get(0)
+            })?;
         Ok(Self {
             data: Mutex::new(StoreData {
                 connection,
                 active: HashMap::new(),
                 analytics_cache: Default::default(),
+                settlements: Default::default(),
+                last_attempt,
             }),
         })
     }
@@ -180,12 +190,24 @@ impl UsageStore {
         };
         let mut value = serde_json::to_value(&record).expect("usage metadata");
         value["cached_input_tokens"] = json!(cached);
+        let cost = crate::pricing::estimate(&value, false);
+        let billing_identity = data.settlements.finish(&record);
         let metadata = json!({"attempt_id":record.attempt_id,"token_details":record.token_details,
             "first_token_latency_ms":record.first_token_latency_ms,"generation_ms":record.generation_ms,
-            "cost":crate::pricing::estimate(&value,false)}).to_string();
+            "billing_identity":billing_identity,"cost":cost}).to_string();
         let result = data.connection.execute("INSERT INTO usage (request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)", params![record.request_id,record.source_id,record.source_name,record.model,number(record.started_at),record.status,number(record.input_tokens),number(record.output_tokens),number(cached),record.complete,number(record.latency_ms),metadata]);
         data.active.remove(&record.attempt_id);
         result?;
+        let attempt = data.connection.last_insert_rowid();
+        data.last_attempt = data.last_attempt.max(attempt);
+        if let Some(identity) = billing_identity {
+            data.settlements.charge(
+                &record.source_id,
+                &identity,
+                attempt,
+                settlement::Cost::read(&cost),
+            );
+        }
         Ok(())
     }
     pub fn summary(&self, days: u32) -> Result<Value> {

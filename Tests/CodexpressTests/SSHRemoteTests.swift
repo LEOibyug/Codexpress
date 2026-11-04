@@ -63,6 +63,27 @@ final class SSHRemoteTests: XCTestCase {
         let args = try? model.profile.arguments()
         XCTAssertFalse(args?.contains("-l") ?? true); XCTAssertFalse(args?.contains("-p") ?? true); XCTAssertFalse(args?.contains("-i") ?? true)
     }
+    func testLegacyProfileDecodesAsCodexWithoutLosingMachineMetadata() throws {
+        let data = Data(#"{"id":"old-id","destination":"server","username":"worker","sshPort":"2222","identityFile":"/fixture/key","codexHome":"/fixture/.codex","gatewayHost":"192.0.2.4","backupID":"latest","originalBackupID":"first","mapExistingProviders":true}"#.utf8)
+        let profile = try JSONDecoder().decode(SSHRemoteProfile.self, from: data)
+        XCTAssertEqual(profile.kind, .codex); XCTAssertNil(profile.clientKind)
+        XCTAssertEqual(profile.id, "old-id"); XCTAssertEqual(profile.directory, "/fixture/.codex")
+        XCTAssertEqual(profile.backupID, "latest"); XCTAssertEqual(profile.originalBackupID, "first")
+        XCTAssertEqual(profile.username, "worker"); XCTAssertTrue(profile.mapExistingProviders)
+        XCTAssertEqual(try JSONDecoder().decode(SSHRemoteProfile.self, from: JSONEncoder().encode(profile)), profile)
+    }
+    @MainActor func testConfiguredHostSelectionKeepsOMPClientAndItsOwnSavedMetadata() {
+        let model = SSHRemoteModel(); model.selectKind(.omp)
+        var codex = SSHRemoteProfile(); codex.destination = "shared"; codex.codexHome = "/codex"
+        var omp = SSHRemoteProfile(); omp.destination = "shared"; omp.clientKind = .omp
+        omp.ompAgentDirectory = "/omp"; omp.ompDefaultModel = "fixture-model"
+        omp.backupID = "omp-backup"
+        model.selectConfiguredHost("shared", saved: [codex, omp])
+        XCTAssertEqual(model.profile, omp)
+        model.selectConfiguredHost("new", saved: [codex, omp])
+        XCTAssertEqual(model.profile.kind, .omp); XCTAssertEqual(model.profile.directory, "")
+        XCTAssertNil(model.profile.backupID); XCTAssertNotEqual(model.profile.id, omp.id)
+    }
     func testSSHArgumentsUseKnownHostsAndSeparateOptionsWithoutShellInterpolation() throws {
         var profile=SSHRemoteProfile();profile.destination="server-alias";profile.username="worker";profile.sshPort="2222";profile.identityFile="/tmp/test key"
         let args=try profile.arguments()

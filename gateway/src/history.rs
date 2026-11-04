@@ -16,6 +16,20 @@ pub const MIN_LIMIT: u64 = 64_000_000;
 pub const MAX_LIMIT: u64 = 1_000_000_000_000;
 const CHUNK: usize = 64 * 1024;
 
+mod inspect;
+
+/// Dashboard provenance only: never include scope, credentials or source identity.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CaptureMetadata {
+    pub captured_at: u64,
+    pub source_id: String,
+    pub source_name: String,
+    pub model: String,
+    pub ingress: String,
+    pub request_id: String,
+    pub attempt_id: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HistoryConfig {
     pub enabled: bool,
@@ -92,6 +106,19 @@ impl HistoryStore {
             CREATE TABLE IF NOT EXISTS snapshots(key TEXT PRIMARY KEY, tail TEXT NOT NULL, envelope TEXT NOT NULL, last_used INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS snapshots_lru ON snapshots(last_used);
             CREATE TABLE IF NOT EXISTS preferences(id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL, max_bytes INTEGER NOT NULL);")?;
+        let has_metadata = {
+            let mut columns = db.prepare("PRAGMA table_info(snapshots)")?;
+            let names = columns.query_map([], |r| r.get::<_, String>(1))?;
+            names.collect::<rusqlite::Result<Vec<_>>>()?.iter().any(|name| name == "metadata")
+        };
+        if !has_metadata {
+            db.execute_batch("ALTER TABLE snapshots ADD COLUMN metadata TEXT;")?;
+        }
+        db.execute_batch("CREATE INDEX IF NOT EXISTS snapshots_captured ON snapshots(json_extract(metadata,'$.captured_at'));
+            CREATE INDEX IF NOT EXISTS snapshots_source ON snapshots(json_extract(metadata,'$.source_id'));
+            CREATE INDEX IF NOT EXISTS snapshots_model ON snapshots(json_extract(metadata,'$.model'));
+            CREATE INDEX IF NOT EXISTS snapshots_ingress ON snapshots(json_extract(metadata,'$.ingress'));
+            CREATE INDEX IF NOT EXISTS snapshots_attempt ON snapshots(json_extract(metadata,'$.attempt_id'));")?;
         let config = db
             .query_row(
                 "SELECT enabled,max_bytes FROM preferences WHERE id=1",
@@ -191,6 +218,16 @@ impl HistoryStore {
         response: &Value,
         generation: u64,
     ) -> Result<()> {
+        self.capture_with_metadata_at(scope, request, response, generation, None)
+    }
+    pub fn capture_with_metadata_at(
+        &self,
+        scope: &str,
+        request: &Value,
+        response: &Value,
+        generation: u64,
+        metadata: Option<&CaptureMetadata>,
+    ) -> Result<()> {
         let mut data = self
             .data
             .lock()
@@ -198,7 +235,7 @@ impl HistoryStore {
         if !data.config.enabled || generation != data.generation {
             return Ok(());
         }
-        let result = capture(&mut data, scope, request, response);
+        let result = capture(&mut data, scope, request, response, metadata);
         if result.is_err() {
             data.skipped += 1;
             data.error = Some("部分正文未能缓存，相关请求将无法使用本地历史重建。");
@@ -350,7 +387,7 @@ fn prepare_block(db: &Connection, bytes: &[u8]) -> Result<Block> {
         stored_bytes,
     })
 }
-fn capture(data: &mut Data, scope: &str, request: &Value, response: &Value) -> Result<()> {
+fn capture(data: &mut Data, scope: &str, request: &Value, response: &Value, metadata: Option<&CaptureMetadata>) -> Result<()> {
     let Some(id) = response["id"]
         .as_str()
         .filter(|id| !id.is_empty() && id.len() <= 512)
@@ -423,6 +460,7 @@ fn capture(data: &mut Data, scope: &str, request: &Value, response: &Value) -> R
     }
     data.tick += 1;
     let tick = data.tick;
+    let metadata = metadata.map(serde_json::to_string).transpose()?;
     loop {
         let result = (|| -> rusqlite::Result<()> {
             let tx = data.db.transaction()?;
@@ -443,8 +481,8 @@ fn capture(data: &mut Data, scope: &str, request: &Value, response: &Value) -> R
                     .execute(params![node.hash,node.parent,node.block,node.end,tick])?;
             }
             tx.execute(
-                "INSERT OR REPLACE INTO snapshots VALUES(?1,?2,?3,?4)",
-                params![snapshot_key(scope, id), tail, envelope, tick],
+                "INSERT INTO snapshots(key,tail,envelope,last_used,metadata) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(key) DO UPDATE SET tail=excluded.tail,envelope=excluded.envelope,last_used=excluded.last_used,metadata=excluded.metadata",
+                params![snapshot_key(scope, id), tail, envelope, tick, metadata],
             )?;
             tx.commit()
         })();
