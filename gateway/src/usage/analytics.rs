@@ -1,5 +1,6 @@
 //! Window-wide aggregates; neither this module nor request lists fetch error bodies.
 use super::{
+    grouping,
     requests::{self, Query, ATTEMPTS, FILTERS},
     StoreData,
 };
@@ -374,6 +375,7 @@ pub(super) fn build(data: &mut StoreData, payload: &Value) -> Result<Value> {
         }
     }
     ensure!(groups.len() <= MAX_OPTIONS, "统计分组过多，请缩小查询范围");
+    let groups = grouping::merge(groups.values(), true);
     let daily: Vec<_> = daily
         .into_iter()
         .zip(&query.days)
@@ -398,7 +400,7 @@ pub(super) fn build(data: &mut StoreData, payload: &Value) -> Result<Value> {
         })
         .collect();
     Ok(
-        json!({"groups":groups.into_values().collect::<Vec<_>>(),"daily":daily,"performance":performance,"options":options,"from":query.from,"to":query.to,"fetched_at":crate::model::now()}),
+        json!({"groups":groups,"daily":daily,"performance":performance,"options":options,"from":query.from,"to":query.to,"fetched_at":crate::model::now()}),
     )
 }
 

@@ -226,6 +226,7 @@ async fn duplicate_official_accounts_are_rejected_before_any_sync_publication() 
         .await
         .insert("response".into(), "held".into());
     let revision = state.routing_revision.load(Ordering::Acquire);
+    let budget_revision = management::dispatch(&state, "omp.budgets.revision", json!({})).await.unwrap();
 
     for account_location in ["metadata", "credential", "both"] {
         let mut duplicate = official_source("official-copy", Some("account-a"));
@@ -240,7 +241,8 @@ async fn duplicate_official_accounts_are_rejected_before_any_sync_publication() 
         let result = management::dispatch(
             &state,
             "sync",
-            json!({"sources":[original.clone(),duplicate],"load_balance":true}),
+            json!({"sources":[original.clone(),duplicate],"load_balance":true,
+                "model_compaction":[{"model":"m","auto_compact_token_limit":100,"context_window":1000}]}),
         )
         .await;
         assert!(result.is_err());
@@ -262,6 +264,7 @@ async fn duplicate_official_accounts_are_rejected_before_any_sync_publication() 
             Some("held")
         );
         assert_eq!(state.routing_revision.load(Ordering::Acquire), revision);
+        assert_eq!(management::dispatch(&state, "omp.budgets.revision", json!({})).await.unwrap(), budget_revision);
         assert!(!state.settings.read().await.load_balance);
     }
 }

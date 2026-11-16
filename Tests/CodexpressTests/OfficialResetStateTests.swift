@@ -2,6 +2,10 @@ import XCTest
 import Darwin
 @testable import Codexpress
 
+private func officialResetTestDirectory() -> URL {
+    FileManager.default.temporaryDirectory.appendingPathComponent("r-\(UUID().uuidString.prefix(8))", isDirectory: true)
+}
+
 final class OfficialResetStateTests: XCTestCase {
     @MainActor func testRejectedInitialSyncKeepsOwnedHelperAvailableToRemoveDuplicateSources() async throws {
         let owner = Self.source("account-A")
@@ -78,8 +82,26 @@ final class OfficialResetStateTests: XCTestCase {
         XCTAssertFalse(fixture.model.refreshingQuotas.contains(source.id))
     }
 
+    @MainActor func testQuotaRefreshDoesNotBlockEditingAnotherSource() async throws {
+        let account = Self.source("account-A")
+        let other = Self.source("account-B")
+        let fixture = try OfficialResetFixture(sources: [account, other])
+        defer { fixture.stop() }
+        try await fixture.start()
+        try Data().write(to: fixture.directory.appendingPathComponent("hold-refresh"))
+        fixture.model.refresh(account.id)
+        try await fixture.waitUntil { fixture.model.refreshingQuotas.contains(account.id) }
+        XCTAssertFalse(fixture.model.busy)
+        fixture.model.toggle(other)
+        try await fixture.waitUntil { fixture.model.settings.sources.first { $0.id == other.id }?.enabled == false }
+        XCTAssertTrue(fixture.model.refreshingQuotas.contains(account.id))
+        try Data().write(to: fixture.directory.appendingPathComponent("release-refresh-true"))
+        try await fixture.waitUntil { !fixture.model.refreshingQuotas.contains(account.id) && !fixture.model.busy }
+        XCTAssertNil(fixture.model.error)
+    }
+
     @MainActor func testStoredResultsFollowAccountsAndLegacyRecordsProtectTheirOriginalSource() throws {
-        let directory = URL(fileURLWithPath: "/tmp/cx-reset-history-\(UUID().uuidString)", isDirectory: true)
+        let directory = officialResetTestDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         var first = Self.source("account-A")
         let alias = Self.source("account-A")
@@ -268,6 +290,39 @@ final class OfficialResetStateTests: XCTestCase {
         XCTAssertTrue(try ResetOperationStore(directory: fixture.directory).load().isEmpty)
     }
 
+    @MainActor func testOfficialFailureSnapshotsDoNotExtendNormalRefreshIntervals() async throws {
+        let source = Self.source("account-A")
+        let fixture = try OfficialResetFixture(sources: [source])
+        defer { fixture.stop() }
+        try await fixture.start()
+        try await fixture.model.queryOfficial(source.id, includeCredits: true)
+        let now = Date()
+        let schedule = fixture.model.officialRefreshSchedule
+        XCTAssertTrue(schedule.isDue(source.id, now: now.addingTimeInterval(15), foreground: true))
+        XCTAssertTrue(schedule.isDue(source.id, now: now.addingTimeInterval(60), interval: 60))
+        XCTAssertLessThanOrEqual(schedule.backgroundDelay(for: [source.id], since: now, interval: 60, now: now), 60)
+        XCTAssertFalse(schedule.needsCredits(source.id, now: now.addingTimeInterval(299)))
+        XCTAssertTrue(schedule.needsCredits(source.id, now: now.addingTimeInterval(300)))
+    }
+
+    @MainActor func testManualBalanceRefreshBypassesFailureCooldownButOrdinaryRefreshDoesNot() async throws {
+        var source = Source(); source.name = "手动余额"; source.automaticModelDiscovery = false
+        let fixture = try OfficialResetFixture(sources: [source])
+        defer { fixture.stop() }
+        let cached: JSONValue = .object(["amount": .number(10), "currency": .string("USD"), "failure_count": .number(2), "next_retry_at": .number(Date().addingTimeInterval(3600).timeIntervalSince1970)])
+        try fixture.setSources([source], balances: [source.id: cached])
+        try await fixture.start()
+        await fixture.model.refreshAccount(source.id, foreground: true)
+        await fixture.model.refreshAccount(source.id, foreground: false)
+        XCTAssertFalse(try fixture.operations().contains("balance.query"))
+        XCTAssertEqual(fixture.model.apiBalances[source.id], cached)
+        await fixture.model.refreshAccount(source.id, foreground: true, force: true)
+        XCTAssertEqual(fixture.model.apiBalances[source.id]?["amount"].number, 12)
+        XCTAssertEqual(try fixture.balanceRequests(), [.object(["source_id": .string(source.id), "force": .bool(true)])])
+        await fixture.model.refreshAccount(source.id, foreground: true)
+        XCTAssertEqual(try fixture.balanceRequests().last?["force"].bool, false)
+    }
+
     @MainActor func testStatusBalancesTrackLocalSpendWithoutUpstreamQueriesAndClearAfterIdentityChange() async throws {
         var source = Source(); source.name = "本地余额"; source.automaticModelDiscovery = false
         let fixture = try OfficialResetFixture(sources: [source])
@@ -291,7 +346,7 @@ final class OfficialResetStateTests: XCTestCase {
     }
 
     @MainActor func testUnreadableOperationHistoryBlocksEveryAccount() throws {
-        let directory = URL(fileURLWithPath: "/tmp/cx-reset-corrupt-\(UUID().uuidString)", isDirectory: true)
+        let directory = officialResetTestDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try Data("{invalid".utf8).write(to: ResetOperationStore(directory: directory).file)
@@ -315,7 +370,7 @@ final class OfficialResetStateTests: XCTestCase {
     private let rejectDuplicateSync: Bool
 
     init(sources: [Source], disconnectConsume: Bool = false, rejectDuplicateSync: Bool = false) throws {
-        directory = URL(fileURLWithPath: "/tmp/cx-reset-\(UUID().uuidString)", isDirectory: true)
+        directory = officialResetTestDirectory()
         self.disconnectConsume = disconnectConsume
         self.rejectDuplicateSync = rejectDuplicateSync
         var settings = AppSettings(); settings.sources = sources
@@ -373,6 +428,10 @@ final class OfficialResetStateTests: XCTestCase {
 
     func refreshRequests() throws -> [JSONValue] {
         try recordedRequests("refresh-requests")
+    }
+
+    func balanceRequests() throws -> [JSONValue] {
+        try recordedRequests("balance-requests")
     }
 
     func operations() throws -> [String] {
@@ -447,6 +506,11 @@ final class OfficialResetStateTests: XCTestCase {
                 with record_lock:
                     cancelled_resets.add(request['payload']['id'])
                 data = dict(status='cancelled')
+            elif operation == 'balance.query':
+                with record_lock:
+                    with (directory / 'balance-requests').open('a') as record:
+                        record.write(json.dumps(request['payload']) + '\n')
+                data = dict(amount=12, currency='USD', failure_count=0, next_retry_at=None)
             elif operation == 'official.refresh':
                 with record_lock:
                     with (directory / 'refresh-requests').open('a') as record:
@@ -456,7 +520,8 @@ final class OfficialResetStateTests: XCTestCase {
                     deadline = time.monotonic() + 8
                     while not (directory / release).exists() and time.monotonic() < deadline:
                         time.sleep(0.01)
-                data = {}
+                failure = dict(failure_count=1, next_retry_at=time.time() + 3600, stale=True, error='Fixture query failed')
+                data = dict(quota=failure, credits=failure)
             elif operation in ('official.credits.consume', 'control.reset.confirm'):
                 with record_lock:
                     with (directory / 'consume-requests').open('a') as record:

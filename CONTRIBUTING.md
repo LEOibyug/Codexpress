@@ -13,6 +13,35 @@ bash scripts/build.sh
 
 `check.sh` 运行测试与静态检查，`build.sh` 生成 `dist/Codexpress.app`。
 
+OMP 扩展的源码位于配套 `omp_extension` 项目。更新扩展时在那里执行 `bun run pack`，将生成的 `dist/codexpress-omp-extension-*.tgz` 复制为本项目 `Resources/omp-extension.tgz` 后再构建应用。发行版携带该完整包，安装时不依赖配套源码或开发工具。
+
+## 目录与本地产物
+
+| 路径 | 用途 |
+| --- | --- |
+| `Sources/`、`Tests/` | 原生应用源码与测试 |
+| `gateway/` | Rust 网关源码、测试及内置资源 |
+| `Resources/` | 应用图标配置、Skill 与 OMP 扩展发行包 |
+| `docs/`、`scripts/` | 用户文档和开发／打包入口 |
+| `dist/` | 当前应用、DMG、ZIP 与校验文件；不放历史备份 |
+| `.runtime/build/rust/`、`.runtime/build/swift/` | 可再生编译产物 |
+| `.runtime/cache/`、`.runtime/tmp/` | 项目缓存和临时文件 |
+| `.runtime/backups/applications/` | 旧应用安装备份 |
+| `.runtime/benchmarks/`、`.runtime/archive/` | 实测结果、历史操作记录与调查资料 |
+| `.tools/`、`references/` | 本地工具链、只读参考仓库 |
+
+使用 `scripts/` 中的入口构建和检查：公共脚本自动设置项目内的 Rust／Swift 构建目录、模块缓存和 `TMPDIR`／`TMP`／`TEMP`，不依赖终端预设的系统临时目录。需要独立构建树时，可指定项目内的 `CARGO_TARGET_DIR` 或 `CODEXPRESS_SWIFT_SCRATCH_PATH`。直接运行 `cargo`／`swift` 不会自动加载这些设置；IDE／语言服务也可能自行生成被忽略的 `.build/` 索引。
+
+公共脚本将项目根目录解析为真实路径，软链接入口与真实路径共用同一套缓存地址，避免 Swift 模块缓存因路径别名冲突而损坏。
+
+没有构建、测试或打包正在运行时，可删除以下可再生产物；下次运行脚本会重建：
+
+```sh
+rm -rf .runtime/build .runtime/cache .runtime/tmp
+```
+
+不要整体删除 `.runtime/`，其中还保留旧安装包与不可重新生成的实测记录。应用运行数据和凭据不在此清理范围内。
+
 生成 DMG、ZIP 和校验文件：
 
 ```sh

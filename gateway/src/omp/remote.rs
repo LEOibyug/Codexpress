@@ -164,7 +164,7 @@ pub(super) async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Re
     let port = access["port"].as_u64().filter(|port| (1..=65535).contains(port))
         .context("聊天客户端端口无效")?;
     let key = state.chatbot.key()?["key"].as_str().context("聊天客户端密钥不可用")?.to_owned();
-    let base_url = format!("http://{host}:{port}/v1");
+    let base_url = format!("http://{host}:{port}/omp/v1");
     let selected_model = upstream_model(selected);
     verify_model_access(&settings.value, selected_model)?;
     let ids = source_models(state, Some(selected_model)).await?;
@@ -195,7 +195,7 @@ pub(super) async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Re
     }
     files.insert(snapshot.models.name.clone(), Some(snapshot.models.applied.clone()));
     files.insert(snapshot.settings.name.clone(), Some(snapshot.settings.applied.clone()));
-    let summary = format!("默认模型 = codexpress/{selected}\nbaseUrl = {base_url}\n协议 = OpenAI Responses\nAPI Key = 已设置（与聊天客户端共用）\nOMP 配置 = {}\n写入后请重启远端 OMP", if configuration_changed { "已更改" } else { "未更改" });
+    let summary = format!("默认模型 = codexpress/{selected}\nbaseUrl = {base_url}\n协议 = Codex Responses\nAPI Key = 已设置（与聊天客户端共用）\nOMP 配置 = {}\n写入后请重启远端 OMP", if configuration_changed { "已更改" } else { "未更改" });
     let mut result = result(files, Some(&snapshot), &summary)?;
     result["base_url"] = json!(base_url);
     result["key"] = json!(key);

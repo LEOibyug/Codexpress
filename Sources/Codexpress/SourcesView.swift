@@ -141,11 +141,11 @@ struct SourcesView: View {
             HStack(spacing: 6) {
                 Button { model.move(IndexSet(integer: index), to: index - 1) } label: {
                     Image(systemName: "chevron.up")
-                }.disabled(index == 0 || model.busy)
+                }.disabled(index == 0 || !canEdit)
                     .help("提高优先级").accessibilityLabel("提高 \(source.name) 的优先级")
                 Button { model.move(IndexSet(integer: index), to: index + 2) } label: {
                     Image(systemName: "chevron.down")
-                }.disabled(index == model.sources.count - 1 || model.busy)
+                }.disabled(index == model.sources.count - 1 || !canEdit)
                     .help("降低优先级").accessibilityLabel("降低 \(source.name) 的优先级")
             }.buttonStyle(.borderless).font(.system(size: 10, weight: .semibold))
         }.frame(width: 44).padding(.top, 3)
@@ -160,31 +160,34 @@ struct SourcesView: View {
             Spacer(minLength: 8)
             if source.official, source.account_id == nil {
                 Button("登录…") { model.login(source) }.buttonStyle(.borderedProminent).controlSize(.small)
-                    .disabled(model.busy || model.loginFlow != nil)
+                    .disabled(!canEdit || model.loginFlow != nil)
             }
             SourceRoutingActions(source: source, compact: true).fixedSize()
             StatusPill(text: source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用",
                        color: sourceColor(source), active: model.sourceHasActivity(source.id))
             Toggle("启用 \(source.name)", isOn: Binding(get: { source.enabled }, set: { _ in model.toggle(source) }))
-                .toggleStyle(.switch).labelsHidden().controlSize(.small).disabled(model.busy)
+                .toggleStyle(.switch).labelsHidden().controlSize(.small).disabled(!canEdit)
             Menu {
                 Button("编辑…") { editing = EditingSource(source: source, isNew: false) }
-                Button("删除…", role: .destructive) { deleting = source }
+                Button("删除…", role: .destructive) { deleting = source }.disabled(!canEdit)
             } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).frame(width: 20)
         }
     }
 
     private func quotaSummary(_ source: Source) -> some View {
         let quota = model.state(source.id)["quota"]
+        let overview = QuotaOverview(quota)
         return HStack(alignment: .top, spacing: 24) {
-            ForEach(QuotaOverview(quota).mainWindows) { window in
+            ForEach(overview.mainWindows) { window in
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(window.title).font(AppTypography.small).foregroundStyle(.secondary)
                         Text(window.remainingLabel).font(AccountTypography.value).monospacedDigit()
                             .foregroundStyle(AccountLevel.quota(window.remaining).color)
                             .accessibilityLabel("\(window.title)剩余 \(window.remainingLabel)")
+                        if !overview.hasShortWindow { QuotaReferenceLabel(window: window) }
                     }
+                    if overview.hasShortWindow { QuotaReferenceLabel(window: window) }
                     Text(window.resetLabel).font(AppTypography.small).foregroundStyle(.secondary)
                         .lineLimit(1).help(window.resetLabel)
                 }

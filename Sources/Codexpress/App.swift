@@ -67,7 +67,7 @@ struct GatewayMenuIcon: View {
             window.titleVisibility = .visible
             window.toolbarStyle = .unified
             window.setContentSize(NSSize(width: 1040, height: 800))
-            window.minSize = NSSize(width: 960, height: 700)
+            window.contentMinSize = NSSize(width: 960, height: 700)
             window.isReleasedWhenClosed = false
             window.delegate = self
             window.center()

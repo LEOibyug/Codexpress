@@ -13,6 +13,7 @@ struct Operation {
     created_at: u64,
     status: &'static str,
     bindings: Vec<Binding>,
+    include_credits: bool,
     results: Vec<Value>,
 }
 impl Operation {
@@ -46,7 +47,7 @@ pub(super) async fn start(state: &Arc<AppState>, kind: &str, payload: Value) -> 
     {
         bail!("来源不存在");
     }
-    let bindings: Vec<_> = sources
+    let selected: Vec<_> = sources
         .iter()
         .filter(|runtime| {
             runtime.source.kind
@@ -57,8 +58,9 @@ pub(super) async fn start(state: &Arc<AppState>, kind: &str, payload: Value) -> 
                 }
                 && source_id.as_ref().is_none_or(|id| &runtime.source.id == id)
         })
-        .map(|runtime| Binding::of(&runtime.source))
+        .map(|runtime| runtime.source.clone())
         .collect();
+    let bindings: Vec<_> = selected.iter().map(Binding::of).collect();
     if source_id.is_some() && bindings.is_empty() {
         bail!("所选来源不支持此刷新操作");
     }
@@ -70,6 +72,14 @@ pub(super) async fn start(state: &Arc<AppState>, kind: &str, payload: Value) -> 
             .operations
             .lock()
             .map_err(|_| anyhow::anyhow!("刷新队列忙碌"))?;
+        if let Some(operation) = store.entries.iter().find(|operation| {
+            operation.status == "running"
+                && operation.kind == kind
+                && operation.bindings == bindings
+                && operation.include_credits == include_credits
+        }) {
+            return Ok(operation.view());
+        }
         if store
             .entries
             .iter()
@@ -93,6 +103,7 @@ pub(super) async fn start(state: &Arc<AppState>, kind: &str, payload: Value) -> 
             created_at: now(),
             status: "running",
             bindings: bindings.clone(),
+            include_credits,
             results: Vec::new(),
         };
         let response = operation.view();
@@ -104,26 +115,14 @@ pub(super) async fn start(state: &Arc<AppState>, kind: &str, payload: Value) -> 
     tokio::spawn(async move {
         let mut results = Vec::new();
         let mut failed = false;
-        for binding in bindings {
-            // Serialize with configuration publication so this queued operation
-            // cannot accidentally select a newly rebound source ID.
-            let _routing = state.routing_sync.lock().await;
+        for (binding, source) in bindings.into_iter().zip(selected) {
             let outcome = if !binding.current(&state).await {
                 None
             } else {
                 let result = if kind == "balances" {
-                    crate::balance::query(
-                        &state,
-                        json!({"source_id":binding.source_id,"force":true}),
-                    )
-                    .await
+                    crate::balance::query_for_source(&state, &source, true).await
                 } else {
-                    crate::official::handle(
-                        &state,
-                        "official.refresh",
-                        json!({"source_id":binding.source_id,"include_credits":include_credits}),
-                    )
-                    .await
+                    crate::official::refresh_for_source(&state, &source, include_credits).await
                 };
                 if binding.current(&state).await {
                     Some(result)
@@ -146,7 +145,22 @@ pub(super) async fn start(state: &Arc<AppState>, kind: &str, payload: Value) -> 
                         json!({"source_id":binding.source_id,"status":"completed","result":result})
                     } else {
                         failed = true;
-                        json!({"source_id":binding.source_id,"status":"failed","code":"refresh_failed","result":null})
+                        let next_retry_at = if kind == "balances" {
+                            result["next_retry_at"].as_u64()
+                        } else {
+                            [
+                                result["quota"]["next_retry_at"].as_u64(),
+                                if include_credits {
+                                    result["credits"]["next_retry_at"].as_u64()
+                                } else {
+                                    None
+                                },
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .min()
+                        };
+                        json!({"source_id":binding.source_id,"status":"failed","code":"upstream_refresh_failed","next_retry_at":next_retry_at,"result":null})
                     }
                 }
                 Some(Err(_)) => {

@@ -10,14 +10,13 @@ use axum::{
     extract::{Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -305,7 +304,7 @@ async fn gate(State(state): State<Arc<AppState>>, mut request: Request, next: Ne
     );
     response.headers_mut().insert(
         "access-control-expose-headers",
-        HeaderValue::from_static("x-codexpress-adapted-parameters"),
+        HeaderValue::from_static("x-codexpress-adapted-parameters, x-codexpress-source-id, x-codexpress-source-identity"),
     );
     response
 }
@@ -321,67 +320,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/responses", post(responses))
         .route("/v1/responses/compact", post(compact))
         .route("/responses/compact", post(compact))
+        .merge(crate::omp_ingress::router(state.clone()))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, gate))
 }
 async fn remote_check() -> Json<Value> {
     Json(json!({"service":"codexpress","mode":"chatbot","version":1}))
 }
-async fn models(State(state): State<Arc<AppState>>) -> Response {
-    use futures_util::StreamExt;
-    let sources = crate::routing::candidates(&state, "", None).await;
-    let mut names = BTreeSet::new();
-    for source in &sources {
-        names.extend(source.models.clone());
+pub(crate) async fn models(State(state): State<Arc<AppState>>) -> Response {
+    match crate::model_catalog::load(&state, crate::model_policy::ClientKind::Chatbot).await {
+        Ok(catalog) => Json(json!({"object":"list","data":catalog.models()})).into_response(),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "无法获取来源模型列表，请先在来源页刷新或手动填写", None),
     }
-    let uncached: Vec<_> = sources
-        .into_iter()
-        .filter(|source| source.models.is_empty())
-        .collect();
-    let had_uncached = !uncached.is_empty();
-    let mut queries = futures_util::stream::iter(uncached)
-        .map(|source| {
-            let state = state.clone();
-            async move { crate::discovery::list(&state, json!({"source_id":source.id})).await }
-        })
-        .buffer_unordered(4);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while let Ok(Some(result)) = tokio::time::timeout_at(deadline, queries.next()).await {
-        if let Ok(result) = result {
-            for name in result["models"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-            {
-                names.insert(name.to_owned());
-                if names.len() >= 10_000 {
-                    break;
-                }
-            }
-        }
-        if names.len() >= 10_000 {
-            break;
-        }
-    }
-    if had_uncached && names.is_empty() {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "无法获取来源模型列表，请先在来源页刷新模型或手动填写",
-            None,
-        );
-    }
-    let mut data = Vec::new();
-    for name in names.into_iter().take(10_000) {
-        if !crate::routing::candidates(&state, &name, None)
-            .await
-            .is_empty()
-        {
-            data.push(json!({"id":name,"object":"model","created":0,"owned_by":"codexpress"}));
-        }
-    }
-    use axum::response::IntoResponse;
-    Json(json!({"object":"list","data":data})).into_response()
 }
 async fn chat(State(state): State<Arc<AppState>>, request: Request) -> Response {
     infer(state, request, requests::Format::Chat).await

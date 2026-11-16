@@ -22,6 +22,7 @@ struct Operation {
     operation_id: String,
     created_at: u64,
     result: Value,
+    weekly_generation: Option<u64>,
 }
 fn operation_path(state: &Arc<AppState>, id: &str) -> PathBuf {
     state
@@ -30,18 +31,20 @@ fn operation_path(state: &Arc<AppState>, id: &str) -> PathBuf {
         .join(format!("{:x}.json", Sha256::digest(id.as_bytes())))
 }
 fn write_operation(state: &Arc<AppState>, operation: &Operation, create: bool) -> Result<()> {
+    write_record(&operation_path(state, &operation.operation_id), operation, create)
+}
+pub(super) fn write_record(path: &std::path::Path, value: &impl Serialize, create: bool) -> Result<()> {
     use std::{
         fs::{self, OpenOptions},
         io::Write,
         os::unix::fs::{OpenOptionsExt, PermissionsExt},
     };
-    let path = operation_path(state, &operation.operation_id);
     let parent = path.parent().unwrap();
     fs::create_dir_all(parent).map_err(|_| anyhow!("无法保存重置操作记录"))?;
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
         .map_err(|_| anyhow!("无法保护重置操作目录"))?;
     let target = if create {
-        path.clone()
+        path.to_path_buf()
     } else {
         path.with_extension("tmp")
     };
@@ -51,12 +54,12 @@ fn write_operation(state: &Arc<AppState>, operation: &Operation, create: bool) -
         .create_new(true)
         .open(&target)
         .map_err(|_| anyhow!("无法保存重置操作记录，请先核实已有操作"))?;
-    let bytes = serde_json::to_vec(operation)?;
+    let bytes = serde_json::to_vec(value)?;
     file.write_all(&bytes)
         .and_then(|_| file.sync_all())
         .map_err(|_| anyhow!("无法落盘重置操作记录"))?;
     if !create {
-        fs::rename(&target, &path).map_err(|_| anyhow!("无法更新重置操作记录"))?;
+        fs::rename(&target, path).map_err(|_| anyhow!("无法更新重置操作记录"))?;
     }
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
@@ -75,8 +78,6 @@ pub(super) async fn consume(
         bail!("使用重置卡需要明确确认");
     }
     let id = field(payload, "source_id")?;
-    let credit = field(payload, "credit_id")?;
-    let operation_id = field(payload, "operation_id")?;
     let expected_account = field(payload, "expected_account_id")?;
     let initial = source(state, id).await?;
     if account(&initial) != Some(expected_account) {
@@ -88,6 +89,21 @@ pub(super) async fn consume(
     )
     .await;
     let _guard = mutex.lock().await;
+    consume_locked(state, payload, endpoints, &initial, None).await
+}
+
+// Automatic authorization is internal only; IPC always enters the confirmed wrapper above.
+pub(super) async fn consume_locked(
+    state: &Arc<AppState>,
+    payload: &Value,
+    endpoints: Endpoints<'_>,
+    initial: &crate::model::Source,
+    automatic: Option<(&crate::model::Source, u64, u64)>,
+) -> Result<Value> {
+    let id = field(payload, "source_id")?;
+    let credit = if automatic.is_some() { "" } else { field(payload, "credit_id")? };
+    let operation_id = field(payload, "operation_id")?;
+    let expected_account = field(payload, "expected_account_id")?;
     if account(&source(state, id).await?) != Some(expected_account) {
         bail!("确认的账号已变化，请重新确认重置卡操作");
     }
@@ -97,9 +113,8 @@ pub(super) async fn consume(
             std::fs::read(&path).map_err(|_| anyhow!("无法读取重置操作记录，禁止重复提交"))?;
         let operation: Operation = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow!("重置操作记录损坏，禁止重复提交"))?;
-        if operation.source_id != id
-            || operation.credit_id != credit
-            || operation.account_id.as_deref() != account(&initial)
+        if (automatic.is_none() && (operation.source_id != id || operation.credit_id != credit))
+            || operation.account_id.as_deref() != account(initial)
         {
             bail!("操作标识已经绑定其他来源、账号或重置卡");
         }
@@ -115,11 +130,12 @@ pub(super) async fn consume(
         return Ok(result);
     }
     let src = refresh_inner(state, id, false, endpoints).await?;
-    if account(&initial) != account(&src) || initial.proxy != src.proxy {
+    if account(initial) != account(&src) || initial.proxy != src.proxy {
         bail!("来源账号或代理已变化，请重新确认");
     }
     // A previous uncertain operation for this card blocks new IDs, including after restart.
     let directory = state.state_dir.join("official-operations");
+    let mut uncertain_cards = Vec::new();
     if directory.exists() {
         for entry in std::fs::read_dir(&directory).map_err(|_| anyhow!("无法核实待确认操作"))?
         {
@@ -137,11 +153,18 @@ pub(super) async fn consume(
                 .map_or(operation.source_id == id, |account_id| {
                     Some(account_id) == account(&src)
                 })
-                && operation.credit_id == credit
+                && (automatic.is_some() || operation.credit_id == credit)
                 && ["pending_verification", "unknown"]
                     .contains(&operation.result["code"].as_str().unwrap_or(""))
             {
-                bail!("此重置卡有结果待核实的操作，请刷新核实，不能再次提交");
+                if automatic.is_none()
+                    || !super::auto_reset::allows_uncertain(state, &src, operation.weekly_generation).await?
+                {
+                    bail!("此重置卡有结果待核实的操作，请刷新核实，不能再次提交");
+                }
+                // A later confirmed recovery/new cycle authorizes a new event,
+                // never a replay of an uncertain card's POST.
+                uncertain_cards.push(operation.credit_id);
             }
         }
     }
@@ -150,6 +173,12 @@ pub(super) async fn consume(
     let credits_mutex = lock(state, format!("credits:{}", src.identity())).await;
     let credits_guard = credits_mutex.lock().await;
     let cards = credits_snapshot(&get(&src, endpoints.credits).await?)?;
+    let credit = if automatic.is_some() {
+        super::auto_reset::select_card(&cards, &uncertain_cards)
+            .ok_or_else(|| anyhow!("没有可用的重置卡"))?
+    } else {
+        credit
+    };
     let card = cards["credits"]
         .as_array()
         .and_then(|cards| cards.iter().find(|c| c["id"] == credit))
@@ -159,7 +188,7 @@ pub(super) async fn consume(
         bail!("重置卡不可用、已过期或状态未知，请刷新后重新确认");
     }
     // Compare the visible card to the fresh inventory; any meaningful change needs a new confirmation.
-    {
+    if automatic.is_none() {
         let sources = state.sources.read().await;
         if let Some(previous) = sources
             .iter()
@@ -174,10 +203,31 @@ pub(super) async fn consume(
             }
         }
     }
-    let latest = source(state, id).await?;
-    if account(&latest) != Some(expected_account) || !same_binding(&latest, &src) {
+    let _routing = if automatic.is_some() {
+        Some(state.routing_sync.lock().await)
+    } else {
+        None
+    };
+    let event_mutex = super::auto_reset::event_lock(state, &src).await;
+    let event_guard = event_mutex.lock().await;
+    let settings = state.settings.read().await;
+    let sources = state.sources.read().await;
+    let latest = sources.iter().find(|r| r.source.id == id)
+        .ok_or_else(|| anyhow!("来源已删除"))?;
+    if account(&latest.source) != Some(expected_account) || !same_binding(&latest.source, &src) {
         bail!("来源在确认期间发生变化，请重新确认");
     }
+    if let Some((expected, reset_at, generation)) = automatic {
+        if !settings.auto_reset_weekly_quota
+            || !super::auto_reset::authorized_snapshot(&sources, expected, reset_at)
+            || super::auto_reset::current_generation(state, &src)? != Some(generation)
+        {
+            bail!("自动重置条件已变化");
+        }
+    }
+    let weekly_generation = super::auto_reset::mark_submitted(
+        state, &src, operation_id, &latest.quota, settings.auto_reset_weekly_quota,
+    )?;
     let mut operation = Operation {
         source_id: id.into(),
         account_id: account(&src).map(str::to_owned),
@@ -185,8 +235,13 @@ pub(super) async fn consume(
         operation_id: operation_id.into(),
         created_at: now(),
         result: reset_result("pending_verification", Value::Null),
+        weekly_generation,
     };
     write_operation(state, &operation, true)?;
+    drop(sources);
+    drop(settings);
+    drop(event_guard);
+    drop(_routing);
     // All errors after durable intent are uncertain. Never retry this POST, including on 401.
     let mut request = transport::client(&src)?
         .post(endpoints.consume)

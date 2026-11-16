@@ -4,26 +4,45 @@ import Darwin
 struct OMPInstallation: Equatable, Sendable {
     var executable: String?
     var version: String?
-    var agentDirectory: String
 
     static func detect(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         candidatePaths: [String]? = nil,
-        currentDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
         timeout: TimeInterval = 4
     ) async -> Self {
         await Task.detached(priority: .utility) {
-            let directory = agentDirectory(environment: environment, home: home, currentDirectory: currentDirectory)
             let candidates = candidatePaths ?? executableCandidates(environment: environment, home: home)
             let executable = candidates.first { path in
                 var isDirectory: ObjCBool = false
                 return path.hasPrefix("/") && FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
                     && !isDirectory.boolValue && FileManager.default.isExecutableFile(atPath: path)
             }
-            guard let executable else { return Self(agentDirectory: directory) }
+            guard let executable else { return Self() }
             let output = versionOutput(executable: executable, environment: environment, timeout: timeout)
-            return Self(executable: executable, version: output.flatMap(parseVersion), agentDirectory: directory)
+            return Self(executable: executable, version: output.flatMap(parseVersion))
+        }.value
+    }
+
+    func installExtension(packageURL: URL, environment: [String: String] = ProcessInfo.processInfo.environment) async throws {
+        guard let executable else {
+            throw NSError(domain: "OMPInstallation", code: 1, userInfo: [NSLocalizedDescriptionKey: "未找到 OMP，请先安装 OMP 或选择其可执行文件。"])
+        }
+        try await Task.detached(priority: .utility) {
+            let result = try Self.commandOutput(
+                executable: executable,
+                arguments: ["plugin", "install", "@codexpress/omp-extension@file:\(packageURL.path)"],
+                environment: environment,
+                currentDirectory: packageURL.deletingLastPathComponent(),
+                timeout: 180,
+                outputLimit: 1024 * 1024
+            )
+            guard result.status == 0 else {
+                let detail = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                throw NSError(domain: "OMPInstallation", code: Int(result.status), userInfo: [
+                    NSLocalizedDescriptionKey: "OMP 扩展安装失败（\(result.status)）。\(detail.isEmpty ? "" : "\n\(detail)")"
+                ])
+            }
         }.value
     }
 
@@ -33,34 +52,6 @@ struct OMPInstallation: Equatable, Sendable {
         return path + ["/opt/homebrew/bin/omp", "/usr/local/bin/omp",
                        home.appendingPathComponent(".local/bin/omp").path,
                        home.appendingPathComponent(".bun/bin/omp").path]
-    }
-
-    private static func agentDirectory(environment: [String: String], home: URL, currentDirectory: URL) -> String {
-        // OMP 18's `config path` initializes writable storage and can migrate settings.
-        // Resolve its documented directory rules without opening config or credentials.
-        // XDG moves categorized data/state/cache, but does not move this config directory.
-        let rootName = environment["PI_CONFIG_DIR"].flatMap { $0.isEmpty ? nil : $0 } ?? ".omp"
-        let root = home.appendingPathComponent(rootName).standardizedFileURL
-        let profile = (environment["OMP_PROFILE"] ?? environment["PI_PROFILE"] ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !profile.isEmpty && profile != "default" {
-            let pattern = #"^[a-z0-9][a-z0-9._-]{0,63}$"#
-            let reserved = #"^(?i:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\..*)?$"#
-            guard profile.range(of: pattern, options: .regularExpression) != nil,
-                  profile != ".", profile != "..", !profile.hasSuffix("."),
-                  profile.range(of: reserved, options: .regularExpression) == nil else {
-                return home.appendingPathComponent(".omp/agent").path
-            }
-            return root.appendingPathComponent("profiles").appendingPathComponent(profile)
-                .appendingPathComponent("agent").path
-        }
-        if let override = environment["PI_CODING_AGENT_DIR"], !override.isEmpty,
-           !override.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
-            let resolved = override.hasPrefix("/") ? URL(fileURLWithPath: override)
-                : currentDirectory.appendingPathComponent(override)
-            return resolved.standardizedFileURL.path
-        }
-        return root.appendingPathComponent("agent").path
     }
 
     private static func parseVersion(_ output: String) -> String? {
@@ -73,39 +64,56 @@ struct OMPInstallation: Equatable, Sendable {
     }
 
     private static func versionOutput(executable: String, environment: [String: String], timeout: TimeInterval) -> String? {
+        let deadline = min(max(timeout.isFinite ? timeout : 4, 0.05), 5)
+        guard let result = try? commandOutput(
+            executable: executable, arguments: ["--version"], environment: environment,
+            currentDirectory: FileManager.default.temporaryDirectory, timeout: deadline, outputLimit: 8192
+        ), result.status == 0 else { return nil }
+        return result.output
+    }
+
+    private static func commandOutput(
+        executable: String, arguments: [String], environment: [String: String],
+        currentDirectory: URL, timeout: TimeInterval, outputLimit: Int
+    ) throws -> (status: Int32, output: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = ["--version"]
+        process.arguments = arguments
         process.environment = environment
-        process.currentDirectoryURL = FileManager.default.temporaryDirectory
+        process.currentDirectoryURL = currentDirectory
         process.standardInput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
         let pipe = Pipe()
         process.standardOutput = pipe
+        process.standardError = pipe
         defer {
+            stop(process)
             try? pipe.fileHandleForReading.close()
             try? pipe.fileHandleForWriting.close()
         }
         let descriptor = pipe.fileHandleForReading.fileDescriptor
         let flags = fcntl(descriptor, F_GETFL)
-        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0 else { return nil }
-        do { try process.run() } catch { return nil }
-        // Keeping reads nonblocking also bounds a broken wrapper whose child retains stdout.
-        let deadline = ProcessInfo.processInfo.systemUptime + min(max(timeout.isFinite ? timeout : 4, 0.05), 5)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0 else {
+            throw POSIXError(.EIO)
+        }
+        try process.run()
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
         var output = Data()
         var bytes = [UInt8](repeating: 0, count: 4096)
         while true {
             let count = Darwin.read(descriptor, &bytes, bytes.count)
             if count > 0 {
-                guard output.count + count <= 8192 else { stop(process); return nil }
+                guard output.count + count <= outputLimit else {
+                    throw NSError(domain: "OMPInstallation", code: 2, userInfo: [NSLocalizedDescriptionKey: "OMP 输出过多，操作已停止。"])
+                }
                 output.append(contentsOf: bytes.prefix(count))
             } else if count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
-                stop(process); return nil
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             } else if !process.isRunning {
-                guard process.terminationStatus == 0 else { return nil }
-                return String(data: output, encoding: .utf8)
+                return (process.terminationStatus, String(decoding: output, as: UTF8.self))
             }
-            guard ProcessInfo.processInfo.systemUptime < deadline else { stop(process); return nil }
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                throw NSError(domain: "OMPInstallation", code: 3, userInfo: [NSLocalizedDescriptionKey: "OMP 操作超时，请检查 OMP 是否能正常启动后重试。"])
+            }
             if count <= 0 { usleep(10_000) }
         }
     }

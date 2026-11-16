@@ -77,7 +77,9 @@ def check(helper, codex, scenario):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        with tempfile.TemporaryDirectory(prefix="cx-continuation-", dir="/tmp", ignore_cleanup_errors=True) as temp:
+        temporary_root = Path(__file__).resolve().parents[1] / ".runtime/tmp"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="cxc-", dir=temporary_root, ignore_cleanup_errors=True) as temp:
             root = Path(temp)
             home, state, work = [root / name for name in ("codex", "app", "work")]
             for directory in (home, state, work):

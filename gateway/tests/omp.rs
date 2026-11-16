@@ -8,7 +8,7 @@ use codexpress_gateway::{
 use serde_json::{json, Value};
 use std::{
     fs,
-    os::unix::fs::{symlink, PermissionsExt},
+    os::unix::fs::{symlink, MetadataExt, PermissionsExt},
     path::Path,
     sync::Arc,
 };
@@ -142,7 +142,7 @@ async fn merge_preserves_providers_defaults_and_compression_and_never_returns_ke
         models["providers"]["personal"]["apiKey"],
         "PRIVATE-PERSONAL-KEY"
     );
-    assert_eq!(models["providers"]["codexpress"]["api"], "openai-responses");
+    assert_eq!(models["providers"]["codexpress"]["api"], "openai-codex-responses");
     assert_eq!(models["providers"]["codexpress"]["auth"], "apiKey");
     let key = management::dispatch(&state, "chatbot.key", json!({}))
         .await
@@ -811,6 +811,159 @@ async fn precise_edits_reject_stale_views_and_preserve_unmanaged_provider_prefer
     assert!(fs::read_to_string(home.join("config.yml"))
         .unwrap()
         .contains("codexpress/*: 80% # untouched selector"));
+}
+
+#[tokio::test]
+async fn legacy_budget_migration_hands_off_real_native_ownership_without_rewriting_preferences() {
+    let (directory, state) = fixture().await;
+    state.sources.write().await[0].source.models.extend(["gpt-6-sol".into(), "gpt-6-terra".into()]);
+    let home = directory.path().join("legacy-budget-agent");
+    fs::create_dir(&home).unwrap();
+    let personal = "  personal: {apiKey: 'PRIVATE-PERSONAL-KEY'} # exact personal text\n";
+    fs::write(home.join("models.yml"), format!("# models comment\nproviders:\n{personal}")).unwrap();
+    fs::write(home.join("config.yml"), "# preferences comment\ncompaction:\n  enabled: false\n  methodOrder: [snapcompact, remote]\n  reserveTokens: 32\n  modelThresholds:\n    codexpress/gpt-6-astra: f111111 # original restore point\n    codexpress/untracked: 77% # not gateway owned\n    personal/*: 65%\ncustom: 'PRIVATE-PREFERENCE' # exact custom text\n").unwrap();
+    let binding = management::dispatch(&state, "omp.binding", json!({})).await.unwrap();
+    assert_eq!(binding["capabilities"]["legacy_budget_migration"], true);
+    let attached = call(&state, "omp.attach", &home, json!({"model_id":"gpt-6-astra"})).await.unwrap();
+    configure(&state, &home, &attached, json!([
+        {"file":"config","path":["compaction","modelThresholds","codexpress/gpt-6-astra"],"value":"f256000"},
+        {"file":"config","path":["compaction","modelThresholds","codexpress/gpt-6-sol"],"value":"f600000"},
+        {"file":"config","path":["compaction","modelThresholds","codexpress/gpt-6-terra"],"value":"f600000"},
+        {"file":"config","path":["compaction","modelThresholds","codexpress/*"],"value":"80%"},
+        {"file":"config","path":["compaction","modelThresholds","codexpress/number"],"value":123456},
+        {"file":"config","path":["compaction","modelThresholds","codexpress/nullable"],"value":null},
+        {"file":"config","path":["compaction","modelThresholds","personal/*"],"value":"66%"},
+        {"file":"config","path":["compaction","reserveTokens"],"value":123},
+        {"file":"models","path":["providers","codexpress","modelOverrides","gpt-6-astra","contextWindow"],"value":256000},
+        {"file":"models","path":["providers","codexpress","modelOverrides","gpt-6-astra","maxContextWindow"],"value":300000},
+        {"file":"models","path":["providers","codexpress","modelOverrides","gpt-6-sol","contextWindow"],"value":600000},
+        {"file":"models","path":["providers","codexpress","modelOverrides","gpt-6-terra","contextWindow"],"value":600000},
+        {"file":"models","path":["providers","codexpress","modelOverrides","gpt-6-astra","maxTokens"],"value":8192},
+        {"file":"models","path":["providers","codexpress","modelOverrides","gpt-6-astra","omitMaxOutputTokens"],"value":true}
+    ])).await.unwrap();
+    call(&state, "omp.bind", &home, json!({})).await.unwrap();
+    let model_path = home.join("models.yml");
+    let config_path = home.join("config.yml");
+    let receipt_path = directory.path().join("state/omp/attachment.json");
+    let ledger_path = home.join("codexpress-compaction.json");
+    let tail = "\n# exact user tail\nunmanaged: 'PRIVATE-TAIL' # keep quotes and spacing\n";
+    let mut model_text = fs::read_to_string(&model_path).unwrap();
+    model_text.push_str(tail);
+    fs::write(&model_path, &model_text).unwrap();
+    let models_before = yaml(&model_path);
+    let settings_before = fs::read(&config_path).unwrap();
+    let snapshot_before: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    // Migration is local-file-only, even when no client or upstream source is available.
+    management::dispatch(&state, "chatbot.configure", json!({"enabled":false})).await.unwrap();
+    state.sources.write().await.clear();
+    let migrated = call(&state, "omp.budgets.migrate", &home, json!({})).await.unwrap();
+    assert_eq!(migrated, json!({"migrated":true,"models_changed":true}));
+    assert_eq!(fs::read(&config_path).unwrap(), settings_before);
+    let ledger: Value = serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    assert_eq!(ledger, json!({
+        "codexpress/gpt-6-astra":"f256000", "codexpress/gpt-6-sol":"f600000",
+        "codexpress/gpt-6-terra":"f600000", "codexpress/*":"80%",
+        "codexpress/number":123456, "codexpress/nullable":null
+    }));
+    let models_after = yaml(&model_path);
+    let mut expected_models = models_before.clone();
+    for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6-terra"] {
+        let overrides = expected_models["providers"]["codexpress"]["modelOverrides"][id].as_object_mut().unwrap();
+        overrides.remove("contextWindow");
+        overrides.remove("maxContextWindow");
+    }
+    assert_eq!(models_after, expected_models);
+    let model_text = fs::read_to_string(&model_path).unwrap();
+    assert!(model_text.contains(personal));
+    assert!(model_text.starts_with("# models comment\n"));
+    assert!(model_text.ends_with(tail));
+    let snapshot: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    for file in ["models", "settings"] {
+        assert_eq!(snapshot[file]["original"], snapshot_before[file]["original"]);
+        assert_eq!(snapshot[file]["baseline"], snapshot_before[file]["baseline"]);
+    }
+    assert_eq!(snapshot["native_before"].as_array().unwrap().len(), 4);
+    let paths = [&model_path, &config_path, &receipt_path, &ledger_path];
+    let before: Vec<_> = paths.iter().map(|path| (fs::read(path).unwrap(), fs::metadata(path).unwrap().ino())).collect();
+    assert_eq!(call(&state, "omp.budgets.migrate", &home, json!({})).await.unwrap(), json!({"migrated":false,"models_changed":false}));
+    let after: Vec<_> = paths.iter().map(|path| (fs::read(path).unwrap(), fs::metadata(path).unwrap().ino())).collect();
+    assert_eq!(after, before);
+    // The old restore still restores unrelated preferences, never the handed-off budget.
+    let new_settings = String::from_utf8(settings_before).unwrap().replace("f256000", "f250000");
+    fs::write(&config_path, &new_settings).unwrap();
+    call(&state, "omp.restore", &home, json!({})).await.unwrap();
+    let restored = yaml(&config_path);
+    assert_eq!(restored["compaction"]["modelThresholds"]["codexpress/gpt-6-astra"], "f250000");
+    assert_eq!(restored["compaction"]["modelThresholds"]["codexpress/*"], "80%");
+    assert_eq!(restored["compaction"]["reserveTokens"], 32);
+    assert_eq!(restored["compaction"]["modelThresholds"]["personal/*"], "65%");
+    assert_eq!(fs::read(&ledger_path).unwrap(), before[3].0);
+    assert!(fs::read_to_string(&model_path).unwrap().ends_with(tail));
+}
+
+#[tokio::test]
+async fn legacy_budget_migration_respects_user_edits_profile_identity_and_existing_ledger() {
+    for case in ["manual", "deleted", "other-profile", "different-file", "missing-snapshot", "existing-ledger"] {
+        let (directory, state) = fixture().await;
+        let mut home = directory.path().join("agent");
+        apply(&state, &home).await;
+        let receipt_path = directory.path().join("state/omp/attachment.json");
+        let original_models = fs::read(home.join("models.yml")).unwrap();
+        let original_settings = fs::read(home.join("config.yml")).unwrap();
+        if matches!(case, "manual" | "deleted") {
+            let mut models = yaml(&home.join("models.yml"));
+            let mut settings = yaml(&home.join("config.yml"));
+            let overrides = models["providers"]["codexpress"]["modelOverrides"]["gpt-6-astra"].as_object_mut().unwrap();
+            let thresholds = settings["compaction"]["modelThresholds"].as_object_mut().unwrap();
+            if case == "manual" {
+                overrides.insert("contextWindow".into(), json!(999999));
+                thresholds.insert("codexpress/gpt-6-astra".into(), json!("f99999"));
+            } else {
+                overrides.remove("contextWindow");
+                thresholds.remove("codexpress/gpt-6-astra");
+            }
+            fs::write(home.join("models.yml"), serde_yaml::to_string(&models).unwrap()).unwrap();
+            fs::write(home.join("config.yml"), serde_yaml::to_string(&settings).unwrap()).unwrap();
+        } else if case == "other-profile" {
+            home = directory.path().join("other-agent");
+            fs::create_dir(&home).unwrap();
+            fs::write(home.join("models.yml"), &original_models).unwrap();
+            fs::write(home.join("config.yml"), &original_settings).unwrap();
+        } else if case == "different-file" {
+            fs::rename(home.join("models.yml"), home.join("models.yaml")).unwrap();
+        } else if case == "missing-snapshot" {
+            fs::remove_file(&receipt_path).unwrap();
+        }
+        let ledger_path = home.join("codexpress-compaction.json");
+        let existing_ledger = b"{ \"codexpress/gpt-6-astra\":\"f99999\", \"codexpress/*\":\"80%\", \"personal/m\":null }\n";
+        if case == "existing-ledger" { fs::write(&ledger_path, existing_ledger).unwrap(); }
+        let model_path = home.join(if case == "different-file" { "models.yaml" } else { "models.yml" });
+        let config_path = home.join("config.yml");
+        let models_before = fs::read(&model_path).unwrap();
+        let settings_before = fs::read(&config_path).unwrap();
+        let receipt_before = fs::read(&receipt_path).ok();
+        let should_migrate = matches!(case, "manual" | "deleted" | "existing-ledger");
+        assert_eq!(call(&state, "omp.budgets.migrate", &home, json!({})).await.unwrap(), json!({"migrated":should_migrate,"models_changed":case == "existing-ledger"}), "{case}");
+        assert_eq!(fs::read(&config_path).unwrap(), settings_before, "{case}");
+        if case == "existing-ledger" {
+            assert_eq!(fs::read(&ledger_path).unwrap(), existing_ledger);
+            assert!(yaml(&model_path)["providers"]["codexpress"]["modelOverrides"]["gpt-6-astra"].get("contextWindow").is_none());
+        } else {
+            assert_eq!(fs::read(&model_path).unwrap(), models_before, "{case}");
+            assert!(!ledger_path.exists(), "{case}");
+        }
+        if !should_migrate { assert_eq!(fs::read(&receipt_path).ok(), receipt_before, "{case}"); }
+        if matches!(case, "manual" | "deleted") {
+            // A later user setting equal to the old managed value must stay user-owned.
+            fs::write(&model_path, &original_models).unwrap();
+            fs::write(&config_path, &original_settings).unwrap();
+            let receipt = fs::read(&receipt_path).unwrap();
+            assert_eq!(call(&state, "omp.budgets.migrate", &home, json!({})).await.unwrap(), json!({"migrated":false,"models_changed":false}));
+            assert_eq!(fs::read(&model_path).unwrap(), original_models);
+            assert_eq!(fs::read(&config_path).unwrap(), original_settings);
+            assert_eq!(fs::read(&receipt_path).unwrap(), receipt);
+        }
+    }
 }
 
 fn remote_bundle() -> Value {

@@ -4,7 +4,7 @@ import Darwin
 
 final class GatewayClientTests: XCTestCase {
     func testUnixIPCFramingAndRequestIdentity() async throws {
-        let path = "/tmp/cx-test-\(UUID().uuidString).sock"
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent("ipc-\(UUID().uuidString.prefix(8)).sock").path
         let server = socket(AF_UNIX, SOCK_STREAM, 0)
         XCTAssertGreaterThanOrEqual(server, 0)
         defer { close(server); unlink(path) }

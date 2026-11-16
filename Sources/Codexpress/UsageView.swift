@@ -1,14 +1,21 @@
 import SwiftUI
 
+enum UsagePeriod: Hashable {
+    case hours(Int), days(Int), custom
+}
+
 struct UsageSelection: Equatable {
-    var days = 30
+    var period = UsagePeriod.days(30)
     var start = Calendar.current.date(byAdding: .day, value: -29, to: Date()) ?? Date()
     var end = Date()
     var sourceID = ""
     var modelID = ""
     var query: UsageQuery? {
-        if days == 0 { return try? UsageQuery(start: start, end: end, sourceID: sourceID, modelID: modelID) }
-        return UsageQuery.last(days: days, sourceID: sourceID, modelID: modelID)
+        switch period {
+        case .hours(let hours): return UsageQuery(lastHours: hours, sourceID: sourceID, modelID: modelID)
+        case .days(let days): return UsageQuery.last(days: days, sourceID: sourceID, modelID: modelID)
+        case .custom: return try? UsageQuery(start: start, end: end, sourceID: sourceID, modelID: modelID)
+        }
     }
 }
 
@@ -55,7 +62,7 @@ struct UsageView: View {
                     summary
                     breakdown
                     UsageActivityCard(selection: selection, snapshot: snapshot, overviewQuery: snapshotQuery)
-                    UsageTrendChart(days: daily)
+                    UsageTrendChart(days: daily, intraday: snapshotQuery?.isIntraday == true)
                     HStack {
                         Button("API 价格表") { showingPrices = true }.buttonStyle(.link)
                         Spacer()
@@ -117,9 +124,10 @@ struct UsageFilters: View {
             HStack(alignment: .bottom, spacing: 14) {
                 VStack(alignment: .leading, spacing: 6) {
                     filterLabel("时间范围")
-                    Picker("时间范围", selection: $selection.days) {
-                        Text("近 1 天").tag(1)
-                        Text("近 7 天").tag(7); Text("近 30 天").tag(30); Text("近 90 天").tag(90); Text("近 365 天").tag(365); Text("自定义").tag(0)
+                    Picker("时间范围", selection: $selection.period) {
+                        Text("近 1 小时").tag(UsagePeriod.hours(1)); Text("近 5 小时").tag(UsagePeriod.hours(5))
+                        Text("近 1 天").tag(UsagePeriod.days(1))
+                        Text("近 7 天").tag(UsagePeriod.days(7)); Text("近 30 天").tag(UsagePeriod.days(30)); Text("近 90 天").tag(UsagePeriod.days(90)); Text("近 365 天").tag(UsagePeriod.days(365)); Text("自定义").tag(UsagePeriod.custom)
                     }.labelsHidden().frame(maxWidth: .infinity)
                 }.frame(width: 138)
                 VStack(alignment: .leading, spacing: 6) {
@@ -142,7 +150,7 @@ struct UsageFilters: View {
                     Button { selection.sourceID = ""; selection.modelID = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary).frame(width: 22, height: 22) }.buttonStyle(.plain).help("清除来源与模型筛选")
                 }
             }.controlSize(.regular).font(.system(size: 13))
-            if selection.days == 0 {
+            if selection.period == .custom {
                 HStack(spacing: 16) {
                     DatePicker("从", selection: $selection.start, displayedComponents: .date).fixedSize()
                     DatePicker("至", selection: $selection.end, displayedComponents: .date).fixedSize()

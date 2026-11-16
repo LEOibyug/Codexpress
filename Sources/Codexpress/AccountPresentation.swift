@@ -28,6 +28,12 @@ enum AccountLevel {
         guard let remaining, remaining.isFinite else { return .unknown }
         return remaining > 30 ? .healthy : remaining > 10 ? .caution : .low
     }
+
+    static func quotaReference(_ reference: Double, remaining: Double?) -> Self {
+        guard reference.isFinite, let remaining, remaining.isFinite else { return .unknown }
+        let difference = reference - remaining
+        return difference >= 10 ? .low : difference >= 5 ? .caution : .unknown
+    }
 }
 
 struct BalanceAmount {
@@ -42,6 +48,24 @@ struct BalanceAmount {
         unit = formatter.currencySymbol ?? currency
         number = amount.formatted(.number.locale(Locale(identifier: "zh_CN"))
             .precision(.fractionLength(amount != 0 && abs(amount) < 0.01 ? 4 : 2)))
+    }
+}
+
+struct QuotaReferenceLabel: View {
+    let window: QuotaWindow
+    var compact = false
+
+    var body: some View {
+        if window.seconds == 604800 && (window.resetAt != nil || window.refCost != nil) {
+            TimelineView(.periodic(from: .now, by: 60)) { context in
+                if let reference = window.referenceCost(at: context.date) {
+                    Text("ref \(reference.formatted(.number.locale(Locale(identifier: "en_US_POSIX")).precision(.fractionLength(1))))%")
+                        .font(.system(size: compact ? 10 : 11)).monospacedDigit().fixedSize()
+                        .foregroundStyle(AccountLevel.quotaReference(reference, remaining: window.remaining).color)
+                        .help("本周期剩余时间百分比")
+                }
+            }
+        }
     }
 }
 

@@ -3,8 +3,8 @@ import Darwin
 @testable import Codexpress
 
 final class AppModelSyncTests: XCTestCase {
-    @MainActor func testSettingChangesReuseTheStatusRefreshFromSync() async throws {
-        let directory = URL(fileURLWithPath: "/tmp/cx-sync-\(UUID().uuidString)", isDirectory: true)
+    @MainActor func testBackupRefreshKeepsVisibleDataAndRejectsPreviousDirectoryResults() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("b-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let helper = directory.appendingPathComponent("gateway-fixture")
@@ -16,104 +16,151 @@ final class AppModelSyncTests: XCTestCase {
             if let previousHelper { setenv("CODEXPRESS_GATEWAY_PATH", previousHelper, 1) }
             else { unsetenv("CODEXPRESS_GATEWAY_PATH") }
         }
-        var first = Source(); first.name = "First"; first.automaticModelDiscovery = false
-        var second = Source(); second.name = "Second"; second.automaticModelDiscovery = false; second.priority = 1
-        var settings = AppSettings(); settings.sources = [first, second]; settings.codexHome = directory.appendingPathComponent("codex").path
+        let first = directory.appendingPathComponent("first")
+        let second = directory.appendingPathComponent("second")
+        for (home, id) in [(first, "snapshot-first"), (second, "snapshot-second")] {
+            try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+            try JSONEncoder().encode(JSONValue.object(["backups": .array([.object(["id": .string(id)])])])).write(to: home.appendingPathComponent("backups.json"))
+        }
+        var settings = AppSettings(); settings.codexHome = first.path
         try MetadataStore(directory: directory).save(settings)
         let model = AppModel(stateDirectory: directory)
         defer { model.stop() }
         await model.startHelper()
         XCTAssertTrue(model.running, model.error ?? "Fixture helper did not start")
-        guard model.running else { return }
-        let requests = directory.appendingPathComponent("requests")
-        let syncPayload = directory.appendingPathComponent("last-sync.json")
-        func syncedLoadBalance() throws -> JSONValue {
-            try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: syncPayload))["load_balance"]
-        }
-        XCTAssertEqual(try syncedLoadBalance(), .bool(false))
-        var retryPayload = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: syncPayload))
-        XCTAssertEqual(retryPayload["upstream_attempts"], .number(3))
-        XCTAssertEqual(retryPayload["upstream_retry_delay_seconds"], .number(3))
-
-        func expectOneRefresh(_ action: () -> Void) async throws {
-            try Data().write(to: requests)
-            action()
-            let deadline = Date().addingTimeInterval(5)
-            while model.busy && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
-            XCTAssertFalse(model.busy, "Fixture management operation timed out")
-            XCTAssertNil(model.error)
-            let recorded = try operations()
-            XCTAssertEqual(recorded.filter { $0 == "sync" }.count, 1)
-            XCTAssertEqual(recorded.filter { $0 == "status" }.count, 1)
-        }
-        func operations() throws -> [String] {
-            try String(contentsOf: requests).split(separator: "\n").map(String.init)
-        }
-        try await expectOneRefresh { model.changeRouting(mode: "fixed", fixed: first.id) }
-        XCTAssertEqual(model.settings.fixed_source_id, first.id)
-        try await expectOneRefresh { model.changeLowQuotaThreshold(20) }
-        try await expectOneRefresh { model.changeContextFallback(false) }
-        try await expectOneRefresh { model.changeLoadBalance(true) }
-        XCTAssertEqual(try syncedLoadBalance(), .bool(true))
-        XCTAssertTrue(try MetadataStore(directory: directory).load().loadBalanceEnabled)
-        try await expectOneRefresh { model.changeLoadBalance(false) }
-        XCTAssertEqual(try syncedLoadBalance(), .bool(false))
-        XCTAssertFalse(try MetadataStore(directory: directory).load().loadBalanceEnabled)
-        try await expectOneRefresh { model.changeIdleReturnDelay(60) }
-        try await expectOneRefresh { model.changeUpstreamRetry(attempts: 5, delaySeconds: 7) }
-        retryPayload = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: syncPayload))
-        XCTAssertEqual(retryPayload["upstream_attempts"], .number(5))
-        XCTAssertEqual(retryPayload["upstream_retry_delay_seconds"], .number(7))
-        let persisted = try MetadataStore(directory: directory).load()
-        XCTAssertEqual(persisted.upstreamAttemptLimit, 5)
-        XCTAssertEqual(persisted.upstreamRetryDelay, 7)
-        try await expectOneRefresh { model.move(IndexSet(integer: 0), to: 2) }
-        XCTAssertEqual(model.sources.first?.id, second.id)
-
-        try Data().write(to: requests)
-        var edited = try XCTUnwrap(model.settings.sources.first { $0.id == first.id })
-        edited.name = "Renamed"
-        try await model.saveSource(edited, apiKey: "")
-        // Saving first checks current identity, then sync performs the final refresh.
-        let recorded = try operations()
-        XCTAssertEqual(recorded.filter { $0 == "sync" }.count, 1)
-        XCTAssertEqual(recorded.filter { $0 == "status" }.count, 2)
-        XCTAssertEqual(model.settings.sources.first { $0.id == first.id }?.name, "Renamed")
-
-        func expectManualOperation(_ operation: String, _ action: () -> Void) async throws {
-            try Data().write(to: requests)
-            action()
-            let deadline = Date().addingTimeInterval(5)
-            while model.busy && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
-            XCTAssertFalse(model.busy)
-            XCTAssertNil(model.error)
-            let recorded = try operations()
-            XCTAssertEqual(recorded.filter { $0 == operation }.count, 1)
-            XCTAssertEqual(recorded.filter { $0 == "status" }.count, 1)
-            XCTAssertFalse(recorded.contains("sync"))
-        }
-        try await expectManualOperation("routing.recover") { model.recoverSource(first.id) }
-        try await expectManualOperation("routing.try") { model.startSourceTakeover(second.id) }
-        XCTAssertEqual(model.status["manual_route"]["source_id"].string, second.id)
-        try await expectManualOperation("routing.cancel") { model.cancelSourceTakeover() }
-        XCTAssertEqual(model.status["manual_route"], .null)
-
         await model.refreshConfigurationBackups()
-        XCTAssertEqual(model.configurationBackups.first?["id"].string, settings.codexHome)
-        try Data().write(to: requests)
+        XCTAssertEqual(model.configurationBackups.first?["id"].string, "snapshot-first")
+        try Data().write(to: directory.appendingPathComponent("hold-backups"))
         let pending = Task { await model.refreshConfigurationBackups() }
         let deadline = Date().addingTimeInterval(3)
-        while !(try operations()).contains("config.backups"), Date() < deadline {
+        while !FileManager.default.fileExists(atPath: directory.appendingPathComponent("backups-started").path), Date() < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
-        XCTAssertTrue(try operations().contains("config.backups"))
-        var changedDirectory = model.settings
-        changedDirectory.codexHome = directory.appendingPathComponent("other-codex").path
-        try model.persistSettings(changedDirectory)
+        XCTAssertEqual(model.configurationBackups.first?["id"].string, "snapshot-first", "Refreshing must not hide existing backups")
+        var changed = model.settings; changed.codexHome = second.path
+        try model.persistSettings(changed)
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("hold-backups"))
         await pending.value
-        XCTAssertTrue(model.configurationBackups.isEmpty, "An old directory's backups must not appear in the new directory")
+        XCTAssertTrue(model.configurationBackups.isEmpty, "Previous-directory backups must not appear under a new directory")
         await model.refreshConfigurationBackups()
-        XCTAssertEqual(model.configurationBackups.first?["id"].string, changedDirectory.codexHome)
+        XCTAssertEqual(model.configurationBackups.first?["id"].string, "snapshot-second")
+        try FileManager.default.removeItem(at: second.appendingPathComponent("backups.json"))
+        await model.refreshConfigurationBackups()
+        XCTAssertEqual(model.configurationBackups.first?["id"].string, "snapshot-second", "A failed refresh must keep the last successful list")
+        XCTAssertNotNil(model.error)
+    }
+
+    @MainActor func testSettingChangePersistsWhenSyncFailsAndCanBeRetried() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("s-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("gateway-fixture")
+        try Self.helperScript.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let previousHelper = ProcessInfo.processInfo.environment["CODEXPRESS_GATEWAY_PATH"]
+        setenv("CODEXPRESS_GATEWAY_PATH", helper.path, 1)
+        defer {
+            if let previousHelper { setenv("CODEXPRESS_GATEWAY_PATH", previousHelper, 1) }
+            else { unsetenv("CODEXPRESS_GATEWAY_PATH") }
+        }
+        var settings = AppSettings(); settings.codexHome = directory.appendingPathComponent("codex").path
+        let metadata = MetadataStore(directory: directory)
+        try metadata.save(settings)
+        try "official".write(to: directory.appendingPathComponent("connection-mode"), atomically: true, encoding: .utf8)
+        let localFailure = directory.appendingPathComponent("fail-local-models")
+        try Data().write(to: localFailure)
+        let model = AppModel(stateDirectory: directory)
+        defer { model.stop() }
+        await model.startHelper()
+        XCTAssertTrue(model.running, model.error ?? "Fixture helper did not start")
+        XCTAssertNil(model.localModelSettingsSyncError)
+        XCTAssertTrue(model.localModelSettingsNeedsSync)
+        let applied = directory.appendingPathComponent("applied-settings.json")
+        let initial = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
+        XCTAssertEqual(initial["auto_reset_weekly_quota"].bool, false)
+
+        let failure = directory.appendingPathComponent("fail-sync")
+        try Data().write(to: failure)
+        model.changeAutoResetWeeklyQuota(true)
+        let deadline = Date().addingTimeInterval(3)
+        while model.busy, Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(model.busy)
+        XCTAssertNotNil(model.error, "An unsuccessful immediate sync must remain visible")
+        XCTAssertTrue(model.pendingSync)
+        XCTAssertTrue(try metadata.load().autoResetWeeklyQuotaEnabled, "Sync failure must not discard the persisted user choice")
+        let unchanged = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
+        XCTAssertEqual(unchanged["auto_reset_weekly_quota"].bool, false)
+
+        try FileManager.default.removeItem(at: failure)
+        try await model.sync()
+        XCTAssertFalse(model.pendingSync)
+        let retried = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
+        XCTAssertEqual(retried["auto_reset_weekly_quota"].bool, true)
+
+        try await model.updateStatus()
+        let helperPID = model.status["process_id"]
+        let policy = ModelPolicy(model: "custom-model", sourceIDs: [], clients: [.omp])
+        let rule = try ModelCompactionRule.parse(model: "custom-model", threshold: "90000", window: "100000")
+        try Data().write(to: failure)
+        do {
+            try await model.saveModelSettings(model: policy.model, policy: policy, compaction: rule)
+            XCTFail("Failed sync must be reported to the model editor")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("已保存在本机"))
+        }
+        XCTAssertFalse(model.busy)
+        XCTAssertTrue(model.pendingSync)
+        let saved = try metadata.load()
+        XCTAssertEqual(saved.modelPolicies, [policy])
+        XCTAssertEqual(saved.modelCompaction, [rule], "Policy and compression must persist together even when sync fails")
+        let beforeRetry = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
+        XCTAssertEqual(beforeRetry["model_policies"].array, [])
+        try FileManager.default.removeItem(at: failure)
+        try await model.saveModelSettings(model: policy.model, policy: policy, compaction: rule)
+        XCTAssertFalse(model.pendingSync)
+        let modelRetry = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
+        XCTAssertEqual(modelRetry["model_policies"], try JSONValue.from([policy]))
+        XCTAssertEqual(modelRetry["model_compaction"], try JSONValue.from([rule]))
+        XCTAssertEqual(model.configuredModelIDs, [policy.model])
+        XCTAssertNil(try metadata.load().localCodexAppliedModelSettingsRevision)
+        XCTAssertTrue(model.localModelSettingsNeedsSync)
+        XCTAssertNil(model.localModelSettingsSyncError, "Saving gateway settings must not attempt a local Codex update")
+        model.retryLocalModelSettingsSync()
+        let failureDeadline = Date().addingTimeInterval(3)
+        while model.busy, Date() < failureDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertNotNil(model.localModelSettingsSyncError)
+        XCTAssertTrue(model.localModelSettingsNeedsSync)
+        XCTAssertFalse(model.pendingSync)
+        try FileManager.default.removeItem(at: localFailure)
+        try Data().write(to: failure)
+        model.retryLocalModelSettingsSync()
+        let localDeadline = Date().addingTimeInterval(3)
+        while model.busy, Date() < localDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(model.busy)
+        XCTAssertNil(model.localModelSettingsSyncError)
+        XCTAssertFalse(model.localModelSettingsNeedsSync)
+        let manuallyApplied = try metadata.load().localCodexAppliedModelSettingsRevision
+        XCTAssertEqual(manuallyApplied, model.modelSettingsRevision)
+        try FileManager.default.removeItem(at: failure)
+        try Data().write(to: localFailure)
+        let revisedRule = try ModelCompactionRule.parse(model: policy.model, threshold: "80000", window: "100000")
+        try await model.saveModelSettings(model: policy.model, policy: policy, compaction: revisedRule)
+        XCTAssertFalse(model.pendingSync)
+        XCTAssertTrue(model.localModelSettingsNeedsSync)
+        XCTAssertNil(model.localModelSettingsSyncError)
+        XCTAssertEqual(try metadata.load().localCodexAppliedModelSettingsRevision, manuallyApplied)
+        XCTAssertNotEqual(manuallyApplied, model.modelSettingsRevision)
+        try await model.updateStatus()
+        XCTAssertEqual(model.status["process_id"], helperPID)
+        XCTAssertEqual(model.connectionMode, "official")
+        let invalid = ModelCompactionRule(model: policy.model, auto_compact_token_limit: 0, context_window: nil)
+        do {
+            try await model.saveModelSettings(model: policy.model, policy: ModelPolicy(model: policy.model), compaction: invalid)
+            XCTFail("Invalid compression must reject the entire model edit")
+        } catch {}
+        let unchangedModel = try metadata.load()
+        XCTAssertEqual(unchangedModel.modelPolicies, [policy])
+        XCTAssertEqual(unchangedModel.modelCompaction, [revisedRule])
     }
 
     private static let helperScript = #"""
@@ -123,46 +170,40 @@ final class AppModelSyncTests: XCTestCase {
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(directory / 'control.sock'))
     server.listen()
-    pending_trial = None
     while True:
         connection, _ = server.accept()
         with connection:
-            stream = connection.makefile('rb')
-            request = json.loads(stream.readline())
+            request = json.loads(connection.makefile('rb').readline())
             operation = request['op']
-            with (directory / 'requests').open('a') as record:
-                record.write(operation + '\n')
-            if operation == 'sync':
-                (directory / 'last-sync.json').write_text(json.dumps(request['payload']))
-            if operation == 'status':
-                data = dict(process_id=os.getpid(), port=17863, sources=[], manual_route=pending_trial)
-            elif operation == 'routing.try':
-                pending_trial = dict(id='fixture-trial', source_id=request['payload']['source_id'])
-                data = pending_trial
-            elif operation == 'routing.cancel':
-                data = dict(cancelled=pending_trial is not None and pending_trial['id'] == request['payload']['id'])
-                if data['cancelled']:
-                    pending_trial = None
-            elif operation == 'routing.recover':
-                data = dict(recovered=True)
-            elif operation == 'credentials.storage.status':
-                data = dict(mode='keychain')
-            elif operation == 'config.backups':
-                time.sleep(0.1)
-                data = dict(backups=[dict(id=request['payload']['codex_home'])])
-            elif operation == 'credentials.read':
-                data = dict(items=[dict(source_id=source, secret=dict(api_key='fixture-api-key')) for source in request['payload']['source_ids']])
-            elif operation == 'credentials':
-                data = dict(updated_secrets=[])
-            elif operation == 'notifications.list':
-                data = dict(events=[])
-            elif operation == 'control.reset.pending':
-                data = dict(requests=[])
-            elif operation in ('sync', 'history.configure'):
-                data = {}
-            else:
-                connection.sendall((json.dumps(dict(id=request['id'], ok=False, error='Unexpected fixture operation')) + '\n').encode())
-                continue
-            connection.sendall((json.dumps(dict(id=request['id'], ok=True, data=data)) + '\n').encode())
+            try:
+                if operation == 'status':
+                    mode = directory / 'connection-mode'
+                    data = dict(process_id=os.getpid(), port=17863, sources=[], connection_mode=mode.read_text() if mode.exists() else 'unmanaged')
+                elif operation == 'credentials.storage.status':
+                    data = dict(mode='file')
+                elif operation == 'config.backups':
+                    if (directory / 'hold-backups').exists():
+                        (directory / 'backups-started').touch()
+                        while (directory / 'hold-backups').exists(): time.sleep(0.01)
+                    data = json.loads((pathlib.Path(request['payload']['codex_home']) / 'backups.json').read_text())
+                elif operation == 'credentials':
+                    data = dict(updated_secrets=[])
+                elif operation == 'sync':
+                    if (directory / 'fail-sync').exists():
+                        raise ValueError('Fixture sync failed')
+                    (directory / 'applied-settings.json').write_text(json.dumps(request['payload']))
+                    data = {}
+                elif operation == 'config.models.apply':
+                    if (directory / 'fail-local-models').exists():
+                        raise ValueError('Fixture model apply failed')
+                    data = dict(applied=(directory / 'connection-mode').exists(), reason='unmanaged')
+                elif operation == 'history.configure':
+                    data = {}
+                else:
+                    raise ValueError('Unexpected fixture operation')
+                response = dict(id=request['id'], ok=True, data=data)
+            except Exception:
+                response = dict(id=request['id'], ok=False, error='Fixture read failed')
+            connection.sendall((json.dumps(response) + '\n').encode())
     """#
 }

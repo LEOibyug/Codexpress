@@ -40,6 +40,8 @@ struct Snapshot {
     agent_dir: PathBuf,
     models: AttachedFile,
     settings: AttachedFile,
+    #[serde(default)]
+    builtin_binding: bool,
     // Read once when migrating the original connection-only snapshot.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     threshold_before: BTreeMap<String, Option<String>>,
@@ -286,13 +288,13 @@ fn owned_matches(snapshot: &Snapshot, models: &Value, settings: &Value) -> Resul
             return Ok(false);
         }
     }
-    Ok(["api", "baseUrl", "apiKey", "auth"].iter().all(|field| {
+    Ok(snapshot.builtin_binding || ["api", "baseUrl", "apiKey", "auth"].iter().all(|field| {
         at(models, &["providers", "codexpress", field])
             == at(&applied_models, &["providers", "codexpress", field])
     }))
 }
 fn verify(snapshot: &Snapshot, models: &Document, settings: &Document) -> Result<()> {
-    if models.bytes.is_none()
+    if (!snapshot.builtin_binding && models.bytes.is_none())
         || settings.bytes.is_none()
         || !owned_matches(snapshot, &models.value, &settings.value)?
     {
@@ -447,10 +449,14 @@ fn attached_file(document: &Document, applied: Vec<u8>) -> Result<AttachedFile> 
 // files, but never overwrite a concurrent writer's bytes during rollback.
 type FileChange<'a> = (&'a Path, Option<&'a [u8]>, Option<&'a [u8]>);
 fn write_files(changes: &[FileChange<'_>]) -> Result<()> {
+    write_files_limited(changes, FILE_LIMIT)
+}
+
+fn write_files_limited(changes: &[FileChange<'_>], limit: usize) -> Result<()> {
     let mut written = Vec::new();
     let result = (|| -> Result<()> {
         for (path, before, after) in changes {
-            if read(path, FILE_LIMIT)?.as_deref() != *before {
+            if read(path, limit)?.as_deref() != *before {
                 bail!("OMP 配置在写入前发生变化，未覆盖");
             }
             if before == after {
@@ -468,12 +474,10 @@ fn write_files(changes: &[FileChange<'_>]) -> Result<()> {
             }
             written.push((*path, *before, *after));
             #[cfg(test)]
-            if written.len() == 1 {
-                let failure = FAIL_AFTER_FIRST_WRITE.with(|flag| flag.get());
-                if failure == 2 {
-                    fs::write(path, b"concurrent writer\n")?;
-                }
-                if failure != 0 {
+            {
+                let (count, concurrent) = FAIL_AFTER_WRITE.with(|flag| flag.get());
+                if written.len() == count {
+                    if concurrent { fs::write(path, b"concurrent writer\n")?; }
                     bail!("模拟写入失败");
                 }
             }
@@ -482,7 +486,7 @@ fn write_files(changes: &[FileChange<'_>]) -> Result<()> {
     })();
     if let Err(error) = result {
         for (path, before, after) in written.into_iter().rev() {
-            if !read(path, FILE_LIMIT).is_ok_and(|bytes| bytes.as_deref() == after) {
+            if !read(path, limit).is_ok_and(|bytes| bytes.as_deref() == after) {
                 bail!("OMP 写入失败且文件已被其他程序修改，请保留连接快照后检查文件");
             }
             let rollback = match before {
@@ -498,7 +502,7 @@ fn write_files(changes: &[FileChange<'_>]) -> Result<()> {
     Ok(())
 }
 #[cfg(test)]
-thread_local! { static FAIL_AFTER_FIRST_WRITE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; }
+thread_local! { static FAIL_AFTER_WRITE: std::cell::Cell<(usize, bool)> = const { std::cell::Cell::new((0, false)) }; }
 
 fn has_raw_edits(owned: &AttachedFile, current: &Document, mutable_default: bool) -> Result<bool> {
     if owned.applied.is_empty() || current.bytes.as_deref() == Some(owned.applied.as_slice()) {
@@ -550,7 +554,7 @@ fn restore_documents(
         .and_then(Value::as_str)
         .and_then(|selection| selection.split_once('/'))
         .is_some_and(|(provider, _)| provider.eq_ignore_ascii_case("codexpress"));
-    if selected_codexpress {
+    if selected_codexpress && !snapshot.builtin_binding {
         put(
             &mut restored_settings,
             DEFAULT_MODEL,
@@ -558,7 +562,9 @@ fn restore_documents(
         )?;
     }
     restore_footer(snapshot, &mut restored_settings)?;
-    configuration::restore_provider(snapshot, &mut restored_models, &original_models)?;
+    if !snapshot.builtin_binding {
+        configuration::restore_provider(snapshot, &mut restored_models, &original_models)?;
+    }
     prune(&mut restored_models, &original_models, &[&["providers"]])?;
     prune(
         &mut restored_settings,
@@ -620,6 +626,7 @@ fn prepare_attachment(
             agent_dir: home.to_path_buf(),
             models: attached_file(models, Vec::new())?,
             settings: attached_file(settings, Vec::new())?,
+            builtin_binding: false,
             threshold_before: BTreeMap::new(),
             native_before: Vec::new(),
             added_models: Vec::new(),
@@ -628,8 +635,9 @@ fn prepare_attachment(
         },
     };
     preserve_raw_edits(&mut snapshot, models, settings)?;
+    snapshot.builtin_binding = false;
     for (field, value) in [
-        ("api", "openai-responses"),
+        ("api", "openai-codex-responses"),
         ("baseUrl", base_url),
         ("apiKey", local_key),
         ("auth", "apiKey"),
@@ -670,10 +678,9 @@ fn status(
         .and_then(|model| model.strip_prefix("codexpress/"));
     let needs_update = if let Some(snapshot) = snapshot {
         !owned_matches(snapshot, &models.value, &settings.value)?
-            || at(&models.value, &["providers", "codexpress", "baseUrl"]).and_then(Value::as_str)
-                != Some(base_url)
-            || at(&models.value, &["providers", "codexpress", "apiKey"]).and_then(Value::as_str)
-                != Some(local_key)
+            || (!snapshot.builtin_binding && (
+                at(&models.value, &["providers", "codexpress", "baseUrl"]).and_then(Value::as_str) != Some(base_url)
+                || at(&models.value, &["providers", "codexpress", "apiKey"]).and_then(Value::as_str) != Some(local_key)))
             || snapshot.status_plugin.is_some()
             || !snapshot.footer_before.is_empty()
     } else {
@@ -691,6 +698,23 @@ fn status(
 }
 
 pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Json> {
+    if op == "omp.budgets.revision" {
+        return Ok(crate::omp_ingress::budgets_revision(state).await);
+    }
+    if op == "omp.budgets.migrate" {
+        let _guard = state.config_lock.lock().await;
+        let home = payload["agent_dir"].as_str().context("缺少 OMP 配置目录")?;
+        return configuration::migrate_budgets(&state.state_dir, &normalized_dir(Path::new(home))?);
+    }
+    if matches!(op, "omp.binding" | "omp.bind") {
+        let binding = crate::omp_ingress::binding(state, op == "omp.bind").await?;
+        if op == "omp.bind" {
+            if let Some(home) = payload.get("agent_dir").and_then(Json::as_str) {
+                retire_local_connection(state, Path::new(home)).await?;
+            }
+        }
+        return Ok(binding);
+    }
     if matches!(op, "omp.remote.read" | "omp.remote.preview" | "omp.remote.restore") {
         return remote::handle(state, op, payload).await;
     }
@@ -729,8 +753,8 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Json) -> Result<Js
         .map(|path| read(path, FILE_LIMIT))
         .transpose()?
         .flatten();
-    let access = state.chatbot.status().await?;
-    let base_url = access["base_url"].as_str().context("聊天客户端地址无效")?;
+    let access = crate::omp_ingress::binding(state, false).await?;
+    let base_url = access["base_url"].as_str().context("OMP 客户端地址无效")?;
     let local_key = state.chatbot.key()?["key"]
         .as_str()
         .context("聊天客户端密钥不可用")?
@@ -883,7 +907,7 @@ mod tests {
         let second = directory.path().join("config.yml");
         fs::write(&first, b"original models").unwrap();
         fs::write(&second, b"original settings").unwrap();
-        FAIL_AFTER_FIRST_WRITE.with(|flag| flag.set(1));
+        FAIL_AFTER_WRITE.with(|flag| flag.set((1, false)));
         let result = write_files(&[
             (&first, Some(b"original models"), Some(b"changed models")),
             (
@@ -892,7 +916,7 @@ mod tests {
                 Some(b"changed settings"),
             ),
         ]);
-        FAIL_AFTER_FIRST_WRITE.with(|flag| flag.set(0));
+        FAIL_AFTER_WRITE.with(|flag| flag.set((0, false)));
         assert!(result.is_err());
         assert_eq!(fs::read(first).unwrap(), b"original models");
         assert_eq!(fs::read(second).unwrap(), b"original settings");
@@ -924,9 +948,9 @@ mod tests {
         let original_models = fs::read(home.join("models.yml")).unwrap();
         let original_settings = fs::read(home.join("config.yml")).unwrap();
         let payload = json!({"agent_dir":home,"model_id":"explicit-model"});
-        FAIL_AFTER_FIRST_WRITE.with(|flag| flag.set(1));
+        FAIL_AFTER_WRITE.with(|flag| flag.set((1, false)));
         let result = handle(&state, "omp.attach", payload.clone()).await;
-        FAIL_AFTER_FIRST_WRITE.with(|flag| flag.set(0));
+        FAIL_AFTER_WRITE.with(|flag| flag.set((0, false)));
         assert!(result.is_err());
         assert_eq!(fs::read(home.join("models.yml")).unwrap(), original_models);
         assert_eq!(
@@ -935,9 +959,9 @@ mod tests {
         );
         assert!(!snapshot_path(&state.state_dir).exists());
 
-        FAIL_AFTER_FIRST_WRITE.with(|flag| flag.set(2));
+        FAIL_AFTER_WRITE.with(|flag| flag.set((1, true)));
         let result = handle(&state, "omp.attach", payload).await;
-        FAIL_AFTER_FIRST_WRITE.with(|flag| flag.set(0));
+        FAIL_AFTER_WRITE.with(|flag| flag.set((0, false)));
         assert!(result.unwrap_err().to_string().contains("快照已保留"));
         assert_eq!(
             fs::read(home.join("models.yml")).unwrap(),
@@ -950,5 +974,131 @@ mod tests {
         let snapshot = load_snapshot(&state.state_dir).unwrap().unwrap();
         assert_eq!(snapshot.models.original, Some(original_models));
         assert_eq!(snapshot.settings.original, Some(original_settings));
+    }
+
+    #[tokio::test]
+    async fn legacy_budget_migration_rolls_back_files_and_receipt_before_retry() {
+        fs::create_dir_all(".runtime").unwrap();
+        let directory = tempfile::tempdir_in(".runtime").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        fs::create_dir(root.join("state")).unwrap();
+        let state = AppState::new(root.join("state"), 17863, "fixture".into()).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        crate::chatbot::configure(&state, json!({"port":port})).await.unwrap();
+        let home = root.join("agent");
+        let payload = json!({"agent_dir":home,"model_id":"explicit-model"});
+        let attached = handle(&state, "omp.attach", payload.clone()).await.unwrap();
+        handle(&state, "omp.configure", json!({
+            "agent_dir":home,"expected_revision":attached["configuration_revision"],"edits":[
+                {"file":"config","path":["compaction","modelThresholds","codexpress/explicit-model"],"value":"f180000"},
+                {"file":"models","path":["providers","codexpress","modelOverrides","explicit-model","contextWindow"],"value":300000},
+                {"file":"models","path":["providers","codexpress","modelOverrides","explicit-model","maxContextWindow"],"value":400000}
+            ]
+        })).await.unwrap();
+        let receipt_path = snapshot_path(&state.state_dir);
+        let ledger_path = home.join("codexpress-compaction.json");
+        let models_path = home.join("models.yml");
+        let config_path = home.join("config.yml");
+        let receipt_before = fs::read(&receipt_path).unwrap();
+        let models_before = fs::read(&models_path).unwrap();
+        let settings_before = fs::read(&config_path).unwrap();
+        for count in [1, 2] {
+            FAIL_AFTER_WRITE.with(|flag| flag.set((count, false)));
+            let result = handle(&state, "omp.budgets.migrate", payload.clone()).await;
+            FAIL_AFTER_WRITE.with(|flag| flag.set((0, false)));
+            assert!(result.is_err());
+            assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+            assert_eq!(fs::read(&models_path).unwrap(), models_before);
+            assert_eq!(fs::read(&config_path).unwrap(), settings_before);
+            assert!(!ledger_path.exists());
+        }
+        let user_edit = String::from_utf8(models_before).unwrap().replace("300000", "777777");
+        fs::write(&models_path, &user_edit).unwrap();
+        assert_eq!(handle(&state, "omp.budgets.migrate", payload.clone()).await.unwrap(), json!({"migrated":true,"models_changed":true}));
+        let models = choose(&home, "models", "models.json").unwrap();
+        assert_eq!(at(&models.value, &["providers","codexpress","modelOverrides","explicit-model","contextWindow"]), Some(&Value::Number(777777.into())));
+        assert!(at(&models.value, &["providers","codexpress","modelOverrides","explicit-model","maxContextWindow"]).is_none());
+        let ledger: Json = serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        assert_eq!(ledger, json!({"codexpress/explicit-model":"f180000"}));
+        assert_eq!(fs::read(&config_path).unwrap(), settings_before);
+    }
+}
+
+async fn retire_local_connection(state: &Arc<AppState>, home: &Path) -> Result<()> {
+    let _guard = state.config_lock.lock().await;
+    let Some(mut snapshot) = load_snapshot(&state.state_dir)? else { return Ok(()); };
+    if snapshot.builtin_binding { return Ok(()); }
+    let home = normalized_dir(home)?;
+    let models = choose(&home, "models", "models.json")?;
+    let settings = choose(&home, "config", "settings.json")?;
+    same_home(&snapshot, &home, &models, &settings)?;
+    verify(&snapshot, &models, &settings)?;
+    preserve_raw_edits(&mut snapshot, &models, &settings)?;
+    let original = parse(snapshot.models.baseline.as_bytes())?;
+    let mut migrated = models.value.clone();
+    configuration::restore_provider(&snapshot, &mut migrated, &original)?;
+    prune(&mut migrated, &original, &[&["providers"]])?;
+    let after = restored_bytes(&snapshot.models, &models, &original, &migrated, false)?;
+    snapshot.builtin_binding = true;
+    snapshot.added_models.clear();
+    snapshot.models.applied = after.clone().unwrap_or(encode(&mapping())?);
+    snapshot.settings.applied = settings.bytes.clone().unwrap_or(encode(&settings.value)?);
+    write_files(&[(&models.path, models.bytes.as_deref(), after.as_deref())])?;
+    if let Err(error) = save_snapshot(&state.state_dir, &snapshot) {
+        write_files(&[(&models.path, after.as_deref(), models.bytes.as_deref())])
+            .context("OMP 内置连接迁移失败，且无法回滚")?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod builtin_migration_tests {
+    use super::*;
+    #[tokio::test]
+    async fn binding_retires_only_owned_connection_and_preserves_native_preferences() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        fs::create_dir(root.join("state")).unwrap();
+        let state = AppState::new(root.join("state"), 17863, "fixture".into()).unwrap();
+        let home = root.join("agent");
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("config.yml"), b"custom: keep\n").unwrap();
+        let models = choose(&home, "models", "models.json").unwrap();
+        let settings = choose(&home, "config", "settings.json").unwrap();
+        let ids = BTreeSet::from(["owned-model".to_owned()]);
+        let (mut snapshot, mut applied_models, mut applied_settings) = prepare_attachment(
+            &home, &models, &settings, &None, "owned-model", &ids,
+            ("http://127.0.0.1:17865/v1", "old-key")
+        ).unwrap();
+        put(&mut applied_models, &["providers","codexpress","custom"], Some(key("keep"))).unwrap();
+        put(&mut applied_models, &["providers","codexpress","modelOverrides","owned-model","contextWindow"], Some(Value::Number(300000.into()))).unwrap();
+        put(&mut applied_settings, &["compaction","reserveTokens"], Some(Value::Number(1234.into()))).unwrap();
+        snapshot.models.applied = encode(&applied_models).unwrap();
+        snapshot.settings.applied = encode(&applied_settings).unwrap();
+        secure_write(&models.path, &snapshot.models.applied).unwrap();
+        secure_write(&settings.path, &snapshot.settings.applied).unwrap();
+        save_snapshot(&state.state_dir, &snapshot).unwrap();
+        retire_local_connection(&state, &home).await.unwrap();
+        let models = choose(&home, "models", "models.json").unwrap();
+        let settings = choose(&home, "config", "settings.json").unwrap();
+        for field in ["api","apiKey","auth","baseUrl","models"] {
+            assert!(at(&models.value, &["providers","codexpress",field]).is_none());
+        }
+        assert_eq!(at(&models.value, &["providers","codexpress","custom"]), Some(&key("keep")));
+        assert_eq!(at(&settings.value, DEFAULT_MODEL), Some(&key("codexpress/owned-model")));
+        assert!(at(&settings.value, &["compaction","reserveTokens"]).is_some());
+        assert!(at(&models.value, &["providers","codexpress","modelOverrides"]).is_some());
+        let snapshot = load_snapshot(&state.state_dir).unwrap().unwrap();
+        assert!(snapshot.builtin_binding);
+        verify(&snapshot, &models, &settings).unwrap();
+        let restored = restore_documents(&snapshot, &models, &settings).unwrap();
+        let restored_settings = parse(restored.1.as_deref().unwrap()).unwrap();
+        assert_eq!(at(&restored_settings, DEFAULT_MODEL), Some(&key("codexpress/owned-model")));
+        let fresh = root.join("fresh");
+        retire_local_connection(&state, &fresh).await.unwrap();
+        assert!(!fresh.exists());
     }
 }

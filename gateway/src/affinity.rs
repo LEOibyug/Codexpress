@@ -322,7 +322,6 @@ impl AffinityStore {
                 let key = key?;
                 let entry = data.entries.get(key)?;
                 if seconds == 0
-                    || source.priority >= from.priority
                     || entry.source_id != from.id
                     || entry.identity != from.identity()
                     || data.pending.contains_key(key)

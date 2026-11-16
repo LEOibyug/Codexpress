@@ -1,5 +1,5 @@
 //! Private, bounded diagnostics. Only failed upstream feedback may contain text.
-use super::{summary, StoreData};
+use super::{summary, Ingress, StoreData};
 use crate::model::Source;
 use anyhow::{bail, Context, Result};
 use http::HeaderMap;
@@ -32,7 +32,7 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub fn new(attempt_id: &str, created_at: u64, source: &Source, gateway_key: &str) -> Self {
+    pub fn new(attempt_id: &str, created_at: u64, source: &Source, gateway_key: &str, ingress: Ingress) -> Self {
         fn strings(value: &Value, secrets: &mut Vec<String>) {
             match value {
                 Value::String(s) if !s.is_empty() => secrets.push(s.clone()),
@@ -51,7 +51,7 @@ impl Capture {
         Self {
             attempt_id: attempt_id.into(),
             created_at,
-            metadata: json!({"ingress":"unknown","method":null,"path":null,"upstream_url":null,"http_status":null,"response_headers":{},"error_kind":null,"error_message":null,"error_code":null,"error_param":null,"adapted_parameters":[],"body_complete":false,"body_truncated":false,"body_evicted":false}),
+            metadata: json!({"ingress":ingress,"method":null,"path":null,"upstream_url":null,"http_status":null,"response_headers":{},"error_kind":null,"error_message":null,"error_code":null,"error_param":null,"adapted_parameters":[],"body_complete":false,"body_truncated":false,"body_evicted":false}),
             body: Vec::new(),
             secrets,
             received: 0,
@@ -68,7 +68,7 @@ impl Capture {
         url: &str,
         adapted: &[String],
     ) {
-        self.metadata["ingress"] = json!(self.redact(ingress));
+        self.metadata["ingress"] = json!(Ingress::parse(ingress).unwrap_or_default());
         self.metadata["method"] = json!(self.redact(method));
         self.metadata["path"] = json!(self.redact(path));
         let safe = url::Url::parse(url).ok().map(|mut url| {
@@ -642,7 +642,7 @@ pub(super) fn detail(data: &StoreData, payload: &Value) -> Result<Value> {
         })
         .transpose()?
         .unwrap_or(65536);
-    let saved = data.connection.query_row(&format!("SELECT {COLUMNS} FROM usage WHERE json_extract(metadata,'$.attempt_id')=?1 OR ('legacy:'||attempt)=?1 LIMIT 1"), [id], stored_record).optional()?;
+    let saved = data.connection.query_row(&format!("SELECT {COLUMNS},{} FROM usage u WHERE json_extract(metadata,'$.attempt_id')=?1 OR ('legacy:'||attempt)=?1 LIMIT 1", summary::INGRESS_COLUMN), [id], stored_record).optional()?;
     let active = data.active.get(id).map(|(record, started)| {
         let mut value = serde_json::to_value(record).expect("record");
         value["active"] = json!(true);
@@ -658,7 +658,14 @@ pub(super) fn detail(data: &StoreData, payload: &Value) -> Result<Value> {
         value["cost"] = crate::pricing::estimate(&value, false);
         value
     });
-    let record = saved.or(active).context("请求记录不存在")?;
+    let mut record = saved.or(active).context("请求记录不存在")?;
+    if record["ingress"] == "unknown" && record["active"] == true {
+        let ingress: Option<String> = data.connection.query_row(
+            "SELECT json_extract(metadata,'$.ingress') FROM diagnostics WHERE attempt_id=?1",
+            [id], |row| row.get(0),
+        ).optional()?.flatten();
+        record["ingress"] = json!(ingress.as_deref().and_then(Ingress::parse).unwrap_or_default());
+    }
     // Live cost refreshes must not read/decompress error bodies, query related
     // attempts or run retention cleanup on every refresh.
     if payload["record_only"] == true {
@@ -708,7 +715,7 @@ pub(super) fn detail(data: &StoreData, payload: &Value) -> Result<Value> {
         Value::Null
     };
     let mut statement = data.connection.prepare(&format!(
-        "SELECT {COLUMNS} FROM usage WHERE request_id=?1 ORDER BY attempt LIMIT 100"
+        "SELECT {COLUMNS},{} FROM usage u WHERE request_id=?1 ORDER BY attempt LIMIT 100", summary::INGRESS_COLUMN
     ))?;
     let related = statement
         .query_map([record["request_id"].as_str().unwrap_or("")], stored_record)?
@@ -717,7 +724,7 @@ pub(super) fn detail(data: &StoreData, payload: &Value) -> Result<Value> {
 }
 
 fn stored_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
-    let mut record = summary::stored_record(row)?;
+    let mut record = summary::stored_record_with_ingress(row)?;
     if record["attempt_id"].as_str().is_none_or(str::is_empty) {
         record["attempt_id"] = json!(format!("legacy:{}", row.get::<_, i64>(0)?));
     }

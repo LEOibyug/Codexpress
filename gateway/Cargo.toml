@@ -1,6 +1,6 @@
 [package]
 name = "codexpress-gateway"
-version = "0.7.0"
+version = "0.8.18"
 edition = "2021"
 rust-version = "1.85"
 
@@ -25,7 +25,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 toml_edit = "0.22"
 url = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 yaml-edit = "=0.3.6"
 zstd = "0.13"
 

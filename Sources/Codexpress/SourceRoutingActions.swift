@@ -8,17 +8,24 @@ struct SourceRoutingActions: View {
     private var cooling: Bool { ["cooldown", "proxy_error"].contains(model.state(source.id)["health"].string ?? "") }
     private var takingOver: Bool { model.status["manual_route"]["source_id"].string == source.id }
     private var exhausted: Bool { source.official && model.state(source.id)["health"].string == "exhausted" }
+    private var needsLogin: Bool { source.official && source.account_id == nil }
+    private var takeoverHelp: String {
+        if !source.enabled { return "请先启用此来源" }
+        if needsLogin { return "请先登录此账号" }
+        if exhausted { return "额度已耗尽，请先刷新额度或使用重置卡" }
+        return takingOver ? "正在接管后续请求" : "从后续请求开始尝试此来源"
+    }
 
     var body: some View {
         HStack(spacing: compact ? 4 : 8) {
             if cooling {
                 action("立即恢复", symbol: "arrow.clockwise") { model.recoverSource(source.id) }
-                    .help("解除临时冷却，重新参与分配")
+                    .help(source.enabled ? "解除临时冷却，重新参与分配" : "请先启用此来源")
                     .disabled(!source.enabled)
             }
             action("立即抢占", symbol: "bolt.fill") { model.startSourceTakeover(source.id) }
-                .help(exhausted ? "额度已耗尽" : takingOver ? "正在抢占" : "立即抢占")
-                .disabled(takingOver || exhausted || !source.enabled)
+                .help(takeoverHelp)
+                .disabled(takingOver || exhausted || needsLogin || !source.enabled)
             if takingOver {
                 if !compact {
                     Label("正在抢占", systemImage: "clock")

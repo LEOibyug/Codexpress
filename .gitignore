@@ -18,6 +18,13 @@ DerivedData/
 *.xcresult/
 *.profraw
 *.profdata
+/*.d
+/*.dia
+/*.swiftdeps
+/*.swiftmodule
+/*.swiftdoc
+/*.swiftsourceinfo
+/*.o
 Codexpress-*.dmg
 Codexpress-*.zip
 /SHA256SUMS.txt

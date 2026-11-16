@@ -230,10 +230,10 @@ struct UsageRequestDetailView: View {
         values.append("来源：" + (record["source_name"].string ?? "—"))
         values.append("模型：" + (record["model"].string ?? "—"))
         values.append("状态：" + usageRequestStatus(record))
+        values.append("入口：" + usageIngressName(record["ingress"].string ?? diagnostic["ingress"].string))
         if diagnostic != .null {
             let httpStatus = diagnostic["http_status"].number.map { String(Int($0)) } ?? "—"
             values.append("HTTP：" + httpStatus)
-            values.append("入口：" + usageIngressName(diagnostic["ingress"].string))
             values.append("上游：" + (diagnostic["upstream_url"].string ?? "—"))
             values.append("错误：" + (diagnostic["error_message"].string ?? "—"))
             values.append("代码：" + (diagnostic["error_code"].string ?? "—"))

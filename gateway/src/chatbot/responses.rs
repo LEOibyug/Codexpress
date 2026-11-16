@@ -473,12 +473,17 @@ fn json_events(response: &Value) -> Vec<Value> {
 }
 
 pub(super) async fn adapt(response: Response, options: OutputOptions) -> Response {
-    let status = response.status();
-    let headers = output_headers(response.headers(), options.stream);
-    if !status.is_success() {
-        let _ = to_bytes(response.into_body(), RESPONSE_CAPTURE_LIMIT).await;
-        return error(status, "上游拒绝请求，请检查模型、参数或来源状态", None);
+    if response.extensions().get::<crate::model_catalog::ModelClientRejection>().is_some() {
+        return response;
     }
+    let status = response.status();
+    if !status.is_success() {
+        let mut rejection = error(status, "上游拒绝请求，请检查模型、参数或来源状态", None);
+        *rejection.headers_mut() = output_headers(response.headers(), false);
+        let _ = to_bytes(response.into_body(), RESPONSE_CAPTURE_LIMIT).await;
+        return rejection;
+    }
+    let headers = output_headers(response.headers(), options.stream);
     if response
         .headers()
         .get(header::CONTENT_ENCODING)
@@ -619,6 +624,38 @@ pub(super) async fn adapt(response: Response, options: OutputOptions) -> Respons
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn rejected_requests_keep_retry_guidance_with_json_errors() {
+        for stream in [false, true] {
+            let response = Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("retry-after", "20")
+                .header("x-request-id", "request-fixture")
+                .header("set-cookie", "PRIVATE")
+                .body(Body::from("PRIVATE"))
+                .unwrap();
+            let response = adapt(
+                response,
+                OutputOptions {
+                    format: Format::Responses,
+                    stream,
+                    include_usage: false,
+                    model: "m".into(),
+                },
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["retry-after"], "20");
+            assert_eq!(response.headers()["x-request-id"], "request-fixture");
+            assert_eq!(response.headers()["content-type"], "application/json");
+            assert!(!response.headers().contains_key("set-cookie"));
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(value["error"].is_object());
+            assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE"));
+        }
+    }
+
     #[tokio::test]
     async fn buffered_upstream_objects_become_valid_events_for_both_client_protocols() {
         for format in [Format::Chat, Format::Responses] {

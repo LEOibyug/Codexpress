@@ -4,6 +4,11 @@ struct LegacyProviderOriginsView: View {
     @EnvironmentObject var model: AppModel
     @State private var selections: [String:String] = [:]
     @State private var confirmed = false
+    @State private var loadedSelections: [String: String] = [:]
+
+    private var changed: Bool { selections.filter { !$0.value.isEmpty } != loadedSelections }
+    private var originError: Bool { model.preview["origin_error"].string != nil }
+    private var needsConfirmation: Bool { selections.values.contains(where: { !$0.isEmpty }) && (changed || originError) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -23,15 +28,26 @@ struct LegacyProviderOriginsView: View {
                     }
                 }
             }
-            Toggle("所选来源与原供应商使用同一账号和 API Key", isOn: $confirmed)
-                .font(.system(size: 13))
+            if needsConfirmation {
+                Toggle("所选来源与原供应商使用同一账号和 API Key", isOn: $confirmed)
+                    .font(.system(size: 13))
+            }
             HStack(alignment: .firstTextBaseline, spacing: 20) {
                 Spacer()
-                Button("确认来源并更新预览") { model.saveLegacyOrigins(selections) }
-                    .disabled(model.busy || (!confirmed && selections.values.contains(where: { !$0.isEmpty })))
+                Button("保存来源对应") { model.saveLegacyOrigins(selections) }
+                    .disabled(model.busy || (!changed && !originError) || (needsConfirmation && !confirmed))
             }
         }
-            .onAppear { selections = Dictionary(uniqueKeysWithValues: (model.settings.legacyProviderOrigins ?? []).map { ($0.provider_id, $0.source_id) }) }
+            .onAppear {
+                loadedSelections = Dictionary(uniqueKeysWithValues: (model.settings.legacyProviderOrigins ?? []).map { ($0.provider_id, $0.source_id) })
+                selections = loadedSelections
+            }
+            .onChange(of: model.settings.legacyProviderOrigins) { _, values in
+                let next = Dictionary(uniqueKeysWithValues: (values ?? []).map { ($0.provider_id, $0.source_id) })
+                if selections == loadedSelections { selections = next }
+                loadedSelections = next
+                confirmed = false
+            }
     }
 
     private func compatibleSources(_ base: String?) -> [Source] {

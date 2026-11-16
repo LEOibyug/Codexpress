@@ -9,7 +9,7 @@ struct APIBalanceView: View {
     var body: some View {
         let balance = model.apiBalances[sourceID] ?? .null
         let amount = balance["amount"].number
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
+        return HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text("余额").foregroundStyle(.secondary)
             if let amount, amount.isFinite, let currency = balance["currency"].string {
                 Text(balanceMoney(amount, currency: currency))
@@ -21,15 +21,29 @@ struct APIBalanceView: View {
                     Image(systemName: "function").foregroundStyle(.secondary)
                         .help("按最近一次上游余额减去之后的本机花费推算；账单核对后会修正，以上游余额为准。")
                 }
-                if balance["stale"].bool == true && !model.refreshingBalances.contains(sourceID) {
+                if balance["stale"].bool == true && balance["error"].string == nil && !model.refreshingBalances.contains(sourceID) {
                     Image(systemName: "clock").foregroundStyle(.orange).help("更新失败，显示上次获取的余额")
                 }
             } else {
                 Text(model.refreshingBalances.contains(sourceID) ? "查询中…" : balance == .null ? "未查询" : "无法获取")
                     .foregroundStyle(.secondary)
             }
+            if let error = balance["error"].string {
+                Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+                    .help(error).accessibilityLabel("余额更新失败：\(error)")
+            }
             if showUpdating { ProgressView().controlSize(.mini).help("正在更新余额") }
-            if !compact { Spacer(minLength: 8) }
+            if !compact {
+                Button {
+                    Task { await model.refreshAccount(sourceID, foreground: true, force: true) }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }.buttonStyle(.borderless)
+                    .help("重新查询上游余额")
+                    .accessibilityLabel("刷新余额")
+                    .disabled(!model.running || model.busy || model.refreshingBalances.contains(sourceID))
+                Spacer(minLength: 8)
+            }
         }.font(.system(size: compact ? 10 : 12))
             .help(balance["updated_at"].number.map { "\(balance["estimated"].bool == true ? "动态推算余额" : balance["scope"].string == "key" ? "当前密钥可用余额" : "账户总余额") · 上游余额更新于 \(timestampLabel(.number($0)))" } ?? "")
             .task(id: model.refreshingBalances.contains(sourceID)) {

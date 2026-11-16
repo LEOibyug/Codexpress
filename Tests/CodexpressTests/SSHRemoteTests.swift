@@ -45,7 +45,7 @@ final class SSHRemoteTests: XCTestCase {
         XCTAssertEqual(catalog.hosts, ["available"])
         XCTAssertTrue(catalog.exists); XCTAssertTrue(catalog.incomplete)
     }
-    @MainActor func testSelectingConfiguredHostUsesSSHDefaultsAndKeepsMachineMetadataIsolated() {
+    @MainActor func testSelectingConfiguredHostKeepsSavedLoginAndMachineMetadataIsolated() {
         let model = SSHRemoteModel()
         model.profile.destination = "old-server"; model.profile.codexHome = "/old/.codex"; model.profile.backupID = "old-backup"
         model.profile.username = "old-user"; model.profile.sshPort = "2222"; model.profile.identityFile = "/old/key"
@@ -56,12 +56,21 @@ final class SSHRemoteTests: XCTestCase {
         XCTAssertEqual(model.profile.destination, "new-server"); XCTAssertEqual(model.profile.codexHome, ""); XCTAssertNil(model.profile.backupID)
         var saved = SSHRemoteProfile(); saved.destination = "known-server"; saved.codexHome = "/known/.codex"; saved.backupID = "known-backup"
         saved.username = "override"; saved.sshPort = "2222"; saved.identityFile = "/some/key"
+        saved.appliedModelSettingsRevision = "saved-revision"; saved.codexConnectionRestored = false
         model.selectConfiguredHost("known-server", saved: [saved])
         XCTAssertEqual(model.profile.id, saved.id); XCTAssertEqual(model.profile.backupID, "known-backup")
+        XCTAssertEqual(model.profile.appliedModelSettingsRevision, "saved-revision")
         XCTAssertEqual(model.profile.codexHome, "/known/.codex")
-        XCTAssertEqual(model.profile.username, ""); XCTAssertEqual(model.profile.sshPort, ""); XCTAssertEqual(model.profile.identityFile, "")
+        XCTAssertEqual(model.profile.username, "override"); XCTAssertEqual(model.profile.sshPort, "2222"); XCTAssertEqual(model.profile.identityFile, "/some/key")
         let args = try? model.profile.arguments()
-        XCTAssertFalse(args?.contains("-l") ?? true); XCTAssertFalse(args?.contains("-p") ?? true); XCTAssertFalse(args?.contains("-i") ?? true)
+        XCTAssertTrue(args?.contains("-l") ?? false); XCTAssertTrue(args?.contains("-p") ?? false); XCTAssertTrue(args?.contains("-i") ?? false)
+        model.profile.destination = "another-server"
+        XCTAssertNotEqual(model.profile.id, saved.id)
+        XCTAssertNil(model.profile.backupID); XCTAssertNil(model.profile.originalBackupID)
+        XCTAssertNil(model.profile.appliedModelSettingsRevision); XCTAssertNil(model.profile.codexConnectionRestored)
+        model.select(saved)
+        model.selectKind(.omp)
+        XCTAssertNil(model.profile.appliedModelSettingsRevision); XCTAssertNil(model.profile.codexConnectionRestored)
     }
     func testLegacyProfileDecodesAsCodexWithoutLosingMachineMetadata() throws {
         let data = Data(#"{"id":"old-id","destination":"server","username":"worker","sshPort":"2222","identityFile":"/fixture/key","codexHome":"/fixture/.codex","gatewayHost":"192.0.2.4","backupID":"latest","originalBackupID":"first","mapExistingProviders":true}"#.utf8)
@@ -70,13 +79,56 @@ final class SSHRemoteTests: XCTestCase {
         XCTAssertEqual(profile.id, "old-id"); XCTAssertEqual(profile.directory, "/fixture/.codex")
         XCTAssertEqual(profile.backupID, "latest"); XCTAssertEqual(profile.originalBackupID, "first")
         XCTAssertEqual(profile.username, "worker"); XCTAssertTrue(profile.mapExistingProviders)
+        XCTAssertEqual(profile.modelSettingsSyncStatus(revision: "current"), .needsReview)
         XCTAssertEqual(try JSONDecoder().decode(SSHRemoteProfile.self, from: JSONEncoder().encode(profile)), profile)
+    }
+    @MainActor func testRemoteModelSyncStatusSurvivesReloadAndTracksSavedPoliciesAndRules() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let directory = root.appendingPathComponent(".runtime/tmp/remote-model-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var settings = AppSettings(); settings.codexHome = directory.appendingPathComponent("codex").path
+        try MetadataStore(directory: directory).save(settings)
+        let model = AppModel(stateDirectory: directory)
+        let revision = model.modelSettingsRevision
+        var applied = SSHRemoteProfile(); applied.destination = "applied"
+        applied.backupID = "checkpoint"; applied.originalBackupID = "original"
+        applied.appliedModelSettingsRevision = revision
+        var legacy = SSHRemoteProfile(); legacy.destination = "legacy"; legacy.originalBackupID = "legacy-original"
+        var restored = applied; restored.id = "restored"; restored.destination = "restored"
+        restored.appliedModelSettingsRevision = nil; restored.codexConnectionRestored = true
+        var omp = applied; omp.id = "omp"; omp.clientKind = .omp
+        let fresh = SSHRemoteProfile()
+        try model.saveRemoteProfiles([applied, legacy, restored, omp, fresh])
+        let unchanged = AppModel(stateDirectory: directory)
+        XCTAssertNil(unchanged.settings.sshRemoteProfiles?[0].modelSettingsSyncStatus(revision: unchanged.modelSettingsRevision))
+        XCTAssertEqual(unchanged.settings.sshRemoteProfiles?[1].modelSettingsSyncStatus(revision: unchanged.modelSettingsRevision), .needsReview)
+
+        var policyChange = model.settings
+        policyChange.modelPolicies = [ModelPolicy(model: "fixture-model", clients: [.omp])]
+        try model.persistSettings(policyChange)
+        let afterPolicy = AppModel(stateDirectory: directory)
+        XCTAssertNotEqual(afterPolicy.modelSettingsRevision, revision)
+        let profiles = try XCTUnwrap(afterPolicy.settings.sshRemoteProfiles)
+        XCTAssertEqual(profiles[0].modelSettingsSyncStatus(revision: afterPolicy.modelSettingsRevision), .needsSync)
+        XCTAssertEqual(profiles[1].modelSettingsSyncStatus(revision: afterPolicy.modelSettingsRevision), .needsReview)
+        for profile in profiles.dropFirst(2) {
+            XCTAssertNil(profile.modelSettingsSyncStatus(revision: afterPolicy.modelSettingsRevision))
+        }
+
+        var synchronized = profiles[0]; synchronized.appliedModelSettingsRevision = afterPolicy.modelSettingsRevision
+        try afterPolicy.saveRemoteProfiles([synchronized])
+        var ruleChange = afterPolicy.settings
+        ruleChange.modelCompaction = [try ModelCompactionRule.parse(model: "fixture-model", threshold: "90000", window: "100000")]
+        try afterPolicy.persistSettings(ruleChange)
+        let afterRule = AppModel(stateDirectory: directory)
+        XCTAssertEqual(afterRule.settings.sshRemoteProfiles?.first?.modelSettingsSyncStatus(revision: afterRule.modelSettingsRevision), .needsSync)
     }
     @MainActor func testConfiguredHostSelectionKeepsOMPClientAndItsOwnSavedMetadata() {
         let model = SSHRemoteModel(); model.selectKind(.omp)
         var codex = SSHRemoteProfile(); codex.destination = "shared"; codex.codexHome = "/codex"
         var omp = SSHRemoteProfile(); omp.destination = "shared"; omp.clientKind = .omp
-        omp.ompAgentDirectory = "/omp"; omp.ompDefaultModel = "fixture-model"
+        omp.ompAgentDirectory = "/omp"
         omp.backupID = "omp-backup"
         model.selectConfiguredHost("shared", saved: [codex, omp])
         XCTAssertEqual(model.profile, omp)
@@ -84,6 +136,18 @@ final class SSHRemoteTests: XCTestCase {
         XCTAssertEqual(model.profile.kind, .omp); XCTAssertEqual(model.profile.directory, "")
         XCTAssertNil(model.profile.backupID); XCTAssertNotEqual(model.profile.id, omp.id)
     }
+    func testOMPConnectionURLUsesEditedHostAndCurrentSharedPort() throws {
+        var profile = SSHRemoteProfile(); profile.clientKind = .omp
+        profile.gatewayHost = "10.250.164.115"
+        XCTAssertEqual(try profile.ompBaseURL(port: 17865), "http://10.250.164.115:17865/omp/v1")
+        profile.gatewayHost = "gateway.example"
+        XCTAssertEqual(try profile.ompBaseURL(port: 18965), "http://gateway.example:18965/omp/v1")
+        for host in ["", "http://gateway.example", "gateway.example/path", "host name", "user@gateway.example"] {
+            profile.gatewayHost = host
+            XCTAssertThrowsError(try profile.ompBaseURL(port: 17865))
+        }
+    }
+
     func testSSHArgumentsUseKnownHostsAndSeparateOptionsWithoutShellInterpolation() throws {
         var profile=SSHRemoteProfile();profile.destination="server-alias";profile.username="worker";profile.sshPort="2222";profile.identityFile="/tmp/test key"
         let args=try profile.arguments()
@@ -115,10 +179,27 @@ with tempfile.TemporaryDirectory() as folder:
         result=subprocess.run([sys.executable,'-c',agent],input=json.dumps(payload).encode(),capture_output=True,env=env,timeout=10)
         assert result.returncode==0 and not result.stderr
         return json.loads(result.stdout)
+    # A fresh install can be inspected without creating files, then applied directly.
+    existing=codex;codex=home/'fresh'/'.codex';env['CODEX_HOME']=str(codex)
+    assert call('discover')['data']['candidates'][0]==str(codex)
+    fresh=call('read')['data'];assert fresh['config']=='' and fresh['digest']=='absent' and not codex.exists()
+    fresh_fields=dict(base_url='http://127.0.0.1:%d/v1'%server.server_port,key='fixture-remote-key',expected_home=fresh['codex_home'],expected_digest=fresh['digest'],config=base64.b64encode(b'model_provider="codexpress"\n').decode())
+    assert not call('apply',**dict(fresh_fields,base_url='http://127.0.0.1:1/v1'))['ok'] and not codex.exists()
+    fresh_applied=call('apply',**fresh_fields);assert fresh_applied['ok']
+    assert (codex/'config.toml').read_bytes()==b'model_provider="codexpress"\n'
+    assert call('restore')['ok'] and not (codex/'config.toml').exists()
+    # Equal absent-file digests must not allow a selected symlink to change identity.
+    alias=home/'codex-alias';alias.symlink_to(codex,target_is_directory=True)
+    codex=alias;selected=call('read')['data']
+    alias.unlink();other=home/'other-fresh';alias.symlink_to(other,target_is_directory=True)
+    retarget=call('apply',**dict(fresh_fields,expected_home=selected['codex_home']))
+    assert not retarget['ok'] and not other.exists()
+    alias.unlink()
+    codex=existing;env['CODEX_HOME']=str(codex)
     found=call('discover')['data'];assert found['client_ip']=='192.0.2.44' and found['candidates']==[str(codex)]
     before=call('read')['data'];assert base64.b64decode(before['config'])==original
     assert b'private-fixture-auth' not in json.dumps(before).encode()
-    fields=dict(base_url='http://127.0.0.1:%d/v1'%server.server_port,key='fixture-remote-key',expected_digest=before['digest'],config=base64.b64encode(b'model_provider="codexpress"\n').decode())
+    fields=dict(base_url='http://127.0.0.1:%d/v1'%server.server_port,key='fixture-remote-key',expected_home=before['codex_home'],expected_digest=before['digest'],config=base64.b64encode(b'model_provider="codexpress"\n').decode())
     assert not call('apply',**dict(fields,base_url='http://127.0.0.1:1/v1'))['ok'] and config.read_bytes()==original
     result=call('apply',**fields);assert result['ok'];backup=result['data']['backup_id']
     assert result['data']['original_backup_id']==backup

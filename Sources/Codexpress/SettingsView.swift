@@ -1,12 +1,13 @@
 import SwiftUI
 
 enum SettingsPage: String, CaseIterable, Identifiable {
-    case overview = "概览", sources = "来源池", usage = "用量", connections = "接入", general = "设置"
+    case overview = "概览", sources = "来源池", models = "模型", usage = "用量", connections = "接入", general = "设置"
     var id: String { rawValue }
     var symbol: String {
         switch self {
         case .overview: return "square.grid.2x2"
         case .sources: return "server.rack"
+        case .models: return "cube"
         case .usage: return "chart.bar.xaxis"
         case .connections: return "point.3.connected.trianglepath.dotted"
         case .general: return "slider.horizontal.3"
@@ -28,7 +29,7 @@ struct SettingsView: View {
             VStack(spacing: 0) {
                 List(selection: $page) {
                     Section {
-                        ForEach([SettingsPage.overview, .sources, .usage]) { navigationItem($0) }
+                        ForEach([SettingsPage.overview, .sources, .models, .usage]) { navigationItem($0) }
                     }
                     Section {
                         navigationItem(.connections)
@@ -54,6 +55,7 @@ struct SettingsView: View {
                     switch page ?? .overview {
                     case .overview: OverviewView(openSources: { page = .sources }, openUsage: { page = .usage }, openConnection: { connectionSection = $0; page = .connections })
                     case .sources: SourcesView()
+                    case .models: ModelSettingsView()
                     case .usage: UsageView()
                     case .connections: ConnectionSettingsView(section: $connectionSection)
                     case .general: GeneralSettingsView()
@@ -91,7 +93,7 @@ struct SettingsView: View {
                 if model.pendingSync {
                     banner("配置尚未应用到网关，当前路由仍使用上次设置。请重试启动。", symbol: "arrow.triangle.2.circlepath", color: .orange)
                 }
-            }.padding(.horizontal, AppMetrics.pageInset).padding(.top, 18).frame(maxWidth: 1120)
+            }.padding(.horizontal, AppMetrics.pageInset).padding(.top, 18).frame(minWidth: 700, maxWidth: 1120)
         }
     }
 

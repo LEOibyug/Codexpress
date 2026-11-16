@@ -27,14 +27,34 @@ async fn credentials(state: &Arc<AppState>) -> Value {
 }
 
 pub async fn status(state: &Arc<AppState>) -> Result<Value> {
-    let settings = state.settings.read().await.clone();
-    let sources = state.sources.read().await.clone();
+    let (settings, sources, model_policies) = {
+        let _routing_sync = state.routing_sync.lock().await;
+        let settings = state.settings.read().await.clone();
+        let sources = state.sources.read().await.clone();
+        let model_policies = state.model_policies.read().await.clone();
+        (settings, sources, model_policies)
+    };
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || status_snapshot(&state, settings, sources, model_policies))
+        .await
+        .context("无法读取本地状态")?
+}
+
+fn status_snapshot(
+    state: &Arc<AppState>,
+    settings: crate::model::RoutingSettings,
+    sources: Vec<crate::model::SourceRuntime>,
+    model_policies: Arc<[crate::model_policy::ModelPolicy]>,
+) -> Result<Value> {
     state.manual_routing.refresh(&sources, &state.affinity);
     crate::routing::notify_quotas(state, &sources);
     let active = state.usage.active_by_source();
     let mut source_statuses = Vec::with_capacity(sources.len());
     for runtime in &sources {
         let mut value = serde_json::to_value(runtime).expect("source status");
+        if runtime.source.kind == "official" {
+            crate::official::update_quota_reference(&mut value["quota"], crate::model::now());
+        }
         if crate::routing::official_exhausted(runtime, &sources) {
             value["health"] = json!("exhausted");
             value["last_error"] = json!("官方额度已耗尽，等待额度恢复");
@@ -46,7 +66,13 @@ pub async fn status(state: &Arc<AppState>) -> Result<Value> {
         value["admission"] =
             crate::routing::admission_with_settings(state, runtime, &sources, &settings);
         value["balance"] = if runtime.source.kind == "api" {
-            crate::balance::cached(state, &runtime.source).await?
+            match state.usage.cached_balance(&runtime.source) {
+                Ok(balance) => serde_json::to_value(balance)?,
+                Err(_) => {
+                    value["balance_status"] = json!("unavailable");
+                    Value::Null
+                }
+            }
         } else {
             Value::Null
         };
@@ -54,7 +80,7 @@ pub async fn status(state: &Arc<AppState>) -> Result<Value> {
     }
     let sources = source_statuses;
     Ok(
-        json!({"running":true,"process_id":std::process::id(),"port":state.port,"base_url":format!("http://127.0.0.1:{}/v1",state.port),"mode":settings.mode,"fixed_source_id":settings.fixed_source_id,"load_balance":settings.load_balance,"manual_route":state.manual_routing.status(),"official_low_quota_percent":settings.official_low_quota_percent,"degraded_context_fallback":settings.degraded_context_fallback,"idle_return_minutes":settings.idle_return_minutes,"upstream_attempts":settings.upstream_attempts,"upstream_retry_delay_seconds":settings.upstream_retry_delay_seconds,"sources":sources,"inflight":state.inflight.load(Ordering::Relaxed),"connection_mode":config::connection_mode(&state.state_dir).unwrap_or("unknown")}),
+        json!({"running":true,"process_id":std::process::id(),"port":state.port,"base_url":format!("http://127.0.0.1:{}/v1",state.port),"mode":settings.mode,"fixed_source_id":settings.fixed_source_id,"load_balance":settings.load_balance,"manual_route":state.manual_routing.status(),"official_low_quota_percent":settings.official_low_quota_percent,"auto_reset_weekly_quota":settings.auto_reset_weekly_quota,"degraded_context_fallback":settings.degraded_context_fallback,"idle_return_minutes":settings.idle_return_minutes,"upstream_attempts":settings.upstream_attempts,"upstream_retry_delay_seconds":settings.upstream_retry_delay_seconds,"model_policies":&*model_policies,"sources":sources,"inflight":state.inflight.load(Ordering::Relaxed),"connection_mode":config::connection_mode(&state.state_dir).unwrap_or("unknown")}),
     )
 }
 
@@ -95,9 +121,11 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
         "remote.compaction.source" => crate::remote::compaction_source(
             payload["config"].as_str().context("缺少远端模型配置")?,
         ),
-        "remote.preview" => state
-            .remote
-            .prepare(serde_json::from_value(payload).context("远端预览参数无效")?),
+        "remote.preview" => {
+            let mut preview: crate::remote::RemotePreview = serde_json::from_value(payload).context("远端预览参数无效")?;
+            preview.excluded_models = crate::model_policy::codex_excluded_models(state).await;
+            state.remote.prepare(preview)
+        }
         "history.status" => state
             .history
             .status()
@@ -145,15 +173,22 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             .await
             .context("用量查询失败")?
         }
-        "usage" => state.usage.summary_filtered(
-            payload
-                .get("days")
-                .and_then(Value::as_u64)
-                .unwrap_or(30)
-                .clamp(1, 3660) as u32,
-            payload.get("source_id").and_then(Value::as_str),
-            payload.get("model").and_then(Value::as_str),
-        ),
+        "usage" => {
+            let usage = state.usage.clone();
+            tokio::task::spawn_blocking(move || {
+                usage.summary_filtered(
+                    payload
+                        .get("days")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(30)
+                        .clamp(1, 3660) as u32,
+                    payload.get("source_id").and_then(Value::as_str),
+                    payload.get("model").and_then(Value::as_str),
+                )
+            })
+            .await
+            .context("用量查询失败")?
+        }
         op if op.starts_with("control.") => crate::control::handle(state, op, payload).await,
         op if op.starts_with("omp.") => crate::omp::handle(state, op, payload).await,
         op if op.starts_with("config.") => config::handle(state, op, payload).await,

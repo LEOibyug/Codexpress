@@ -26,7 +26,7 @@ for legacy in (False,True):
         result=subprocess.run([sys.executable,'-c',code],input=json.dumps(dict(action=action,codex_home=str(codex),**fields)).encode(),capture_output=True,timeout=10)
         assert result.returncode==0 and not result.stderr
         return json.loads(result.stdout)
-    common=dict(base_url='http://127.0.0.1:%d/v1'%server.server_port,key='fixture-remote')
+    common=dict(base_url='http://127.0.0.1:%d/v1'%server.server_port,key='fixture-remote',expected_home=str(codex))
     gateway=b'model_provider="codexpress"\n'
     if legacy:
         before=call('read')['data']

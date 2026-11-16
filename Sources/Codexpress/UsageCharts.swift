@@ -3,6 +3,7 @@ import Charts
 
 struct UsageTrendChart: View {
     let days: [UsageDaily]
+    var intraday = false
     @State private var selectedDate: Date?
     private var selected: UsageDaily? {
         guard let selectedDate else { return nil }
@@ -15,7 +16,7 @@ struct UsageTrendChart: View {
                 Text("Token 趋势").font(.system(size: 14, weight: .semibold))
                 Spacer()
                 if let selected {
-                    Text(selected.date.formatted(.dateTime.month().day()) + " · " + usageCount(selected.total, estimated: selected.estimated) + " Token")
+                    Text(selected.date.formatted(intraday ? .dateTime.month().day().hour().minute() : .dateTime.month().day()) + " · " + usageCount(selected.total, estimated: selected.estimated) + " Token")
                         .font(.system(size: 12, weight: .medium)).monospacedDigit()
                 }
             }
@@ -35,7 +36,7 @@ struct UsageTrendChart: View {
                 }
             }
             .chartYScale(domain: 0...max(1, (days.map(\.total).max() ?? 0) * 1.12))
-            .chartXAxis { AxisMarks(values: .automatic(desiredCount: 5)) { _ in AxisValueLabel(format: .dateTime.month().day()).font(.system(size: 11)); AxisTick() } }
+            .chartXAxis { AxisMarks(values: .automatic(desiredCount: 5)) { _ in AxisValueLabel(format: intraday ? .dateTime.hour().minute() : .dateTime.month().day()).font(.system(size: 11)); AxisTick() } }
             .chartYAxis { AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) { value in AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5)).foregroundStyle(Color.secondary.opacity(0.16)); AxisValueLabel { if let number = value.as(Double.self) { Text(usageCount(number)).font(.system(size: 11)).monospacedDigit() } } } }
             .chartXSelection(value: $selectedDate)
             .chartOverlay { proxy in

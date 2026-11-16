@@ -49,7 +49,7 @@ def home_path(raw):
     if not raw or not os.path.isabs(raw) or '..' in pathlib.Path(raw).parts:
         fail('请填写远端 Codex 目录的绝对路径。')
     path = pathlib.Path(raw)
-    if not path.is_dir(): fail('远端 Codex 目录不存在。')
+    if path.exists() and not path.is_dir(): fail('远端 Codex 路径不是目录。')
     # User-selected CODEX_HOME may itself be a symlink; config/auth targets may not.
     return path.resolve()
 
@@ -211,11 +211,16 @@ def main(payload):
         user_home = os.path.expanduser('~')
         candidates = []
         for raw in (os.environ.get('CODEX_HOME', ''), os.path.join(user_home, '.codex')):
-            if raw and os.path.isabs(raw) and os.path.isdir(raw) and raw not in candidates: candidates.append(raw)
+            if raw and os.path.isabs(raw) and raw not in candidates: candidates.append(raw)
         parts = os.environ.get('SSH_CONNECTION', '').split()
         return {'user_home': user_home, 'candidates': candidates, 'client_ip': parts[0] if len(parts) == 4 else '', 'remote_host': socket.gethostname()}
     if action == 'probe': return probe(payload)
     path = home_path(payload.get('codex_home', ''))
+    if action == 'apply':
+        if payload.get('expected_home') != str(path): fail('远端 Codex 目录指向已变化，请重新读取连接配置。')
+        probe(payload)
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if action == 'restore' and not path.is_dir(): fail('远端 Codex 目录不存在，无法还原。')
     if action == 'catalog': return source_catalog(path, payload.get('catalog_path'))
     lock = None
     if action in ('apply', 'restore'):
@@ -228,7 +233,6 @@ def main(payload):
         # No auth.json contents leave the server.
         return {'config': base64.b64encode(value or b'').decode(), 'digest': digest(value), 'codex_home': str(path), 'catalog_digest': digest(read(path / CATALOG)), 'compaction_state_digest': digest(read(path / '.codexpress-backups/compaction-original.json')), 'compaction_base': base64.b64encode(prior[1]['config.toml'] or b'').decode() if prior else None}
     if action == 'apply':
-        probe(payload)
         value = read(path / 'config.toml')
         if digest(value) != payload.get('expected_digest'): fail('远端配置已变化，请重新预览。')
         next_config = base64.b64decode(payload['config'], validate=True)

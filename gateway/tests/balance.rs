@@ -43,6 +43,12 @@ async fn query(state: &Arc<AppState>) -> Value {
         .unwrap()
 }
 
+async fn elapse(seconds: u64) {
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(seconds)).await;
+    tokio::time::resume();
+}
+
 #[tokio::test]
 async fn cch_logs_in_once_and_only_reports_total_account_balance() {
     let logins = Arc::new(AtomicUsize::new(0));
@@ -135,6 +141,10 @@ async fn unsupported_or_invalid_balances_are_not_invented_or_logged() {
     assert_eq!(result["status"], "unavailable");
     assert!(result["amount"].is_null());
     assert!(!result.to_string().contains("PRIVATE"));
+    assert_eq!(result["failure_count"], 1);
+    assert!(result["next_retry_at"].as_u64().unwrap() >= codexpress_gateway::model::now() + 59);
+    let source = state.sources.read().await[0].source.clone();
+    assert_eq!(codexpress_gateway::balance::cached(&state, &source).await.unwrap(), result);
     let count = hits.load(Ordering::SeqCst);
     assert_eq!(query(&state).await, result);
     assert_eq!(hits.load(Ordering::SeqCst), count);
@@ -249,6 +259,7 @@ fn settled_record(
     codexpress_gateway::usage::UsageRecord {
         attempt_id: id.into(),
         request_id: id.into(),
+        ingress: codexpress_gateway::usage::Ingress::Native,
         source_id: source.id.clone(),
         source_name: source.name.clone(),
         model: "gpt-6.1-terra".into(),
@@ -353,6 +364,7 @@ async fn projection_replaces_estimates_and_authoritative_watermark_prevents_old_
         "statusCode":200,"duration":1000,"endpoint":"/v1/responses"})
     };
     invoices.lock().unwrap().push(invoice(1, 100_000, 0.25));
+    elapse(2).await;
     reconcile(&state).await;
     let actual = codexpress_gateway::balance::cached(&state, &source)
         .await
@@ -361,6 +373,7 @@ async fn projection_replaces_estimates_and_authoritative_watermark_prevents_old_
     assert_eq!(actual["local_spend"], 0.25);
     assert_eq!(actual["estimated"], false);
     amount.store(80, Ordering::SeqCst);
+    elapse(2).await;
     let copy = state.clone();
     let pending = tokio::spawn(async move {
         management::dispatch(
@@ -388,6 +401,7 @@ async fn projection_replaces_estimates_and_authoritative_watermark_prevents_old_
         80.0,
         "权威返回优先于查询期间的本机估算"
     );
+    elapse(2).await;
     invoices.lock().unwrap().push(invoice(2, 200_000, 2.0));
     reconcile(&state).await;
     let reset = codexpress_gateway::balance::cached(&state, &source)
@@ -406,6 +420,7 @@ async fn projection_replaces_estimates_and_authoritative_watermark_prevents_old_
     assert_eq!(incomplete["unknown_spend_requests"], 1);
     assert_eq!(incomplete["estimated"], true);
     failing.store(true, Ordering::SeqCst);
+    elapse(2).await;
     let failed = management::dispatch(
         &state,
         "balance.query",
@@ -510,5 +525,82 @@ async fn completed_forwarding_projects_the_response_charge_without_a_balance_ref
     assert_eq!(balance["local_spend"], 0.3);
     assert_eq!(balance["estimated"], false);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn manual_queries_bypass_failure_backoff_while_automatic_queries_wait() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (calls, fail) = (hits.clone(), failing.clone());
+    let (address, task) = serve(Router::new().route("/api/v1/me/quota", get(move || {
+        let (calls, fail) = (calls.clone(), fail.clone());
+        async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if fail.load(Ordering::SeqCst) {
+                (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
+            } else {
+                (StatusCode::OK, Json(json!({"userLimitTotalUsd":80,"userCurrentTotalUsd":0})))
+            }
+        }
+    })).fallback(|| async { StatusCode::NOT_FOUND })).await;
+    let (_dir, state) = state(&format!("{address}/v1")).await;
+    let original = query(&state).await;
+    assert_eq!(original["amount"], 80.0);
+    failing.store(true, Ordering::SeqCst);
+    for (index, delay) in [60_u64, 120, 240, 480, 900, 900].into_iter().enumerate() {
+        let failed = management::dispatch(&state, "balance.query", json!({"source_id":"balance-api","force":true})).await.unwrap();
+        assert_eq!(failed["failure_count"], index + 1);
+        assert_eq!(failed["amount"], 80.0);
+        assert_eq!(failed["stale"], true);
+        assert_eq!(failed["updated_at"], original["updated_at"]);
+        let retry = failed["next_retry_at"].as_u64().unwrap();
+        assert!((delay - 1..=delay).contains(&retry.saturating_sub(codexpress_gateway::model::now())));
+        let before = hits.load(Ordering::SeqCst);
+        elapse(delay - 1).await;
+        let (a, b) = tokio::join!(
+            query(&state),
+            query(&state),
+        );
+        assert_eq!(a, failed);
+        assert_eq!(b, failed);
+        assert_eq!(hits.load(Ordering::SeqCst), before);
+    }
+    elapse(1).await;
+    let before = hits.load(Ordering::SeqCst);
+    let retried = query(&state).await;
+    assert_eq!(retried["failure_count"], 7);
+    assert_eq!(hits.load(Ordering::SeqCst), before + 1);
+    failing.store(false, Ordering::SeqCst);
+    let before = hits.load(Ordering::SeqCst);
+    let (recovered, shared) = tokio::join!(
+        management::dispatch(&state, "balance.query", json!({"source_id":"balance-api","force":true})),
+        management::dispatch(&state, "balance.query", json!({"source_id":"balance-api","force":true})),
+    );
+    let recovered = recovered.unwrap();
+    assert_eq!(shared.unwrap(), recovered);
+    assert_eq!(hits.load(Ordering::SeqCst), before + 1);
+    assert_eq!(recovered["failure_count"], 0);
+    assert!(recovered["next_retry_at"].is_null());
+    assert_eq!(recovered["stale"], false);
+    let before = hits.load(Ordering::SeqCst);
+    assert_eq!(query(&state).await, recovered);
+    assert_eq!(hits.load(Ordering::SeqCst), before);
+    task.abort();
+}
+
+#[tokio::test]
+async fn stale_identity_cached_reads_do_not_discard_the_new_balance() {
+    let (address, task) = serve(Router::new().route("/api/v1/me/quota", get(|| async {
+        Json(json!({"userLimitTotalUsd":42,"userCurrentTotalUsd":0}))
+    }))).await;
+    let (_dir, state) = state(&format!("{address}/v1")).await;
+    let old = state.sources.read().await[0].source.clone();
+    query(&state).await;
+    state.sources.write().await[0].source.secret = json!({"api_key":"PRIVATE-NEW-IDENTITY"});
+    let current = state.sources.read().await[0].source.clone();
+    let expected = query(&state).await;
+    assert!(codexpress_gateway::balance::cached(&state, &old).await.unwrap().is_null());
+    assert_eq!(codexpress_gateway::balance::cached(&state, &current).await.unwrap(), expected);
     task.abort();
 }

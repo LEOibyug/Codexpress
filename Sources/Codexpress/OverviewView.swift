@@ -125,12 +125,17 @@ struct OverviewView: View {
             }
             Spacer(minLength: 12)
             if source.official {
-                HStack(spacing: 18) {
-                    ForEach(QuotaOverview(model.state(source.id)["quota"]).mainWindows) { window in
+                let overview = QuotaOverview(model.state(source.id)["quota"])
+                HStack(alignment: .top, spacing: 18) {
+                    ForEach(overview.mainWindows) { window in
                         VStack(alignment: .trailing, spacing: 3) {
                             Text(window.title).font(AppTypography.small).foregroundStyle(.secondary)
-                            Text(window.remainingLabel).font(.system(size: 18, weight: .semibold)).monospacedDigit()
-                                .foregroundStyle(AccountLevel.quota(window.remaining).color).help(window.resetLabel)
+                            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                Text(window.remainingLabel).font(.system(size: 18, weight: .semibold)).monospacedDigit()
+                                    .foregroundStyle(AccountLevel.quota(window.remaining).color).help(window.resetLabel)
+                                if !overview.hasShortWindow { QuotaReferenceLabel(window: window) }
+                            }
+                            if overview.hasShortWindow { QuotaReferenceLabel(window: window) }
                         }
                     }
                     OfficialResetControl(source: source)

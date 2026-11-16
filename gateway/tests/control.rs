@@ -114,6 +114,7 @@ fn record() -> UsageRecord {
     UsageRecord {
         attempt_id: "attempt-fixture".into(),
         request_id: "request-fixture".into(),
+        ingress: codexpress_gateway::usage::Ingress::Native,
         source_id: "api".into(),
         source_name: "API".into(),
         model: "gpt-6.1-sol".into(),
@@ -844,7 +845,14 @@ async fn official_refresh_failure_is_an_async_safe_result_and_never_bypasses_the
     .await;
     let (_directory, state, key, base) = enabled().await;
     let mut runtime = official(&proxy);
-    runtime.quota = json!({"windows":[{"name":"primary","used_percent":15,"reset_at":now()+3600}],"fetched_at":now(),"stale":false});
+    let observed = now();
+    runtime.quota = json!({"windows":[
+        {"name":"primary","used_percent":15,"reset_at":observed+3600,"window_seconds":18000},
+        {"name":"secondary","used_percent":60,"reset_at":observed+151200,"window_seconds":604800},
+        {"name":"future:secondary","used_percent":0,"reset_at":observed+1209600,"window_seconds":604800},
+        {"name":"expired:secondary","used_percent":100,"reset_at":observed-1,"window_seconds":604800},
+        {"name":"unknown:secondary","used_percent":20,"window_seconds":604800}
+    ],"fetched_at":observed,"stale":false});
     runtime.credits =
         json!({"available_count":1,"credits":[{"id":"card-a","status":"available"}],"stale":false});
     state.sources.write().await.push(runtime);
@@ -862,6 +870,14 @@ async fn official_refresh_failure_is_an_async_safe_result_and_never_bypasses_the
         status["sources"][0]["quota"]["windows"][0]["used_percent"],
         15
     );
+    let windows = &status["sources"][0]["quota"]["windows"];
+    assert!(windows[0].get("ref_cost").is_none());
+    assert!((windows[1]["ref_cost"].as_f64().unwrap() - 25.0).abs() < 0.01);
+    assert_eq!(windows[1]["used_percent"], 60);
+    assert_eq!(windows[2]["ref_cost"], 100.0);
+    assert_eq!(windows[3]["ref_cost"], 0.0);
+    assert!(windows[4]["ref_cost"].is_null());
+    assert!(state.sources.read().await[0].quota["windows"][1].get("ref_cost").is_none());
     assert_eq!(hits.load(Ordering::SeqCst), 0);
     let response = http
         .post(format!("{base}/refresh/quotas"))
@@ -874,7 +890,8 @@ async fn official_refresh_failure_is_an_async_safe_result_and_never_bypasses_the
     let refresh = read(response).await;
     let result = operation(&http, &base, &key, &refresh["id"]).await;
     assert_eq!(result["status"], "failed");
-    assert_eq!(result["result"]["sources"][0]["code"], "refresh_failed");
+    assert_eq!(result["result"]["sources"][0]["code"], "upstream_refresh_failed");
+    assert!(result["result"]["sources"][0]["next_retry_at"].is_null());
     assert!(!result.to_string().contains("PRIVATE"));
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     stop(&state).await;
@@ -921,7 +938,7 @@ async fn dashboard_queries_filter_all_statistics_and_read_saved_error_and_cache_
     failure.latency_ms = 90;
     failure.complete = false;
     state.usage.record(failure.clone()).unwrap();
-    let mut diagnostic = codexpress_gateway::usage::diagnostics::Capture::new(&failure.attempt_id, failure.started_at, &source, &state.gateway_key);
+    let mut diagnostic = codexpress_gateway::usage::diagnostics::Capture::new(&failure.attempt_id, failure.started_at, &source, &state.gateway_key, failure.ingress);
     diagnostic.request("native", "POST", "/v1/responses", "http://127.0.0.1:1/v1/responses", &[]);
     diagnostic.response(429, &Default::default());
     diagnostic.chunk("{\"error\":{\"message\":\"稍后重试 <script>literal</script>\",\"code\":\"rate_limit\"}}".as_bytes());
@@ -998,4 +1015,128 @@ async fn dashboard_queries_filter_all_statistics_and_read_saved_error_and_cache_
     assert!(text.contains("完整回答"));
     assert!(text.contains("<script>literal</script>"));
     stop(&state).await;
+}
+
+#[tokio::test]
+async fn concurrent_refreshes_share_a_job_without_blocking_source_rebinding() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (upstream, task) = server::serve(Router::new().route(
+        "/api/usage/token/",
+        get({
+            let hits = hits.clone();
+            let started = started.clone();
+            let release = release.clone();
+            move || {
+                let hits = hits.clone();
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    release.acquire().await.unwrap().forget();
+                    Json(json!({"code":true,"data":{"total_available":1_250_000}}))
+                }
+            }
+        }),
+    ))
+    .await;
+    let (_directory, state, key, base) = enabled().await;
+    let source = source_fixture::api_source(
+        "api", "API", &format!("{upstream}/v1"), "PRIVATE-OLD-KEY",
+    );
+    state.sources.write().await.push(SourceRuntime::new(source.clone()));
+    let http = client();
+    let first = read(http.post(format!("{base}/refresh/balances"))
+        .bearer_auth(&key).json(&json!({"source_id":"api"}))
+        .send().await.unwrap()).await;
+    tokio::time::timeout(Duration::from_secs(1), started.notified()).await.unwrap();
+    let duplicate = read(http.post(format!("{base}/refresh/balances"))
+        .bearer_auth(&key).json(&json!({"source_id":"api"}))
+        .send().await.unwrap()).await;
+    assert_eq!(duplicate["id"], first["id"]);
+    let mut replacement = serde_json::to_value(source).unwrap();
+    replacement["secret"] = json!({"api_key":"PRIVATE-NEW-KEY"});
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        codexpress_gateway::management::dispatch(&state, "sync", json!({"sources":[replacement]})),
+    ).await.expect("a network refresh must not hold configuration publication").unwrap();
+    let snapshot = read(http.get(format!("{base}/status?include_usage=false"))
+        .bearer_auth(&key).send().await.unwrap()).await;
+    assert_eq!(snapshot["running"], true);
+    assert!(snapshot["sources"][0]["balance"].is_null());
+    release.add_permits(1);
+    let done = operation(&http, &base, &key, &first["id"]).await;
+    assert_eq!(done["status"], "failed");
+    assert_eq!(done["result"]["sources"][0]["code"], "source_changed");
+    assert!(done["result"]["sources"][0]["result"].is_null());
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    stop(&state).await;
+    task.abort();
+}
+
+#[tokio::test]
+async fn status_can_skip_usage_and_keeps_components_readable_when_summary_fails() {
+    let (directory, state, key, base) = enabled().await;
+    state.sources.write().await.push(SourceRuntime::new(source_fixture::api_source(
+        "api", "API", "http://127.0.0.1:1/v1", "PRIVATE-UPSTREAM-KEY",
+    )));
+    state.usage.record(record()).unwrap();
+    let database = rusqlite::Connection::open(directory.path().join("usage.sqlite")).unwrap();
+    database.execute("UPDATE usage SET source_name=x'ff'", []).unwrap();
+    let http = client();
+    let light = http.get(format!("{base}/status?include_usage=false"))
+        .bearer_auth(&key).send().await.unwrap();
+    assert_eq!(light.status(), 200);
+    let light = read(light).await;
+    assert!(light.get("usage").is_none());
+    assert!(light.get("component_errors").is_none());
+    assert_eq!(light["sources"][0]["id"], "api");
+    let full = http.get(format!("{base}/status"))
+        .bearer_auth(&key).send().await.unwrap();
+    assert_eq!(full.status(), 200);
+    let full = read(full).await;
+    assert_eq!(full["running"], true);
+    assert_eq!(full["sources"][0]["id"], "api");
+    assert!(full["usage"].is_null());
+    assert_eq!(full["component_errors"]["usage"], "unavailable");
+    assert_eq!(full["control"]["running"], true);
+    assert!(http.get(format!("{base}/usage"))
+        .bearer_auth(&key).send().await.unwrap().status().is_client_error());
+    for path in ["status?include_usage=0", "sources?include_usage=false"] {
+        assert_eq!(http.get(format!("{base}/{path}"))
+            .bearer_auth(&key).send().await.unwrap().status(), 400);
+    }
+    stop(&state).await;
+}
+
+#[tokio::test]
+async fn private_extension_operations_share_queues_with_http_disabled() {
+    let directory = tempfile::tempdir_in(".").unwrap();
+    let state = AppState::new(directory.path().into(), 17863, "PRIVATE-GATEWAY-KEY".into()).unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let (proxy, task) = server::serve(Router::new().fallback(move || {
+        seen.fetch_add(1, Ordering::SeqCst);
+        async { StatusCode::BAD_GATEWAY }
+    })).await;
+    state.sources.write().await.push(official(&proxy));
+    let refresh = codexpress_gateway::management::dispatch(&state, "control.refresh.balances", json!({})).await.unwrap();
+    let operation = codexpress_gateway::management::dispatch(&state, "control.operation", json!({"id":refresh["id"]})).await.unwrap();
+    assert_eq!(operation["id"], refresh["id"]);
+    assert_eq!(operation["kind"], "balances");
+    let id = uuid::Uuid::new_v4().to_string();
+    let payload = json!({"request_id":id,"source_id":"official","credit_id":"card-a"});
+    let queued = codexpress_gateway::management::dispatch(&state, "control.reset.request", payload.clone()).await.unwrap();
+    assert_eq!(queued["status"], "pending_confirmation");
+    let same = codexpress_gateway::management::dispatch(&state, "control.reset.status", json!({"id":id})).await.unwrap();
+    assert_eq!(same, queued);
+    let duplicate = codexpress_gateway::management::dispatch(&state, "control.reset.request", payload).await.unwrap();
+    assert_eq!(duplicate, queued);
+    let status = control::handle(&state, "control.status", json!({})).await.unwrap();
+    assert_eq!(status["enabled"], false);
+    assert_eq!(status["running"], false);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    task.abort();
 }

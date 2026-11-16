@@ -1,7 +1,9 @@
-use super::StoreData;
+use super::{grouping, requests::RECORD_COLUMNS, Ingress, StoreData};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
+
+pub(super) const INGRESS_COLUMN: &str = "COALESCE(NULLIF(json_extract(u.metadata,'$.ingress'),''),(SELECT NULLIF(json_extract(d.metadata,'$.ingress'),'') FROM diagnostics d WHERE d.attempt_id=COALESCE(NULLIF(json_extract(u.metadata,'$.attempt_id'),''),'legacy:'||u.attempt)),'unknown')";
 
 const COST_FIELDS: [&str; 6] = [
     "total_usd",
@@ -38,7 +40,8 @@ pub(super) fn build(
     let inflight = recent.len();
     recent.extend(stored);
     recent.truncate(200);
-    let source_rows = aggregate_sources(&rows);
+    let source_rows = grouping::merge(&rows, false);
+    let rows = grouping::merge(&rows, true);
     Ok(
         json!({"rows":source_rows,"groups":rows,"recent":recent,"inflight":inflight,"pricing":crate::pricing::catalog(),"fetched_at":crate::model::now()}),
     )
@@ -101,9 +104,9 @@ fn load_recent(
     source_id: Option<&str>,
     model: Option<&str>,
 ) -> Result<Vec<Value>> {
-    let mut latest = connection.prepare("SELECT attempt,request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata FROM usage WHERE started_at>=?1 AND (?2 IS NULL OR source_id=?2) AND (?3 IS NULL OR model=?3) ORDER BY attempt DESC LIMIT 200")?;
+    let mut latest = connection.prepare(&format!("SELECT {RECORD_COLUMNS},{INGRESS_COLUMN} FROM usage u WHERE started_at>=?1 AND (?2 IS NULL OR source_id=?2) AND (?3 IS NULL OR model=?3) ORDER BY attempt DESC LIMIT 200"))?;
     let stored = latest
-        .query_map(params![since, source_id, model], stored_record)?
+        .query_map(params![since, source_id, model], stored_record_with_ingress)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(stored)
 }
@@ -206,40 +209,23 @@ fn merge_active_groups(rows: &mut Vec<Value>, active_records: &[Value]) {
     }
 }
 
-fn aggregate_sources(groups: &[Value]) -> Vec<Value> {
-    let mut rows: Vec<Value> = Vec::new();
-    for group in groups {
-        let index = rows
-            .iter()
-            .position(|row| row["source_id"] == group["source_id"])
-            .unwrap_or_else(|| {
-                rows.push(
-                    json!({"source_id":group["source_id"],"source_name":group["source_name"]}),
-                );
-                rows.len() - 1
-            });
-        for (name, value) in group.as_object().expect("aggregate").iter() {
-            if let Some(number) = value.as_u64() {
-                rows[index][name] = json!(rows[index][name]
-                    .as_u64()
-                    .unwrap_or(0)
-                    .saturating_add(number));
-            } else if let Some(number) = value.as_f64() {
-                rows[index][name] = json!(rows[index][name].as_f64().unwrap_or(0.0) + number);
-            }
-        }
-    }
-    rows
-}
 pub(super) fn stored_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     let metadata: Value =
         serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_else(|_| json!({}));
     let complete = r.get::<_, bool>(10)?;
     let details=metadata.get("token_details").cloned().unwrap_or_else(||json!({"output_available":complete || r.get::<_,u64>(8).unwrap_or(0)>0,"input_available":complete || r.get::<_,u64>(7).unwrap_or(0)>0,"cached_input_reported":r.get::<_,u64>(9).unwrap_or(0)>0,"legacy":true}));
     let mut record = json!({"attempt_id":metadata.get("attempt_id").cloned().unwrap_or_else(||json!(format!("legacy:{}",r.get::<_,i64>(0).unwrap_or(0)))),"request_id":r.get::<_,String>(1)?,"source_id":r.get::<_,String>(2)?,"source_name":r.get::<_,String>(3)?,"model":r.get::<_,String>(4)?,"started_at":r.get::<_,u64>(5)?,"status":r.get::<_,String>(6)?,"input_tokens":r.get::<_,u64>(7)?,"output_tokens":r.get::<_,u64>(8)?,"cached_input_tokens":r.get::<_,u64>(9)?,"complete":complete,"latency_ms":r.get::<_,u64>(11)?,"token_details":details,"active":false,"first_token_latency_ms":metadata["first_token_latency_ms"],"generation_ms":metadata["generation_ms"],"cost":metadata["cost"]});
+    record["ingress"] = json!(metadata["ingress"].as_str().and_then(Ingress::parse).unwrap_or_default());
     add_rate(&mut record);
     Ok(record)
 }
+
+pub(super) fn stored_record_with_ingress(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let mut record = stored_record(r)?;
+    record["ingress"] = json!(r.get::<_, String>(13)?);
+    Ok(record)
+}
+
 pub(super) fn add_rate(record: &mut Value) {
     let duration = record["generation_ms"].as_u64().unwrap_or(0);
     record["generation_tps"] =

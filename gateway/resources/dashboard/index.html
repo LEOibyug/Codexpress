@@ -26,38 +26,38 @@
       </header>
 
       <form id="filters" class="filter-card" aria-label="数据筛选">
-        <div class="range-row"><span class="field-caption">日期范围</span><div id="quick-ranges" class="segmented" aria-label="快捷日期"><button type="button" data-days="1">今天</button><button type="button" data-days="7">7 天</button><button type="button" data-days="30" aria-pressed="true">30 天</button><button type="button" data-days="90">90 天</button><button type="button" data-days="365">365 天</button></div><span id="timezone" class="hint"></span></div>
+        <div class="range-row"><span class="field-caption">时间范围</span><div id="quick-ranges" class="segmented" aria-label="快捷时间范围"><button type="button" data-hours="1" aria-pressed="false">近1小时</button><button type="button" data-hours="5" aria-pressed="false">近5小时</button><button type="button" data-days="1" aria-pressed="false">今天</button><button type="button" data-days="7" aria-pressed="false">7 天</button><button type="button" data-days="30" aria-pressed="true">30 天</button><button type="button" data-days="90" aria-pressed="false">90 天</button><button type="button" data-days="365" aria-pressed="false">365 天</button></div><span id="timezone" class="hint"></span></div>
         <div class="filter-grid">
-          <label>开始日期<input id="filter-from" type="date" required></label>
-          <label>结束日期（含）<input id="filter-to" type="date" required></label>
+          <label><span id="filter-from-label">开始日期</span><input id="filter-from" type="date" required></label>
+          <label><span id="filter-to-label">结束日期（含）</span><input id="filter-to" type="date" required></label>
           <label>来源<select id="filter-source"><option value="">全部来源</option></select></label>
           <label>模型<select id="filter-model"><option value="">全部模型</option></select></label>
           <label>入口<select id="filter-ingress"><option value="">全部入口</option></select></label>
           <label>请求状态<select id="filter-status"><option value="">全部状态</option><option value="success">成功</option><option value="unsuccessful">未成功</option><option value="failed">失败</option><option value="interrupted">已中断</option><option value="active">进行中</option></select></label>
           <label class="search-field">元数据关键词<input id="filter-search" type="search" maxlength="256" placeholder="请求 ID、模型、错误信息…"></label>
-          <div class="filter-actions"><button class="primary" type="submit">应用筛选</button><button id="reset" class="secondary" type="button">重置</button></div>
+          <div class="filter-actions"><button id="reset" class="secondary" type="button">重置筛选</button></div>
         </div>
-        <p class="hint">每次最多选择 366 个本地日历日；可选择任意历史日期，并分页读取该范围内全部已保存记录。关键词仅搜索元数据，不搜索原文。</p>
-        <p id="cache-filter-note" class="hint" hidden>原文缓存仅支持时间、来源、模型、入口及关联请求筛选；请求状态和关键词不作用于缓存。旧缓存缺少时间与来源，需使用“全部保留缓存”。</p>
+        <p class="hint">筛选自动更新。小时范围滚动更新，每 5 分钟聚合；选择日历快捷项可恢复日期编辑，最多 366 天。关键词搜索请求 ID、模型和错误信息。</p>
+        <p id="cache-filter-note" class="hint" hidden>缓存按时间、来源、模型和入口筛选。缺少元数据的旧快照可在“全部保留缓存”中查看。</p>
       </form>
 
       <div class="feedback-row"><p id="feedback" role="status" aria-live="polite"></p><span id="refresh-state" class="hint"></span></div>
       <section id="panel-overview" role="tabpanel" aria-labelledby="tab-overview">
         <div id="gateway-status" class="status-strip"></div>
         <div id="kpis" class="kpi-grid"></div>
-        <section class="card"><div class="card-heading"><div><h2>每日请求走势</h2><p class="hint">本地日历日 · 请求次数（含进行中）</p></div><span id="daily-summary" class="hint"></span></div><div id="daily-chart" class="chart" role="img" aria-label="每日请求次数图"></div><details><summary>每日完整数据表</summary><div id="daily-table" class="table-scroll"></div></details></section>
-        <section class="card"><div class="card-heading"><div><h2>来源 × 模型</h2><p class="hint">当前筛选窗口的完整分组；未知费用、缺失时序不补零。</p></div></div><div id="groups" class="table-scroll"></div></section>
+        <section class="card"><div class="card-heading"><div><h2 id="daily-title">每日请求走势</h2><p id="daily-note" class="hint">本地日历日 · 请求次数（含进行中）</p></div><span id="daily-summary" class="hint"></span></div><div id="daily-chart" class="chart" role="img" aria-label="每日请求次数图"></div><details><summary id="daily-table-title">每日完整数据表</summary><div id="daily-table" class="table-scroll"></div></details></section>
+        <section class="card"><div class="card-heading"><div><h2>来源 × 模型</h2><p class="hint">当前筛选范围的分组统计。</p></div></div><div id="groups" class="table-scroll"></div></section>
         <details class="card"><summary>统计口径与本地网关状态</summary><p class="hint">成功率 = 成功 / 已结束请求；加权输出 TPS = 有效成功样本输出 token / 对应请求总耗时（秒），包含首 token 等待。TTFT 为首 token 延迟。缓存命中率仅使用明确报告缓存量、且输入未估算的样本；推理 token 属于输出 token，不额外累加。费用为已知部分 USD；上游账单与按价格估算的条数分别显示，缺失不代表免费。</p><div id="status-details"></div></details>
       </section>
 
       <section id="panel-requests" role="tabpanel" aria-labelledby="tab-requests" hidden>
         <section class="card"><div class="card-heading"><div><h2>请求记录</h2><p id="requests-count" class="hint"></p></div><span class="hint">选择一行查看诊断与关联尝试</span></div><div id="requests-table" class="table-scroll"></div><div class="load-row"><button id="requests-more" class="secondary" hidden>加载更多请求</button></div></section>
-        <details class="card"><summary>诊断正文的保留限制</summary><p>诊断只保留实际捕获的上游失败反馈，不是请求正文。单条错误正文捕获上限为 8 MiB，正文保留 30 天，总压缩正文上限为 128 MiB，超限时淘汰较早正文。分页读完仅代表读完可用数据；是否完整请看 body_complete、body_truncated、body_evicted 等诊断字段。历史记录中已经保存为“[已隐藏]”的值无法还原，面板不对现有正文增加替换。</p></details>
+        <details class="card"><summary>错误正文保留范围</summary><p>错误反馈保留 30 天，单条上限 8 MiB，总压缩容量上限 128 MiB；超出容量时淘汰较早正文。已截断、淘汰或写入时隐藏的内容无法恢复。</p></details>
       </section>
 
       <section id="panel-cache" role="tabpanel" aria-labelledby="tab-cache" hidden>
         <section class="card"><div class="card-heading"><div><h2>保留的原文缓存</h2><p id="cache-count" class="hint"></p></div><button id="cache-unfiltered" class="secondary" aria-pressed="false">全部保留缓存（含旧快照）</button></div><p id="cache-scope" class="hint"></p><div id="cache-table" class="table-scroll"></div><div class="load-row"><button id="cache-more" class="secondary" hidden>加载更多缓存</button></div></section>
-        <details class="card"><summary>缓存与诊断正文说明</summary><p>这里只读取网关实际保留的数据。关闭捕获后，仍可阅读保留缓存；未捕获、已淘汰、缺失分片或旧快照缺少的信息会明确标记，不会重建不存在的请求正文。</p><p>原文每次最多读取 262,144 字节，可继续分页或取消“读取全部”。未读完前只展示已验证片段，不宣称完整。诊断错误正文单独分页；完整与否以网关返回的保留状态为准。图片与文件只展示数据，不自动访问任何外部地址。加密内容无法由面板解密。</p></details>
+        <details class="card"><summary>缓存说明</summary><p>关闭采集后仍可阅读已有缓存。内容按页加载，可取消后继续读取；读完后支持复制与下载。缺失或损坏的缓存会显示具体原因。图片、文件和链接仅展示内容；加密字段只能查看原值。</p></details>
       </section>
     </main>
   </div>

@@ -29,7 +29,7 @@ pub async fn adapt(
     edit: bool,
     extensions: axum::http::Extensions,
 ) -> Result<Value> {
-    let mut obj: Map<String, Value> =
+    let obj: Map<String, Value> =
         if mime.to_ascii_lowercase().starts_with("multipart/form-data") {
             if !edit {
                 bail!("文生图请使用 JSON 请求");
@@ -92,6 +92,10 @@ pub async fn adapt(
         } else {
             bail!("请使用 JSON 或图片编辑 multipart 表单");
         };
+    adapt_object(obj, edit)
+}
+
+pub(super) fn adapt_object(mut obj: Map<String, Value>, edit: bool) -> Result<Value> {
     for key in obj.keys() {
         if ![
             "model",

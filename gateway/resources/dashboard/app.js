@@ -10,12 +10,15 @@
     cache: '查看已保留的对话、工具调用与历史快照。',
   };
   const statusNames = { success: '成功', failed: '失败', interrupted: '已中断', active: '进行中', connecting: '连接中', streaming: '接收中' };
+  const ingressNames = { native: 'Codex', ssh: 'Codex（SSH）', omp: 'OMP', chatbot: '聊天客户端', image: '图片生成', unknown: '未知入口' };
+  const ingressName = (value) => ingressNames[value] || '未知入口';
   const state = {
-    tab: 'overview', filter: null, epoch: 0, busy: false,
+    tab: 'overview', filter: null, hours: 0, epoch: 0, busy: false,
     controllers: new Map(), records: [], cacheRecords: [], next: null, pages: 0,
     total: 0, active: 0, legacy: 0, unfiltered: false, attempt: '', detail: null,
     lastFocus: null,
   };
+  let searchTimer;
   const numberFormat = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
   const isNumber = (value) => typeof value === 'number' && Number.isFinite(value);
   const n = (value) => isNumber(value) ? numberFormat.format(value) : '未知';
@@ -43,6 +46,37 @@
   function dateValue(date) {
     return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')].join('-');
   }
+  function timeValue(date) {
+    return [date.getHours(), date.getMinutes(), date.getSeconds()].map((value) => String(value).padStart(2, '0')).join(':');
+  }
+  function selectQuickRange(kind, value) {
+    document.querySelectorAll('[data-days], [data-hours]').forEach((item) => item.setAttribute('aria-pressed', String(Number(item.dataset[kind]) === value)));
+  }
+  function setRangeMode(hours) {
+    state.hours = hours;
+    for (const id of ['filter-from', 'filter-to']) {
+      $(id).type = hours ? 'datetime-local' : 'date';
+      $(id).disabled = hours > 0;
+      $(id).step = hours ? '1' : 'any';
+    }
+    $('filter-from-label').textContent = hours ? '开始时间（含）' : '开始日期';
+    $('filter-to-label').textContent = hours ? '结束时间（不含）' : '结束日期（含）';
+    $('timezone').textContent = '时区：' + (Intl.DateTimeFormat().resolvedOptions().timeZone || '本地时区') + (hours ? ' · 滚动小时，每 5 分钟分桶' : ' · 按本地午夜分日');
+    if (state.tab === 'overview') $('page-subtitle').textContent = hours ? '按 5 分钟聚合整个滚动窗口，不受日志分页影响。' : subtitles.overview;
+  }
+  function hourRange() {
+    const to = Math.floor(Date.now() / 1000) + 1;
+    const from = to - state.hours * 3600;
+    for (const [id, value] of [['filter-from', from], ['filter-to', to]]) {
+      const date = new Date(value * 1000);
+      $(id).value = dateValue(date) + 'T' + timeValue(date);
+    }
+    return { from, to, day_starts: Array.from({ length: state.hours * 12 + 1 }, (_, i) => from + i * 300) };
+  }
+  function quickHours(hours) {
+    setRangeMode(hours);
+    selectQuickRange('hours', hours);
+  }
   function localDate(value) {
     const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
     if (!match) throw new Error('请选择有效日期。');
@@ -51,26 +85,31 @@
     return result;
   }
   function quickRange(days) {
+    setRangeMode(0);
     const end = new Date();
     const start = new Date(end.getFullYear(), end.getMonth(), end.getDate());
     start.setDate(start.getDate() - days + 1);
     $('filter-from').value = dateValue(start);
     $('filter-to').value = dateValue(end);
-    document.querySelectorAll('[data-days]').forEach((item) => item.setAttribute('aria-pressed', String(Number(item.dataset.days) === days)));
+    selectQuickRange('days', days);
   }
   function readFilters() {
-    const start = localDate($('filter-from').value);
-    const end = localDate($('filter-to').value);
-    if (end < start) throw new Error('结束日期不能早于开始日期。');
-    const days = [];
-    const cursor = new Date(start);
-    while (cursor <= end && days.length <= 366) {
+    let result;
+    if (state.hours) result = hourRange();
+    else {
+      const start = localDate($('filter-from').value);
+      const end = localDate($('filter-to').value);
+      if (end < start) throw new Error('结束日期不能早于开始日期。');
+      const days = [];
+      const cursor = new Date(start);
+      while (cursor <= end && days.length <= 366) {
+        days.push(Math.floor(cursor.getTime() / 1000));
+        cursor.setDate(cursor.getDate() + 1);
+      }
+      if (days.length > 366) throw new Error('每次最多选择 366 个本地日历日。请缩小范围；可另选任意历史日期。');
       days.push(Math.floor(cursor.getTime() / 1000));
-      cursor.setDate(cursor.getDate() + 1);
+      result = { from: days[0], to: days[days.length - 1], day_starts: days };
     }
-    if (days.length > 366) throw new Error('每次最多选择 366 个本地日历日。请缩小范围；可另选任意历史日期。');
-    days.push(Math.floor(cursor.getTime() / 1000));
-    const result = { from: days[0], to: days[days.length - 1], day_starts: days };
     for (const [field, id] of [['source_id', 'source'], ['model', 'model'], ['ingress', 'ingress'], ['status', 'status'], ['search', 'search']]) {
       const value = $('filter-' + id).value.trim();
       if (value) result[field] = value;
@@ -99,6 +138,7 @@
     return result;
   }
   function cancelPending() {
+    clearTimeout(searchTimer);
     state.epoch++;
     for (const value of state.controllers.values()) value.abort();
     state.controllers.clear();
@@ -133,14 +173,14 @@
       seen.add(value);
       select.add(new Option(labelOf(item), value));
     }
-    if (selected && !seen.has(selected)) select.add(new Option(selected + '（当前筛选）', selected));
+    if (selected && !seen.has(selected)) select.add(new Option((id === 'filter-ingress' ? ingressName(selected) : selected) + '（当前筛选）', selected));
     select.value = selected;
   }
   function renderOptions(options) {
     if (!options) return;
     fillOptions('filter-source', options.sources, '全部来源', (x) => x.id, (x) => (x.name || x.id) + (x.name && x.name !== x.id ? ' · ' + x.id : ''));
     fillOptions('filter-model', options.models, '全部模型', (x) => x, (x) => x || '未记录模型');
-    fillOptions('filter-ingress', options.ingresses, '全部入口', (x) => x, (x) => ({ native: '本机', ssh: 'SSH', chatbot: '聊天机器人', image: '图像', unknown: '未知' })[x] || x);
+    fillOptions('filter-ingress', options.ingresses, '全部入口', (x) => x, ingressName);
   }
   function table(headers, rows, empty = '当前筛选范围内没有记录。', rowActions = []) {
     if (!rows.length) return node('p', 'empty', empty);
@@ -229,11 +269,19 @@
     $('status-details').replaceChildren(rawDetails('本地状态、历史与对账信息（原始字段）', status, true));
   }
   function renderDaily(daily) {
-    $('daily-summary').textContent = daily.length + ' 个本地日历日';
-    $('daily-table').replaceChildren(table(['日期', '请求', '成功', '失败', '输入', '输出', '缓存', '总 token', 'USD（已知）'], daily.map((d) => [dateValue(new Date(d.start_at * 1000)), n(d.requests), n(d.successes), n(d.failures), n(d.input_tokens), n(d.output_tokens), n(d.cached_input_tokens), n(d.total_tokens), usd(d.total_usd)])));
+    const hourly = state.hours > 0;
+    $('daily-title').textContent = hourly ? '每 5 分钟请求走势' : '每日请求走势';
+    $('daily-note').textContent = hourly ? '滚动小时窗口 · 每 5 分钟请求次数（含进行中）' : '本地日历日 · 请求次数（含进行中）';
+    $('daily-table-title').textContent = hourly ? '每 5 分钟完整数据表' : '每日完整数据表';
+    $('daily-summary').textContent = daily.length + (hourly ? ' 个 5 分钟区间' : ' 个本地日历日');
+    $('daily-table').replaceChildren(table([hourly ? '区间开始时间' : '日期', '请求', '成功', '失败', '输入', '输出', '缓存', '总 token', 'USD（已知）'], daily.map((d) => [hourly ? stamp(d.start_at) : dateValue(new Date(d.start_at * 1000)), n(d.requests), n(d.successes), n(d.failures), n(d.input_tokens), n(d.output_tokens), n(d.cached_input_tokens), n(d.total_tokens), usd(d.total_usd)])));
     const host = $('daily-chart');
     host.replaceChildren();
-    if (!daily.length) { host.append(node('p', 'empty', '没有每日数据。')); return; }
+    if (!daily.length) {
+      host.setAttribute('aria-label', hourly ? '没有 5 分钟区间数据' : '没有每日数据');
+      host.append(node('p', 'empty', hourly ? '没有 5 分钟区间数据。' : '没有每日数据。'));
+      return;
+    }
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     const width = Math.max(650, Math.min(daily.length * 13, 1500));
     svg.setAttribute('viewBox', '0 0 ' + width + ' 210');
@@ -260,11 +308,11 @@
       const x = 47 + i * step;
       const bar = shape('rect', { x, y: 175 - height, width: Math.max(1, step * .72), height, rx: Math.min(3, step / 4), class: 'bar' });
       const title = document.createElementNS(svg.namespaceURI, 'title');
-      title.textContent = dateValue(new Date(d.start_at * 1000)) + '：' + n(count) + ' 次请求';
+      title.textContent = (hourly ? stamp(d.start_at) + ' 至 ' + stamp(d.start_at + 300) + '（5 分钟）' : dateValue(new Date(d.start_at * 1000))) + '：' + n(count) + ' 次请求';
       bar.append(title);
-      if (i % labelStep === 0 || i === daily.length - 1) shape('text', { x: x + step / 2, y: 199, 'text-anchor': 'middle' }, dateValue(new Date(d.start_at * 1000)).slice(5));
+      if (i % labelStep === 0 || i === daily.length - 1) shape('text', { x: x + step / 2, y: 199, 'text-anchor': 'middle' }, hourly ? timeValue(new Date(d.start_at * 1000)).slice(0, 5) : dateValue(new Date(d.start_at * 1000)).slice(5));
     });
-    host.setAttribute('aria-label', daily.length + ' 天每日请求趋势，最大 ' + n(maximum) + ' 次。完整数值见每日数据表。');
+    host.setAttribute('aria-label', daily.length + (hourly ? ' 个 5 分钟区间请求趋势' : ' 天每日请求趋势') + '，最大 ' + n(maximum) + ' 次。完整数值见' + (hourly ? '每 5 分钟' : '每日') + '数据表。');
     host.append(svg);
   }
   function statusBadge(status) { return node('span', 'badge ' + (['connecting', 'streaming'].includes(status) ? 'active' : status in statusNames ? status : ''), statusNames[status] || status || '未知'); }
@@ -282,7 +330,7 @@
     $('requests-count').textContent = '已加载 ' + state.records.length + ' / ' + n(state.total) + ' 条 · 进行中 ' + n(state.active) + ' 条 · 每页最多 100 条';
     $('requests-table').replaceChildren(table(
       ['时间', '来源', '模型', '入口', '状态', 'HTTP', '输入 / 输出 token', 'USD', '完整耗时', 'TTFT', '输出 TPS'],
-      state.records.map((r) => [button(stamp(r.started_at), () => openRequest(r.attempt_id), 'row-link'), r.source_name || r.source_id || '未记录', r.model || '未记录', r.ingress || '未知', statusBadge(r.status), r.http_status ?? '未记录', tokenLabel(r), costLabel(r.cost), ms(r.latency_ms), ms(r.first_token_latency_ms), n(r.output_tps)]),
+      state.records.map((r) => [button(stamp(r.started_at), () => openRequest(r.attempt_id), 'row-link'), r.source_name || r.source_id || '未记录', r.model || '未记录', ingressName(r.ingress), statusBadge(r.status), r.http_status ?? '未记录', tokenLabel(r), costLabel(r.cost), ms(r.latency_ms), ms(r.first_token_latency_ms), n(r.output_tps)]),
       '当前筛选范围内没有请求记录。',
       state.records.map((r) => () => openRequest(r.attempt_id)),
     ));
@@ -293,12 +341,12 @@
     $('cache-unfiltered').setAttribute('aria-pressed', String(state.unfiltered));
     $('cache-unfiltered').textContent = state.unfiltered ? '返回当前筛选范围' : '全部保留缓存（含旧快照）';
     $('cache-scope').textContent = state.unfiltered
-      ? '正在显示全部保留缓存：忽略日期、来源、模型、入口和关联请求筛选。旧快照未记录的时间、来源与请求关联标记为“未记录”。'
-      : state.attempt ? '关联尝试：' + state.attempt + '。正在显示此尝试的全部保留缓存，不额外限制日期、来源、模型或入口。'
-        : '当前日期与来源筛选不包含缺少元数据的旧快照；请点“全部保留缓存”浏览它们，旧快照未被丢弃。';
+      ? '全部保留缓存，包含没有时间与来源信息的旧快照。'
+      : state.attempt ? '关联尝试：' + state.attempt
+        : '按时间、来源、模型与入口筛选。缺少元数据的旧快照可在“全部保留缓存”中查看。';
     $('cache-table').replaceChildren(table(
       ['捕获时间', '来源', '模型', '入口', '请求 / 尝试', '类型', '读取'],
-      state.cacheRecords.map((r) => [stamp(r.captured_at), r.source_name || r.source_id || '未记录', r.model || '未记录', r.ingress || '未记录', r.attempt_id || r.request_id || '未记录', node('span', 'badge', r.legacy ? '旧快照 · 关联未知' : '捕获记录'), button('打开原文', () => openCache(r.id), 'row-link')]),
+      state.cacheRecords.map((r) => [stamp(r.captured_at), r.source_name || r.source_id || '未记录', r.model || '未记录', ingressName(r.ingress), r.attempt_id || r.request_id || '未记录', node('span', 'badge', r.legacy ? '旧快照 · 关联未知' : '捕获记录'), button('打开原文', () => openCache(r.id), 'row-link')]),
       state.unfiltered ? '网关没有保留的原文缓存。' : '当前筛选下没有缓存。旧快照可能缺少筛选元数据，请使用上方“全部保留缓存”。',
     ));
     $('cache-more').hidden = state.next === null;
@@ -309,6 +357,13 @@
     return [...merged.values()].sort((a, b) => (b.started_at ?? b.sequence ?? 0) - (a.started_at ?? a.sequence ?? 0));
   }
   async function load({ more = false, refresh = false, options = false } = {}) {
+    if (state.hours && !more) {
+      state.filter = { ...state.filter, ...hourRange() };
+      if (state.tab !== 'cache' || (!state.unfiltered && !state.attempt)) {
+        resetPages();
+        refresh = false;
+      }
+    }
     const scope = controller('list');
     const epoch = state.epoch;
     const tab = state.tab;
@@ -428,7 +483,7 @@
     const top = section('请求指标');
     top.append(metrics([
       ['尝试 ID', r.attempt_id || detail.id], ['请求 ID', r.request_id || '未记录'], ['开始时间', stamp(r.started_at)],
-      ['来源', r.source_name || r.source_id || '未记录'], ['模型', r.model || '未记录'], ['入口', r.ingress || d?.ingress || '未知'],
+      ['来源', r.source_name || r.source_id || '未记录'], ['模型', r.model || '未记录'], ['入口', ingressName(r.ingress ?? d?.ingress)],
       ['状态', statusNames[r.status] || r.status || '未知'], ['HTTP', String(r.http_status ?? d?.http_status ?? '未记录')],
       ['输入 / 输出', tokenLabel(r)], ['缓存输入', r.token_details?.cached_input_reported ? n(r.cached_input_tokens) : '未报告'],
       ['推理 token', n(r.token_details?.reasoning_output_tokens)], ['完整耗时', ms(r.latency_ms)], ['首 token 延迟', ms(r.first_token_latency_ms)],
@@ -733,8 +788,9 @@
       $('tab-' + name).tabIndex = name === tab ? 0 : -1;
     }
     $('page-title').textContent = titles[tab];
-    $('page-subtitle').textContent = subtitles[tab];
+    $('page-subtitle').textContent = tab === 'overview' && state.hours ? '按 5 分钟聚合整个滚动窗口，不受日志分页影响。' : subtitles[tab];
     $('cache-filter-note').hidden = tab !== 'cache';
+    for (const id of ['filter-status', 'filter-search']) $(id).disabled = tab === 'cache';
     updateRefreshState();
   }
   function selectTab(tab) {
@@ -773,7 +829,16 @@
     applyFilters();
   });
   document.querySelectorAll('[data-days]').forEach((item) => item.addEventListener('click', () => { quickRange(Number(item.dataset.days)); applyFilters(); }));
-  for (const id of ['filter-from', 'filter-to']) $(id).addEventListener('change', () => document.querySelectorAll('[data-days]').forEach((item) => item.setAttribute('aria-pressed', 'false')));
+  document.querySelectorAll('[data-hours]').forEach((item) => item.addEventListener('click', () => { quickHours(Number(item.dataset.hours)); applyFilters(); }));
+  for (const id of ['filter-from', 'filter-to']) $(id).addEventListener('change', () => {
+    selectQuickRange('days', 0);
+    applyFilters();
+  });
+  for (const id of ['source', 'model', 'ingress', 'status']) $('filter-' + id).addEventListener('change', applyFilters);
+  $('filter-search').addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(applyFilters, 250);
+  });
   for (const tab of tabs) $('tab-' + tab).addEventListener('click', () => selectTab(tab));
   document.querySelector('[role="tablist"]').addEventListener('keydown', (event) => {
     const index = tabs.indexOf(state.tab);
@@ -810,7 +875,6 @@
     document.body.dataset.theme = dark ? 'light' : 'dark';
   });
   window.addEventListener('pagehide', () => { cancelPending(); closeDetail(); });
-  $('timezone').textContent = '时区：' + (Intl.DateTimeFormat().resolvedOptions().timeZone || '本地时区') + ' · 按本地午夜分日';
   quickRange(30);
   state.filter = readFilters();
   activateTab('overview');

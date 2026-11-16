@@ -4,7 +4,7 @@ pub(crate) use health::mark_upstream_failure;
 pub use health::{mark_auth_preflight_failure, mark_failure, mark_ready, mark_rejection};
 pub(crate) mod priority;
 
-use crate::model::{now, AppState, Source};
+use crate::{model::{now, AppState, Source}, model_policy};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -97,6 +97,7 @@ async fn recovery_readiness(
     origin: Option<RecoveryOrigin<'_>>,
 ) -> RecoveryReadiness {
     let settings = state.settings.read().await.clone();
+    let policies = state.model_policies.read().await.clone();
     let runtimes = state.sources.read().await;
     let bound_id = if let Some(binding) = binding {
         match state.bindings.lock().await.get(binding).cloned() {
@@ -114,6 +115,7 @@ async fn recovery_readiness(
     for runtime in runtimes.iter() {
         let source = &runtime.source;
         if !source.enabled
+            || !model_policy::source_allowed(&policies, model, &source.id)
             || !(model.is_empty()
                 || source.models.is_empty()
                 || source.models.iter().any(|m| m == model))
@@ -165,6 +167,7 @@ pub(crate) async fn rejection_diagnostics(
 ) -> Value {
     let settings = state.settings.read().await.clone();
     let runtimes = state.sources.read().await;
+    let policies = state.model_policies.read().await.clone();
     let timestamp = now();
     Value::Array(
         runtimes
@@ -183,8 +186,9 @@ pub(crate) async fn rejection_diagnostics(
                 json!({
                     "index":index,
                     "enabled":source.enabled,
-                    "model_supported":model.is_empty() || source.models.is_empty()
-                        || source.models.iter().any(|candidate| candidate == model),
+                    "model_supported":model_policy::source_allowed(&policies, model, &source.id)
+                        && (model.is_empty() || source.models.is_empty()
+                            || source.models.iter().any(|candidate| candidate == model)),
                     "fixed_selected":settings.mode != "fixed"
                         || settings.fixed_source_id.as_ref() == Some(&source.id),
                     "quota_available":account_remaining(runtime, &runtimes)
@@ -207,6 +211,7 @@ async fn candidate_sources(
     check_capacity: bool,
 ) -> Vec<Source> {
     let settings = state.settings.read().await.clone();
+    let policies = state.model_policies.read().await.clone();
     // Identity updates clear bindings while holding sources.write. Read both
     // under the same lock order so an old binding cannot select a new identity.
     let runtimes = state.sources.read().await;
@@ -225,6 +230,7 @@ async fn candidate_sources(
         .filter(|runtime| {
             let source = &runtime.source;
             source.enabled
+                && model_policy::source_allowed(&policies, model, &source.id)
                 && (model.is_empty()
                     || source.models.is_empty()
                     || source.models.iter().any(|m| m == model))
@@ -243,8 +249,10 @@ async fn candidate_sources(
         })
         .map(|r| r.source.clone())
         .collect();
-    sources.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.id.cmp(&b.id)));
-    if settings.load_balance && settings.mode == "auto" && binding.is_none() {
+    model_policy::sort_sources(&policies, model, &mut sources);
+    if settings.load_balance && settings.mode == "auto" && binding.is_none()
+        && !model_policy::has_custom_sources(&policies, model)
+    {
         state.affinity.order_by_load(&mut sources);
     }
     if binding.is_none() {
@@ -380,16 +388,25 @@ pub async fn reserve_idle_return(
     session: &str,
 ) -> Option<(Source, crate::affinity::RouteLease)> {
     let settings = state.settings.read().await.clone();
-    if settings.mode != "auto" || settings.load_balance || settings.idle_return_minutes == 0 {
+    let policies = state.model_policies.read().await.clone();
+    let custom_sources = model_policy::has_custom_sources(&policies, model);
+    if settings.mode != "auto" || (settings.load_balance && !custom_sources) || settings.idle_return_minutes == 0 {
         return None;
     }
     let sources = state.sources.read().await;
-    let all: Vec<_> = sources.iter().map(|r| r.source.clone()).collect();
+    let mut all: Vec<_> = sources.iter().map(|r| r.source.clone()).collect();
+    model_policy::sort_sources(&policies, model, &mut all);
     let preferred = state.affinity.preferred(session, &all)?;
     let from = all.iter().find(|source| source.id == preferred)?;
+    let from_rank = all.iter().position(|source| source.id == preferred)?;
     let mut targets: Vec<_> = sources.iter().filter(|runtime| {
         let source = &runtime.source;
-        source.enabled && source.priority < from.priority
+        source.enabled && model_policy::source_allowed(&policies, model, &source.id)
+            && (if custom_sources {
+                all.iter().position(|candidate| candidate.id == source.id).is_some_and(|rank| rank < from_rank)
+            } else {
+                source.priority < from.priority
+            })
             && !official_exhausted(runtime, &sources)
             && (model.is_empty() || source.models.is_empty() || source.models.iter().any(|m| m == model))
             && (runtime.health == "ready" || matches!(runtime.health.as_str(), "cooldown" | "proxy_error" | "exhausted")
@@ -398,12 +415,7 @@ pub async fn reserve_idle_return(
             // positive evidence of account recovery, including after restart.
             && (source.kind != "official" || account_remaining(runtime, &sources).is_some_and(|v| v > 0.0))
     }).collect();
-    targets.sort_by(|a, b| {
-        a.source
-            .priority
-            .cmp(&b.source.priority)
-            .then(a.source.id.cmp(&b.source.id))
-    });
+    targets.sort_by_key(|runtime| all.iter().position(|source| source.id == runtime.source.id));
     for target in targets {
         let low = account_remaining(target, &sources)
             .is_some_and(|v| v <= f64::from(settings.official_low_quota_percent));
@@ -450,11 +462,13 @@ async fn reserve_model_with_policy(
     allow_handoff: bool,
 ) -> Option<crate::affinity::RouteLease> {
     let settings = state.settings.read().await.clone();
+    let policies = state.model_policies.read().await.clone();
     let sources = state.sources.read().await;
     let runtime = sources.iter().find(|runtime| {
         runtime.source.id == source.id
             && runtime.source.identity() == source.identity()
             && runtime.source.enabled
+            && model_policy::source_allowed(&policies, model, &runtime.source.id)
             && (model.is_empty()
                 || runtime.source.models.is_empty()
                 || runtime.source.models.iter().any(|m| m == model))
@@ -463,6 +477,7 @@ async fn reserve_model_with_policy(
         .iter()
         .filter(|runtime| {
             runtime.source.enabled
+                && model_policy::source_allowed(&policies, model, &runtime.source.id)
                 && (model.is_empty()
                     || runtime.source.models.is_empty()
                     || runtime.source.models.iter().any(|m| m == model))
@@ -594,6 +609,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_policy_revocation_blocks_preselected_manual_priority_and_bound_routes() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned(), 0, "fixture".into()).unwrap();
+        let source = recovery_source();
+        *state.sources.write().await = vec![SourceRuntime::new(source.clone())];
+        manual::handle(&state, "routing.try", json!({"source_id":source.id})).await.unwrap();
+        let trial = manual::claim(&state, "m").await.unwrap();
+        state.bindings.lock().await.insert("opaque-origin".into(), source.id.clone());
+        *state.model_policies.write().await = vec![crate::model_policy::ModelPolicy {
+            model: "m".into(),
+            source_ids: Some(vec!["removed".into()]),
+            clients: vec![crate::model_policy::ClientKind::Codex],
+        }].into();
+        assert!(manual::source_for_trial(&state, &trial, "m").await.is_none());
+        assert!(manual::reserve(&state, &source, None, "m").await.is_none());
+        assert!(!priority::eligible(&state, &source, "m").await);
+        assert!(priority::candidates(&state, "m", None).await.is_empty());
+        assert!(!source_is_eligible(&state, &source, "m").await);
+        assert!(candidates(&state, "m", Some("opaque-origin")).await.is_empty());
+    }
+
+
+    #[tokio::test]
     async fn recovery_wait_rechecks_capacity_without_holding_state_locks() {
         let directory = tempfile::tempdir().unwrap();
         let state = AppState::new(directory.path().to_owned(), 0, "fixture".into()).unwrap();
@@ -630,6 +668,7 @@ mod tests {
         for case in [
             "disabled",
             "model",
+            "model_policy",
             "fixed",
             "auth",
             "quota",
@@ -644,6 +683,13 @@ mod tests {
             match case {
                 "disabled" => runtime.source.enabled = false,
                 "model" => runtime.source.models = vec!["different".into()],
+                "model_policy" => {
+                    *state.model_policies.write().await = vec![crate::model_policy::ModelPolicy {
+                        model: "m".into(),
+                        source_ids: Some(vec!["removed".into()]),
+                        clients: vec![crate::model_policy::ClientKind::Codex],
+                    }].into();
+                }
                 "fixed" => {
                     let mut settings = state.settings.write().await;
                     settings.mode = "fixed".into();
@@ -664,7 +710,9 @@ mod tests {
                     "m",
                     (case == "binding").then_some("unknown"),
                     None,
-                    None,
+                    (case == "model_policy").then_some(RecoveryOrigin {
+                        source_id: "recovery", identity: None,
+                    }),
                     tokio::time::Instant::now() + std::time::Duration::from_millis(60)
                 )
                 .await,

@@ -30,8 +30,9 @@ extension AppModel {
     }
     func completeLogin() {
         guard let id = loginSource, let flow = loginFlow else { return }
+        let callback = callbackURL.trimmingCharacters(in: .whitespacesAndNewlines)
         perform {
-            _ = try await self.client.call("official.login.complete", .object(["source_id": .string(id), "flow_id": .string(flow), "callback_url": .string(self.callbackURL)]))
+            _ = try await self.client.call("official.login.complete", .object(["source_id": .string(id), "flow_id": .string(flow), "callback_url": .string(callback)]))
             try await self.finishLogin(id)
         }
     }
@@ -66,7 +67,13 @@ extension AppModel {
         officialQueries[id] = (includeCredits, task)
         try await task.value
     }
-    func refresh(_ id: String) { perform { try await self.queryOfficial(id, includeCredits: true) } }
+    func refresh(_ id: String) {
+        guard running else { return }
+        Task {
+            do { try await queryOfficial(id, includeCredits: true) }
+            catch { self.error = error.localizedDescription }
+        }
+    }
     func prepareCredit(source: Source, credit: JSONValue) async throws -> CreditConfirmation {
         try requireWritableMetadata()
         guard let before = settings.sources.first(where: { $0.id == source.id }), before == source else { throw AppError.message("来源已删除或发生变化，请重新选择重置卡。") }

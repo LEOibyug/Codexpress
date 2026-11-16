@@ -3,34 +3,34 @@ import SwiftUI
 struct CodexSettingsView: View {
     @EnvironmentObject var model: AppModel
     @State private var home = ""
+    @State private var loadedHome = ""
     @State private var confirming: String?
     @State private var selectedBackup = ""
 
-    private var preferencesChanged: Bool { home != model.settings.codexHome }
-    private var canPreview: Bool { !model.busy && model.running && !preferencesChanged && !model.portNeedsRestart && !model.metadataLoadFailed }
+    private var preferencesChanged: Bool { (home.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath != model.settings.codexHome }
+    private var canConnect: Bool { !model.busy && model.running && !preferencesChanged && !model.portNeedsRestart && !model.metadataLoadFailed }
 
     var body: some View {
         ScrollViewReader { scroll in
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
-                    PageHeading("Codex") {
-                        HStack(spacing: 10) {
-                            if preferencesChanged { Text("未保存").font(.system(size: 12)).foregroundStyle(.secondary) }
-                            Button("保存目录") { model.savePreferences(port: model.settings.port, codexHome: home) }
-                                .disabled(model.busy || model.metadataLoadFailed || !preferencesChanged)
-                        }
-                    }
+                    PageHeading("Codex")
                     connectionCard
-                    ModelCompactionView()
-                    previewActions
+                    modelSettingsCard
                     if model.preview != .null { previewCard.id("connection-preview") }
                     backupCard
                 }.settingsPage()
             }.onChange(of: model.preview != .null) { _, visible in
                 if visible { withAnimation(.easeInOut(duration: 0.25)) { scroll.scrollTo("connection-preview", anchor: .center) } }
-            }.onAppear { home = model.settings.codexHome }
-                .task(id: model.settings.codexHome) { selectedBackup = ""; await model.refreshConfigurationBackups() }
-                .alert(confirming == "backup.restore" ? "还原所选备份？" : confirming == "config.restore" ? "恢复原连接？" : "应用连接设置？", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
+            }.onAppear {
+                if loadedHome.isEmpty { home = model.settings.codexHome; loadedHome = home }
+            }
+                .onChange(of: model.settings.codexHome) { _, value in
+                    if home == loadedHome { home = value }
+                    loadedHome = value
+                }
+                .task(id: "\(model.running):\(model.settings.codexHome)") { selectedBackup = ""; await model.refreshConfigurationBackups() }
+                .alert(confirming == "backup.restore" ? "还原所选备份？" : "恢复原连接？", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
                     Button("取消", role: .cancel) { confirming = nil }
                     Button("确认") {
                         if confirming == "backup.restore" { model.restoreConfigurationBackup(backupID) }
@@ -43,18 +43,36 @@ struct CodexSettingsView: View {
         }
     }
 
-    private var previewActions: some View {
+    private var connectionActions: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .center, spacing: 18) {
-                if preferencesChanged { InfoNote(text: "请先保存配置目录。") }
-                Spacer(minLength: 0)
+            HStack(spacing: 12) {
                 Button { model.configPreview() } label: {
-                    Label("预览连接配置", systemImage: "doc.text.magnifyingglass")
-                }.buttonStyle(.borderedProminent).disabled(!canPreview)
+                    Label("查看高级预览", systemImage: "doc.text.magnifyingglass")
+                }.disabled(!canConnect)
+                if model.connectionMode == "gateway" {
+                    Button("恢复原连接…") { confirming = "config.restore" }
+                        .disabled(model.busy || !model.running || preferencesChanged || model.metadataLoadFailed)
+                }
+                Spacer(minLength: 0)
+                Button(model.codexConnectionPhase ?? (model.connectionMode == "gateway" ? "更新连接设置" : "接入来源池")) {
+                    model.switchCodexConnection(.gateway)
+                }.buttonStyle(.borderedProminent).disabled(!canConnect)
             }
+            InfoNote(text: preferencesChanged ? "请先提交配置目录。" : "接入时自动备份配置并重启 Codex，请先结束 Codex 中的操作。")
             if model.portNeedsRestart {
                 InfoNote(text: "请重启 Codexpress 以启用新端口。", symbol: "arrow.clockwise", color: .orange)
             }
+        }
+    }
+
+    private var modelSettingsCard: some View {
+        SettingsCard("模型设置同步", symbol: "arrow.triangle.2.circlepath", accessory: {
+            if model.localModelSettingsNeedsSync {
+                Button("同步模型设置") { model.retryLocalModelSettingsSync() }
+                    .disabled(model.busy || !model.running || preferencesChanged || model.metadataLoadFailed)
+            }
+        }) {
+            InfoNote(text: model.localModelSettingsStatus, symbol: model.localModelSettingsNeedsSync ? "exclamationmark.triangle" : "info.circle", color: model.localModelSettingsNeedsSync ? .orange : .secondary)
         }
     }
 
@@ -67,18 +85,23 @@ struct CodexSettingsView: View {
                             .font(.system(size: 13, weight: .medium))
                     }
                     Spacer()
-                    if model.connectionMode == "official" {
-                        Button("使用来源池") { model.switchCodexConnection(.gateway) }
-                            .disabled(model.busy || !model.running || preferencesChanged)
-                    }
                     DirectOfficialLoginButton().disabled(preferencesChanged)
                 }
                 Divider().overlay(AppPalette.border)
                 VStack(alignment: .leading, spacing: 8) {
                     Text("配置目录").font(.system(size: 13, weight: .medium))
-                    TextField("Codex 配置目录（绝对路径）", text: $home)
-                        .font(.system(size: 13, design: .monospaced)).settingsField()
+                    HStack(spacing: 10) {
+                        TextField("Codex 配置目录（绝对路径）", text: $home)
+                            .font(.system(size: 13, design: .monospaced)).settingsField()
+                            .onSubmit { saveDirectory() }
+                        if preferencesChanged {
+                            Button("保存目录") { saveDirectory() }
+                                .disabled(model.busy || model.metadataLoadFailed)
+                        }
+                    }
                 }
+                Divider().overlay(AppPalette.border)
+                connectionActions
             }
         }
     }
@@ -128,12 +151,10 @@ struct CodexSettingsView: View {
                         .font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 if !model.preview["legacy_providers"].array.isEmpty || model.preview["origin_error"].string != nil { LegacyProviderOriginsView() }
-                HStack(spacing: 10) {
-                    Button("恢复原连接…") { confirming = "config.restore" }.disabled(model.preview["attached"].bool != true)
+                HStack {
                     Spacer()
-                    Button("应用连接设置…") { confirming = "config.attach" }
-                        .buttonStyle(.borderedProminent).disabled(model.portNeedsRestart || model.metadataLoadFailed || preferencesChanged)
-                }.disabled(model.busy)
+                    Button("收起预览") { model.preview = .null }
+                }
             }
         }
     }
@@ -146,5 +167,11 @@ struct CodexSettingsView: View {
                     .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .topLeading).padding(12)
             }.frame(height: 220).background(AppPalette.well, in: RoundedRectangle(cornerRadius: 6))
         }.frame(maxWidth: .infinity)
+    }
+
+    private func saveDirectory() {
+        guard preferencesChanged, !model.busy, !model.metadataLoadFailed else { return }
+        home = home.trimmingCharacters(in: .whitespacesAndNewlines)
+        model.savePreferences(port: model.settings.port, codexHome: home)
     }
 }

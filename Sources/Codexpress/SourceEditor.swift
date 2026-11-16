@@ -5,6 +5,7 @@ struct SourceEditor: View {
     @Environment(\.dismiss) private var dismiss
     @State var source: Source
     let isNew: Bool
+    private let initialModels: [String]
     @State private var apiKey = ""
     @State private var modelsText = ""
     @State private var automaticModels = true
@@ -22,6 +23,7 @@ struct SourceEditor: View {
 
     init(source: Source, isNew: Bool) {
         _source = State(initialValue: source); self.isNew = isNew
+        initialModels = source.models
         _modelsText = State(initialValue: source.models.joined(separator: ", "))
         _automaticModels = State(initialValue: source.discoversModels)
         _proxyPort = State(initialValue: source.proxy.localPort ?? "")
@@ -40,7 +42,7 @@ struct SourceEditor: View {
         if source.official {
             return model.settings.sources.contains { $0.id == source.id && $0.account_id != nil }
         }
-        return !apiKey.isEmpty || (!isNew && model.settings.sources.first(where: { $0.id == source.id })?.base_url == source.base_url)
+        return !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (!isNew && model.settings.sources.first(where: { $0.id == source.id })?.base_url == source.base_url)
     }
 
     var body: some View {
@@ -64,6 +66,9 @@ struct SourceEditor: View {
                         SecureField(isNew ? "API 密钥" : "新 API 密钥", text: $apiKey, prompt: Text(isNew ? "API 密钥" : "留空保留现有密钥"))
                     }
                     Toggle("启用此来源", isOn: $source.enabled).toggleStyle(.switch)
+                    if isNew && source.official && model.loginFlow != nil {
+                        Text("完成当前登录后，可在来源池登录此账号。").font(.system(size: 12)).foregroundStyle(.secondary)
+                    }
                 }
                 conversationCapacitySection
                 if !source.official {
@@ -106,6 +111,9 @@ struct SourceEditor: View {
                             Button("刷新") { Task { await loadModels() } }
                                 .disabled(loadingModels || saving || !canFetch)
                         }
+                        if source.official && !canFetch {
+                            Text("登录后自动获取模型。").font(.system(size: 12)).foregroundStyle(.secondary)
+                        }
                         if !source.models.isEmpty {
                             ScrollView {
                                 VStack(alignment: .leading, spacing: 6) {
@@ -118,7 +126,7 @@ struct SourceEditor: View {
                         TextField("支持模型", text: $modelsText, prompt: Text("模型 ID，以逗号分隔；留空不限"))
                     }
                 }
-            }.formStyle(.grouped).scrollContentBackground(.hidden)
+            }.formStyle(.grouped).scrollContentBackground(.hidden).disabled(saving)
 
             Divider()
             VStack(spacing: 14) {
@@ -126,15 +134,17 @@ struct SourceEditor: View {
                 HStack {
                     Spacer()
                     Button("取消") { dismiss() }.keyboardShortcut(.cancelAction).disabled(saving)
-                    Button(saving ? "保存中…" : "保存来源") { save() }
-                        .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(saving || !model.running || model.busy)
+                    Button(saving ? "保存中…" : isNew && source.official && model.loginFlow == nil ? "添加并登录…" : isNew ? "添加来源" : "保存来源") { save() }
+                        .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(saving || !model.running || model.busy || model.metadataLoadFailed)
                 }
             }.padding(.horizontal, 28).padding(.bottom, 24).padding(.top, 18)
         }.font(.system(size: 13)).background(AppPalette.canvas).frame(width: 660, height: 760)
+            .interactiveDismissDisabled(saving)
             .task(id: discoveryInput) {
                 fetchID = UUID(); loadingModels = false; modelError = nil
-                guard automaticModels, canFetch else { return }
+                guard automaticModels, canFetch, !saving else { return }
                 do { try await Task.sleep(for: .milliseconds(800)) } catch { return }
+                guard !saving else { return }
                 await loadModels()
             }
             .onDisappear { fetchID = UUID() }
@@ -168,16 +178,17 @@ struct SourceEditor: View {
         do {
             let draft = try configuredSource()
             let models = try await model.fetchModels(for: draft, apiKey: apiKey)
-            guard !Task.isCancelled, fetchID == requestID, discoveryInput == input else { return }
-            source.models = models; modelsText = models.joined(separator: ", ")
+            guard !Task.isCancelled, !saving, fetchID == requestID, discoveryInput == input else { return }
+            source.models = models
         } catch {
-            guard !Task.isCancelled, fetchID == requestID, discoveryInput == input else { return }
+            guard !Task.isCancelled, !saving, fetchID == requestID, discoveryInput == input else { return }
             modelError = error.localizedDescription
         }
     }
 
     private func save() {
         saving = true; localError = nil
+        fetchID = UUID(); loadingModels = false
         Task {
             do {
                 var draft = try configuredSource()
@@ -191,8 +202,14 @@ struct SourceEditor: View {
                 draft.automaticModelDiscovery = automaticModels
                 if !automaticModels {
                     draft.models = Array(Set(modelsText.split(whereSeparator: { $0 == "," || $0 == "，" }).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
+                } else if source.models == initialModels, apiKey.isEmpty,
+                          let current = model.settings.sources.first(where: { $0.id == source.id }),
+                          current.base_url == draft.base_url, current.proxy == draft.proxy {
+                    draft.models = current.models
                 }
-                try await model.saveSource(draft, apiKey: apiKey); apiKey = ""; dismiss()
+                try await model.saveSource(draft, apiKey: apiKey)
+                apiKey = ""; dismiss()
+                if isNew && draft.official && model.loginFlow == nil { model.login(draft) }
             }
             catch { localError = error.localizedDescription }
             saving = false

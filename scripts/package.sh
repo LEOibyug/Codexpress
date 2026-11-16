@@ -10,7 +10,7 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 codexpress_verify_app "$app"
 
-staging="$(mktemp -d "${TMPDIR:-/tmp}/codexpress-package.XXXXXX")"
+staging="$(mktemp -d "$TMPDIR/codexpress-package.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 ditto "$app" "$staging/Codexpress.app"
 ln -s /Applications "$staging/Applications"

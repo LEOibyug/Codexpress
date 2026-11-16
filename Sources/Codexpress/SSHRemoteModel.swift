@@ -2,7 +2,19 @@ import Foundation
 import SwiftUI
 
 @MainActor final class SSHRemoteModel: ObservableObject {
-    @Published var profile = SSHRemoteProfile()
+    @Published var profile = SSHRemoteProfile() {
+        didSet {
+            guard !Self.sameTarget(oldValue, profile) else { return }
+            if !selectingProfile, oldValue.id == profile.id {
+                profile.id = UUID().uuidString
+                profile.backupID = nil; profile.originalBackupID = nil
+                profile.appliedModelSettingsRevision = nil; profile.codexConnectionRestored = nil
+            }
+            prepared = .null; summary = ""; candidates = []; aliases = []
+            error = nil; notice = nil
+            ompStatus = .null; ompStatusProfile = nil
+        }
+    }
     var port: String { status["port"].number.map { String(Int($0)) } ?? (profile.kind == .omp ? "17865" : "") }
     @Published private(set) var status: JSONValue = .null
     @Published private(set) var busy = false
@@ -15,31 +27,34 @@ import SwiftUI
     @Published private(set) var configuredHosts: [String] = []
     @Published private(set) var readingSSHConfig = false
     @Published private(set) var sshConfigMessage: String?
-    @Published var ompDraft = OMPConfiguration()
-    @Published private(set) var ompConfiguration: JSONValue = .null
-    @Published private(set) var ompConfigurationRevision = ""
-    @Published private(set) var ompDraftRefresh = 0
-    @Published var localOMPDirectory = ""
-    private var ompConfigurationProfile: SSHRemoteProfile?
-    private var ompConfigurationDigest = ""
-    private var preparedOMPChanges: [OMPConfiguration.Field: String] = [:]
-    var hasOMPConfiguration: Bool {
-        guard ompConfiguration != .null, let loaded = ompConfigurationProfile else { return false }
-        return loaded.kind == profile.kind && loaded.destination == profile.destination
-            && loaded.username == profile.username && loaded.sshPort == profile.sshPort
-            && loaded.identityFile == profile.identityFile && loaded.directory == profile.directory
+    @Published private(set) var ompStatus: JSONValue = .null
+    private var ompStatusProfile: SSHRemoteProfile?
+    private var selectingProfile = false
+    private static func sameTarget(_ lhs: SSHRemoteProfile, _ rhs: SSHRemoteProfile) -> Bool {
+        lhs.kind == rhs.kind && lhs.destination == rhs.destination && lhs.username == rhs.username
+            && lhs.sshPort == rhs.sshPort && lhs.identityFile == rhs.identityFile && lhs.directory == rhs.directory
+    }
+    var hasOMPStatus: Bool {
+        guard ompStatus != .null, let loaded = ompStatusProfile else { return false }
+        return Self.sameTarget(loaded, profile)
+    }
+    var ompInstalled: Bool { hasOMPStatus && ompStatus["installed"].bool == true }
+    var ompAddressChanged: Bool {
+        guard hasOMPStatus, let port = Int(port), let requested = try? profile.ompBaseURL(port: port) else { return false }
+        return ompStatus["base_url"].string != requested
     }
     private var prepared: JSONValue = .null
     private var expectedDigest = ""
+    private var expectedCodexHome = ""
     private var preparedProfile: SSHRemoteProfile?
     private var preparedPort = ""
-    private var preparedRules: [ModelCompactionRule] = []
+    private var preparedModelSettingsRevision: String?
     private var expectedCatalogDigest = ""
     private var expectedCompactionStateDigest = ""
     private var expectedFiles: JSONValue = .array([])
     func canApply(_ model: AppModel) -> Bool {
-        prepared != .null && preparedProfile == profile && preparedPort == port
-            && (profile.kind == .omp ? preparedOMPChanges == ompDraft.changes : preparedRules == (model.settings.modelCompaction ?? []))
+        !model.pendingSync && prepared != .null && preparedProfile == profile && preparedPort == port
+            && preparedModelSettingsRevision == model.modelSettingsRevision
     }
     var running: Bool { status["running"].bool == true }
     var canRestore: Bool { !profile.destination.isEmpty && profile.directory.hasPrefix("/") }
@@ -48,22 +63,28 @@ import SwiftUI
         Task { defer { busy = false; phase = "" }; do { try await action() } catch { self.error = error.localizedDescription } }
     }
     func refresh(_ model: AppModel) async {
-        guard model.running, !busy else { return }
+        guard model.running else { status = .null; return }
+        guard !busy else { return }
         let kind = profile.kind
         do {
             let result = try await model.remoteCall(kind == .omp ? "chatbot.status" : "remote.status")
-            if profile.kind == kind { status = result }
+            if profile.kind == kind, !busy { status = result }
         }
         catch { self.error = error.localizedDescription }
     }
-    func select(_ value: SSHRemoteProfile) { profile = value; summary = ""; prepared = .null; candidates = []; clearOMPConfiguration() }
+    func select(_ value: SSHRemoteProfile) {
+        selectingProfile = true
+        profile = value
+        selectingProfile = false
+    }
     func selectKind(_ kind: SSHRemoteKind) {
         guard kind != profile.kind else { return }
         profile.clientKind = kind; profile.id = UUID().uuidString
         profile.backupID = nil; profile.originalBackupID = nil
+        profile.appliedModelSettingsRevision = nil; profile.codexConnectionRestored = nil
         status = .null; prepared = .null; summary = ""; candidates = []; aliases = []
+        ompStatus = .null; ompStatusProfile = nil
         error = nil; notice = nil
-        clearOMPConfiguration()
     }
     func loadSSHConfig() async {
         guard !readingSSHConfig else { return }
@@ -75,10 +96,11 @@ import SwiftUI
     }
     func selectConfiguredHost(_ alias: String, saved: [SSHRemoteProfile]) {
         let kind = profile.kind
-        var next = saved.first { $0.kind == kind && $0.destination.caseInsensitiveCompare(alias) == .orderedSame } ?? SSHRemoteProfile()
-        next.clientKind = kind
-        next.destination = alias
-        next.username = ""; next.sshPort = ""; next.identityFile = ""
+        if let saved = saved.first(where: { $0.kind == kind && $0.destination.caseInsensitiveCompare(alias) == .orderedSame }) {
+            select(saved); return
+        }
+        var next = SSHRemoteProfile()
+        next.clientKind = kind; next.destination = alias
         select(next); error = nil; notice = nil
     }
     private func remember(_ value: SSHRemoteProfile, in model: AppModel) throws {
@@ -90,22 +112,35 @@ import SwiftUI
         perform("正在连接并查找目录…") {
             let result = try await SSHRemoteClient(profile: original).call("discover")
             guard self.profile == original else { throw AppError.message("连接信息已变化，请重新探测。") }
-            self.candidates = result["candidates"].array.compactMap(\.string)
+            let candidates = result["candidates"].array.compactMap(\.string)
             if original.kind == .omp {
-                if self.profile.directory.isEmpty { self.profile.ompAgentDirectory = self.candidates.first ?? "" }
-            } else if self.profile.codexHome.isEmpty { self.profile.codexHome = self.candidates.first ?? "" }
+                if self.profile.directory.isEmpty { self.profile.ompAgentDirectory = candidates.first ?? "" }
+            } else if self.profile.codexHome.isEmpty { self.profile.codexHome = candidates.first ?? "" }
             if self.profile.gatewayHost.isEmpty { self.profile.gatewayHost = result["client_ip"].string ?? "" }
+            self.candidates = candidates
+            if original.kind == .omp {
+                let selected = self.profile
+                let installed = try await SSHRemoteClient(profile: selected).call("status")
+                guard self.profile == selected else { throw AppError.message("连接信息已变化，请重新探测。") }
+                self.ompStatus = installed; self.ompStatusProfile = selected
+            }
             try self.remember(self.profile, in: model)
-            self.notice = self.candidates.isEmpty ? "未找到 \(original.kind.title) 目录，请手动填写远端绝对路径。" : "已找到远端目录和 SSH 连接地址，请核对后预览。"
+            self.notice = self.candidates.isEmpty ? "未找到 \(original.kind.title) 目录，请手动填写远端绝对路径。" : "已找到远端目录和 SSH 连接地址。"
         }
     }
     func preview(_ model: AppModel) {
-        if profile.kind == .omp { previewOMP(model); return }
-        let original = profile; let originalPort = port; let rules = model.settings.modelCompaction ?? []
-        perform("正在读取并预览远端配置…") {
+        perform("正在读取并预览远端配置…") { try await self.prepareCodex(model) }
+    }
+    private func prepareCodex(_ model: AppModel) async throws {
+            let original = profile; let rules = model.settings.modelCompaction ?? []
+            let revision = model.modelSettingsRevision
+            guard !model.pendingSync else { throw AppError.message("请先将已保存的模型设置同步到本地网关，再预览远端配置。") }
             try ModelCompactionRule.validate(rules)
             guard original.codexHome.hasPrefix("/"), !original.gatewayHost.isEmpty else { throw AppError.message("请先填写远端 Codex 目录和本机地址。") }
-            guard self.running, self.status["port"].number == model.status["port"].number else { throw AppError.message("网关端口已变化，请重新打开页面后预览。") }
+            let connection = try await model.remoteCall("remote.status")
+            self.status = connection
+            guard self.running else { throw AppError.message("请先启动本地网关。") }
+            let originalPort = port
             let result = try await SSHRemoteClient(profile: original).call("read")
             guard let encoded = result["config"].string, let bytes = Data(base64Encoded: encoded), let config = String(data: bytes, encoding: .utf8) else { throw AppError.message("远端配置不是有效 UTF-8。") }
             var base: String?
@@ -120,11 +155,14 @@ import SwiftUI
                 catalog = fetched["catalog"]; checks = fetched["expected_files"]
             }
             let rendered = try await model.remoteCall("remote.preview", .object(["id":.string(original.id),"name":.string(original.username.isEmpty ? original.destination : "\(original.username)@\(original.destination)"),"host":.string(original.gatewayHost),"config":.string(config),"aliases":.bool(original.mapExistingProviders),"codex_home":result["codex_home"],"model_compaction":try JSONValue.from(rules),"compaction_base":base.map(JSONValue.string) ?? .null,"catalog":catalog]))
-            guard self.profile == original, self.port == originalPort, (model.settings.modelCompaction ?? []) == rules else { throw AppError.message("设置已变化，请重新预览。") }
+            let current = try await model.remoteCall("remote.status")
+            guard self.profile == original, current["port"] == connection["port"], current["running"].bool == true,
+                  !model.pendingSync, model.modelSettingsRevision == revision else { throw AppError.message("模型设置或网关端口已变化，请重新预览。") }
             self.prepared = rendered; self.expectedDigest = result["digest"].string ?? ""
+            self.expectedCodexHome = result["codex_home"].string ?? ""
             self.expectedCatalogDigest = result["catalog_digest"].string ?? ""
             self.expectedCompactionStateDigest = result["compaction_state_digest"].string ?? ""
-            self.expectedFiles = checks; self.preparedRules = rules
+            self.expectedFiles = checks; self.preparedModelSettingsRevision = revision
             self.preparedProfile = original; self.preparedPort = originalPort
             var summary = rendered["summary"].string ?? ""
             if rules.isEmpty { summary += base == nil ? "\n模型压缩 = 保留远端设置" : "\n模型压缩 = 恢复远端原设置" }
@@ -133,35 +171,38 @@ import SwiftUI
                 for rule in rules { summary += "\n\(rule.model)：压缩 \(rule.auto_compact_token_limit.formatted()) Token" + (rule.context_window.map { "，窗口 \($0.formatted())" } ?? "") }
             }
             self.summary = summary; self.aliases = rendered["aliases"].array.compactMap(\.string)
-            self.status = try await model.remoteCall("remote.status")
-            try self.remember(original, in: model)
-        }
+            self.status = current
     }
     func apply(_ model: AppModel) {
-        if profile.kind == .omp { applyOMP(model); return }
-        guard canApply(model) else { error = "请先重新预览远端配置。"; return }
-        let original = profile; let prepared = prepared; let digest = expectedDigest
+        let original = profile
         perform("正在验证连通性并备份远端配置…") {
-            guard self.running else { throw AppError.message("请先启动本地网关。") }
-            let fields: [String:JSONValue] = ["base_url":prepared["base_url"],"key":prepared["key"],"expected_digest":.string(digest),"config":.string(Data((prepared["config"].string ?? "").utf8).base64EncodedString()),"catalog_action":prepared["catalog_action"],"catalog":prepared["catalog"],"expected_catalog_digest":.string(self.expectedCatalogDigest),"expected_compaction_state_digest":.string(self.expectedCompactionStateDigest),"expected_files":self.expectedFiles]
+            guard self.canApply(model), let revision = self.preparedModelSettingsRevision else {
+                throw AppError.message("请先预览当前模型设置，再应用到远端。")
+            }
+            let prepared = self.prepared; let digest = self.expectedDigest
+            let current = try await model.remoteCall("remote.status")
+            self.status = current
+            guard self.profile == original, self.canApply(model), self.running else { throw AppError.message("设置或网关端口已变化，请重试。") }
+            let fields: [String:JSONValue] = ["base_url":prepared["base_url"],"key":prepared["key"],"expected_home":.string(self.expectedCodexHome),"expected_digest":.string(digest),"config":.string(Data((prepared["config"].string ?? "").utf8).base64EncodedString()),"catalog_action":prepared["catalog_action"],"catalog":prepared["catalog"],"expected_catalog_digest":.string(self.expectedCatalogDigest),"expected_compaction_state_digest":.string(self.expectedCompactionStateDigest),"expected_files":self.expectedFiles]
             let result = try await SSHRemoteClient(profile: original).call("apply", fields: fields)
             var saved = original; saved.backupID = result["backup_id"].string
             saved.originalBackupID = result["original_backup_id"].string
+            saved.appliedModelSettingsRevision = revision; saved.codexConnectionRestored = false
             try self.remember(saved, in: model)
-            if self.profile == original { self.profile = saved }
+            if self.profile == original { self.select(saved) }
             self.prepared = .null
             self.notice = "已备份并应用远端来源池配置。请重启远端 Codex；使用 VS Code 时，请重载对应的远端窗口。"
         }
     }
     func restore(_ model: AppModel) {
-        if profile.kind == .omp { restoreOMP(model); return }
         let original = profile
         perform("正在备份当前状态并还原接入前设置…") {
             guard self.canRestore else { throw AppError.message("请先填写 SSH 连接和远端 Codex 目录。") }
             let result = try await SSHRemoteClient(profile: original).call("restore")
             var saved = original; saved.backupID = result["recovery_backup_id"].string
             saved.originalBackupID = result["original_backup_id"].string
-            try self.remember(saved, in: model); if self.profile == original { self.profile = saved }
+            saved.appliedModelSettingsRevision = nil; saved.codexConnectionRestored = true
+            try self.remember(saved, in: model); if self.profile == original { self.select(saved) }
             self.prepared = .null; self.summary = ""
             self.notice = "已还原首次接入前的配置和文件认证。请重启远端 Codex；还原前状态另有备份。"
         }
@@ -170,128 +211,66 @@ import SwiftUI
         guard profile.kind == .codex else { return }
         perform("正在撤销远端 Key…") { self.status = try await model.remoteCall("remote.revoke", .object(["id":.string(id)])); self.prepared = .null; self.summary = "" }
     }
-    private func clearOMPConfiguration() {
-        ompConfiguration = .null; ompDraft = OMPConfiguration()
-        ompConfigurationRevision = ""
-        ompConfigurationProfile = nil; ompConfigurationDigest = ""; ompDraftRefresh += 1
-    }
-    func detectLocalOMPDirectory() async {
-        guard localOMPDirectory.isEmpty else { return }
-        let installation = await OMPInstallation.detect()
-        if localOMPDirectory.isEmpty { localOMPDirectory = installation.agentDirectory }
-    }
-    private func renderOMP(_ operation: String, original: SSHRemoteProfile, bundle: JSONValue, edits: [JSONValue] = [], model: AppModel) async throws -> JSONValue {
-        try await model.remoteCall(operation, .object([
-            "agent_dir": bundle["agent_dir"], "files": bundle["files"], "snapshot": bundle["snapshot"],
-            "agent_db_exists": bundle["agent_db_exists"], "model_id": .string(original.ompDefaultModel ?? ""),
-            "host": .string(original.gatewayHost), "configuration_edits": .array(edits)
-        ]))
-    }
-    private func requireOMPConnection(_ original: SSHRemoteProfile) throws {
-        guard original.directory.hasPrefix("/") else { throw AppError.message("请填写远端 OMP 配置目录的绝对路径。") }
-        guard !original.gatewayHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw AppError.message("请填写远端可访问的本机地址后预览连接。")
-        }
-        guard !(original.ompDefaultModel ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw AppError.message("请填写默认模型后预览连接。")
-        }
-    }
-    func loadOMPConfiguration(_ model: AppModel) {
+    func loadOMPStatus() {
         let original = profile
-        perform("正在读取远端 OMP 配置…") {
+        perform("正在读取远端扩展状态…") {
             guard original.directory.hasPrefix("/") else { throw AppError.message("请填写远端 OMP 配置目录的绝对路径。") }
-            let bundle = try await SSHRemoteClient(profile: original).call("read")
-            let rendered = try await self.renderOMP("omp.remote.read", original: original, bundle: bundle, model: model)
-            guard self.profile == original else { throw AppError.message("设置已变化，请重新读取远端配置。") }
-            self.ompConfiguration = rendered["configuration"]
-            self.ompConfigurationRevision = rendered["configuration_revision"].string ?? ""
-            self.ompDraft = OMPConfiguration(stored: rendered["configuration"])
-            if (self.profile.ompDefaultModel ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-               let selected = rendered["model_id"].string { self.profile.ompDefaultModel = selected }
-            self.ompConfigurationProfile = self.profile; self.ompConfigurationDigest = bundle["digest"].string ?? ""
-            self.ompDraftRefresh += 1; self.prepared = .null; self.summary = ""
-            self.notice = "已读取远端 OMP 配置，尚未写入任何更改。"
+            let result = try await SSHRemoteClient(profile: original).call("status")
+            guard self.profile == original else { throw AppError.message("连接信息已变化，请重新读取。") }
+            self.ompStatus = result; self.ompStatusProfile = original
         }
     }
-    func importLocalOMPConfiguration(_ model: AppModel) {
-        guard hasOMPConfiguration else { error = "请先读取远端 OMP 配置。"; return }
+    func installOMPExtension(_ model: AppModel) { updateOMPConnection(model, install: true) }
+    func updateOMPAddress(_ model: AppModel) { updateOMPConnection(model, install: false) }
+    private func updateOMPConnection(_ model: AppModel, install: Bool) {
         let original = profile
-        let directory = (localOMPDirectory as NSString).expandingTildeInPath
-        perform("正在读取本地已保存的 OMP 配置…") {
-            guard directory.hasPrefix("/") else { throw AppError.message("请填写本地 OMP 配置目录的绝对路径。") }
-            let value = try await model.remoteCall("omp.read", .object(["agent_dir": .string(directory)]))
-            guard self.profile == original, self.hasOMPConfiguration else { throw AppError.message("设置已变化，请重新读取远端配置。") }
-            let skipped = self.ompDraft.importSaved(value["configuration"])
-            self.ompDraftRefresh += 1
-            self.notice = skipped.isEmpty ? "已填入本地压缩与模型覆盖，请预览后应用。" : "已填入本地配置；远端没有这些模型，未导入：" + skipped.joined(separator: "、")
-        }
-    }
-    func useOpenAIOMPConfiguration() {
-        guard hasOMPConfiguration, !busy else { return }
-        ompDraft.applyOpenAIPreset(); ompDraftRefresh += 1
-        notice = "已填入 OpenAI 推荐配置，请预览后应用。"
-    }
-    private func previewOMP(_ model: AppModel) {
-        if !hasOMPConfiguration { loadOMPConfiguration(model); return }
-        guard let edits = ompDraft.edits() else { error = "请修正 OMP 配置中标出的字段后预览。"; return }
-        let original = profile; let changes = ompDraft.changes; let digest = ompConfigurationDigest
-        perform("正在预览远端 OMP 连接与配置…") {
-            try self.requireOMPConnection(original)
-            let connection = try await model.remoteCall("chatbot.status")
-            self.status = connection
-            guard self.running else { throw AppError.message("请先启用聊天客户端接入。") }
-            let originalPort = self.port
-            let bundle = try await SSHRemoteClient(profile: original).call("read")
-            guard bundle["digest"].string == digest else { throw AppError.message("远端 OMP 配置已变化，请重新读取后编辑。") }
-            let rendered = try await self.renderOMP("omp.remote.preview", original: original, bundle: bundle, edits: edits, model: model)
-            let current = try await model.remoteCall("chatbot.status")
-            guard self.profile == original, self.ompDraft.changes == changes,
-                  current["port"] == connection["port"], current["running"].bool == true else {
-                throw AppError.message("设置或聊天客户端端口已变化，请重新预览。")
+        perform(install ? "正在安装远端扩展并连接…" : "正在更新远端连接地址…") {
+            guard original.directory.hasPrefix("/") else { throw AppError.message("请填写远端 OMP 配置目录的绝对路径。") }
+            var fields: [String: JSONValue] = [:]
+            if install {
+                guard let package = Bundle.main.url(forResource: "omp-extension", withExtension: "tgz") else {
+                    throw AppError.message("内置扩展包缺失，请重新安装 Codexpress。")
+                }
+                fields["package"] = .string(try Data(contentsOf: package).base64EncodedString())
             }
-            self.status = current; self.prepared = rendered; self.expectedDigest = digest
-            self.preparedProfile = original; self.preparedPort = originalPort; self.preparedOMPChanges = changes
-            self.summary = rendered["summary"].string ?? ""; self.aliases = []
+            let binding = try await model.remoteCall("omp.bind")
+            guard binding["running"].bool == true,
+                  let local = binding["base_url"].string,
+                  let port = URLComponents(string: local)?.port,
+                  let key = binding["key"].string else { throw AppError.message("无法取得本机 OMP 接入信息，请检查网关。") }
+            let baseURL = try original.ompBaseURL(port: port)
+            fields["base_url"] = .string(baseURL)
+            fields["key"] = .string(key)
+            let client = SSHRemoteClient(profile: original)
+            if install {
+                let current = try await client.call("status")
+                guard current["omp_executable"].string != nil else { throw AppError.message("远端未找到 OMP，请先安装官方版 OMP。") }
+                _ = try await client.call("probe", fields: ["base_url": .string(baseURL), "key": .string(key)])
+                try await self.migrateLegacyOMP(client, model: model)
+            }
+            let result = try await client.call(install ? "install" : "configure", fields: fields, timeout: install ? 180 : 60)
+            guard self.profile == original else { throw AppError.message("远端操作已完成，但连接信息已变化，请重新读取状态。") }
+            self.ompStatus = result; self.ompStatusProfile = original
             try self.remember(original, in: model)
-        }
-    }
-    private func applyOMP(_ model: AppModel) {
-        guard canApply(model) else { error = "请先重新预览远端 OMP 配置。"; return }
-        let original = profile; let rendered = prepared; let digest = expectedDigest; let originalPort = port
-        perform("正在验证聊天客户端入口并备份远端 OMP 配置…") {
-            let connection = try await model.remoteCall("chatbot.status")
-            self.status = connection
-            guard self.profile == original, self.running, self.port == originalPort else {
-                throw AppError.message("设置或聊天客户端端口已变化，请重新预览。")
+            self.status = try await model.remoteCall("chatbot.status")
+            if self.status["port"].number != Double(port) {
+                self.notice = "远端操作已完成，但本机端口已变化，请更新连接地址。"
+            } else if result["environment_override"].bool == true {
+                self.notice = "连接已保存；远端仍有旧的 CODEXPRESS_BASE_URL 环境覆盖，请移除后启动 OMP。"
+            } else {
+                self.notice = install ? "远端扩展已安装并绑定。重启远端 OMP，在 /model 中选择 Codexpress 模型。" : "远端连接地址已更新，已有会话将在下一轮使用新地址。"
             }
-            let result = try await SSHRemoteClient(profile: original).call("apply", fields: [
-                "base_url": rendered["base_url"], "key": rendered["key"], "files": rendered["files"],
-                "snapshot": rendered["snapshot"], "expected_digest": .string(digest)
-            ])
-            var saved = original; saved.ompAgentDirectory = result["agent_dir"].string ?? original.directory
-            saved.backupID = result["backup_id"].string
-            try self.remember(saved, in: model); if self.profile == original { self.profile = saved }
-            self.prepared = .null
-            self.clearOMPConfiguration()
-            self.notice = "已备份并应用远端 OMP 配置。使用聊天客户端共享 Key（不是每台机器独立的 Key），请重启远端 OMP。"
         }
     }
-    private func restoreOMP(_ model: AppModel) {
-        let original = profile
-        perform("正在还原远端 OMP 接入设置…") {
-            guard self.canRestore else { throw AppError.message("请先填写 SSH 连接和远端 OMP 目录。") }
-            let bundle = try await SSHRemoteClient(profile: original).call("read")
-            let rendered = try await self.renderOMP("omp.remote.restore", original: original, bundle: bundle, model: model)
-            guard self.profile == original else { throw AppError.message("设置已变化，请重新还原。") }
-            let result = try await SSHRemoteClient(profile: original).call("restore", fields: [
-                "files": rendered["files"], "snapshot": rendered["snapshot"], "expected_digest": bundle["digest"]
-            ])
-            var saved = original; saved.ompAgentDirectory = result["agent_dir"].string ?? original.directory
-            saved.backupID = result["backup_id"].string
-            try self.remember(saved, in: model); if self.profile == original { self.profile = saved }
-            self.prepared = .null; self.summary = ""
-            self.clearOMPConfiguration()
-            self.notice = "已撤回远端 OMP 的 Codexpress 接入设置，保留无关修改；还原前配置已另行备份，请重启远端 OMP。"
-        }
+    private func migrateLegacyOMP(_ client: SSHRemoteClient, model: AppModel) async throws {
+        let previous = try await client.call("read")
+        guard previous["snapshot"] != .null else { return }
+        let restored = try await model.remoteCall("omp.remote.restore", .object([
+            "agent_dir": previous["agent_dir"], "files": previous["files"],
+            "snapshot": previous["snapshot"], "agent_db_exists": previous["agent_db_exists"]
+        ]))
+        _ = try await client.call("restore", fields: [
+            "files": restored["files"], "snapshot": restored["snapshot"], "expected_digest": previous["digest"]
+        ])
     }
 }

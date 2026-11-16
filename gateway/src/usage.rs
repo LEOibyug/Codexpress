@@ -1,6 +1,7 @@
 mod analytics;
 pub(crate) mod billing;
 pub mod diagnostics;
+mod grouping;
 mod requests;
 mod settlement;
 mod summary;
@@ -42,10 +43,60 @@ pub struct ReportedCost {
     pub record_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Ingress {
+    Native,
+    Ssh,
+    Omp,
+    Chatbot,
+    Image,
+    #[default]
+    Unknown,
+}
+
+impl Ingress {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Ssh => "ssh",
+            Self::Omp => "omp",
+            Self::Chatbot => "chatbot",
+            Self::Image => "image",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "native" => Some(Self::Native),
+            "ssh" => Some(Self::Ssh),
+            "omp" => Some(Self::Omp),
+            "chatbot" => Some(Self::Chatbot),
+            "image" => Some(Self::Image),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_extensions(extensions: &http::Extensions) -> Self {
+        if extensions.get::<crate::omp_ingress::OmpIngress>().is_some() {
+            Self::Omp
+        } else if extensions.get::<crate::chatbot::ChatbotIngress>().is_some() {
+            Self::Chatbot
+        } else if extensions.get::<crate::remote::RemoteIngress>().is_some() {
+            Self::Ssh
+        } else {
+            Self::Native
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct UsageRecord {
     pub attempt_id: String,
     pub request_id: String,
+    pub ingress: Ingress,
     pub source_id: String,
     pub source_name: String,
     pub model: String,
@@ -182,7 +233,7 @@ impl UsageStore {
             .map_err(|_| anyhow::anyhow!("用量数据库不可用"))?;
         let number = |v: u64| v.min(i64::MAX as u64) as i64;
         // One lock prevents a poll from seeing both the active and persisted attempt.
-        // Only fixed numeric metadata enters SQLite; no bodies or headers.
+        // Only bounded attempt metadata enters SQLite; no bodies or headers.
         let cached = if record.token_details.input_estimated {
             record.cached_input_tokens
         } else {
@@ -192,7 +243,7 @@ impl UsageStore {
         value["cached_input_tokens"] = json!(cached);
         let cost = crate::pricing::estimate(&value, false);
         let billing_identity = data.settlements.finish(&record);
-        let metadata = json!({"attempt_id":record.attempt_id,"token_details":record.token_details,
+        let metadata = json!({"attempt_id":record.attempt_id,"ingress":record.ingress,"token_details":record.token_details,
             "first_token_latency_ms":record.first_token_latency_ms,"generation_ms":record.generation_ms,
             "billing_identity":billing_identity,"cost":cost}).to_string();
         let result = data.connection.execute("INSERT INTO usage (request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)", params![record.request_id,record.source_id,record.source_name,record.model,number(record.started_at),record.status,number(record.input_tokens),number(record.output_tokens),number(cached),record.complete,number(record.latency_ms),metadata]);
@@ -362,6 +413,227 @@ mod tests {
         assert!(record["generation_tps"].as_f64().unwrap() > 1000.0);
     }
     #[test]
+    fn ingress_survives_active_updates_completion_and_reopen_without_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.sqlite");
+        let now = crate::model::now();
+        let query = json!({"from":now-1,"to":now+86400,"ingress":"omp"});
+        {
+            let store = UsageStore::open(&path).unwrap();
+            for status in ["success", "failed", "interrupted"] {
+                let mut record = requests::tests::record(status, now);
+                record.ingress = Ingress::Omp;
+                record.status = "connecting".into();
+                store.start(&record);
+                assert_eq!(store.requests(&query).unwrap()["records"][0]["ingress"], "omp");
+                record.status = "streaming".into();
+                store.update(&record);
+                let detail = store.detail(&json!({"attempt_id":status,"record_only":true})).unwrap();
+                assert_eq!(detail["record"]["ingress"], "omp");
+                assert_eq!(detail["record"]["status"], "streaming");
+                record.status = status.into();
+                record.complete = status == "success";
+                store.record(record).unwrap();
+            }
+        }
+        let store = UsageStore::open(&path).unwrap();
+        let records = store.requests(&query).unwrap();
+        assert_eq!(records["total"], 3);
+        assert!(store.summary(1).unwrap()["recent"].as_array().unwrap().iter().all(|r| r["ingress"] == "omp"));
+        for status in ["success", "failed", "interrupted"] {
+            for record_only in [false, true] {
+                let detail = store.detail(&json!({"attempt_id":status,"record_only":record_only})).unwrap();
+                assert_eq!(detail["record"]["ingress"], "omp");
+                assert_eq!(detail["record"]["status"], status);
+                assert!(detail["diagnostic"].is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn named_supplier_statistics_merge_without_merging_attempts_or_settlement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = UsageStore::open(&dir.path().join("usage.sqlite")).unwrap();
+        let now = crate::model::now();
+        let source = |id: &str| crate::model::Source {
+            id: id.into(),
+            name: "Shared supplier".into(),
+            kind: "api".into(),
+            is_subscription: false,
+            base_url: format!("https://{id}.example.invalid"),
+            enabled: true,
+            priority: 0,
+            max_active_conversations: None,
+            active_conversation_window_seconds: 15,
+            proxy: crate::model::ProxyPolicy { mode: "direct".into(), url: None },
+            models: Vec::new(),
+            account_id: None,
+            secret: Value::Null,
+        };
+        let a_source = source("a");
+        let mut b_source = source("b");
+        b_source.name.push(' ');
+        let mut c_source = source("c");
+        c_source.name = format!("\u{a0}{}\t", c_source.name);
+        let mut a = requests::tests::record("actual-a", now);
+        a.source_name = a_source.name.clone();
+        a.token_details.source_kind = Some("api".into());
+        a.token_details.reasoning_output_tokens = Some(2);
+        a.token_details.upstream_cost = Some(ReportedCost {
+            usd: 1.25,
+            method: "fixture-ledger".into(),
+            record_id: Some("actual-a".into()),
+        });
+        store.start_for_source(&a, &a_source);
+        store.record(a.clone()).unwrap();
+        let mut b = UsageRecord {
+            attempt_id: "estimated-b".into(),
+            source_id: "b".into(),
+            source_name: b_source.name.clone(),
+            input_tokens: 200,
+            output_tokens: 30,
+            cached_input_tokens: 50,
+            latency_ms: 400,
+            first_token_latency_ms: Some(30),
+            generation_ms: Some(200),
+            ..a.clone()
+        };
+        b.token_details.upstream_cost = None;
+        b.token_details.input_estimated = true;
+        b.token_details.reasoning_output_tokens = Some(3);
+        store.start_for_source(&b, &b_source);
+        store.record(b.clone()).unwrap();
+        let mut unknown = UsageRecord {
+            attempt_id: "unknown-b".into(),
+            model: "unknown-supplier-model".into(),
+            input_tokens: 40,
+            output_tokens: 4,
+            cached_input_tokens: 0,
+            latency_ms: 700,
+            first_token_latency_ms: None,
+            generation_ms: None,
+            ..b.clone()
+        };
+        unknown.token_details.input_estimated = false;
+        unknown.token_details.cached_input_reported = false;
+        unknown.token_details.reasoning_output_tokens = None;
+        store.start_for_source(&unknown, &b_source);
+        store.record(unknown.clone()).unwrap();
+        let mut live = UsageRecord {
+            attempt_id: "active-c".into(),
+            source_id: "c".into(),
+            source_name: c_source.name.clone(),
+            input_tokens: 7,
+            output_tokens: 3,
+            status: "streaming".into(),
+            complete: false,
+            ..unknown
+        };
+        live.token_details.input_estimated = true;
+        store.start_for_source(&live, &c_source);
+
+        let summary = store.summary(1).unwrap();
+        assert_eq!(summary["rows"].as_array().unwrap().len(), 1);
+        let supplier = &summary["rows"][0];
+        assert_eq!(supplier["source_name"], "Shared supplier");
+        assert!(supplier["source_id"].is_null());
+        assert_eq!(supplier["source_ids"], json!(["a", "b", "c"]));
+        assert_eq!(supplier["requests"], 4);
+        assert_eq!(supplier["active_requests"], 1);
+        assert_eq!(supplier["timed_output_tokens"], 40);
+        assert_eq!(supplier["total_generation_ms"], 250);
+        assert_eq!(supplier["throughput_output_tokens"], 44);
+        assert_eq!(supplier["throughput_latency_ms"], 1200);
+        assert_eq!(supplier["total_first_token_ms"], 40);
+        assert_eq!(supplier["first_token_samples"], 2);
+        assert_eq!(supplier["cached_reported_input_tokens"], 100);
+        assert_eq!(supplier["cached_reported_tokens"], 20);
+        assert_eq!(supplier["estimated_requests"], 2);
+        assert_eq!(supplier["reasoning_output_tokens"], 5);
+        assert_eq!(summary["groups"].as_array().unwrap().len(), 2);
+        let payload = json!({"from":now-1,"to":now+86_399,"day_starts":[now-1,now+86_399]});
+        let analytics = store.analytics(&payload).unwrap();
+        assert_eq!(analytics["groups"].as_array().unwrap().len(), 2);
+        for output in [&summary, &analytics] {
+            let groups = output["groups"].as_array().unwrap();
+            let known = groups.iter().find(|row| row["model"] == a.model).unwrap();
+            assert_eq!(known["source_ids"], json!(["a", "b"]));
+            assert!(known["source_id"].is_null());
+            assert_eq!(known["requests"], 2);
+            assert_eq!(known["priced_requests"], 2);
+            assert_eq!(known["upstream_priced_requests"], 1);
+            assert_eq!(known["estimated_cost_requests"], 1);
+            assert_eq!(known["timed_output_tokens"], 40);
+            assert_eq!(known["total_generation_ms"], 250);
+            let unknown = groups.iter().find(|row| row["model"] == live.model).unwrap();
+            assert_eq!(unknown["source_ids"], json!(["b", "c"]));
+            assert_eq!(unknown["requests"], 2);
+            assert_eq!(unknown["unpriced_requests"], 2);
+            assert_eq!(unknown["priced_requests"], 0);
+            assert!(unknown["total_usd"].is_null());
+            assert!(unknown["reasoning_output_tokens"].is_null());
+        }
+        assert_eq!(analytics["options"]["sources"].as_array().unwrap().len(), 3);
+        let mut filtered_payload = payload.clone();
+        filtered_payload["source_id"] = json!("a");
+        let filtered = store.analytics(&filtered_payload).unwrap();
+        assert_eq!(filtered["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["groups"][0]["source_id"], "a");
+        assert_eq!(filtered["groups"][0]["source_ids"], json!(["a"]));
+        assert_eq!(filtered["groups"][0]["requests"], 1);
+        assert_eq!(filtered["groups"][0]["total_usd"], 1.25);
+        assert_eq!(filtered["options"], analytics["options"]);
+        let selected = store.summary_for(1, Some("a")).unwrap();
+        assert_eq!(summary["recent"].as_array().unwrap().len(), 4);
+        assert_eq!(selected["rows"], summary["rows"]);
+        assert_eq!(selected["recent"].as_array().unwrap().len(), 1);
+        let attempt = &selected["recent"][0];
+        assert_eq!(attempt["attempt_id"], "actual-a");
+        assert_eq!(attempt["source_id"], "a");
+        assert!(attempt.get("source_ids").is_none());
+        assert_eq!(attempt["cost"]["total_usd"], 1.25);
+        assert_eq!(attempt["cost"]["upstream_record_id"], "actual-a");
+        let requests = store.requests(&json!({"from":now-1,"to":now+1,"source_id":"a"})).unwrap();
+        assert_eq!(requests["total"], 1);
+        assert_eq!(requests["records"][0]["source_id"], "a");
+        assert_eq!(requests["records"][0]["cost"], attempt["cost"]);
+        let all_requests = store.requests(&json!({"from":now-1,"to":now+1})).unwrap();
+        assert_eq!(all_requests["total"], 4);
+        assert_eq!(all_requests["active_count"], 1);
+        for record in all_requests["records"].as_array().unwrap() {
+            assert!(matches!(record["source_id"].as_str(), Some("a" | "b" | "c")));
+            assert!(record.get("source_ids").is_none());
+        }
+        assert_eq!(store.active_by_source().get("c"), Some(&1));
+        for index in 0..49 {
+            let next = UsageRecord { attempt_id: format!("settlement-a-{index}"), ..a.clone() };
+            store.start_for_source(&next, &a_source);
+            store.record(next).unwrap();
+        }
+        assert!(store.billing_claim(&a_source, false));
+        assert!(!store.billing_claim(&b_source, false));
+        assert!(!store.billing_claim(&c_source, false));
+        for (id, name) in [
+            ("unnamed-a", ""),
+            ("unnamed-b", "\u{a0} \t"),
+            ("case", "shared supplier"),
+        ] {
+            store.record(UsageRecord {
+                attempt_id: id.into(),
+                source_id: id.into(),
+                source_name: name.into(),
+                ..a.clone()
+            }).unwrap();
+        }
+        let distinct = store.summary(1).unwrap();
+        assert_eq!(distinct["rows"].as_array().unwrap().len(), 4);
+        for id in ["unnamed-a", "unnamed-b", "case"] {
+            let row = distinct["rows"].as_array().unwrap().iter().find(|row| row["source_id"] == id).unwrap();
+            assert_eq!(row["source_ids"], json!([id]));
+            assert_eq!(row["requests"], 1);
+        }
+    }
+    #[test]
     fn costs_group_all_requests_by_source_and_model_and_snapshot_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("usage.sqlite");
@@ -369,6 +641,7 @@ mod tests {
         let base = UsageRecord {
             attempt_id: "priced".into(),
             request_id: "r".into(),
+            ingress: Ingress::Native,
             source_id: "a".into(),
             source_name: "A".into(),
             model: "gpt-6.1-sol".into(),
@@ -526,6 +799,7 @@ mod tests {
             let first = UsageRecord {
                 attempt_id: "first".into(),
                 request_id: "same-request".into(),
+                ingress: Ingress::Native,
                 source_id: "removed-source".into(),
                 source_name: "旧名称".into(),
                 model: "m".into(),
@@ -580,6 +854,7 @@ mod tests {
         let record = UsageRecord {
             attempt_id: "new-b".into(),
             request_id: "r-b".into(),
+            ingress: Ingress::Native,
             source_id: "b".into(),
             source_name: "Provider B".into(),
             model: "fixture".into(),

@@ -19,16 +19,16 @@ struct OfficialAccountView: View {
                 }
                 Spacer(minLength: 0)
                 Button(live["account_id"].string == nil ? "登录…" : "重新登录…") { model.login(source) }
-                    .disabled(model.busy || model.loginFlow != nil)
+                    .disabled(!model.running || model.busy || model.metadataLoadFailed || model.loginFlow != nil)
                 Button { model.refresh(source.id) } label: {
                     Label(model.refreshingQuotas.contains(source.id) ? "刷新中…" : "刷新额度", systemImage: "arrow.clockwise")
-                }.disabled(model.busy || model.refreshingQuotas.contains(source.id))
+                }.disabled(!model.running || source.account_id == nil || model.refreshingQuotas.contains(source.id))
             }.controlSize(.small)
             if live["account_id"].string == nil && quota["windows"].array.isEmpty {
                 Text("登录后查看额度").font(.system(size: 11)).foregroundStyle(.secondary)
             } else if !extraWindows.isEmpty {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 24)], spacing: 14) {
-                    ForEach(extraWindows) { window in quotaWindow(window) }
+                    ForEach(extraWindows) { window in quotaWindow(window, referenceBelow: overview.hasShortWindow) }
                 }
             }
             if quota != .null {
@@ -39,11 +39,11 @@ struct OfficialAccountView: View {
             if model.loginSource == source.id {
                 VStack(alignment: .leading, spacing: 10) {
                     Divider()
-                    Text(model.loginMessage ?? "等待浏览器授权…").font(.system(size: 13, weight: .medium))
-                    SecureField("完整回调地址", text: $model.callbackURL).settingsField()
+                    Text(model.loginMessage ?? "等待浏览器授权…").font(.system(size: 13, weight: .medium)).textSelection(.enabled)
+                    SecureField("完整回调地址", text: $model.callbackURL).settingsField().disabled(model.busy || model.loginFlow == nil)
                     HStack {
                         Button("完成登录") { model.completeLogin() }.buttonStyle(.borderedProminent)
-                            .disabled(model.callbackURL.isEmpty || model.busy || model.loginFlow == nil)
+                            .disabled(model.callbackURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.busy || model.loginFlow == nil || !model.running)
                         Button("取消登录") { model.cancelLogin() }.disabled(model.busy)
                     }.controlSize(.small)
                 }.padding(.top, 2)
@@ -51,15 +51,17 @@ struct OfficialAccountView: View {
         }
     }
 
-    private func quotaWindow(_ window: QuotaWindow) -> some View {
+    private func quotaWindow(_ window: QuotaWindow, referenceBelow: Bool) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             Text(window.title).font(.system(size: 12)).foregroundStyle(.secondary)
             HStack(alignment: .firstTextBaseline, spacing: 5) {
                 Text(window.remainingLabel).font(AccountTypography.value).monospacedDigit()
                     .foregroundStyle(AccountLevel.quota(window.remaining).color)
                 Text("剩余").font(.system(size: 11)).foregroundStyle(.secondary)
+                if !referenceBelow { QuotaReferenceLabel(window: window) }
                 Spacer(minLength: 0)
             }
+            if referenceBelow { QuotaReferenceLabel(window: window) }
             if let remaining = window.remaining {
                 ProgressView(value: remaining, total: 100).tint(AccountLevel.quota(remaining).color).controlSize(.small)
             }
@@ -101,7 +103,7 @@ struct OfficialResetControl: View {
                 }
             }
         }.controlSize(.small).fixedSize(horizontal: true, vertical: false)
-            .disabled(!model.running || model.busy || model.metadataLoadFailed || source.account_id == nil)
+            .disabled(!model.running || source.account_id == nil)
     }
 
     private func resetButton(quick: Bool) -> some View {

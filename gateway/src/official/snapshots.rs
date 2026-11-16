@@ -1,5 +1,5 @@
 //! Official quota and reset-credit snapshots, including recovery and low-quota retention.
-use super::{account, json_response, lock, same_binding, token, Endpoints, REQUEST_TIMEOUT};
+use super::{account, json_response, lock, query_key, refresh_bound_inner, same_account_binding, same_binding, token, Endpoints, REQUEST_TIMEOUT};
 use crate::{
     model::{now, AppState, Source},
     transport,
@@ -254,9 +254,11 @@ pub(super) async fn refresh_selected_snapshots(
     let sources = state.sources.read().await;
     let runtime = sources
         .iter()
-        .find(|r| same_binding(&r.source, src))
+        .find(|r| same_account_binding(&r.source, src))
         .ok_or_else(|| anyhow!("来源在查询期间发生变化，请刷新"))?;
-    Ok(json!({"quota":runtime.quota,"credits":runtime.credits}))
+    let mut result = json!({"quota":runtime.quota,"credits":runtime.credits});
+    super::update_quota_reference(&mut result["quota"], now());
+    Ok(result)
 }
 
 async fn refresh_quota(
@@ -264,7 +266,7 @@ async fn refresh_quota(
     src: &Source,
     endpoints: Endpoints<'_>,
 ) -> Result<()> {
-    let mutex = lock(state, format!("quota:{}", src.identity())).await;
+    let mutex = lock(state, query_key("quota-lock", src)).await;
     let _guard = match mutex.try_lock() {
         Ok(guard) => guard,
         Err(_) => {
@@ -272,13 +274,22 @@ async fn refresh_quota(
             // state. Another source entry for this account needs no second GET.
             let _guard = mutex.lock().await;
             let sources = state.sources.read().await;
-            if !sources.iter().any(|r| same_binding(&r.source, src)) {
+            if !sources.iter().any(|r| same_account_binding(&r.source, src)) {
                 bail!("来源在查询期间发生变化，请刷新");
             }
             return Ok(());
         }
     };
-    let threshold = state.settings.read().await.official_low_quota_percent;
+    let access = refresh_bound_inner(state, src, false, endpoints).await;
+    if access.as_ref().is_ok_and(|current| !same_account_binding(current, src)) {
+        bail!("来源在查询期间发生变化，请刷新");
+    }
+    let refreshed = access.as_ref().unwrap_or(src);
+    let src = refreshed;
+    let (threshold, auto_enabled) = {
+        let settings = state.settings.read().await;
+        (settings.official_low_quota_percent, settings.auto_reset_weekly_quota)
+    };
     let sources = state.sources.read().await;
     let account_revisions: std::collections::HashMap<_, _> = sources
         .iter()
@@ -292,9 +303,13 @@ async fn refresh_quota(
         })
         .map(|r| r.health_revision);
     drop(sources);
-    let quota = get(src, endpoints.usage)
-        .await
-        .and_then(|v| quota_snapshot(&v));
+    let quota = match &access {
+        Ok(_) => get(src, endpoints.usage).await.and_then(|v| quota_snapshot(&v)),
+        Err(error) => Err(anyhow!(error.to_string())),
+    };
+    let query_error = quota.as_ref().err().map(ToString::to_string);
+    let event_mutex = super::auto_reset::event_lock(state, src).await;
+    let _event_guard = event_mutex.lock().await;
     let mut sources = state.sources.write().await;
     let may_confirm_recovery = sources
         .iter()
@@ -305,6 +320,11 @@ async fn refresh_quota(
         .find(|r| same_binding(&r.source, src))
         .map(|r| crate::routing::account_quota_snapshot(r, &sources))
         .ok_or_else(|| anyhow!("来源在查询期间发生变化，请刷新"))?;
+    let failure_count = if quota.is_err() {
+        previous_quota["failure_count"].as_u64().unwrap_or(0).saturating_add(1)
+    } else {
+        0
+    };
     let runtime = sources
         .iter_mut()
         .find(|r| same_binding(&r.source, src))
@@ -332,6 +352,8 @@ async fn refresh_quota(
         ),
         Err(e) => stale(previous_quota, "quota", &e.to_string()),
     };
+    runtime.quota["failure_count"] = json!(failure_count);
+    runtime.quota["next_retry_at"] = Value::Null;
     if crate::routing::remaining(runtime).is_some_and(|v| v <= 0.0) {
         if !runtime.quota_exhausted {
             runtime.health_revision = runtime.health_revision.wrapping_add(1);
@@ -368,7 +390,17 @@ async fn refresh_quota(
             }
         }
     }
+    if let Some(error) = query_error {
+        for runtime in sources.iter_mut().filter(|r| {
+            r.source.identity() == src.identity() && r.source.proxy == src.proxy
+        }) {
+            runtime.quota = stale(runtime.quota.clone(), "quota", &error);
+            runtime.quota["failure_count"] = json!(failure_count);
+            runtime.quota["next_retry_at"] = Value::Null;
+        }
+    }
     crate::routing::notify_quotas(state, &sources);
+    let _ = super::auto_reset::observe_snapshot(state, src, &confirmed_quota, auto_enabled);
     Ok(())
 }
 
@@ -377,45 +409,54 @@ async fn refresh_credits(
     src: &Source,
     endpoints: Endpoints<'_>,
 ) -> Result<()> {
-    let mutex = lock(state, format!("credits-query:{}", src.identity())).await;
+    let mutex = lock(state, query_key("credits-query-lock", src)).await;
     let _guard = match mutex.try_lock() {
         Ok(guard) => guard,
         Err(_) => {
             let _guard = mutex.lock().await;
             let sources = state.sources.read().await;
-            if !sources.iter().any(|r| same_binding(&r.source, src)) {
+            if !sources.iter().any(|r| same_account_binding(&r.source, src)) {
                 bail!("来源在查询期间发生变化，请刷新");
             }
             return Ok(());
         }
     };
+    let access = refresh_bound_inner(state, src, false, endpoints).await;
+    if access.as_ref().is_ok_and(|current| !same_account_binding(current, src)) {
+        bail!("来源在查询期间发生变化，请刷新");
+    }
+    let refreshed = access.as_ref().unwrap_or(src);
+    let src = refreshed;
     // Reset preflight/submission uses the inventory lock too, but it does not
     // count as a completed query that concurrent refresh callers can reuse.
     let inventory_mutex = lock(state, format!("credits:{}", src.identity())).await;
     let _inventory_guard = inventory_mutex.lock().await;
-    let credits = get(src, endpoints.credits)
-        .await
-        .and_then(|v| credits_snapshot(&v));
+    let credits = match &access {
+        Ok(_) => get(src, endpoints.credits).await.and_then(|v| credits_snapshot(&v)),
+        Err(error) => Err(anyhow!(error.to_string())),
+    };
     let mut sources = state.sources.write().await;
     if !sources.iter().any(|r| same_binding(&r.source, src)) {
         bail!("来源在查询期间发生变化，请刷新");
     }
     // Inventory belongs to the account. Serializing its query and publication
     // prevents an older response from replacing the inventory after a reset.
-    match credits {
-        Ok(value) => {
-            for runtime in sources
-                .iter_mut()
-                .filter(|r| r.source.kind == "official" && r.source.identity() == src.identity())
-            {
-                runtime.credits = value.clone();
-            }
-        }
-        Err(error) => {
-            if let Some(runtime) = sources.iter_mut().find(|r| same_binding(&r.source, src)) {
-                runtime.credits = stale(runtime.credits.clone(), "credits", &error.to_string());
-            }
-        }
+    let previous = sources.iter().find(|r| same_binding(&r.source, src)).unwrap().credits.clone();
+    let failure_count = if credits.is_err() {
+        previous["failure_count"].as_u64().unwrap_or(0).saturating_add(1)
+    } else {
+        0
+    };
+    let mut value = match credits {
+        Ok(value) => value,
+        Err(error) => stale(previous, "credits", &error.to_string()),
+    };
+    value["failure_count"] = json!(failure_count);
+    value["next_retry_at"] = Value::Null;
+    for runtime in sources.iter_mut().filter(|r| {
+        r.source.kind == "official" && r.source.identity() == src.identity() && r.source.proxy == src.proxy
+    }) {
+        runtime.credits = value.clone();
     }
     Ok(())
 }

@@ -39,7 +39,7 @@ struct ResetCreditsSheet: View {
             }
             Divider()
             if request.managementRequestID != nil {
-                InfoNote(text: "来自管理 API 的请求。只有点击“确认使用”才会消耗重置卡。", symbol: "hand.raised", color: .secondary)
+                InfoNote(text: "管理 API 请求使用此账号的重置卡。", symbol: "hand.raised", color: .secondary)
             }
             if let source {
                 if let confirmation { confirmationContent(confirmation) }
@@ -63,7 +63,7 @@ struct ResetCreditsSheet: View {
                             if request.managementRequestID != nil { submitted = true; dismiss() }
                         }
                     }.buttonStyle(.borderedProminent)
-                        .disabled(source == nil || !model.canSubmitCredit(for: confirmation.source, creditID: confirmation.credit["id"].string ?? ""))
+                        .disabled(source == nil || !model.running || model.busy || model.metadataLoadFailed || !model.canSubmitCredit(for: confirmation.source, creditID: confirmation.credit["id"].string ?? ""))
                 }
             }
         }.font(AppTypography.body).padding(24).frame(width: 560)
@@ -129,11 +129,20 @@ struct ResetCreditsSheet: View {
     }
 
     private func confirmationContent(_ item: CreditConfirmation) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let overview = QuotaOverview(item.quota)
+        return VStack(alignment: .leading, spacing: 14) {
             LabeledContent("卡片", value: item.credit["title"].string ?? "重置卡")
             LabeledContent("到期时间", value: timestampLabel(item.credit["expires_at"]))
-            ForEach(QuotaOverview(item.quota).mainWindows) { window in
-                LabeledContent(window.title, value: "剩余 \(window.remainingLabel)")
+            ForEach(overview.mainWindows) { window in
+                LabeledContent(window.title) {
+                    VStack(alignment: .trailing, spacing: 3) {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text("剩余 \(window.remainingLabel)")
+                            if !overview.hasShortWindow { QuotaReferenceLabel(window: window) }
+                        }
+                        if overview.hasShortWindow { QuotaReferenceLabel(window: window) }
+                    }
+                }
             }
             Text("将消耗 1 张重置卡。").foregroundStyle(.secondary).padding(.top, 4)
         }
@@ -166,7 +175,7 @@ struct ResetCreditsSheet: View {
     }
 
     private func prepare(_ credit: JSONValue, source: Source) async {
-        refreshing = true; localError = nil
+        refreshing = true; localError = nil; quotaRecovered = false
         defer { refreshing = false }
         do {
             let prepared = try await model.prepareCredit(source: source, credit: credit)

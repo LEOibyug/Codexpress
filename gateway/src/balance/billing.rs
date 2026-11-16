@@ -74,9 +74,7 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
             .await
             .iter()
             .filter(|s| {
-                s.source.kind == "api"
-                    && requested.as_ref().is_none_or(|id| id == &s.source.id)
-                    && state.usage.billing_claim(&s.source, full)
+                s.source.kind == "api" && requested.as_ref().is_none_or(|id| id == &s.source.id)
             })
             .map(|s| s.source.clone())
             .collect();
@@ -91,6 +89,27 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
         progress(&state, 0, 0, 0);
         let (mut pages, mut updated, mut errors) = (0, 0, 0);
         for source in sources {
+            let cached = state
+                .balances
+                .entries
+                .lock()
+                .ok()
+                .and_then(|entries| entries.get(&source.id).cloned());
+            if let Some(entry) = cached {
+                let saved = entry.lock().await;
+                if saved.identity == source.identity()
+                    && saved.proxy.as_ref() == Some(&source.proxy)
+                    && saved.billing_failures > 0
+                    && saved.billing_attempted.is_some_and(|at| {
+                        at.elapsed() < Duration::from_secs(super::failure_delay(saved.billing_failures))
+                    })
+                {
+                    continue;
+                }
+            }
+            if !state.usage.billing_claim(&source, full) {
+                continue;
+            }
             let recognized = state
                 .balances
                 .entries
@@ -141,6 +160,7 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
             let Ok(probe) = Probe::new(&source) else {
                 continue;
             };
+            let errors_before = errors;
             let mut cursor = None;
             let mut cursors = HashSet::new();
             let mut matches: HashMap<i64, Option<ChargeMatch>> = HashMap::new();
@@ -254,6 +274,16 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
                     }
                 }
             }
+            let mut saved = entry.lock().await;
+            if saved.identity == source.identity() && saved.proxy.as_ref() == Some(&source.proxy) {
+                saved.billing_attempted = Some(tokio::time::Instant::now());
+                saved.billing_failures = if errors > errors_before {
+                    saved.billing_failures.saturating_add(1)
+                } else {
+                    0
+                };
+            }
+            drop(saved);
             progress(&state, pages, updated, errors);
         }
         progress(&state, pages, updated, errors);

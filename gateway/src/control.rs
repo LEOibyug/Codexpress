@@ -229,6 +229,19 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
         "control.status" => state.control.status().await,
         "control.key" => state.control.key(),
         "control.configure" => configure(state, payload).await,
+        "control.refresh.balances" => jobs::start(state, "balances", payload).await,
+        "control.refresh.quotas" => jobs::start(state, "quotas", payload).await,
+        "control.operation" => {
+            safety::fields(&payload, &["id"])?;
+            let id = safety::optional_text(&payload, "id")?.context("缺少操作 id")?;
+            jobs::get(state, &id).await?.context("操作不存在")
+        }
+        "control.reset.request" => resets::enqueue(state, payload).await,
+        "control.reset.status" => {
+            safety::fields(&payload, &["id"])?;
+            let id = safety::optional_text(&payload, "id")?.context("缺少请求 id")?;
+            resets::get(state, &id)?.context("重置请求不存在")
+        }
         "control.reset.pending" => resets::pending(state).await,
         "control.reset.present" => resets::present(state, payload).await,
         "control.reset.cancel" => resets::cancel(state, payload).await,

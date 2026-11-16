@@ -92,7 +92,9 @@ struct UsageLogsView: View {
                     guard !Task.isCancelled else { break }
                     let incoming = result["records"].array.enumerated().map { UsageItem($0.element, index: $0.offset) }
                     if !loadingMore {
-                        let merged = usageMergeFirstPage(previous: records, incoming: incoming, previousCursor: nextCursor, incomingCursor: result["next_cursor"].number, preserving: loadedFilter == requested && loadedQuery == query && loadedPages > 1, capacity: loadedPages * 50)
+                        let preserving = loadedFilter == requested && loadedPages > 1
+                        let previous = preserving ? records.filter { (query.from..<query.to).contains($0.value["started_at"].number ?? 0) } : []
+                        let merged = usageMergeFirstPage(previous: previous, incoming: incoming, previousCursor: nextCursor, incomingCursor: result["next_cursor"].number, preserving: preserving, capacity: loadedPages * 50)
                         records = merged.records; nextCursor = merged.nextCursor
                         if !merged.preservedHistory { loadedPages = 1 }
                         loadedQuery = query
@@ -143,11 +145,11 @@ struct UsageLogsView: View {
     }
     private func loadMore() async {
         let requested = filter
-        guard let cursor = nextCursor, let query = requested.query, !loadingMore else { return }
+        guard let cursor = nextCursor, let query = loadedQuery, loadedFilter == requested, !loadingMore else { return }
         loadingMore = true; defer { loadingMore = false }
         do {
             let result = try await model.usageRequests(query, status: requested.status, search: requested.search, before: cursor)
-            guard requested == filter, requested.query == query, loadedQuery == query else { return }
+            guard requested == filter, loadedQuery == query else { return }
             let ids = Set(records.map(\.id))
             records += result["records"].array.enumerated().map { UsageItem($0.element, index: $0.offset) }.filter { !ids.contains($0.id) }
             loadedPages += 1

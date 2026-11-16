@@ -6,6 +6,9 @@ import ServiceManagement
 @MainActor final class AppModel: ObservableObject {
     static let shared = AppModel()
     @Published private(set) var settings = AppSettings()
+    @Published private(set) var configuredModelIDs: [String] = []
+    @Published private(set) var modelSettingsRevision = ModelSettingsRevision.empty
+    @Published private(set) var localModelSettingsSyncError: String?
     @Published private(set) var status: JSONValue = .null
     @Published private(set) var usage: JSONValue = .null
     @Published private(set) var usageRefreshing = false
@@ -42,8 +45,11 @@ import ServiceManagement
     let client: GatewayClient
     private var helper: Process?
     private var logPipe: Pipe?
+    private var logBuffer: GatewayLogBuffer?
     private var timerTask: Task<Void, Never>?
     private var accountTimerTask: Task<Void, Never>?
+    private var officialAccountTimerTask: Task<Void, Never>?
+    private var officialBackgroundStartedAt = Date()
     private var restarting = false
     private var restartCount = 0
     private var shuttingDown = false
@@ -69,6 +75,15 @@ import ServiceManagement
     var fixedName: String { sources.first { $0.id == fixedSourceID }?.name ?? "未选择" }
     var portNeedsRestart: Bool { status["port"].number.map { Int($0) != settings.port } ?? false }
     var connectionMode: String { status["connection_mode"].string ?? "unmanaged" }
+    var localModelSettingsNeedsSync: Bool {
+        localModelSettingsSyncError != nil || (connectionMode != "unmanaged" && (pendingSync || settings.localCodexAppliedModelSettingsRevision != modelSettingsRevision))
+    }
+    var localModelSettingsStatus: String {
+        if let failure = localModelSettingsSyncError { return "本地 Codex 模型设置待同步：\(failure)" }
+        if connectionMode == "unmanaged" { return "本地 Codex 未连接，请先完成接入。" }
+        if localModelSettingsNeedsSync { return "模型设置已变更，请手动同步到本地 Codex。" }
+        return "本地模型配置已更新；重新载入 Codex 或下次启动后新建会话生效。"
+    }
     var credentialStorageMode: String { credentialStorage["mode"].string ?? "keychain" }
     var canManageCredentials: Bool { helper?.isRunning == true && !metadataLoadFailed }
     var localCredentialFile: URL {
@@ -81,12 +96,17 @@ import ServiceManagement
         directory = stateDirectory ?? override.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Codexpress", isDirectory: true)
         metadata = MetadataStore(directory: directory)
         client = GatewayClient(socketPath: directory.appendingPathComponent("control.sock").path)
-        do { settings = try metadata.load() } catch { metadataLoadFailed = true; self.error = "来源文件无法读取，已进入只读保护。原文件未改动，请从备份修复后重新启动应用。" }
+        do {
+            let loaded = try metadata.load()
+            modelSettingsRevision = try ModelSettingsRevision.value(for: loaded)
+            settings = loaded
+        } catch { metadataLoadFailed = true; self.error = "来源文件无法读取，已进入只读保护。原文件未改动，请从备份修复后重新启动应用。" }
+        configuredModelIDs = Self.modelIDs(in: settings)
         do {
             balanceWarnings = try BalanceWarnings(directory: directory)
             if !metadataLoadFailed { try balanceWarnings?.retain(sources: settings.sources) }
         } catch { notice = "无法读取余额预警记录，余额预警暂不可用。"; balanceWarnings = nil }
-        // Merely display the path; reading/modifying it requires explicit preview/attach actions.
+        // Display only; model updates require an existing managed attachment.
         if settings.codexHome.isEmpty { settings.codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path }
         do {
             operations = try ResetOperationStore(directory: directory).load()
@@ -112,9 +132,11 @@ import ServiceManagement
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(1800)) } catch { break }
                 guard !Task.isCancelled, let self else { break }
-                await self.refreshAccountInfo(foreground: false)
+                await self.refreshAccountInfo(sourceIDs: self.sources.filter { !$0.official }.map(\.id), foreground: false)
             }
         }
+        officialBackgroundStartedAt = Date()
+        scheduleOfficialAccountRefresh()
     }
     func startHelper() async {
         guard !metadataLoadFailed else { return }
@@ -134,15 +156,16 @@ import ServiceManagement
                 let pipe = Pipe(); process.standardError = pipe; process.standardOutput = FileHandle.nullDevice
                 // Helper errors are bounded and protected; never append IPC payloads.
                 let logURL = directory.appendingPathComponent("gateway.log")
+                let buffer = GatewayLogBuffer(url: logURL)
+                logBuffer = buffer
                 pipe.fileHandleForReading.readabilityHandler = { handle in
                     let data = handle.availableData
-                    guard !data.isEmpty else { handle.readabilityHandler = nil; return }
-                    // The helper contract guarantees secret-free diagnostics; cap retention at 256 KiB.
-                    var previous = (try? Data(contentsOf: logURL)) ?? Data()
-                    previous.append(data)
-                    if previous.count > 262_144 { previous = previous.suffix(262_144) }
-                    let temp = logURL.deletingLastPathComponent().appendingPathComponent(".gateway-log-\(UUID().uuidString)")
-                    if FileManager.default.createFile(atPath: temp.path, contents: previous, attributes: [.posixPermissions: 0o600]) { _ = rename(temp.path, logURL.path) }
+                    guard !data.isEmpty else {
+                        handle.readabilityHandler = nil
+                        buffer.flush()
+                        return
+                    }
+                    buffer.append(data)
                 }
                 try process.run(); helper = process; logPipe = pipe
                 process.terminationHandler = { [weak self] _ in Task { @MainActor in await self?.helperStopped() } }
@@ -192,18 +215,43 @@ import ServiceManagement
         }
         return Int(count)
     }
-    func stop() { shuttingDown = true; timerTask?.cancel(); accountTimerTask?.cancel(); modelRefreshTask?.cancel(); controlResetPollTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
+    func stop() { shuttingDown = true; timerTask?.cancel(); accountTimerTask?.cancel(); officialAccountTimerTask?.cancel(); modelRefreshTask?.cancel(); controlResetPollTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil; logBuffer?.flush() }
     func retry() { restartCount = 0; Task { await startHelper() } }
     func requireWritableMetadata() throws {
         guard !metadataLoadFailed else { throw AppError.message("来源文件无法读取，已禁止保存。请先从备份修复 sources.json，再重新启动应用；原文件保持不变。") }
     }
     func persistSettings(_ next: AppSettings) throws {
         try requireWritableMetadata()
+        var next = next
+        if next.codexHome != settings.codexHome { next.localCodexAppliedModelSettingsRevision = nil }
+        let revision: String
+        if next.modelCompaction == settings.modelCompaction, next.modelPolicies == settings.modelPolicies {
+            revision = modelSettingsRevision
+        } else {
+            revision = try ModelSettingsRevision.value(for: next)
+        }
         try metadata.save(next)
-        for source in settings.sources where !next.sources.contains(where: { $0.id == source.id && $0.sameConfiguration(as: source) }) {
-            apiBalances[source.id] = nil
+        for source in settings.sources where !next.sources.contains(where: {
+            $0.id == source.id && $0.kind == source.kind && $0.base_url == source.base_url
+                && $0.proxy == source.proxy && $0.account_id == source.account_id
+        }) { apiBalances[source.id] = nil }
+        let nextIDs = Set(next.sources.map(\.id))
+        for source in settings.sources where !nextIDs.contains(source.id) {
+            lastModelRefresh[source.id] = nil
+            modelErrors[source.id] = nil
+        }
+        if next.codexHome != settings.codexHome { configurationBackups = [] }
+        if next.codexHome != settings.codexHome || revision != modelSettingsRevision { localModelSettingsSyncError = nil }
+        let officialIntervalChanged = next.officialQuotaRefreshInterval != settings.officialQuotaRefreshInterval
+        if next.sources.map(\.models) != settings.sources.map(\.models)
+            || next.sources.map(\.official) != settings.sources.map(\.official)
+            || next.modelPolicies?.map(\.model) != settings.modelPolicies?.map(\.model)
+            || next.modelCompaction?.map(\.model) != settings.modelCompaction?.map(\.model) {
+            configuredModelIDs = Self.modelIDs(in: next)
         }
         settings = next
+        modelSettingsRevision = revision
+        if officialIntervalChanged, timerTask != nil { scheduleOfficialAccountRefresh() }
         do { try balanceWarnings?.retain(sources: next.sources) }
         catch { notice = "无法更新余额预警记录，请检查应用数据目录的写入权限。" }
     }
@@ -309,7 +357,7 @@ import ServiceManagement
         }
         if next.sources != settings.sources { try persistSettings(next) }
         do {
-            try await mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true), "load_balance":.bool(settings.loadBalanceEnabled), "idle_return_minutes":.number(Double(settings.idleReturnDelay)), "upstream_attempts":.number(Double(settings.upstreamAttemptLimit)), "upstream_retry_delay_seconds":.number(Double(settings.upstreamRetryDelay))])))
+            try await mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "auto_reset_weekly_quota":.bool(settings.autoResetWeeklyQuotaEnabled), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true), "load_balance":.bool(settings.loadBalanceEnabled), "idle_return_minutes":.number(Double(settings.idleReturnDelay)), "upstream_attempts":.number(Double(settings.upstreamAttemptLimit)), "upstream_retry_delay_seconds":.number(Double(settings.upstreamRetryDelay)), "model_compaction":try JSONValue.from(settings.modelCompaction ?? []), "model_policies":try JSONValue.from(settings.modelPolicies ?? [])])))
             historyStatus = try await client.call("history.configure", historyPayload(settings.historyCacheSettings))
             try await updateStatus()
             pendingSync = false
@@ -343,6 +391,21 @@ import ServiceManagement
         if error == message { error = nil }
     }
     func accountPageOpened() { accountRefreshGeneration += 1 }
+    private func scheduleOfficialAccountRefresh() {
+        officialAccountTimerTask?.cancel()
+        officialAccountTimerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let delay = self?.officialBackgroundDelay() else { break }
+                do { try await Task.sleep(for: .seconds(delay)) } catch { break }
+                guard !Task.isCancelled, let self else { break }
+                await self.refreshAccountInfo(sourceIDs: self.sources.filter(\.official).map(\.id), foreground: false)
+            }
+        }
+    }
+    private func officialBackgroundDelay() -> TimeInterval {
+        officialRefreshSchedule.backgroundDelay(for: sources.filter { $0.enabled && $0.official }.map(\.id),
+            since: officialBackgroundStartedAt, interval: Double(settings.officialQuotaRefreshInterval) * 60)
+    }
     func refreshAccountInfo(sourceIDs: [String]? = nil, foreground: Bool = true) async {
         guard running, !busy, !Task.isCancelled else { return }
         let selected = sources.filter { $0.enabled && (sourceIDs?.contains($0.id) ?? true) }
@@ -356,18 +419,20 @@ import ServiceManagement
             }
         }
     }
-    func refreshAccount(_ id: String, foreground: Bool) async {
-        guard running, !busy, !Task.isCancelled, let before = settings.sources.first(where: { $0.id == id }), before.enabled else { return }
+    func refreshAccount(_ id: String, foreground: Bool, force: Bool = false) async {
+        guard running, !busy, !Task.isCancelled, let before = settings.sources.first(where: { $0.id == id }), before.enabled || foreground else { return }
         if before.official {
-            guard !refreshingQuotas.contains(id), officialRefreshSchedule.isDue(id, foreground: foreground), let secret = try? credentialSnapshot.load(id), secret["access_token"].string?.isEmpty == false else { return }
+            guard !refreshingQuotas.contains(id), officialRefreshSchedule.isDue(id, foreground: foreground, interval: Double(settings.officialQuotaRefreshInterval) * 60, since: officialBackgroundStartedAt), let secret = try? credentialSnapshot.load(id), secret["access_token"].string?.isEmpty == false else { return }
             try? await queryOfficial(id, includeCredits: officialRefreshSchedule.needsCredits(id))
         } else {
             guard !refreshingBalances.contains(id) else { return }
+            if !force, let cached = apiBalances[id], (cached["failure_count"].number ?? 0) > 0,
+               let retry = cached["next_retry_at"].number, retry > Date().timeIntervalSince1970 { return }
             let credential = try? credentialSnapshot.load(id)
             refreshingBalances.insert(id)
             defer { refreshingBalances.remove(id) }
             do {
-                let balance = try await client.call("balance.query", .object(["source_id": .string(id)]))
+                let balance = try await client.call("balance.query", .object(["source_id": .string(id), "force": .bool(force)]))
                 guard running, let current = settings.sources.first(where: { $0.id == id }), current.base_url == before.base_url, current.proxy == before.proxy,
                       (try? credentialSnapshot.load(id)) == credential else { return }
                 apiBalances[id] = balance
@@ -376,8 +441,10 @@ import ServiceManagement
                 guard settings.sources.contains(where: { $0.id == id && $0.base_url == before.base_url && $0.proxy == before.proxy }),
                       (try? credentialSnapshot.load(id)) == credential else { return }
                 if case .object(var cached) = apiBalances[id], cached["amount"]?.number != nil {
-                    cached["stale"] = .bool(true); apiBalances[id] = .object(cached)
-                } else { apiBalances[id] = .object(["status": .string("unavailable")]) }
+                    cached["stale"] = .bool(true)
+                    cached["error"] = .string(error.localizedDescription)
+                    apiBalances[id] = .object(cached)
+                } else { apiBalances[id] = .object(["status": .string("unavailable"), "error": .string(error.localizedDescription)]) }
             }
         }
     }
@@ -403,7 +470,11 @@ import ServiceManagement
         try await refreshCredentials()
         try await updateStatus()
         var source = source
+        let previous = settings.sources.first { $0.id == source.id }
         if source.official { source = source.preservingOfficialIdentity(current: settings.sources.first { $0.id == source.id }, live: state(source.id)) }
+        let connectionChanged = previous?.kind != source.kind || previous?.base_url != source.base_url
+            || previous?.proxy != source.proxy || previous?.account_id != source.account_id
+            || (!source.official && !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         try requireUniqueOfficialAccount(source)
         if !source.official, !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             _ = try await client.call("credentials.save_api", .object(["source_id": .string(source.id), "api_key": .string(apiKey.trimmingCharacters(in: .whitespacesAndNewlines))]))
@@ -414,10 +485,12 @@ import ServiceManagement
             else { var item = source; item.priority = next.sources.count; next.sources.append(item) }
             if next.fixed_source_id == source.id && !source.enabled { next.mode = "auto"; next.fixed_source_id = nil }
         }
-        if source.official { officialRefreshSchedule.reset(source.id) }
-        modelErrors[source.id] = nil
-        apiBalances[source.id] = nil
-        lastModelRefresh[source.id] = nil
+        if connectionChanged {
+            if source.official { officialRefreshSchedule.reset(source.id) }
+            modelErrors[source.id] = nil
+            apiBalances[source.id] = nil
+            lastModelRefresh[source.id] = nil
+        }
         scheduleModelRefresh()
         accountPageOpened()
     }
@@ -526,6 +599,11 @@ import ServiceManagement
             try await self.updateSettingsAndSync { $0.officialLowQuotaPercent = value }
         }
     }
+    func changeAutoResetWeeklyQuota(_ enabled: Bool) {
+        perform {
+            try await self.updateSettingsAndSync { $0.autoResetWeeklyQuota = enabled }
+        }
+    }
     func changeContextFallback(_ enabled: Bool) {
         perform {
             try await self.updateSettingsAndSync { $0.degradedContextFallback = enabled }
@@ -597,19 +675,32 @@ import ServiceManagement
     func savePreferences(port: Int, codexHome: String) {
         perform {
             guard (1024...65535).contains(port) else { throw AppError.message("端口须在 1024–65535 之间。") }
-            guard codexHome.hasPrefix("/") else { throw AppError.message("请填写 Codex 配置目录的绝对路径。") }
+            let home = (codexHome.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
+            guard home.hasPrefix("/") else { throw AppError.message("请填写 Codex 配置目录，可使用绝对路径或 ~/ 开头的路径。") }
             let changed = self.settings.port != port
             if changed, self.running {
                 let chatbot = try await self.client.call("chatbot.status")
                 guard chatbot["port"].number != Double(port) else { throw AppError.message("此端口已用于聊天客户端接入，请选择不同端口。") }
                 let images = try await self.client.call("images.status")
                 guard images["port"].number != Double(port) else { throw AppError.message("此端口已用于图片生成，请选择不同端口。") }
+                let control = try await self.client.call("control.status")
+                guard control["port"].number != Double(port) else { throw AppError.message("此端口已用于管理 API，请选择不同端口。") }
             }
-            if changed, FileManager.default.fileExists(atPath: self.directory.appendingPathComponent("config-attachment.json").path) { throw AppError.message("Codex 连接仍由本应用接管。请先预览并恢复接管前连接，再更改本地端口。") }
-            var next = self.settings; next.port = port; if next.codexHome != codexHome { next.legacyProviderOrigins = nil }; next.codexHome = codexHome
+            if changed, FileManager.default.fileExists(atPath: self.directory.appendingPathComponent("config-attachment.json").path) { throw AppError.message("请先在「接入 → Codex」恢复原连接，再更改网关端口。") }
+            var next = self.settings; next.port = port; if next.codexHome != home { next.legacyProviderOrigins = nil }; next.codexHome = home
             try self.persistSettings(next); self.preview = .null
-            if changed { self.notice = "端口已保存，重新启动应用后生效；随后请重新预览连接配置。" }
+            if changed { self.notice = "端口已保存，重新启动 Codexpress 后生效。" }
             else { self.notice = "设置已保存。" }
+        }
+    }
+    func saveOfficialQuotaRefresh(minutes: String) {
+        perform {
+            guard let value = Int(minutes.trimmingCharacters(in: .whitespacesAndNewlines)), value > 0 else {
+                throw AppError.message("官方额度后台查询间隔须为正整数分钟。")
+            }
+            var next = self.settings; next.officialQuotaRefreshMinutes = value
+            try self.persistSettings(next)
+            self.notice = "官方额度后台查询间隔已保存，立即生效。"
         }
     }
     private func historyPayload(_ settings: HistoryCacheSettings) -> JSONValue {
@@ -640,12 +731,72 @@ import ServiceManagement
         try persistSettings(next)
     }
     func requireCurrentPort() throws { try ConfigConnectionPolicy.requireCurrentPort(saved: settings.port, live: status["port"].number) }
-    func saveModelCompaction(_ rules: [ModelCompactionRule]) {
+    private static func modelIDs(in settings: AppSettings) -> [String] {
+        var ids = Set(settings.sources.flatMap(\.models))
+        ids.formUnion((settings.modelPolicies ?? []).map(\.model))
+        ids.formUnion((settings.modelCompaction ?? []).map(\.model))
+        if settings.sources.contains(where: \.official) { ids.insert("gpt-image-2") }
+        return ids.sorted()
+    }
+    func saveModelSettings(model id: String, policy: ModelPolicy?, compaction: ModelCompactionRule?) async throws {
+        guard !busy else { throw AppError.message("请等待当前操作完成后重试。") }
+        busy = true
+        defer { busy = false }
+        try requireWritableMetadata()
+        try ModelPolicy.validateModelID(id)
+        guard policy == nil || policy?.model == id, compaction == nil || compaction?.model == id else {
+            throw AppError.message("模型 ID 已变化，请重新编辑。")
+        }
+        var next = settings
+        var policies = next.modelPolicies ?? []
+        policies.removeAll { $0.model == id }
+        if let policy { policies.append(policy) }
+        var rules = next.modelCompaction ?? []
+        rules.removeAll { $0.model == id }
+        if let compaction { rules.append(compaction) }
+        try ModelPolicy.validate(policies)
+        try ModelCompactionRule.validate(rules)
+        next.modelPolicies = policies; next.modelCompaction = rules
+        try persistSettings(next)
+        preview = .null
+        pendingSync = true
+        do {
+            guard running else { throw AppError.message("网关尚未运行，请启动后重试模型同步。") }
+            try await sync()
+        } catch {
+            throw AppError.message("模型设置已保存在本机，但同步网关失败：\(error.localizedDescription) 请保留当前选择并重试保存。")
+        }
+        notice = "模型设置已保存，OMP 会自动同步预算；本地和远端 Codex 请在接入页手动同步。聊天客户端请刷新模型列表。"
+    }
+    func retryLocalModelSettingsSync() {
         perform {
-            try ModelCompactionRule.validate(rules)
-            var next = self.settings; next.modelCompaction = rules
-            try self.persistSettings(next); self.preview = .null
-            self.notice = "模型规则已保存。请在本机或远端预览并应用连接配置，再重启对应的 Codex。"
+            guard self.running else { throw AppError.message("请先启动网关后重试模型同步。") }
+            if self.pendingSync { try await self.sync() }
+            try await self.applyLocalModelSettings()
+        }
+    }
+    func applyLocalModelSettings() async throws {
+        try requireWritableMetadata()
+        let home = settings.codexHome
+        let revision = modelSettingsRevision
+        let payload: JSONValue = .object(["codex_home": .string(home), "model_compaction": try JSONValue.from(settings.modelCompaction ?? [])])
+        do {
+            let result = try await client.call("config.models.apply", payload)
+            guard settings.codexHome == home, modelSettingsRevision == revision else { return }
+            if result["applied"].bool == true {
+                var next = settings
+                next.localCodexAppliedModelSettingsRevision = revision
+                try persistSettings(next)
+                localModelSettingsSyncError = nil
+            } else {
+                var next = settings
+                next.localCodexAppliedModelSettingsRevision = nil
+                try persistSettings(next)
+                localModelSettingsSyncError = result["reason"].string == "missing" ? "配置目录或文件不存在，请先检查目录并完成接入。" : nil
+            }
+        } catch {
+            localModelSettingsSyncError = error.localizedDescription
+            throw AppError.message("本地 Codex 模型设置同步失败：\(error.localizedDescription) 请检查配置后重试。")
         }
     }
     func configPayload() throws -> JSONValue {
@@ -674,6 +825,14 @@ import ServiceManagement
             _ = try await self.client.call(preflight, payload)
         }, apply: {
             result = try await self.client.call(operation, payload)
+            if operation == "config.attach" || operation == "config.official" {
+                try await self.applyLocalModelSettings()
+            } else {
+                var next = self.settings
+                next.localCodexAppliedModelSettingsRevision = nil
+                try self.persistSettings(next)
+                self.localModelSettingsSyncError = nil
+            }
         }, phase: { self.codexConnectionPhase = $0 })
         preview = .null
         try await updateStatus()
@@ -695,7 +854,6 @@ import ServiceManagement
     func refreshConfigurationBackups() async {
         guard running else { return }
         let home = settings.codexHome
-        configurationBackups = []
         do {
             let result = try await client.call("config.backups", .object(["codex_home":.string(home)]))
             guard !Task.isCancelled, settings.codexHome == home else { return }
@@ -719,8 +877,8 @@ import ServiceManagement
             if target == .gateway {
                 try self.requireCurrentPort()
                 guard self.sources.contains(where: \.enabled) else { throw AppError.message("请先添加并启用一个来源。") }
-                try await self.sync()
             }
+            try await self.sync()
             let payload = try self.configPayload()
             self.codexConnectionPhase = "检查连接设置…"
             defer { self.codexConnectionPhase = nil }
@@ -738,5 +896,67 @@ import ServiceManagement
     func setLaunchAtLogin(_ value: Bool) {
         do { if value { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }; launchAtLogin = SMAppService.mainApp.status == .enabled }
         catch { self.error = "无法更新登录启动设置：\(error.localizedDescription)" }
+    }
+}
+
+private final class GatewayLogBuffer: @unchecked Sendable {
+    private static let maxBytes = 262_144
+    private let url: URL
+    private let queue = DispatchQueue(label: "local.codexpress.gateway-log")
+    private var buffer: Data?
+    private var dirty = false
+    private var pendingFlush: DispatchWorkItem?
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    func append(_ data: Data) {
+        queue.async {
+            var current = self.loadIfNeeded()
+            current.append(data)
+            if current.count > Self.maxBytes {
+                current = current.suffix(Self.maxBytes)
+            }
+            self.buffer = current
+            self.dirty = true
+            self.scheduleFlush()
+        }
+    }
+
+    func flush() {
+        queue.sync {
+            pendingFlush?.cancel()
+            pendingFlush = nil
+            writeIfDirty()
+        }
+    }
+
+    private func loadIfNeeded() -> Data {
+        if let buffer { return buffer }
+        let existing = (try? Data(contentsOf: url)) ?? Data()
+        let bounded = existing.count > Self.maxBytes ? existing.suffix(Self.maxBytes) : existing
+        buffer = bounded
+        return bounded
+    }
+
+    private func scheduleFlush() {
+        guard pendingFlush == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingFlush = nil
+            self.writeIfDirty()
+        }
+        pendingFlush = item
+        queue.asyncAfter(deadline: .now() + .milliseconds(500), execute: item)
+    }
+
+    private func writeIfDirty() {
+        guard dirty, let data = buffer else { return }
+        dirty = false
+        let temp = url.deletingLastPathComponent().appendingPathComponent(".gateway-log-\(UUID().uuidString)")
+        if FileManager.default.createFile(atPath: temp.path, contents: data, attributes: [.posixPermissions: 0o600]) {
+            _ = rename(temp.path, url.path)
+        }
     }
 }

@@ -31,7 +31,7 @@ async fn setup(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(".").unwrap();
     let state = AppState::new(dir.path().into(), 17863, "PRIVATE-NATIVE-KEY".into()).unwrap();
     let source=serde_json::from_value(json!({"id":"official","name":"Official","kind":"official","base_url":"https://chatgpt.com/backend-api/codex","enabled":true,"priority":1,"proxy":{"mode":"explicit","url":proxy},"account_id":"account-fixture","models":["text-model"],"secret":{"access_token":"PRIVATE-OAUTH","expires_at":crate::model::now()+3600}})).unwrap();
     state.sources.write().await.push(SourceRuntime::new(source));
@@ -540,6 +540,7 @@ async fn image_error_feedback_is_saved_without_oauth_or_request_content() {
         .detail(&json!({"attempt_id":record["attempt_id"]}))
         .unwrap();
     assert_eq!(detail["diagnostic"]["ingress"], "image");
+    assert_eq!(detail["record"]["ingress"], "image");
     assert_eq!(detail["diagnostic"]["http_status"], 400);
     assert_eq!(detail["diagnostic"]["body_complete"], true);
     assert!(detail["diagnostic"]["body_text"]
@@ -554,5 +555,185 @@ async fn image_error_feedback_is_saved_without_oauth_or_request_content() {
     ] {
         assert!(!detail.to_string().contains(private));
     }
+    task.abort();
+}
+
+#[tokio::test]
+async fn shared_omp_key_generates_and_edits_native_formats_with_image_usage_despite_exhausted_chat() {
+    const FULL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
+    const FULL_WEBP: &str = "UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA";
+    let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let upstream_threads = threads.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let (_dir, state, image_key, _, task) = setup(Router::new().fallback(move |request: Request| {
+        let calls = seen.clone();
+        let threads = upstream_threads.clone();
+        async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(request.headers()["authorization"], "Bearer PRIVATE-OAUTH");
+            let thread = request.headers()["thread-id"].to_str().unwrap().to_owned();
+            assert_eq!(request.headers()["session_id"], "parent-cache");
+            assert_ne!(thread, "parent-cache");
+            threads.lock().unwrap().push(thread);
+            let edit = request.uri().path().ends_with("/edits");
+            let value: Value = serde_json::from_slice(&to_bytes(request.into_body(), 16 * 1024 * 1024).await.unwrap()).unwrap();
+            assert_eq!(value["model"], "gpt-image-2");
+            assert_eq!(value["prompt"], "draw fixture");
+            if edit {
+                assert_eq!(value["images"].as_array().unwrap().len(), 2);
+                let large = value["images"][0]["image_url"].as_str().unwrap().split_once(',').unwrap().1;
+                assert!(STANDARD.decode(large).unwrap().len() > 2 * 1024 * 1024);
+                assert_eq!(value["images"][1]["image_url"], format!("data:image/png;base64,{FULL_PNG}"));
+            } else {
+                assert!(value.get("images").is_none());
+            }
+            let encoded = if value["output_format"] == "webp" && edit { FULL_WEBP } else { FULL_PNG };
+            Json(json!({"created":7,"data":[{"b64_json":encoded,"revised_prompt":"draw fixture"}],
+                "usage":{"input_tokens":12,"output_tokens":34,"total_tokens":46,
+                    "input_tokens_details":{"image_tokens":8,"text_tokens":4}},
+                "private_field":"PRIVATE-OAUTH"}))
+        }
+    })).await;
+    {
+        let mut sources = state.sources.write().await;
+        sources[0].health = "exhausted".into();
+        sources[0].quota_exhausted = true;
+        sources[0].quota = json!({"windows":[{"name":"primary","used_percent":100}]});
+        sources[0].cooldown_until = Some(crate::model::now() + 3600);
+    }
+    let key = state.chatbot.key().unwrap()["key"].as_str().unwrap().to_owned();
+    let port = state.chatbot.port().unwrap();
+    *state.model_policies.write().await = serde_json::from_value::<Vec<crate::model_policy::ModelPolicy>>(json!([
+        {"model":"text-model","source_ids":[],"clients":[]},
+        {"model":"gpt-image-2","source_ids":["official"],"clients":["omp"]}
+    ])).unwrap().into();
+    let image_port = state.images.port().unwrap();
+    let hidden = images::router(state.clone()).oneshot(request(image_port, &image_key, "/v1/models", None)).await.unwrap();
+    assert_eq!(output(hidden).await["data"], json!([]));
+    let forbidden = images::router(state.clone()).oneshot(request(image_port, &image_key,
+        "/v1/images/generations", Some(json!({"prompt":"not submitted"})))).await.unwrap();
+    assert_eq!(forbidden.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(output(forbidden).await["error"]["code"], "model_not_enabled_for_client");
+    let mut large = PNG.to_vec();
+    large.resize(2 * 1024 * 1024 + 1, 0);
+    for (edit, stream, format, path) in [
+        (false, true, "png", "/omp/v1/responses"),
+        (true, false, "png", "/omp/v1/responses"),
+        (false, false, "webp", "/omp/v1/codex/responses"),
+        (true, true, "webp", "/omp/v1/codex/responses"),
+        (true, false, "webp", "/omp/v1/codex/responses"),
+    ] {
+        let actual_format = if format == "webp" && edit { "webp" } else { "png" };
+        let encoded = if actual_format == "webp" { FULL_WEBP } else { FULL_PNG };
+        let mut content = vec![json!({"type":"input_text","text":"draw fixture"})];
+        if edit {
+            content.push(json!({"type":"input_image","image_url":format!("data:image/png;base64,{}", STANDARD.encode(&large))}));
+            content.push(json!({"type":"input_image","image_url":format!("data:image/png;base64,{FULL_PNG}")}));
+        }
+        let body = json!({"model":"text-model","store":false,"stream":stream,
+            "tools":[{"type":"image_generation","action":if edit {"edit"} else {"generate"},"output_format":format,"size":"1024x1024"}],
+            "tool_choice":{"type":"image_generation"},"input":[{"role":"user","content":content}],
+            "client_metadata":{"codexpress_session_id":"image-real-session"}});
+        let mut req = request(port, &key, path, Some(body.clone()));
+        req.headers_mut().insert("session_id", "parent-cache".parse().unwrap());
+        let response = crate::chatbot::router(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["x-codexpress-source-id"], state.sources.read().await[0].source.id);
+        assert_eq!(response.headers()["x-codexpress-source-identity"], state.sources.read().await[0].source.identity());
+        let result = if stream {
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+            let text = String::from_utf8(to_bytes(response.into_body(), 1024 * 1024).await.unwrap().to_vec()).unwrap();
+            let events: Vec<Value> = text.lines().filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]").map(|data| serde_json::from_str(data).unwrap()).collect();
+            assert_eq!(events[0]["type"], "response.output_item.done");
+            assert_eq!(events[0]["item"]["result"], encoded);
+            assert_eq!(events[1]["type"], "response.completed");
+            events[1]["response"].clone()
+        } else { output(response).await };
+        assert_eq!(result["model"], "gpt-image-2");
+        assert_eq!(result["tools"][0]["model"], "gpt-image-2");
+        assert_eq!(result["output"][0]["type"], "image_generation_call");
+        assert_eq!(result["output"][0]["result"], encoded);
+        assert_eq!(result["output"][0]["output_format"], actual_format);
+        assert_eq!(result["usage"]["input_tokens_details"]["image_tokens"], 8);
+        assert!(!result.to_string().contains("PRIVATE"));
+        let wrong_key = crate::chatbot::router(state.clone())
+            .oneshot(request(port, &image_key, "/omp/v1/responses", Some(body))).await.unwrap();
+        assert_eq!(wrong_key.status(), 401);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 5);
+    {
+        let threads = threads.lock().unwrap();
+        assert_eq!(threads.len(), 5);
+        assert!(threads.iter().all(|thread| thread == &threads[0]));
+    }
+    let sources = state.sources.read().await;
+    assert_eq!(sources[0].health, "exhausted");
+    assert!(sources[0].quota_exhausted);
+    drop(sources);
+    let usage = state.usage.summary(1).unwrap();
+    assert_eq!(usage["recent"][0]["model"], "gpt-image-2");
+    assert!(usage["recent"].as_array().unwrap().iter().all(|record| record["ingress"] == "omp"));
+    let detail = state.usage.detail(&json!({"attempt_id":usage["recent"][0]["attempt_id"]})).unwrap();
+    assert_eq!(detail["diagnostic"]["ingress"], "omp");
+    assert_eq!(usage["recent"][0]["input_tokens"], 12);
+    assert_eq!(usage["recent"][0]["output_tokens"], 34);
+    assert_eq!(state.inflight.load(Ordering::Relaxed), 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn native_images_share_validation_switch_selection_and_isolated_rate_limits() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let (_dir, state, _, _, task) = setup(Router::new().fallback(move || {
+        seen.fetch_add(1, Ordering::Relaxed);
+        async { (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":{"code":"usage_limit_reached"}}))) }
+    })).await;
+    let key = state.chatbot.key().unwrap()["key"].as_str().unwrap().to_owned();
+    let port = state.chatbot.port().unwrap();
+    let body = json!({"model":"text-model","stream":true,
+        "tools":[{"type":"image_generation","action":"generate","output_format":"png"}],
+        "tool_choice":{"type":"image_generation"},
+        "input":[{"role":"user","content":[{"type":"input_text","text":"draw"}]}]});
+    let router = crate::chatbot::router(state.clone());
+    for (policy, expected) in [
+        (json!({"model":"gpt-image-2","clients":["images"]}), StatusCode::BAD_REQUEST),
+        (json!({"model":"gpt-image-2","clients":["omp"],"source_ids":[]}), StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        *state.model_policies.write().await = serde_json::from_value::<Vec<crate::model_policy::ModelPolicy>>(json!([policy])).unwrap().into();
+        let response = router.clone().oneshot(request(port, &key, "/omp/v1/responses", Some(body.clone()))).await.unwrap();
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::BAD_REQUEST {
+            assert_eq!(output(response).await["error"]["code"], "model_not_enabled_for_client");
+        }
+        let binding = management::dispatch(&state, "omp.binding", json!({})).await.unwrap();
+        assert!(!binding["models"].as_array().unwrap().iter().any(|model| model["id"] == "gpt-image-2"));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+    *state.model_policies.write().await = Arc::from([]);
+    let limited = router.clone().oneshot(request(port, &key, "/omp/v1/responses", Some(body.clone()))).await.unwrap();
+    assert_eq!(limited.status(), 429);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(state.sources.read().await[0].health, "ready");
+    assert!(!state.sources.read().await[0].quota_exhausted);
+    for invalid in [
+        { let mut value = body.clone(); value["tools"][0]["output_format"] = json!("gif"); value },
+        { let mut value = body.clone(); value["tools"][0]["action"] = json!("edit"); value },
+        { let mut value = body.clone(); value["input"][0]["content"].as_array_mut().unwrap()
+            .push(json!({"type":"input_image","image_url":"https://example.invalid/image.png"})); value },
+    ] {
+        let response = router.clone().oneshot(request(port, &key, "/omp/v1/responses", Some(invalid))).await.unwrap();
+        assert_eq!(response.status(), 400);
+    }
+    state.images.settings.lock().unwrap().source_id = Some("missing".into());
+    let unavailable = router.clone().oneshot(request(port, &key, "/omp/v1/responses", Some(body.clone()))).await.unwrap();
+    assert_eq!(unavailable.status(), 503);
+    state.images.settings.lock().unwrap().source_id = None;
+    state.images.settings.lock().unwrap().enabled = false;
+    let disabled = router.oneshot(request(port, &key, "/omp/v1/responses", Some(body))).await.unwrap();
+    assert_eq!(disabled.status(), 503);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
     task.abort();
 }

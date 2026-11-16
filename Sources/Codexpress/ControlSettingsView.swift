@@ -4,12 +4,15 @@ import SwiftUI
 struct ControlSettingsView: View {
     @EnvironmentObject var model: AppModel
     @State private var status: JSONValue = .null
-    @State private var port = "17867"
+    @State private var port = ""
+    @State private var savedPort = ""
     @State private var working = false
+    @State private var loading = false
+    @State private var copyingKey = false
     @State private var confirmRotation = false
     @State private var error: String?
 
-    private var canEdit: Bool { model.running && !model.busy && !working && status != .null }
+    private var canEdit: Bool { model.running && !working && !loading && status != .null }
     private var address: String { status["base_url"].string ?? "http://127.0.0.1:17867" }
     private var changed: Bool { port != status["port"].number.map { String(Int($0)) } }
     private var dashboardURL: URL? {
@@ -21,6 +24,7 @@ struct ControlSettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 PageHeading("管理 API")
+                if !model.running { InfoNote(text: "请先启动本机网关。") }
                 SettingsCard("本机管理", symbol: "switch.2", accessory: {
                     StatusPill(text: status["running"].bool == true ? "运行中" : status["enabled"].bool == true ? "未启动" : "已关闭", color: status["running"].bool == true ? .green : .secondary)
                 }) {
@@ -35,20 +39,26 @@ struct ControlSettingsView: View {
                             .multilineTextAlignment(.trailing).settingsField().frame(width: 130).disabled(!canEdit)
                     }
                     HStack {
-                        Button("复制独立 Key") { copyKey() }.disabled(!canEdit)
+                        Button("复制独立 Key") { copyKey() }.disabled(!model.running || status == .null || working || copyingKey)
                         Button("重新生成 Key…") { confirmRotation = true }.disabled(!canEdit)
                         Spacer()
                         if working { ProgressView().controlSize(.small) }
                         Button("应用设置") { save() }.buttonStyle(.borderedProminent).disabled(!canEdit || !changed)
                     }
                     if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
+                    if error != nil || status == .null && model.running {
+                        Button(loading ? "读取中…" : "重新读取") { Task { await load() } }.disabled(!model.running || loading || working)
+                    }
                     if status["enabled"].bool == true && status["running"].bool == false {
-                        InfoNote(text: "管理入口未启动，请更换端口后应用设置。", color: .orange)
+                        HStack {
+                            InfoNote(text: "管理入口未启动。", color: .orange)
+                            Button("重试启动") { update(.object([:])) }.disabled(!canEdit)
+                        }
                     }
                 }
                 SettingsCard("数据面板", symbol: "chart.bar.xaxis") {
                     HStack {
-                        Text("按时间、来源和模型筛选请求日志，查看性能与费用，阅读和导出缓存原文。")
+                        Text("在本机浏览器按时间、来源和模型筛选请求日志，查看性能与费用，阅读和导出缓存原文。")
                             .foregroundStyle(.secondary)
                         Spacer()
                         Button("打开数据面板") {
@@ -85,13 +95,20 @@ struct ControlSettingsView: View {
 
     private func apply(_ value: JSONValue, updatingPort: Bool = true) {
         status = value
-        if updatingPort { port = value["port"].number.map { String(Int($0)) } ?? "17867" }
+        savedPort = value["port"].number.map { String(Int($0)) } ?? ""
+        if updatingPort { port = savedPort }
     }
 
     private func load() async {
-        guard model.running else { status = .null; return }
-        do { apply(try await model.remoteCall("control.status")); error = nil }
-        catch { self.error = error.localizedDescription }
+        guard model.running else { status = .null; error = nil; return }
+        loading = true
+        defer { loading = false }
+        do {
+            let actual = try await model.remoteCall("control.status")
+            guard !Task.isCancelled, model.running else { return }
+            apply(actual, updatingPort: port == savedPort)
+            error = nil
+        } catch { self.error = error.localizedDescription }
     }
 
     private func save() {
@@ -116,10 +133,10 @@ struct ControlSettingsView: View {
     }
 
     private func copyKey() {
-        guard canEdit else { return }
-        working = true; error = nil
+        guard model.running, status != .null, !working, !copyingKey else { return }
+        copyingKey = true; error = nil
         Task {
-            defer { working = false }
+            defer { copyingKey = false }
             do {
                 let result = try await model.remoteCall("control.key")
                 guard let key = result["key"].string, !key.isEmpty else { throw AppError.message("无法读取管理 API Key。") }

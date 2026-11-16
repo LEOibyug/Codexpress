@@ -66,6 +66,46 @@ final class UsagePresentationTests: XCTestCase {
         XCTAssertNil(UsageTotals(rows: []).tps)
         XCTAssertNil(UsageTotals(rows: []).successRate)
     }
+    func testSupplierConsumersMergeNamesAcrossModelsWithoutLosingWeightedOrUnknownMetrics() throws {
+        let groups: [JSONValue] = [
+            .object(["source_id": .null, "source_ids": .array([.string("a"), .string("b")]), "source_name": .string("\u{00a0}供应商\t"), "model": .string("model-a"), "requests": .number(2), "input_tokens": .number(300), "output_tokens": .number(10), "priced_requests": .number(2), "upstream_priced_requests": .number(2), "total_usd": .number(0.5), "throughput_output_tokens": .number(10), "throughput_latency_ms": .number(1000)]),
+            .object(["source_id": .string("c"), "source_name": .string("供应商"), "model": .string("model-b"), "requests": .number(1), "input_tokens": .number(200), "output_tokens": .number(100), "priced_requests": .number(1), "total_usd": .number(1), "throughput_output_tokens": .number(100), "throughput_latency_ms": .number(5000), "estimated_requests": .number(1)]),
+            .object(["source_id": .string("d"), "source_name": .string("供应商"), "model": .string("model-a"), "requests": .number(1), "input_tokens": .number(50), "unpriced_requests": .number(1), "total_usd": .null, "throughput_output_tokens": .null, "throughput_latency_ms": .null]),
+            .object(["source_id": .string("e"), "source_name": .string("供应商 "), "model": .string("unknown"), "requests": .number(1), "input_tokens": .number(7), "unpriced_requests": .number(1)]),
+            .object(["source_id": .string("source-name:供应商"), "source_name": .string(""), "model": .string("unknown"), "requests": .number(1), "input_tokens": .number(9), "unpriced_requests": .number(1)]),
+            .object(["source_id": .string("f"), "source_name": .string(" \n\t\u{00a0}"), "model": .string("unknown"), "requests": .number(1), "input_tokens": .number(11), "unpriced_requests": .number(1)])
+        ]
+        let suppliers = usageComparisons(groups, key: "source_id", sort: "requests")
+        XCTAssertEqual(suppliers.count, 3)
+        XCTAssertEqual(Set(suppliers.map(\.id)).count, 3)
+        let supplier = try XCTUnwrap(suppliers.first)
+        XCTAssertEqual(supplier.name, "供应商")
+        XCTAssertEqual(supplier.totals.sum("requests"), 5)
+        XCTAssertEqual(supplier.totals.total, 667)
+        XCTAssertEqual(supplier.totals.cost, 1.5)
+        XCTAssertEqual(supplier.totals.averageCost, 0.5)
+        XCTAssertEqual(try XCTUnwrap(supplier.totals.tps), 110000.0 / 6000, accuracy: 0.001)
+        XCTAssertEqual(supplier.totals.sum("unpriced_requests"), 2)
+        XCTAssertEqual(supplier.totals.sum("upstream_priced_requests"), 2)
+        XCTAssertEqual(supplier.totals.sum("estimated_requests"), 1)
+        XCTAssertTrue(supplier.totals.costEstimated)
+        XCTAssertTrue(supplier.totals.estimated)
+        XCTAssertEqual(suppliers.filter { $0.name == "已移除来源" }.count, 2)
+        for unknown in suppliers.dropFirst() {
+            XCTAssertNil(unknown.totals.cost)
+            XCTAssertNil(unknown.totals.tps)
+        }
+        let sources = usageDistributionSlices(groups, groupBy: "source_id")
+        XCTAssertEqual(sources.map(\.name), ["供应商"])
+        XCTAssertEqual(sources.first?.tokenTotal, 667)
+        XCTAssertEqual(sources.first?.cost, 1.5)
+        XCTAssertTrue(sources.first?.estimated == true)
+        let models = usageDistributionSlices(groups, groupBy: "model")
+        XCTAssertEqual(models.map(\.name), ["model-a", "model-b", "其他"])
+        XCTAssertEqual(models.map(\.tokenTotal), [360, 300, 27])
+        XCTAssertNil(models.last?.cost)
+    }
+
     func testLocalNaturalDaysUseCalendarBoundariesAcrossDST() throws {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
@@ -146,7 +186,7 @@ final class UsagePresentationTests: XCTestCase {
             return .object(fields)
         }
         let cost = usageDistributionSlices(groups, groupBy: "source_id")
-        XCTAssertEqual(cost.map(\.id), ["source-5", "source-4", "source-3", "usage-other-sources"])
+        XCTAssertEqual(cost.map(\.name), ["来源 5", "来源 4", "来源 3", "其他"])
         XCTAssertEqual(cost.last?.value, 3)
         XCTAssertEqual(cost.last?.cost, 3)
         XCTAssertEqual(cost.last?.tokenTotal, 320)

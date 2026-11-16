@@ -19,6 +19,8 @@ use tokio::{
     sync::Mutex,
 };
 
+#[path = "official/auto_reset.rs"]
+mod auto_reset;
 #[path = "official/resets.rs"]
 mod resets;
 #[path = "official/snapshots.rs"]
@@ -28,6 +30,17 @@ use resets::consume;
 use snapshots::refresh_selected_snapshots;
 #[cfg(test)]
 use snapshots::{credits_snapshot, quota_snapshot};
+
+pub(crate) fn update_quota_reference(quota: &mut Value, at: u64) {
+    let Some(windows) = quota.get_mut("windows").and_then(Value::as_array_mut) else { return };
+    for window in windows {
+        if window["window_seconds"].as_f64() != Some(604800.0) { continue; }
+        window["ref_cost"] = window["reset_at"].as_f64()
+            .filter(|reset| reset.is_finite() && *reset > 0.0 && *reset <= 253402300799.0)
+            .map(|reset| json!(((reset - at as f64) / 604800.0 * 100.0).clamp(0.0, 100.0)))
+            .unwrap_or(Value::Null);
+    }
+}
 
 const PERSISTENCE_FAILURE: &str = "新凭据保存失败，账号已暂停；请检查凭据存储后重新登录";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -40,6 +53,43 @@ const CONSUME: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-cre
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 #[cfg(test)]
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
+
+#[derive(Default)]
+pub struct QuerySchedule {
+    pub failures: u32,
+    pub attempted: Option<tokio::time::Instant>,
+    pub error: Option<String>,
+}
+
+impl QuerySchedule {
+    pub fn is_due(&self) -> bool {
+        self.failures == 0 || self.attempted.is_none_or(|at| {
+            at.elapsed() >= Duration::from_secs(failure_delay(self.failures))
+        })
+    }
+
+    pub fn finish(&mut self, error: Option<String>) {
+        self.failures = if error.is_some() { self.failures.saturating_add(1) } else { 0 };
+        self.attempted = Some(tokio::time::Instant::now());
+        self.error = error;
+    }
+}
+
+fn failure_delay(failures: u32) -> u64 {
+    60_u64.saturating_mul(1 << failures.saturating_sub(1).min(4)).min(900)
+}
+
+fn query_key(kind: &str, src: &Source) -> String {
+    let mut network = Sha256::new();
+    network.update(src.proxy.mode.as_bytes());
+    network.update([0]);
+    network.update(src.proxy.url.as_deref().unwrap_or("").as_bytes());
+    if kind == "token-query" {
+        network.update([0]);
+        network.update(token(&src.secret, "refresh_token").as_bytes());
+    }
+    format!("{kind}:{}:{:x}", src.identity(), network.finalize())
+}
 
 // Endpoints are private, never configurable through IPC/environment/source metadata.
 #[derive(Clone, Copy)]
@@ -113,6 +163,14 @@ fn same_binding(a: &Source, b: &Source) -> bool {
         && a.proxy == b.proxy
         && account(a) == account(b)
         && a.secret == b.secret
+}
+
+fn same_account_binding(a: &Source, b: &Source) -> bool {
+    a.id == b.id
+        && a.kind == b.kind
+        && a.base_url == b.base_url
+        && a.proxy == b.proxy
+        && account(a) == account(b)
 }
 async fn install(
     state: &Arc<AppState>,
@@ -257,7 +315,7 @@ fn merge_tokens(old: &Value, response: Value) -> Result<Value> {
         .or_else(|| access_claims.get("exp").and_then(Value::as_u64))
         .ok_or_else(|| anyhow!("官方令牌响应缺少有效期"))?;
     secret.insert("expires_at".into(), json!(expires));
-    let identity = [&id_claims, &access_claims].into_iter().find_map(|v| {
+    let identity = [&access_claims, &id_claims].into_iter().find_map(|v| {
         v.pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
             .and_then(Value::as_str)
     });
@@ -301,10 +359,23 @@ async fn refresh_inner(
     endpoints: Endpoints<'_>,
 ) -> Result<Source> {
     let initial = source(state, id).await?;
-    let key = format!("token:{}", account(&initial).unwrap_or(id));
+    refresh_bound_inner(state, &initial, force, endpoints).await
+}
+
+async fn refresh_bound_inner(
+    state: &Arc<AppState>,
+    initial: &Source,
+    force: bool,
+    endpoints: Endpoints<'_>,
+) -> Result<Source> {
+    let id = initial.id.as_str();
+    let key = format!("token:{}", account(initial).unwrap_or(id));
     let mutex = lock(state, key).await;
     let _guard = mutex.lock().await;
     let current = source(state, id).await?;
+    if !same_account_binding(&current, initial) {
+        bail!("来源在查询期间发生变化，请刷新");
+    }
     if state
         .sources
         .read()
@@ -328,7 +399,28 @@ async fn refresh_inner(
     if refresh.is_empty() {
         bail!("官方账号需要重新登录");
     }
-    let response = transport::client(&current)?.post(endpoints.token).timeout(REQUEST_TIMEOUT)
+    let query_key = query_key("token-query", &current);
+    if let Some(schedule) = state.official_queries.lock().await.get(&query_key) {
+        if !schedule.is_due() {
+            if let Some(error) = &schedule.error {
+                bail!("{error}");
+            }
+        }
+    }
+    let result = refresh_token(state, &current, endpoints).await;
+    state.official_queries.lock().await.entry(query_key).or_default().finish(
+        result.as_ref().err().map(ToString::to_string),
+    );
+    result
+}
+
+async fn refresh_token(
+    state: &Arc<AppState>,
+    current: &Source,
+    endpoints: Endpoints<'_>,
+) -> Result<Source> {
+    let refresh = token(&current.secret, "refresh_token");
+    let response = transport::client(current)?.post(endpoints.token).timeout(REQUEST_TIMEOUT)
         .json(&json!({"client_id":CLIENT_ID,"grant_type":"refresh_token","refresh_token":refresh,"scope":"openid profile email"}))
         .send().await.map_err(|e| anyhow!("官方令牌刷新{}",transport::failure_reason(&e)))?;
     let status = response.status().as_u16();
@@ -363,7 +455,7 @@ async fn refresh_inner(
             let mut sources = state.sources.write().await;
             if let Some(r) = sources
                 .iter_mut()
-                .find(|r| same_binding(&r.source, &current))
+                .find(|r| same_binding(&r.source, current))
             {
                 r.health = "auth_required".into();
                 r.last_error = Some("官方登录已失效，请重新登录".into());
@@ -373,12 +465,12 @@ async fn refresh_inner(
         bail!("官方令牌接口返回 HTTP 400，请稍后重试");
     }
     let secret = merge_tokens(&current.secret, json_response(response).await?)?;
-    if let Some(identity) = account(&current) {
+    if let Some(identity) = account(current) {
         if secret.get("account_id").and_then(Value::as_str) != Some(identity) {
             bail!("刷新返回了不同账号，请重新登录确认");
         }
     }
-    install(state, &current, secret, false).await
+    install(state, current, secret, false).await
 }
 pub async fn ensure_access(state: &Arc<AppState>, source_id: &str) -> Result<Source> {
     refresh_inner(state, source_id, false, ENDPOINTS).await
@@ -669,12 +761,72 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
                 Some(Value::Bool(include)) => *include,
                 _ => bail!("include_credits 需要布尔值"),
             };
-            let src = ensure_access(state, field(&payload, "source_id")?).await?;
-            refresh_selected_snapshots(state, &src, ENDPOINTS, include_credits).await
+            let src = source(state, field(&payload, "source_id")?).await?;
+            refresh_for_source(state, &src, include_credits).await
         }
         "official.credits.consume" => consume(state, &payload, ENDPOINTS).await,
         _ => bail!("未知官方账号操作"),
     }
+}
+
+pub(crate) async fn refresh_for_source(
+    state: &Arc<AppState>,
+    src: &Source,
+    include_credits: bool,
+) -> Result<Value> {
+    let current = source(state, &src.id).await?;
+    if !same_account_binding(&current, src) {
+        bail!("来源在查询期间发生变化，请刷新");
+    }
+    let result = refresh_selected_snapshots(state, &current, ENDPOINTS, include_credits).await?;
+    if !state.settings.read().await.auto_reset_weekly_quota { return Ok(result); }
+    if let Ok(refreshed) = source(state, &current.id).await {
+        if refreshed.enabled && same_account_binding(&refreshed, &current) {
+            let state = state.clone();
+            tokio::spawn(async move {
+                if let Err(error) = auto_reset::consider(&state, &refreshed, ENDPOINTS).await {
+                    eprintln!("自动使用重置卡失败：{error}");
+                }
+            });
+        }
+    }
+    Ok(result)
+}
+
+pub(crate) async fn schedule_auto_reset(state: &Arc<AppState>) {
+    let sources: Vec<_> = state.sources.read().await.iter()
+        .filter(|r| r.source.enabled && r.source.kind == "official")
+        .map(|r| r.source.clone()).collect();
+    for source in sources {
+        confirm_auto_reset(state, &source).await;
+    }
+}
+
+pub(crate) async fn confirm_auto_reset(state: &Arc<AppState>, src: &Source) {
+    if src.kind != "official" || !src.enabled
+        || !state.settings.read().await.auto_reset_weekly_quota { return; }
+    let state = state.clone();
+    let src = src.clone();
+    tokio::spawn(async move {
+        if let Err(error) = confirm_with_endpoints(&state, &src, ENDPOINTS).await {
+            eprintln!("确认自动重置额度失败：{error}");
+        }
+    });
+}
+
+async fn confirm_with_endpoints(state: &Arc<AppState>, expected: &Source, endpoints: Endpoints<'_>) -> Result<()> {
+    if !expected.enabled || expected.kind != "official"
+        || !state.settings.read().await.auto_reset_weekly_quota { return Ok(()); }
+    let mutex = lock(state, format!("auto-refresh:{}", expected.identity())).await;
+    let Ok(_guard) = mutex.try_lock() else { return Ok(()) };
+    let current = source(state, &expected.id).await?;
+    if !same_binding(&current, expected) { return Ok(()); }
+    refresh_selected_snapshots(state, &current, endpoints, false).await?;
+    let refreshed = source(state, &current.id).await?;
+    if same_account_binding(&refreshed, &current) {
+        auto_reset::consider(state, &refreshed, endpoints).await?;
+    }
+    Ok(())
 }
 
 // Test-only endpoint injection never exists in the production library or management IPC.
@@ -753,18 +905,16 @@ pub(crate) mod fixture {
         include_credits: bool,
     ) -> Result<Value> {
         let (token, usage, credits, consume) = endpoints(base);
-        refresh_selected_snapshots(
-            state,
-            &source(state, id).await?,
-            Endpoints {
-                token: &token,
-                usage: &usage,
-                credits: &credits,
-                consume: &consume,
-            },
-            include_credits,
-        )
-        .await
+        let endpoints = Endpoints {
+            token: &token, usage: &usage, credits: &credits, consume: &consume,
+        };
+        let expected = source(state, id).await?;
+        let result = refresh_selected_snapshots(state, &expected, endpoints, include_credits).await?;
+        let current = source(state, id).await?;
+        if same_account_binding(&current, &expected) {
+            let _ = auto_reset::consider(state, &current, endpoints).await;
+        }
+        Ok(result)
     }
     pub(crate) async fn refresh_at(state: &Arc<AppState>, id: &str, base: &str) -> Result<Source> {
         let (token, usage, credits, consume) = endpoints(base);
@@ -780,5 +930,11 @@ pub(crate) mod fixture {
             },
         )
         .await
+    }
+    pub(crate) async fn confirm_at(state: &Arc<AppState>, expected: &Source, base: &str) -> Result<()> {
+        let (token, usage, credits, consume) = endpoints(base);
+        confirm_with_endpoints(state, expected, Endpoints {
+            token: &token, usage: &usage, credits: &credits, consume: &consume,
+        }).await
     }
 }

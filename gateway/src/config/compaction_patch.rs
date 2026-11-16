@@ -34,6 +34,7 @@ pub(super) fn prepare_compaction(
     state_dir: &Path,
     snapshot: Option<&Snapshot>,
     rules: &[ModelCompactionRule],
+    excluded_models: &std::collections::HashSet<String>,
 ) -> Result<Option<(PathBuf, Vec<u8>)>> {
     compaction::validate(rules)?;
     let original = match snapshot.filter(|s| s.applied_compaction.is_some()) {
@@ -44,7 +45,7 @@ pub(super) fn prepare_compaction(
             .parse::<DocumentMut>()?,
         None => doc.clone(),
     };
-    if rules.is_empty() {
+    if rules.is_empty() && excluded_models.is_empty() {
         if snapshot.is_some_and(|s| s.applied_compaction.is_some()) {
             restore_compaction(doc, &original);
         }
@@ -54,12 +55,9 @@ pub(super) fn prepare_compaction(
         .ok()
         .filter(|bytes| bytes.len() <= 4 * 1024 * 1024)
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-    let bytes = serde_json::to_vec_pretty(&compaction::catalog_with_additions(
-        home,
-        &original,
-        rules,
-        additions.as_ref(),
-    )?)?;
+    let mut catalog = compaction::catalog_with_additions(home, &original, rules, additions.as_ref())?;
+    crate::model_policy::filter_codex_catalog(&mut catalog, excluded_models);
+    let bytes = serde_json::to_vec_pretty(&catalog)?;
     let path = state_dir
         .join("model-catalogs")
         .join(format!("{:x}.json", Sha256::digest(&bytes)));

@@ -63,6 +63,96 @@ pub(super) fn migrate(snapshot: &mut Snapshot) -> Result<()> {
     Ok(())
 }
 
+fn budget(original: &Original) -> bool {
+    let path = &original.path;
+    match (original.file.as_str(), path.len()) {
+        ("config", 3) => path[0] == "compaction"
+            && path[1] == "modelThresholds"
+            && path[2].strip_prefix("codexpress/").is_some_and(|id| !id.is_empty()),
+        ("models", 5) => path[0] == "providers"
+            && path[1] == "codexpress"
+            && path[2] == "modelOverrides"
+            && !path[3].is_empty()
+            && matches!(path[4].as_str(), "contextWindow" | "maxContextWindow"),
+        _ => false,
+    }
+}
+
+pub(super) fn migrate_budgets(state_dir: &Path, home: &Path) -> Result<Json> {
+    let unchanged = json!({"migrated":false,"models_changed":false});
+    let receipt_path = snapshot_path(state_dir);
+    let receipt_before = read(&receipt_path, SNAPSHOT_LIMIT)?;
+    let Some(mut snapshot) = load_snapshot(state_dir)? else { return Ok(unchanged); };
+    if snapshot.agent_dir != home { return Ok(unchanged); }
+    if !snapshot.native_before.iter().any(budget) { return Ok(unchanged); }
+    let models = choose(home, "models", "models.json")?;
+    let settings = choose(home, "config", "settings.json")?;
+    if same_home(&snapshot, home, &models, &settings).is_err() { return Ok(unchanged); }
+    let applied_models = parse(&snapshot.models.applied)?;
+    let applied_settings = parse(&snapshot.settings.applied)?;
+    let mut models_after = models.value.clone();
+    let mut thresholds = serde_json::Map::new();
+    for original in snapshot.native_before.iter().filter(|original| budget(original)) {
+        let (current, applied) = if original.file == "config" {
+            (&settings.value, &applied_settings)
+        } else {
+            (&models.value, &applied_models)
+        };
+        let path: Vec<_> = original.path.iter().map(String::as_str).collect();
+        let Some(value) = at(current, &path) else { continue; };
+        if Some(value) != decoded(&original.applied)?.as_ref() || at(applied, &path) != Some(value) {
+            continue;
+        }
+        if original.file == "config" {
+            let value = serde_json::to_value(value)?;
+            if !preferences::threshold_valid(&value) { continue; }
+            thresholds.insert(original.path[2].clone(), value);
+        } else {
+            put(&mut models_after, &path, None)?;
+        }
+    }
+    let ledger_path = home.join("codexpress-compaction.json");
+    let has_thresholds = !thresholds.is_empty();
+    let ledger_before = if has_thresholds { read(&ledger_path, FILE_LIMIT)? } else { None };
+    let mut ledger: serde_json::Map<String, Json> = ledger_before.as_deref()
+        .map(serde_json::from_slice).transpose()
+        .map_err(|_| anyhow::anyhow!("OMP 压缩归属文件损坏，未修改配置"))?
+        .unwrap_or_default();
+    let mut ledger_changed = false;
+    for (selector, value) in thresholds {
+        if let serde_json::map::Entry::Vacant(entry) = ledger.entry(selector) {
+            entry.insert(value);
+            ledger_changed = true;
+        }
+    }
+    let ledger_after = if ledger_changed {
+        let mut bytes = serde_json::to_vec_pretty(&ledger)?;
+        bytes.push(b'\n');
+        if bytes.len() > FILE_LIMIT { bail!("OMP 压缩归属文件超过大小限制，未修改配置"); }
+        Some(bytes)
+    } else { None };
+    let models_changed = models_after != models.value;
+    let models_after = if models_changed {
+        Some(document::patch(models.bytes.as_deref(), &models.value, &models_after)?)
+    } else { None };
+    // A successful handoff retires the old budget owner, including leaves the user changed.
+    snapshot.native_before.retain(|original| !budget(original));
+    // Original bytes remain the restore point, but must never resurrect handed-off budgets.
+    snapshot.models.preserve_raw = true;
+    snapshot.settings.preserve_raw = true;
+    let receipt_after = serde_json::to_vec(&snapshot)?;
+    if receipt_after.len() > SNAPSHOT_LIMIT { bail!("OMP 连接快照超过大小限制，未修改配置"); }
+    let mut changes: Vec<FileChange<'_>> = Vec::with_capacity(4);
+    if has_thresholds {
+        changes.push((&ledger_path, ledger_before.as_deref(), ledger_after.as_deref().or(ledger_before.as_deref())));
+    }
+    changes.push((&models.path, models.bytes.as_deref(), models_after.as_deref().or(models.bytes.as_deref())));
+    changes.push((&settings.path, settings.bytes.as_deref(), settings.bytes.as_deref()));
+    changes.push((&receipt_path, receipt_before.as_deref(), Some(receipt_after.as_slice())));
+    write_files_limited(&changes, SNAPSHOT_LIMIT)?;
+    Ok(json!({"migrated":true,"models_changed":models_changed}))
+}
+
 pub(super) fn merge_models(
     models: &mut Value,
     generated: Value,

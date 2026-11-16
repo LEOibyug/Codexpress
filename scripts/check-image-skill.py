@@ -28,7 +28,9 @@ class SkillTests(unittest.TestCase):
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
         try:
-            with tempfile.TemporaryDirectory(prefix='cx-image-skill-') as folder:
+            temporary_root = Path(__file__).resolve().parents[1] / '.runtime/tmp'
+            temporary_root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='cx-image-skill-', dir=temporary_root) as folder:
                 directory = Path(folder)
                 config = directory / 'client.json'
                 config.write_text(json.dumps({'base_url': f'http://127.0.0.1:{server.server_port}/v1', 'api_key':'PRIVATE-SKILL-KEY'}))

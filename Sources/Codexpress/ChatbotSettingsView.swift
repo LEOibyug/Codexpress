@@ -5,12 +5,15 @@ struct ChatbotSettingsView: View {
     @EnvironmentObject var model: AppModel
     @State private var status: JSONValue = .null
     @State private var port = ""
+    @State private var savedPort = ""
     @State private var newKey = ""
     @State private var working = false
+    @State private var loading = false
+    @State private var copyingKey = false
     @State private var confirmReset = false
     @State private var error: String?
 
-    private var canEdit: Bool { model.running && !model.busy && !working }
+    private var canEdit: Bool { model.running && status != .null && !working && !loading }
     private var address: String { status["base_url"].string ?? "—" }
     private var changed: Bool { !newKey.isEmpty || port != status["port"].number.map({ String(Int($0)) }) }
 
@@ -18,6 +21,7 @@ struct ChatbotSettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 PageHeading("聊天客户端")
+                if !model.running { InfoNote(text: "请先启动本机网关。") }
                 SettingsCard("客户端 API", symbol: "bubble.left.and.bubble.right", accessory: {
                     StatusPill(text: status["running"].bool == true ? "运行中" : status["enabled"].bool == false ? "已关闭" : "未启动", color: status["running"].bool == true ? .green : .secondary)
                 }) {
@@ -33,17 +37,24 @@ struct ChatbotSettingsView: View {
                     SettingRow(title: "新 API Key") {
                         SecureField("留空保留原 Key", text: $newKey).settingsField().frame(maxWidth: 360).disabled(!canEdit || status == .null)
                     }
+                    if !newKey.isEmpty { InfoNote(text: "应用后旧 Key 将失效，请同步更新客户端。", color: .orange) }
                     Divider()
                     HStack(spacing: 12) {
-                        Button("复制当前 Key") { copyKey() }.disabled(!canEdit || status == .null)
-                        Button("重新生成…") { confirmReset = true }.disabled(!canEdit || status == .null)
+                        Button("复制当前 Key") { copyKey() }.disabled(!model.running || status == .null || working || copyingKey)
+                        Button("重新生成…") { confirmReset = true }.disabled(!canEdit)
                         Spacer()
                         if working { ProgressView().controlSize(.small) }
                         Button("应用设置") { save() }.buttonStyle(.borderedProminent).disabled(!canEdit || !changed)
                     }
                     if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
+                    if error != nil || status == .null && model.running {
+                        Button(loading ? "读取中…" : "重新读取") { Task { await load() } }.disabled(!model.running || loading || working)
+                    }
                     if status["enabled"].bool == true && status["running"].bool == false {
-                        InfoNote(text: "入口未启动，请更换端口后应用设置。", color: .orange)
+                        HStack {
+                            InfoNote(text: "聊天入口未启动。", color: .orange)
+                            Button("重试启动") { update(.object([:])) }.disabled(!canEdit)
+                        }
                     }
                 }
                 SettingsCard("供应商填写", symbol: "link") {
@@ -64,14 +75,22 @@ struct ChatbotSettingsView: View {
         }.task(id: model.running) { await load() }
             .onChange(of: port) { _, _ in error = nil }
             .onChange(of: newKey) { _, _ in error = nil }
-            .alert("重新生成 API Key？", isPresented: $confirmReset) {
+            .alert("重新生成聊天客户端 API Key？", isPresented: $confirmReset) {
                 Button("取消", role: .cancel) {}
-                Button("重新生成") { update(.object(["regenerate_key": .bool(true)]), reset: true) }
+                Button("重新生成") { update(.object(["regenerate_key": .bool(true)])) }
             } message: { Text("旧 Key 将无法发起新请求，使用此入口的客户端需要更新密钥。") }
     }
     private func load() async {
-        guard model.running else { return }
-        do { status = try await model.remoteCall("chatbot.status"); port = status["port"].number.map { String(Int($0)) } ?? ""; error = nil }
+        guard model.running else { status = .null; error = nil; return }
+        loading = true
+        defer { loading = false }
+        do {
+            let actual = try await model.remoteCall("chatbot.status")
+            guard !Task.isCancelled, model.running else { return }
+            if port == savedPort { port = actual["port"].number.map { String(Int($0)) } ?? "" }
+            savedPort = actual["port"].number.map { String(Int($0)) } ?? ""
+            status = actual; error = nil
+        }
         catch { self.error = error.localizedDescription }
     }
     private func save() {
@@ -80,21 +99,31 @@ struct ChatbotSettingsView: View {
         if !newKey.isEmpty { payload["key"] = .string(newKey) }
         update(.object(payload))
     }
-    private func update(_ payload: JSONValue, reset: Bool = false) {
+    private func update(_ payload: JSONValue) {
         guard canEdit else { return }; working = true; error = nil
         Task {
             defer { working = false }
             do {
                 status = try await model.remoteCall("chatbot.configure", payload)
-                port = status["port"].number.map { String(Int($0)) } ?? ""; newKey = ""
-                model.notice = reset ? "API Key 已重新生成，请更新客户端密钥。" : "聊天客户端设置已应用。"
-            } catch { self.error = error.localizedDescription }
+                savedPort = status["port"].number.map { String(Int($0)) } ?? ""
+                if payload["port"] != .null { port = status["port"].number.map { String(Int($0)) } ?? "" }
+                if payload["key"] != .null { newKey = "" }
+                model.notice = payload["regenerate_key"].bool == true || payload["key"] != .null ? "API Key 已更换，请更新客户端密钥。" : "聊天客户端设置已应用。"
+            } catch {
+                let message = error.localizedDescription
+                if let actual = try? await model.remoteCall("chatbot.status") {
+                    status = actual
+                    savedPort = actual["port"].number.map { String(Int($0)) } ?? ""
+                }
+                self.error = message
+            }
         }
     }
     private func copyKey() {
-        guard canEdit else { return }; working = true; error = nil
+        guard model.running, status != .null, !working, !copyingKey else { return }
+        copyingKey = true; error = nil
         Task {
-            defer { working = false }
+            defer { copyingKey = false }
             do {
                 let result = try await model.remoteCall("chatbot.key")
                 guard let key = result["key"].string else { throw AppError.message("无法读取聊天客户端 Key。") }

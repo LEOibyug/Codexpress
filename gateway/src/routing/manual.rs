@@ -2,6 +2,7 @@
 use crate::{
     affinity::AffinityStore,
     model::{AppState, Source, SourceRuntime},
+    model_policy::{self, ModelPolicy},
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -83,14 +84,21 @@ impl ManualRouting {
         }
     }
 
-    fn claim(&self, model: &str, sources: &[SourceRuntime]) -> Option<Trial> {
+    fn claim(
+        &self,
+        model: &str,
+        sources: &[SourceRuntime],
+        policies: &[ModelPolicy],
+    ) -> Option<Trial> {
         let mut pending = self.pending.lock().ok()?;
         let trial = pending.as_mut()?;
         let source = &sources
             .iter()
             .find(|r| r.source.id == trial.source_id)?
             .source;
-        if !source.models.is_empty() && !source.models.iter().any(|m| m == model) {
+        if !model_policy::source_allowed(policies, model, &source.id)
+            || (!source.models.is_empty() && !source.models.iter().any(|m| m == model))
+        {
             return None;
         }
         trial.started = true;
@@ -99,9 +107,11 @@ impl ManualRouting {
 }
 
 pub(crate) async fn claim(state: &Arc<AppState>, model: &str) -> Option<Trial> {
+    let _routing_sync = state.routing_sync.lock().await;
+    let policies = state.model_policies.read().await.clone();
     let sources = state.sources.read().await;
     state.manual_routing.refresh(&sources, &state.affinity);
-    state.manual_routing.claim(model, &sources)
+    state.manual_routing.claim(model, &sources, &policies)
 }
 
 pub(super) fn has_credentials(source: &Source) -> bool {
@@ -192,6 +202,7 @@ pub(crate) async fn source_for_trial(
     trial: &Trial,
     model: &str,
 ) -> Option<Source> {
+    let policies = state.model_policies.read().await.clone();
     let sources = state.sources.read().await;
     sources
         .iter()
@@ -199,6 +210,7 @@ pub(crate) async fn source_for_trial(
             r.source.id == trial.source_id
                 && r.source.identity() == trial.identity
                 && r.source.enabled
+                && model_policy::source_allowed(&policies, model, &r.source.id)
                 && !super::official_exhausted(r, &sources)
                 && has_credentials(&r.source)
                 && (r.source.models.is_empty() || r.source.models.iter().any(|m| m == model))
@@ -212,11 +224,13 @@ pub(crate) async fn reserve(
     session: Option<&str>,
     model: &str,
 ) -> Option<crate::affinity::RouteLease> {
+    let policies = state.model_policies.read().await.clone();
     let sources = state.sources.read().await;
     let runtime = sources.iter().find(|r| {
         r.source.id == source.id
             && r.source.identity() == source.identity()
             && r.source.enabled
+            && model_policy::source_allowed(&policies, model, &r.source.id)
             && !super::official_exhausted(r, &sources)
             && (r.source.models.is_empty() || r.source.models.iter().any(|m| m == model))
     })?;

@@ -51,7 +51,9 @@ def check(helper, codex):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     process = None
     try:
-        with tempfile.TemporaryDirectory(prefix="cx-resume-", dir="/tmp", ignore_cleanup_errors=True) as directory:
+        temporary_root = Path(__file__).resolve().parents[1] / ".runtime/tmp"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="cxr-", dir=temporary_root, ignore_cleanup_errors=True) as directory:
             root = Path(directory)
             home, state, work = [root / name for name in ["codex", "app", "work"]]
             for path in [home, state, work]:

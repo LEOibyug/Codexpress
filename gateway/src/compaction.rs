@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{collections::HashSet, fs, path::Path};
 use toml_edit::DocumentMut;
 
@@ -16,6 +17,25 @@ pub struct ModelCompactionRule {
     pub auto_compact_token_limit: i64,
     #[serde(default)]
     pub context_window: Option<i64>,
+}
+
+pub(crate) fn revision(rules: &[ModelCompactionRule]) -> String {
+    // Rule order does not affect budgets. Hash a canonical, length-delimited
+    // snapshot only when publishing configuration, never on a polling request.
+    let mut ordered: Vec<_> = rules.iter().collect();
+    ordered.sort_unstable_by(|left, right| left.model.cmp(&right.model));
+    let mut hash = Sha256::new();
+    hash.update(b"codexpress-omp-budgets-v1");
+    for rule in ordered {
+        hash.update((rule.model.len() as u64).to_le_bytes());
+        hash.update(rule.model.as_bytes());
+        hash.update(rule.auto_compact_token_limit.to_le_bytes());
+        hash.update([u8::from(rule.context_window.is_some())]);
+        if let Some(window) = rule.context_window {
+            hash.update(window.to_le_bytes());
+        }
+    }
+    format!("{:x}", hash.finalize())
 }
 
 pub fn validate(rules: &[ModelCompactionRule]) -> Result<()> {
@@ -149,33 +169,7 @@ pub fn catalog_from_value(
             index
         } else {
             // Preserve Codex's existing model-family metadata for versioned/namespaced IDs.
-            let suffix = rule.model.split_once('/').map(|(_, suffix)| suffix);
-            let matching = |name: &str| {
-                models
-                    .iter()
-                    .filter(|m| {
-                        m["slug"]
-                            .as_str()
-                            .is_some_and(|slug| name.starts_with(slug))
-                    })
-                    .max_by_key(|m| m["slug"].as_str().map(str::len).unwrap_or(0))
-                    .cloned()
-            };
-            let inherited = matching(&rule.model).or_else(|| suffix.and_then(matching));
-            // Match Codex's conservative fallback for third-party model IDs.
-            let mut metadata = inherited.unwrap_or_else(|| json!({
-                "slug":rule.model,"display_name":rule.model,"description":null,
-                "supported_reasoning_levels":[],"shell_type":"unified_exec",
-                "visibility":"list","supported_in_api":true,"priority":99,
-                "availability_nux":null,"upgrade":null,"support_verbosity":false,
-                "default_verbosity":null,"apply_patch_tool_type":null,
-                "truncation_policy":{"mode":"bytes","limit":10000},
-                "context_window":272000,"max_context_window":272000,
-                "effective_context_window_percent":95,"experimental_supported_tools":[],
-                "model_messages":{"instructions_template":include_str!("../resources/codex-prompt-0.162.1.md")}
-            }));
-            metadata["slug"] = json!(rule.model);
-            metadata["display_name"] = json!(rule.model);
+            let metadata = metadata_for_model(models, &rule.model);
             models.push(metadata);
             models.len() - 1
         };
@@ -217,4 +211,27 @@ pub fn catalog_from_value(
     }
     // Cache envelopes may contain authentication/cache identity; export model metadata only.
     Ok(json!({"models":models}))
+}
+
+pub(crate) fn metadata_for_model(models: &[Value], id: &str) -> Value {
+    let matching = |name: &str| {
+        models.iter().filter(|model| {
+            model["slug"].as_str().is_some_and(|slug| name.starts_with(slug))
+        }).max_by_key(|model| model["slug"].as_str().map(str::len).unwrap_or(0)).cloned()
+    };
+    let inherited = matching(id).or_else(|| id.split_once('/').and_then(|(_, suffix)| matching(suffix)));
+    let mut metadata = inherited.unwrap_or_else(|| json!({
+        "slug":id,"display_name":id,"description":null,
+        "supported_reasoning_levels":[],"shell_type":"unified_exec",
+        "visibility":"list","supported_in_api":true,"priority":99,
+        "availability_nux":null,"upgrade":null,"support_verbosity":false,
+        "default_verbosity":null,"apply_patch_tool_type":null,
+        "truncation_policy":{"mode":"bytes","limit":10000},
+        "context_window":272000,"max_context_window":272000,
+        "effective_context_window_percent":95,"experimental_supported_tools":[],
+        "model_messages":{"instructions_template":include_str!("../resources/codex-prompt-0.162.1.md")}
+    }));
+    metadata["slug"] = json!(id);
+    metadata["display_name"] = json!(id);
+    metadata
 }

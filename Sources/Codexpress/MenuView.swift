@@ -124,15 +124,18 @@ struct MenuView: View {
     }
 
     private func compactQuota(_ quota: JSONValue) -> some View {
-        HStack(alignment: .top, spacing: 14) {
-            ForEach(QuotaOverview(quota).mainWindows) { window in
+        let overview = QuotaOverview(quota)
+        return HStack(alignment: .top, spacing: 14) {
+            ForEach(overview.mainWindows) { window in
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
                         Text(window.title).font(.system(size: 10)).foregroundStyle(.secondary)
                         Text(window.remainingLabel).font(AccountTypography.compactValue)
                             .monospacedDigit().foregroundStyle(AccountLevel.quota(window.remaining).color)
                             .accessibilityLabel("\(window.title)剩余 \(window.remainingLabel)")
+                        if !overview.hasShortWindow { QuotaReferenceLabel(window: window, compact: true) }
                     }
+                    if overview.hasShortWindow { QuotaReferenceLabel(window: window, compact: true) }
                     Text(resetLabel(window)).font(.system(size: 10)).foregroundStyle(.secondary)
                         .lineLimit(1).help(window.resetLabel)
                 }.frame(maxWidth: .infinity, alignment: .leading)

@@ -813,50 +813,57 @@ async fn official_compaction_uses_required_proxy_without_direct_fallback() {
 }
 
 #[tokio::test]
-async fn explicit_invalid_ciphertext_can_rebuild_once_without_replaying_unknown_errors() {
-    let hits = Arc::new(AtomicUsize::new(0));
-    let copy = hits.clone();
-    let (origin, task) = serve(Router::new().route(
-        "/responses",
-        post(move |req: Request| {
-            let copy = copy.clone();
-            async move {
-                let body: Value =
-                    serde_json::from_slice(&to_bytes(req.into_body(), 10000).await.unwrap())
-                        .unwrap();
-                let n = copy.fetch_add(1, Ordering::Relaxed);
-                if n == 0 {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        axum::Json(json!({"error":{"code":"invalid_encrypted_content"}})),
-                    )
-                } else {
-                    assert_eq!(body["input"].as_array().unwrap().len(), 1);
-                    assert!(body.get("previous_response_id").is_none());
-                    (
-                        StatusCode::OK,
-                        axum::Json(
-                            json!({"id":"fresh","usage":{"input_tokens":5,"output_tokens":1}}),
-                        ),
-                    )
+async fn explicit_invalid_ciphertext_can_rebuild_once() {
+    for problem in [
+        json!({"code":"invalid_encrypted_content"}),
+        json!({"type":"invalid_encrypted_content"}),
+        json!({"code":null,"type":"invalid_encrypted_content"}),
+    ] {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let copy = hits.clone();
+        let (origin, task) = serve(Router::new().route(
+            "/responses",
+            post(move |req: Request| {
+                let copy = copy.clone();
+                let problem = problem.clone();
+                async move {
+                    let body: Value =
+                        serde_json::from_slice(&to_bytes(req.into_body(), 10000).await.unwrap())
+                            .unwrap();
+                    let n = copy.fetch_add(1, Ordering::Relaxed);
+                    if n == 0 {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(json!({"error":problem})),
+                        )
+                    } else {
+                        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+                        assert!(body.get("previous_response_id").is_none());
+                        (
+                            StatusCode::OK,
+                            axum::Json(
+                                json!({"id":"fresh","usage":{"input_tokens":5,"output_tokens":1}}),
+                            ),
+                        )
+                    }
                 }
-            }
-        }),
-    ))
-    .await;
-    let (_dir, state) = state(vec![source("a", &origin, 0)]).await;
-    state.settings.write().await.degraded_context_fallback = true;
-    state
-        .bindings
-        .lock()
-        .await
-        .insert("known-old".into(), "a".into());
-    let response=relay::router(state.clone()).oneshot(request(br#"{"model":"m","previous_response_id":"known-old","input":[{"type":"message","content":"visible"},{"type":"reasoning","encrypted_content":"invalid-cipher"}]}"#)).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    to_bytes(response.into_body(), 10000).await.unwrap();
-    assert_eq!(hits.load(Ordering::Relaxed), 2);
-    assert_eq!(state.notifications.list().len(), 1);
-    task.abort();
+            }),
+        ))
+        .await;
+        let (_dir, state) = state(vec![source("a", &origin, 0)]).await;
+        state.settings.write().await.degraded_context_fallback = true;
+        state
+            .bindings
+            .lock()
+            .await
+            .insert("known-old".into(), "a".into());
+        let response=relay::router(state.clone()).oneshot(request(br#"{"model":"m","previous_response_id":"known-old","input":[{"type":"message","content":"visible"},{"type":"reasoning","encrypted_content":"invalid-cipher"}]}"#)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 10000).await.unwrap();
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+        assert_eq!(state.notifications.list().len(), 1);
+        task.abort();
+    }
 }
 
 #[tokio::test]
@@ -2275,7 +2282,7 @@ async fn official_sse_without_content_type_extracts_reported_details_without_rew
 }
 
 #[tokio::test]
-async fn compact_and_models_keep_native_paths_and_compressed_bytes() {
+async fn compact_keeps_native_path_and_compressed_bytes() {
     let compressed = vec![
         31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
@@ -2295,12 +2302,6 @@ async fn compact_and_models_keep_native_paths_and_compressed_bytes() {
                             .unwrap()
                     }
                 }),
-            )
-            .route(
-                "/v1/models",
-                axum::routing::get(|| async {
-                    axum::Json(json!({"object":"list","data":[{"id":"native-model"}]}))
-                }),
             ),
     )
     .await;
@@ -2318,19 +2319,6 @@ async fn compact_and_models_keep_native_paths_and_compressed_bytes() {
     assert_eq!(
         state.usage.summary(1).unwrap()["recent"][0]["complete"],
         false
-    );
-    let models = Request::builder()
-        .uri("/v1/models")
-        .header("host", "localhost:0")
-        .header("authorization", "Bearer local-key")
-        .body(Body::empty())
-        .unwrap();
-    let response = app.oneshot(models).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), 10000).await.unwrap();
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["data"][0]["id"],
-        "native-model"
     );
     task.abort();
 }

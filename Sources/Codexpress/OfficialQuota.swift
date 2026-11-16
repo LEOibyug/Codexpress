@@ -7,9 +7,16 @@ struct QuotaWindow: Identifiable {
     let resetAt: Double?
     let seconds: Double?
     let name: String
+    let refCost: Double?
 
-    var remainingLabel: String { remaining.map { "\(Int($0))%" } ?? "未知" }
+    var remainingLabel: String { remaining.map { $0 > 0 && $0 < 1 ? "<1%" : "\(Int($0))%" } ?? "未知" }
     var resetLabel: String { resetAt.map { "\(timestampLabel(.number($0))) 重置" } ?? "重置时间未知" }
+
+    func referenceCost(at date: Date) -> Double? {
+        guard seconds == 604800 else { return nil }
+        guard let resetAt else { return refCost }
+        return max(0, min(100, (resetAt - date.timeIntervalSince1970) / 604800 * 100))
+    }
 
     init(_ raw: JSONValue, index: Int) {
         name = raw["name"].string ?? ""
@@ -17,6 +24,7 @@ struct QuotaWindow: Identifiable {
         seconds = raw["window_seconds"].number.flatMap { $0.isFinite && $0 > 0 && $0 <= 31536000 ? $0 : nil }
         remaining = raw["used_percent"].number.flatMap { $0.isFinite ? max(0, min(100, 100 - $0)) : nil }
         resetAt = raw["reset_at"].number.flatMap { $0.isFinite && $0 > 0 && $0 <= 253402300799 ? $0 : nil }
+        refCost = seconds == 604800 ? raw["ref_cost"].number.flatMap { $0.isFinite && (0...100).contains($0) ? $0 : nil } : nil
         let parts = name.split(separator: ":", omittingEmptySubsequences: false)
         let period: String
         switch seconds {
@@ -32,13 +40,14 @@ struct QuotaWindow: Identifiable {
 
     init(placeholder name: String, title: String) {
         self.name = name; self.title = title; id = "missing:\(name)"
-        remaining = nil; resetAt = nil; seconds = nil
+        remaining = nil; resetAt = nil; seconds = nil; refCost = nil
     }
 }
 
 struct QuotaOverview {
     let mainWindows: [QuotaWindow]
     let windows: [QuotaWindow]
+    let hasShortWindow: Bool
 
     init(_ quota: JSONValue) {
         let parsed = quota["windows"].array.enumerated().map { QuotaWindow($0.element, index: $0.offset) }
@@ -46,8 +55,8 @@ struct QuotaOverview {
         let weekly = base.first { $0.seconds == 604800 }
         let short = base.first { $0.seconds.map { $0 < 604800 } == true }
             ?? base.first { $0.name == "primary" && $0.seconds == nil }
-        mainWindows = [short ?? QuotaWindow(placeholder: "short", title: "短周期"),
-                       weekly ?? QuotaWindow(placeholder: "weekly", title: "每周")]
+        hasShortWindow = short != nil
+        mainWindows = [short, weekly ?? QuotaWindow(placeholder: "weekly", title: "每周")].compactMap { $0 }
         let selected = Set(mainWindows.map(\.id))
         windows = mainWindows + parsed.filter { !selected.contains($0.id) }
     }
@@ -57,8 +66,18 @@ struct OfficialRefreshSchedule {
     private var quotaAttempts: [String: Date] = [:]
     private var creditAttempts: [String: Date] = [:]
 
-    func isDue(_ id: String, now: Date = Date(), foreground: Bool = false) -> Bool {
-        now.timeIntervalSince(quotaAttempts[id] ?? .distantPast) >= (foreground ? 15 : 1800)
+    func isDue(_ id: String, now: Date = Date(), foreground: Bool = false, interval: TimeInterval = 1800, since start: Date = .distantPast) -> Bool {
+        now.timeIntervalSince(quotaAttempts[id] ?? (foreground ? .distantPast : start)) >= (foreground ? 15 : interval)
+    }
+    func backgroundDelay(for ids: [String], since start: Date, interval: TimeInterval, now: Date = Date()) -> TimeInterval {
+        var deadline: Date?
+        for id in ids {
+            let next = (quotaAttempts[id] ?? start).addingTimeInterval(interval)
+            deadline = min(deadline ?? next, next)
+        }
+        // Recheck overdue accounts without spinning when the gateway is busy or credentials are unavailable.
+        let remaining = deadline?.timeIntervalSince(now) ?? interval
+        return remaining > 0 ? min(remaining, 1800) : 15
     }
     func needsCredits(_ id: String, now: Date = Date()) -> Bool {
         now.timeIntervalSince(creditAttempts[id] ?? .distantPast) >= 300
@@ -67,5 +86,7 @@ struct OfficialRefreshSchedule {
         quotaAttempts[id] = now
         if includeCredits { creditAttempts[id] = now }
     }
-    mutating func reset(_ id: String) { quotaAttempts[id] = nil; creditAttempts[id] = nil }
+    mutating func reset(_ id: String) {
+        quotaAttempts[id] = nil; creditAttempts[id] = nil
+    }
 }

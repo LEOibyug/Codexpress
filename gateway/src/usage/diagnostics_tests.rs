@@ -8,7 +8,7 @@ fn capture(id: &str) -> Capture {
         "secret":{"api_key":"fixture-secret-key","refresh_token":"fixture-refresh-token"}
     }))
     .unwrap();
-    Capture::new(id, crate::model::now(), &source, "fixture-gateway-key")
+    Capture::new(id, crate::model::now(), &source, "fixture-gateway-key", Ingress::Unknown)
 }
 
 fn stored(data: &StoreData, id: &str) -> Value {
@@ -19,7 +19,7 @@ fn stored(data: &StoreData, id: &str) -> Value {
 fn record_refresh_returns_updated_cost_without_reading_error_body() {
     let (_dir, data) = fixture();
     let attempt = persist(&data, &record("cost-refresh", crate::model::now()), None);
-    data.connection.execute("INSERT INTO diagnostics(attempt_id,created_at,metadata,body) VALUES ('cost-refresh',?1,'{}',X'FF')", [crate::model::now()]).unwrap();
+    data.connection.execute("INSERT INTO diagnostics(attempt_id,created_at,metadata,body) VALUES ('cost-refresh',?1,'{\"ingress\":\"chatbot\"}',X'FF')", [crate::model::now()]).unwrap();
     data.connection
         .execute(
             "UPDATE usage SET metadata=json_set(metadata,'$.cost',json(?1)) WHERE attempt=?2",
@@ -35,8 +35,12 @@ fn record_refresh_returns_updated_cost_without_reading_error_body() {
     )
     .unwrap();
     assert_eq!(refreshed["record"]["cost"]["total_usd"], 0.123);
+    assert_eq!(refreshed["record"]["ingress"], "chatbot");
     assert!(refreshed.get("diagnostic").is_none());
     assert!(refreshed.get("related").is_none());
+    data.connection.execute("UPDATE usage SET metadata=json_set(metadata,'$.ingress','omp') WHERE attempt=?1", [attempt]).unwrap();
+    let refreshed = detail(&data, &json!({"attempt_id":"cost-refresh","record_only":true})).unwrap();
+    assert_eq!(refreshed["record"]["ingress"], "omp");
     assert!(detail(&data, &json!({"attempt_id":"cost-refresh"})).is_err());
 }
 

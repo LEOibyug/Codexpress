@@ -3,7 +3,7 @@ import Foundation
 enum SSHRemoteOMPAgent {
     // Fixed Python program. All remote paths, bundles and credentials arrive on stdin.
     static let script = #"""
-import base64, fcntl, hashlib, json, os, pathlib, re, socket, stat, sys, urllib.request, uuid
+import base64, fcntl, hashlib, json, os, pathlib, re, shutil, socket, stat, subprocess, sys, urllib.request, uuid
 NAMES = ('models.yml', 'models.yaml', 'models.json', 'config.yml', 'config.yaml', 'settings.json')
 LIMIT = 4 * 1024 * 1024
 SNAPSHOT_LIMIT = 24 * 1024 * 1024
@@ -127,8 +127,8 @@ def probe(payload):
     base = payload.get('base_url', '')
     parsed = urlsplit(base)
     key = payload.get('key')
-    if parsed.scheme != 'http' or not parsed.hostname or parsed.path != '/v1' or parsed.username or parsed.password or parsed.query or parsed.fragment or not isinstance(key, str) or not key or '\n' in key or '\r' in key:
-        fail('OMP 聊天客户端入口地址或共享 Key 无效。')
+    if parsed.scheme != 'http' or not parsed.hostname or parsed.path != '/omp/v1' or parsed.username or parsed.password or parsed.query or parsed.fragment or not isinstance(key, str) or not key or '\n' in key or '\r' in key:
+        fail('Codexpress Agent 入口地址或共享 Key 无效。')
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl): return None
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
@@ -137,10 +137,134 @@ def probe(payload):
         with opener.open(req, timeout=8) as response:
             if response.geturl() != base + '/remote-check': fail('入口发生重定向。')
             info = json.loads(response.read(4097))
-        if not isinstance(info, dict) or info.get('service') != 'codexpress' or info.get('mode') != 'chatbot' or type(info.get('version')) is not int or info['version'] != 1:
+        if not isinstance(info, dict) or info.get('service') != 'codexpress' or info.get('mode') != 'omp' or type(info.get('version')) is not int or info['version'] != 1:
             fail('入口身份不匹配。')
     except Exception:
-        fail('远端无法验证 Codexpress 聊天客户端入口。请检查地址、共享 Key、端口、防火墙及局域网或 VPN 路由；配置未修改。')
+        fail('远端无法连接 Codexpress Agent 入口。请检查地址、Key、端口及局域网或 VPN 路由；配置未修改。')
+
+
+def cli_environment(path=None):
+    env = dict(os.environ)
+    home = os.path.expanduser('~')
+    paths = [os.path.join(home, '.local', 'bin'), os.path.join(home, '.bun', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin']
+    env['PATH'] = os.pathsep.join(dict.fromkeys(env.get('PATH', '').split(os.pathsep) + paths))
+    if path is not None:
+        env.update(PI_CODING_AGENT_DIR=path, OMP_PROFILE='default', PI_PROFILE='default')
+    return env
+
+def executable():
+    return shutil.which('omp', path=cli_environment()['PATH'])
+
+def run_cli(command, path, args, timeout, capture=False, credentials=None):
+    env = cli_environment(path)
+    # Only native login receives the key, never argv, files or returned command logs.
+    env.pop('CODEXPRESS_API_KEY', None)
+    if credentials is not None:
+        env.update(CODEXPRESS_API_KEY=credentials['key'], CODEXPRESS_BASE_URL=credentials['base_url'])
+    try:
+        result = subprocess.run([command] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env, cwd=path if path and os.path.isdir(path) else os.path.expanduser('~'), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        fail('远端官方 OMP 操作超时；请检查远端网络和 OMP 状态后重试。')
+    except OSError:
+        fail('无法启动远端官方 OMP，请检查安装及运行依赖。')
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).decode('utf-8', errors='replace').strip()
+        if credentials is not None: detail = detail.replace(credentials['key'], '[Key]')
+        detail = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', detail)[-2000:]
+        fail('远端 OMP %s 失败（%d）。%s' % (' '.join(args[:2]), result.returncode, '\n' + detail if detail else '请检查 OMP 安装与运行依赖。'))
+    return result.stdout if capture else None
+
+def version(command):
+    if command is None: return None
+    try: return run_cli(command, None, ['--version'], 10, True).decode('utf-8').strip() or None
+    except (AgentError, UnicodeError): return None
+
+def plugin(command, path):
+    try:
+        value = json.loads(run_cli(command, path, ['plugin', 'list', '--json'], 20, True))
+        if not isinstance(value, dict) or not isinstance(value.get('npm'), list): raise ValueError()
+        return next((item for item in value['npm'] if isinstance(item, dict) and item.get('name') == '@codexpress/omp-extension'), None)
+    except (ValueError, UnicodeError):
+        fail('远端官方 OMP 扩展列表格式无效，请更新官方 OMP。')
+
+def profile(fd):
+    raw = read(fd, 'codexpress.json')
+    try: value = json.loads(raw) if raw is not None else {}
+    except (ValueError, UnicodeError): fail('远端 codexpress.json 不是有效 JSON；未修改。')
+    if not isinstance(value, dict) or ('baseUrl' in value and not isinstance(value['baseUrl'], str)):
+        fail('远端 codexpress.json 配置无效；未修改。')
+    return raw, value
+
+def extension_status(path, command, omp_version, installed):
+    fd = directory(path)
+    try: _, config = profile(fd)
+    finally:
+        if fd is not None: os.close(fd)
+    base = config.get('baseUrl')
+    result = dict(agent_dir=path, omp_executable=command, omp_version=omp_version, installed=installed is not None,
+                  environment_override=bool(os.environ.get('CODEXPRESS_BASE_URL') and os.environ['CODEXPRESS_BASE_URL'] != base))
+    if installed is not None and isinstance(installed.get('version'), str): result['extension_version'] = installed['version']
+    if base is not None: result['base_url'] = base
+    return result
+
+def connect_extension(payload, path, install):
+    command = executable()
+    if command is None: fail('远端未找到官方 omp，请先安装官方 OMP。')
+    probe(payload)
+    package = decoded(payload.get('package'), LIMIT) if install else None
+    if install and not package: fail('OMP 扩展安装包为空。')
+    fd = directory(path, install)
+    if fd is None: fail('远端尚未安装 Codexpress 扩展，请先安装。')
+    meta = lock = None
+    try:
+        meta = child_directory(fd, '.codexpress', True)
+        lock = os.open('remote.lock', os.O_WRONLY | os.O_NONBLOCK | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600, dir_fd=meta)
+        if not stat.S_ISREG(os.fstat(lock).st_mode) or os.fstat(lock).st_nlink != 1: fail('OMP 锁文件无效。')
+        os.fchmod(lock, 0o600); fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        before, config = profile(fd)
+        if install:
+            packages = child_directory(meta, 'packages', True)
+            try:
+                name = 'codexpress-' + hashlib.sha256(package).hexdigest() + '.tgz'
+                previous = read(packages, name)
+                if previous is not None and previous != package: fail('远端持久扩展包内容不匹配；未覆盖。')
+                atomic(packages, name, package, previous)
+            finally: os.close(packages)
+            package_path = os.path.join(path, '.codexpress', 'packages', name)
+            try: run_cli(command, path, ['plugin', 'install', '@codexpress/omp-extension@file:' + package_path], 100)
+            except AgentError as error:
+                fail('官方 OMP 扩展安装失败或超时；持久包已保留，OMP 可能已有部分安装状态，地址配置未修改。\n' + str(error))
+        installed = plugin(command, path)
+        if installed is None: fail('远端尚未安装 Codexpress 扩展，请先安装；地址配置未修改。')
+        config['baseUrl'] = payload['base_url']
+        written = (json.dumps(config, ensure_ascii=False, indent=2) + '\n').encode()
+        atomic(fd, 'codexpress.json', written, before)
+        try:
+            run_cli(command, path, ['login', 'codexpress'], 40, credentials=payload)
+            # Login belongs to OMP; never inspect or alter its credential database.
+            final_raw, final = profile(fd)
+            if final.get('baseUrl') != payload['base_url']:
+                fail('OMP 登录期间地址配置已变化。')
+            preserved = dict(config, **final)
+            if preserved != final:
+                atomic(fd, 'codexpress.json', (json.dumps(preserved, ensure_ascii=False, indent=2) + '\n').encode(), final_raw)
+        except Exception as error:
+            restored = False
+            try:
+                current_raw, current_config = profile(fd)
+                if current_raw != written and current_config != config: fail('配置已被其他写入更改。')
+                atomic(fd, 'codexpress.json', before, current_raw); restored = True
+            except Exception: pass
+            detail = str(error) if isinstance(error, AgentError) else '请检查远端配置文件权限和磁盘状态。'
+            fail('OMP 原生登录失败；' + ('已恢复原地址配置。' if restored else '配置已被其他写入更改，已保留。') + '扩展及原生登录状态可能已改变。\n' + detail)
+        result = extension_status(path, command, version(command), installed)
+        result['connected'] = True
+        return result
+    finally:
+        if lock is not None: os.close(lock)
+        if meta is not None: os.close(meta)
+        os.close(fd)
 
 def discovery():
     home = os.path.expanduser('~')
@@ -157,21 +281,29 @@ def discovery():
     # XDG moves OMP data/state/cache, not the agent configuration directory.
     candidates = [selected(os.path.abspath(preferred))]
     parts = os.environ.get('SSH_CONNECTION', '').split()
-    return dict(candidates=candidates, client_ip=parts[0] if len(parts) == 4 else '', remote_host=socket.gethostname())
+    command = executable()
+    return dict(candidates=candidates, client_ip=parts[0] if len(parts) == 4 else '', remote_host=socket.gethostname(),
+                omp_executable=command, omp_version=version(command))
 
 def main(payload):
     action = payload.get('action')
     if action == 'discover': return discovery()
+    if action == 'probe':
+        probe(payload)
+        return dict(connected=True)
     path = selected(payload.get('agent_dir'))
+    if action == 'status':
+        command = executable()
+        return extension_status(path, command, version(command), plugin(command, path) if command else None)
+    if action in ('install', 'configure'): return connect_extension(payload, path, action == 'install')
     if action == 'read':
         fd = directory(path)
         try: return state(fd, path)
         finally:
             if fd is not None: os.close(fd)
-    if action not in ('apply', 'restore'): fail('未知 OMP 远端操作。')
+    if action != 'restore': fail('未知 OMP 远端操作。')
     files, snapshot = bundle(payload)
-    if action == 'apply': probe(payload)
-    fd = directory(path, action == 'apply')
+    fd = directory(path)
     if fd is None: fail('远端 OMP 目录不存在，无法还原。')
     meta = lock = None
     try:
@@ -203,7 +335,7 @@ def main(payload):
                 try: atomic(target, name, before, written)
                 except Exception: pass
             fail('OMP 应用失败；已撤回仍属于本次操作的变更，保留并发修改和操作前备份。')
-        return dict(applied=True, agent_dir=path, backup_id=backup_id)
+        return dict(applied=True, agent_dir=path, backup_id=backup_id, digest=final['digest'])
     finally:
         if lock is not None: os.close(lock)
         if meta is not None: os.close(meta)

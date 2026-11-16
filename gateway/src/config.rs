@@ -209,7 +209,7 @@ pub fn preview_with_rules(
     key: &str,
     rules: &[ModelCompactionRule],
 ) -> Result<Value> {
-    preview_with_origins(home, state_dir, port, key, rules, &[])
+    preview_with_origins(home, state_dir, port, key, rules, &[], &std::collections::HashSet::new())
 }
 
 pub fn preview_with_origins(
@@ -219,6 +219,7 @@ pub fn preview_with_origins(
     key: &str,
     rules: &[ModelCompactionRule],
     origins: &[ProviderOrigin],
+    excluded_models: &std::collections::HashSet<String>,
 ) -> Result<Value> {
     let home = path_checked(home)?;
     let (_, before) = read_document(&home.join("config.toml"))?;
@@ -261,7 +262,7 @@ pub fn preview_with_origins(
             alias_tables(&doc).map(|p| p.iter().map(|(id, _)| id.to_owned()).collect::<Vec<_>>())
         })
         .unwrap_or_default();
-    let catalog = prepare_compaction(&mut after, &home, state_dir, snapshot.as_ref(), rules)?;
+    let catalog = prepare_compaction(&mut after, &home, state_dir, snapshot.as_ref(), rules, excluded_models)?;
     let model_limits = catalog.as_ref().map(|(_, bytes)| {
         let catalog: Value = serde_json::from_slice(bytes).expect("generated JSON");
         catalog["models"].as_array().unwrap().iter().filter(|m| rules.iter().any(|r| m["slug"] == r.model))
@@ -283,7 +284,7 @@ pub fn attach_with_rules(
     key: &str,
     rules: &[ModelCompactionRule],
 ) -> Result<Value> {
-    attach_with_origins(home, state_dir, port, key, rules, &[])
+    attach_with_origins(home, state_dir, port, key, rules, &[], &std::collections::HashSet::new())
 }
 
 pub fn attach_with_origins(
@@ -293,6 +294,7 @@ pub fn attach_with_origins(
     key: &str,
     rules: &[ModelCompactionRule],
     origins: &[ProviderOrigin],
+    excluded_models: &std::collections::HashSet<String>,
 ) -> Result<Value> {
     let home = path_checked(home)?;
     fs::create_dir_all(&home)?;
@@ -316,7 +318,7 @@ pub fn attach_with_origins(
             bail!("本地连接端口或凭据已变化，请先恢复连接后重新接管");
         }
     }
-    preview_with_origins(&home, state_dir, port, key, rules, origins)?;
+    preview_with_origins(&home, state_dir, port, key, rules, origins, excluded_models)?;
     if let Some(snapshot) = &previous_snapshot {
         restore_official_fields(&mut doc, snapshot)?;
         restore_gateway_aliases(&mut doc, snapshot)?;
@@ -327,6 +329,7 @@ pub fn attach_with_origins(
         state_dir,
         previous_snapshot.as_ref(),
         rules,
+        excluded_models,
     )?;
     select_local(&mut doc);
     if doc.get("model_providers").is_none() {
@@ -355,7 +358,7 @@ pub fn attach_with_origins(
         official_auth_backup_id: previous_snapshot
             .as_ref()
             .and_then(|s| s.official_auth_backup_id.clone()),
-        compaction_before: if rules.is_empty() {
+        compaction_before: if catalog.is_none() {
             None
         } else {
             Some(
@@ -370,7 +373,7 @@ pub fn attach_with_origins(
                     .unwrap_or_else(|| before.clone()),
             )
         },
-        applied_compaction: if rules.is_empty() {
+        applied_compaction: if catalog.is_none() {
             None
         } else {
             Some(compaction_text(&doc))
@@ -416,6 +419,64 @@ pub fn attach_with_origins(
     Ok(
         json!({"attached":true,"message":"已应用连接与模型规则；请重启 Codex 并新建会话，已有会话需另行验证","warning":warning}),
     )
+}
+
+pub fn apply_model_settings(
+    home: &Path,
+    state_dir: &Path,
+    rules: &[ModelCompactionRule],
+    excluded_models: &std::collections::HashSet<String>,
+) -> Result<Value> {
+    let home = path_checked(home)?;
+    let Some(mut snapshot) = snapshot_load(state_dir)? else {
+        return Ok(json!({"applied":false,"reason":"unmanaged"}));
+    };
+    if snapshot.codex_home != home {
+        bail!("所选目录与已管理的 Codex 目录不一致，未更新模型设置");
+    }
+    let config = home.join("config.toml");
+    if !home.is_dir() || !config.exists() {
+        return Ok(json!({"applied":false,"reason":"missing"}));
+    }
+    if fs::symlink_metadata(&config)?.file_type().is_symlink() {
+        bail!("配置文件是符号链接，未更新模型设置；请直接选择真实配置目录");
+    }
+    let (before, mut doc) = read_document(&config)?;
+    verify_attachment(&doc, &snapshot)?;
+    let catalog = prepare_compaction(&mut doc, &home, state_dir, Some(&snapshot), rules, excluded_models)?;
+    let managed = catalog.is_some();
+    if managed && snapshot.applied_compaction.is_none() {
+        snapshot.compaction_before = Some(before.clone());
+    }
+    snapshot.applied_compaction = managed.then(|| compaction_text(&doc));
+    if !managed {
+        snapshot.compaction_before = None;
+    }
+    let after = doc.to_string();
+    let previous = fs::read(snapshot_path(state_dir))?;
+    let next = serde_json::to_vec(&snapshot)?;
+    if fs::read_to_string(&config)? != before {
+        bail!("配置在模型更新期间发生变化，未覆盖；请重试");
+    }
+    if let Some((path, bytes)) = &catalog {
+        if fs::read(path).ok().as_deref() != Some(bytes.as_slice()) {
+            secure_write(path, bytes)?;
+        }
+    }
+    if next != previous {
+        secure_write(&snapshot_path(state_dir), &next)?;
+    }
+    if fs::read_to_string(&config).ok().as_deref() != Some(before.as_str()) {
+        rollback_snapshot(state_dir, Some(&previous));
+        bail!("配置在模型写入前发生变化，未覆盖；请重试");
+    }
+    if after != before {
+        if let Err(error) = secure_write(&config, after.as_bytes()) {
+            rollback_snapshot(state_dir, Some(&previous));
+            return Err(error).context("模型设置写入失败");
+        }
+    }
+    Ok(json!({"applied":true,"changed":after != before,"connection_mode":if snapshot.applied_provider == "openai" {"official"} else {"gateway"},"requires_reload":true}))
 }
 
 fn rollback_snapshot(state_dir: &Path, previous: Option<&[u8]>) {
@@ -661,6 +722,11 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
             .unwrap_or_else(|| json!([])),
     )
     .context("模型压缩规则格式无效")?;
+    let excluded_models = if matches!(op, "config.preview" | "config.attach" | "config.models.apply") {
+        crate::model_policy::codex_excluded_models(state).await
+    } else {
+        std::collections::HashSet::new()
+    };
     let mut origins = Vec::new();
     let mut origin_error = None;
     if matches!(op, "config.preview" | "config.attach") {
@@ -719,6 +785,7 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
                 &state.gateway_key,
                 &rules,
                 &origins,
+                &excluded_models,
             );
             let mut result = match preview {
                 Ok(result) => result,
@@ -731,6 +798,7 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
                         &state.gateway_key,
                         &rules,
                         &[],
+                        &excluded_models,
                     )?
                 }
                 Err(error) => return Err(error),
@@ -745,7 +813,9 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
             &state.gateway_key,
             &rules,
             &origins,
+            &excluded_models,
         ),
+        "config.models.apply" => apply_model_settings(home, &state.state_dir, &rules, &excluded_models),
         "config.restore" => restore(home, &state.state_dir),
         "config.restore.preview" => restore_preview(home, &state.state_dir),
         "config.official.preview" => official_preview(home, &state.state_dir),

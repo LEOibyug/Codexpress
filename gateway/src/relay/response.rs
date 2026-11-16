@@ -134,11 +134,13 @@ impl Attempt {
         request_id: &str,
         model: &str,
         input_units: u64,
+        ingress: crate::usage::Ingress,
     ) -> Self {
         state.inflight.fetch_add(1, Ordering::Relaxed);
         let record = UsageRecord {
             attempt_id: uuid::Uuid::new_v4().to_string(),
             request_id: request_id.into(),
+            ingress,
             source_id: source.id.clone(),
             source_name: source.name.clone(),
             model: model.into(),
@@ -166,6 +168,7 @@ impl Attempt {
             record.started_at,
             source,
             &state.gateway_key,
+            ingress,
         );
         Self {
             state,
@@ -1033,7 +1036,7 @@ mod observation_tests {
         let directory = tempfile::tempdir().unwrap();
         let state = AppState::new(directory.path().to_owned(), 0, "fixture-key".into()).unwrap();
         let source:Source = serde_json::from_value(json!({"id":"fixture","name":"fixture","kind":"api","base_url":"http://127.0.0.1:1","enabled":true,"priority":0,"proxy":{"mode":"direct"},"models":[],"secret":{"api_key":"fixture"}})).unwrap();
-        let mut attempt = Attempt::new(state.clone(), &source, "request", "model", 8);
+        let mut attempt = Attempt::new(state.clone(), &source, "request", "model", 8, crate::usage::Ingress::Native);
         let mut observer = Observer {
             sse: true,
             ..Default::default()

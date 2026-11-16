@@ -2,11 +2,10 @@ import SwiftUI
 
 struct HistoryCacheView: View {
     @EnvironmentObject var model: AppModel
-    @State private var enabled = true
     @State private var capacity = "5"
     @State private var confirmingClear = false
     @State private var validationError: String?
-    private var preferences: HistoryCacheSettings? { try? .parse(enabled: enabled, gigabytes: capacity) }
+    private var preferences: HistoryCacheSettings? { try? .parse(enabled: model.settings.historyCacheSettings.enabled, gigabytes: capacity) }
     private var changed: Bool { preferences != model.settings.historyCacheSettings }
     private func bytes(_ value: JSONValue) -> String {
         value.number.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .decimal) } ?? "—"
@@ -15,12 +14,17 @@ struct HistoryCacheView: View {
         SettingsCard("本地原文缓存", symbol: "externaldrive") {
             VStack(alignment: .leading, spacing: 16) {
                 SettingRow(title: "保存原文") {
-                    Toggle("保存原文", isOn: $enabled).toggleStyle(.switch).labelsHidden()
+                    Toggle("保存原文", isOn: Binding(get: { model.settings.historyCacheSettings.enabled }, set: { enabled in
+                        var next = model.settings.historyCacheSettings
+                        next.enabled = enabled
+                        model.saveHistoryCache(next)
+                    })).toggleStyle(.switch).labelsHidden()
                 }
                 Divider().overlay(AppPalette.border)
                 SettingRow(title: "最大容量") {
                     HStack(spacing: 6) {
                         TextField("容量", text: $capacity).multilineTextAlignment(.trailing).settingsField().frame(width: 110)
+                            .onSubmit { saveCapacity() }
                         Text("GB").foregroundStyle(.secondary)
                     }
                 }
@@ -37,18 +41,23 @@ struct HistoryCacheView: View {
                     }.font(.system(size: 12)).foregroundStyle(.secondary)
                     Spacer(minLength: 12)
                     Button("清空缓存…") { confirmingClear = true }.disabled(!model.running)
-                    Button("保存") {
-                        do { let value = try HistoryCacheSettings.parse(enabled: enabled, gigabytes: capacity); validationError = nil; model.saveHistoryCache(value) }
-                        catch { validationError = error.localizedDescription }
-                    }.disabled(!changed)
+                    Button("应用容量", action: saveCapacity).disabled(!changed)
                 }
             }.disabled(model.busy || model.metadataLoadFailed)
         }
-        .onAppear { let value = model.settings.historyCacheSettings; enabled = value.enabled; capacity = String(format: "%g", Double(value.maxBytes) / 1_000_000_000) }
+        .onAppear { capacity = String(format: "%g", Double(model.settings.historyCacheSettings.maxBytes) / 1_000_000_000) }
         .task { while !Task.isCancelled { await model.refreshHistoryStatus(); do { try await Task.sleep(for: .seconds(5)) } catch { break } } }
         .alert("清空本地原文缓存？", isPresented: $confirmingClear) {
             Button("取消", role: .cancel) {}
             Button("清空", role: .destructive) { model.clearHistoryCache() }
         } message: { Text("将删除所有缓存的增量块。依赖这些块的上下文将无法从网关重建，Codex 中的对话记录保留。") }
+    }
+
+    private func saveCapacity() {
+        do {
+            let value = try HistoryCacheSettings.parse(enabled: model.settings.historyCacheSettings.enabled, gigabytes: capacity)
+            validationError = nil
+            model.saveHistoryCache(value)
+        } catch { validationError = error.localizedDescription }
     }
 }

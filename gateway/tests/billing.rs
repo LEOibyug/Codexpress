@@ -28,6 +28,7 @@ fn record(id: &str, input: u64, output: u64) -> UsageRecord {
     UsageRecord {
         attempt_id: id.into(),
         request_id: id.into(),
+        ingress: codexpress_gateway::usage::Ingress::Native,
         source_id: "cch".into(),
         source_name: "CCH".into(),
         model: "custom-model".into(),
@@ -115,6 +116,13 @@ async fn paginated_ledger_backfills_only_mutually_unique_requests_and_does_not_p
         "后续分页失败不得应用前页部分匹配"
     );
     fail_second.store(false, Ordering::SeqCst);
+    let before = hits.load(Ordering::SeqCst);
+    management::dispatch(&state, "usage.reconcile", json!({"source_id":"cch"})).await.unwrap();
+    finish_sync(&state).await;
+    assert_eq!(hits.load(Ordering::SeqCst), before, "手动核对不能绕过失败冷却");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
     management::dispatch(&state, "usage.reconcile", json!({"source_id":"cch"}))
         .await
         .unwrap();
@@ -331,11 +339,28 @@ async fn automatic_idle_waits_300_seconds_after_last_end_and_failure_needs_new_w
     tokio::time::advance(Duration::from_secs(300)).await;
     spin_until(|| hits.load(Ordering::SeqCst) == 2).await;
     finish_sync(&state).await;
-    // Manual full reconciliation remains available without fresh traffic.
+    // Manual refresh cannot bypass a failed provider's cooldown.
     management::dispatch(&state, "usage.reconcile", json!({"source_id":"cch"}))
         .await
         .unwrap();
+    finish_sync(&state).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // New settled requests stay pending when the daemon checks during cooldown.
+    for i in 0..50 {
+        settle(&state, &source, &format!("cooldown-{i}"));
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    finish_sync(&state).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    tokio::time::advance(Duration::from_secs(59)).await;
     spin_until(|| hits.load(Ordering::SeqCst) == 3).await;
+    finish_sync(&state).await;
+    // A later manual reconciliation still works without further traffic.
+    tokio::time::advance(Duration::from_secs(120)).await;
+    management::dispatch(&state, "usage.reconcile", json!({"source_id":"cch"}))
+        .await
+        .unwrap();
+    spin_until(|| hits.load(Ordering::SeqCst) == 4).await;
     finish_sync(&state).await;
     task.abort();
 }

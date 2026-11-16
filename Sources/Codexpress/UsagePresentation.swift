@@ -31,8 +31,15 @@ struct UsageComparison: Identifiable {
     let totals: UsageTotals
 }
 func usageComparisons(_ rows: [JSONValue], key: String, sort: String) -> [UsageComparison] {
-    Dictionary(grouping: rows, by: { $0[key].string ?? "" }).map { id, rows in
-        UsageComparison(id: id, name: key == "model" ? (id.isEmpty ? "未知模型" : id) : (rows.first?["source_name"].string ?? "已移除来源"), totals: UsageTotals(rows: rows))
+    let models = key == "model"
+    return Dictionary(grouping: rows, by: { row in
+        if models { return row[key].string ?? "" }
+        if let name = row["source_name"].string?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty { return "source-name:\(name)" }
+        return "source-id:\(row["source_id"].string ?? "")"
+    }).map { id, rows in
+        let sourceName = rows.first?["source_name"].string?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = models ? (id.isEmpty ? "未知模型" : id) : (sourceName.flatMap { $0.isEmpty ? nil : $0 } ?? "已移除来源")
+        return UsageComparison(id: id, name: name, totals: UsageTotals(rows: rows))
     }.sorted { a,b in
         let x = sort == "tokens" ? a.totals.total : sort == "requests" ? a.totals.sum("requests") : a.totals.cost ?? -1
         let y = sort == "tokens" ? b.totals.total : sort == "requests" ? b.totals.sum("requests") : b.totals.cost ?? -1
@@ -95,7 +102,6 @@ private func compactUsageNumber(_ number: Double, minimumFractionDigits: Int = 0
 }
 func usageSeconds(_ milliseconds: Double?) -> String { milliseconds.map { String(format: "%.2f 秒", $0 / 1000) } ?? "—" }
 
-/// An inclusive selection of local calendar dates, sent as half-open day boundaries.
 struct UsageRefreshKey<Selection: Equatable>: Equatable {
     let selection: Selection
     let active: Bool
@@ -118,6 +124,13 @@ struct UsageQuery: Equatable, Sendable {
         self.from = from; self.to = to; dayStarts = dates
         self.sourceID = sourceID; self.modelID = modelID; self.ingress = ingress
     }
+    init(lastHours: Int, now: Date = Date(), sourceID: String = "", modelID: String = "") {
+        to = floor(now.timeIntervalSince1970) + 1
+        from = to - Double(lastHours * 3600)
+        dayStarts = Array(stride(from: from, through: to, by: 300))
+        self.sourceID = sourceID; self.modelID = modelID
+    }
+    var isIntraday: Bool { to - from <= 5 * 3600 }
     static func last(days: Int, now: Date = Date(), calendar: Calendar = .current, sourceID: String = "", modelID: String = "") -> UsageQuery {
         let count = min(366, max(1, days))
         let today = calendar.startOfDay(for: now)
@@ -133,6 +146,9 @@ struct UsageQuery: Equatable, Sendable {
         return values
     }
     var label: String {
+        if isIntraday {
+            return Date(timeIntervalSince1970: from).formatted(.dateTime.month().day().hour().minute()) + " – " + Date(timeIntervalSince1970: to - 1).formatted(.dateTime.month().day().hour().minute())
+        }
         let first = Date(timeIntervalSince1970: from).formatted(.dateTime.month().day())
         let last = Date(timeIntervalSince1970: dayStarts.dropLast().last ?? from).formatted(.dateTime.month().day())
         return "\(first) – \(last)"
@@ -181,9 +197,10 @@ func usageRequestStatus(_ item: JSONValue) -> String {
 func usageIngressName(_ value: String?) -> String {
     switch value {
     case "native": return "Codex"
-    case "ssh": return "SSH"
+    case "ssh": return "Codex（SSH）"
+    case "omp": return "OMP"
     case "chatbot": return "聊天客户端"
-    case "image": return "图片"
+    case "image": return "图片生成"
     default: return "未知入口"
     }
 }

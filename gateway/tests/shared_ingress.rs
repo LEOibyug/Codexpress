@@ -56,12 +56,12 @@ async fn local_and_remote_share_one_port_without_activation_and_keep_credentials
         .await
         .unwrap();
     assert_eq!(status["running"], true);
-    let router = remote::router(state);
-    for (ip, host, token, expected) in [
-        ("127.0.0.1:4444", "127.0.0.1:17863", "local-only", 200),
-        ("192.0.2.2:4444", "192.0.2.1:17863", key, 200),
-        ("192.0.2.2:4444", "127.0.0.1:17863", "local-only", 401),
-        ("192.0.2.2:4444", "192.0.2.9:17863", key, 401),
+    let router = remote::router(state.clone());
+    for (ip, host, token, expected, ingress) in [
+        ("127.0.0.1:4444", "127.0.0.1:17863", "local-only", 200, "native"),
+        ("192.0.2.2:4444", "192.0.2.1:17863", key, 200, "ssh"),
+        ("192.0.2.2:4444", "127.0.0.1:17863", "local-only", 401, "unknown"),
+        ("192.0.2.2:4444", "192.0.2.9:17863", key, 401, "unknown"),
     ] {
         let request = Request::builder()
             .method("POST")
@@ -74,6 +74,10 @@ async fn local_and_remote_share_one_port_without_activation_and_keep_credentials
         let response = router.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status().as_u16(), expected);
         let _ = to_bytes(response.into_body(), 1024).await;
+        if expected == 200 {
+            let records = state.usage.summary(1).unwrap();
+            assert_eq!(records["recent"][0]["ingress"], ingress);
+        }
     }
     let response = router
         .oneshot(

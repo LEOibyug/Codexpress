@@ -16,12 +16,32 @@ struct SSHRemoteProfile: Codable, Equatable, Identifiable, Sendable {
     var gatewayHost = ""
     var backupID: String? = nil
     var originalBackupID: String? = nil
+    var appliedModelSettingsRevision: String? = nil
+    var codexConnectionRestored: Bool? = nil
     var mapExistingProviders = false
     var clientKind: SSHRemoteKind? = nil
     var ompAgentDirectory: String? = nil
-    var ompDefaultModel: String? = nil
     var kind: SSHRemoteKind { clientKind ?? .codex }
     var directory: String { kind == .omp ? (ompAgentDirectory ?? "") : codexHome }
+    var displayName: String { username.isEmpty ? destination : "\(username)@\(destination)" }
+
+    func modelSettingsSyncStatus(revision: String) -> SSHRemoteModelSettingsSyncStatus? {
+        guard kind == .codex, codexConnectionRestored != true,
+              appliedModelSettingsRevision != nil || backupID != nil || originalBackupID != nil else { return nil }
+        guard let appliedModelSettingsRevision else { return .needsReview }
+        return appliedModelSettingsRevision == revision ? nil : .needsSync
+    }
+
+    func ompBaseURL(port: Int) throws -> String {
+        let host = gatewayHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let authority = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+        guard !host.isEmpty, host.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              let parts = URLComponents(string: "http://\(authority):\(port)/omp/v1"),
+              let url = parts.url, parts.host?.isEmpty == false, parts.port == port,
+              parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
+              parts.path == "/omp/v1" else { throw AppError.message("请填写远端可访问的本机 IP 或主机名，不含协议、端口或路径。") }
+        return url.absoluteString
+    }
 
     func arguments() throws -> [String] {
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:")
@@ -43,6 +63,12 @@ struct SSHRemoteProfile: Codable, Equatable, Identifiable, Sendable {
     static func shellQuote(_ text: String) -> String { "'" + text.replacingOccurrences(of: "'", with: "'\"'\"'") + "'" }
 }
 
+enum SSHRemoteModelSettingsSyncStatus: Equatable {
+    case needsSync, needsReview
+
+    var title: String { self == .needsReview ? "模型设置待核对" : "模型设置待同步" }
+}
+
 private final class SSHOutput: @unchecked Sendable {
     private let lock = NSLock()
     private var value = Data()
@@ -53,14 +79,14 @@ private final class SSHOutput: @unchecked Sendable {
 
 struct SSHRemoteClient: Sendable {
     let profile: SSHRemoteProfile
-    func call(_ action: String, fields: [String: JSONValue] = [:]) async throws -> JSONValue {
+    func call(_ action: String, fields: [String: JSONValue] = [:], timeout: TimeInterval = 60) async throws -> JSONValue {
         let args = try profile.arguments()
         var payload = fields; payload["action"] = .string(action)
         payload[profile.kind == .omp ? "agent_dir" : "codex_home"] = .string(profile.directory)
         let input = try JSONEncoder().encode(JSONValue.object(payload))
-        return try await Task.detached(priority: .utility) { try Self.execute(arguments: args, input: input) }.value
+        return try await Task.detached(priority: .utility) { try Self.execute(arguments: args, input: input, timeout: timeout) }.value
     }
-    private static func execute(arguments args: [String], input: Data) throws -> JSONValue {
+    private static func execute(arguments args: [String], input: Data, timeout: TimeInterval) throws -> JSONValue {
             let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh"); process.arguments = args
             let stdout = Pipe(), stderr = Pipe(), stdin = Pipe()
             process.standardOutput = stdout; process.standardError = stderr; process.standardInput = stdin
@@ -82,10 +108,10 @@ struct SSHRemoteClient: Sendable {
                 do { try stdin.fileHandleForWriting.write(contentsOf: input) }
                 catch { if process.isRunning { process.terminate() } }
             }
-            if completed.wait(timeout: .now() + 60) == .timedOut {
+            if completed.wait(timeout: .now() + timeout) == .timedOut {
                 process.terminate()
                 if completed.wait(timeout: .now() + 2) == .timedOut { kill(process.processIdentifier, SIGKILL) }
-                throw AppError.message("SSH 操作超时；应用或还原配置时请重新检查远端状态。")
+                throw AppError.message("SSH 操作超时，请检查远端状态后重试。")
             }
             guard readers.wait(timeout: .now() + 3) == .success else { throw AppError.message("SSH 输出未能完整读取。") }
             guard process.terminationStatus == 0 else {

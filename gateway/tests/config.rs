@@ -398,6 +398,87 @@ fn direct_official_without_gateway_preserves_unowned_provider_and_restores() {
 }
 
 #[test]
+fn model_only_updates_preserve_both_connections_and_original_restore_point() {
+    for official in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex");
+        let state = root.path().join("app");
+        fs::create_dir_all(&home).unwrap();
+        let original = "model_provider = \"custom\"\nmodel_context_window = 200000\nmodel_auto_compact_token_limit = 90000\n[mcp_servers.keep]\ncommand = \"keep-tool\"\n";
+        fs::write(home.join("config.toml"), original).unwrap();
+        fs::write(home.join("auth.json"), "private-auth").unwrap();
+        fs::write(home.join("history.jsonl"), "history-sentinel").unwrap();
+        if official {
+            config::use_official(&home, &state).unwrap();
+        } else {
+            config::attach(&home, &state, 17863, "private-local").unwrap();
+        }
+        let mode = config::connection_mode(&state).unwrap();
+        // A user edit made after connection setup becomes the pre-model baseline.
+        let current = fs::read_to_string(home.join("config.toml")).unwrap().replace("200000", "240000");
+        fs::write(home.join("config.toml"), current).unwrap();
+        let connection = fs::read_to_string(home.join("config.toml")).unwrap();
+        let backups = codexpress_gateway::backups::list(&home, &state).unwrap();
+        let mut without_models = connection.parse::<toml_edit::DocumentMut>().unwrap();
+        for key in codexpress_gateway::compaction::MANAGED_KEYS {
+            without_models.remove(key);
+        }
+        for limit in [60000, 70000] {
+            let result = config::apply_model_settings(&home, &state, &[rule("gpt-6.1-sol", limit, Some(100000))], &Default::default()).unwrap();
+            assert_eq!(result["applied"], true);
+            assert_eq!(result["connection_mode"], mode);
+            let catalog = active_catalog(&home);
+            let model = catalog["models"].as_array().unwrap().iter().find(|model| model["slug"] == "gpt-6.1-sol").unwrap();
+            assert_eq!(model["auto_compact_token_limit"], limit);
+            assert_eq!(model["context_window"], 100000);
+            let unchanged = config::apply_model_settings(&home, &state, &[rule("gpt-6.1-sol", limit, Some(100000))], &Default::default()).unwrap();
+            assert_eq!(unchanged["changed"], false);
+            let mut doc = fs::read_to_string(home.join("config.toml")).unwrap().parse::<toml_edit::DocumentMut>().unwrap();
+            for key in codexpress_gateway::compaction::MANAGED_KEYS {
+                doc.remove(key);
+            }
+            assert_eq!(doc.to_string(), without_models.to_string());
+            assert_eq!(config::connection_mode(&state).unwrap(), mode);
+            assert_eq!(fs::read_to_string(home.join("auth.json")).unwrap(), "private-auth");
+            assert_eq!(fs::read_to_string(home.join("history.jsonl")).unwrap(), "history-sentinel");
+        }
+        // Availability alone still needs a catalog, and removing it restores root defaults.
+        let excluded = std::collections::HashSet::from(["gpt-6.1-sol".to_owned()]);
+        config::apply_model_settings(&home, &state, &[], &excluded).unwrap();
+        assert!(!active_catalog(&home)["models"].as_array().unwrap().iter().any(|model| model["slug"] == "gpt-6.1-sol"));
+        config::apply_model_settings(&home, &state, &[], &Default::default()).unwrap();
+        let reverted = fs::read_to_string(home.join("config.toml")).unwrap().parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(reverted["model_context_window"].as_integer(), Some(240000));
+        assert_eq!(reverted["model_auto_compact_token_limit"].as_integer(), Some(90000));
+        assert!(reverted.get("model_catalog_json").is_none());
+        assert_eq!(codexpress_gateway::backups::list(&home, &state).unwrap(), backups, "Model-only sync must not capture auth backups");
+        config::apply_model_settings(&home, &state, &[rule("gpt-6.1-sol", 50000, Some(100000))], &Default::default()).unwrap();
+        config::restore(&home, &state).unwrap();
+        let restored = fs::read_to_string(home.join("config.toml")).unwrap().parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(restored["model_provider"].as_str(), Some("custom"));
+        assert_eq!(restored["model_context_window"].as_integer(), Some(240000));
+        assert_eq!(restored["model_auto_compact_token_limit"].as_integer(), Some(90000));
+        assert_eq!(restored["mcp_servers"]["keep"]["command"].as_str(), Some("keep-tool"));
+        assert!(restored.get("model_catalog_json").is_none());
+    }
+}
+
+#[test]
+fn model_only_sync_never_adopts_unmanaged_or_missing_codex_homes() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex");
+    let state = root.path().join("app");
+    let result = config::apply_model_settings(&home, &state, &[rule("gpt-6.1-sol", 60000, None)], &Default::default()).unwrap();
+    assert_eq!(result["reason"], "unmanaged");
+    assert!(!home.exists());
+    config::use_official(&home, &state).unwrap();
+    fs::remove_file(home.join("config.toml")).unwrap();
+    let result = config::apply_model_settings(&home, &state, &[], &Default::default()).unwrap();
+    assert_eq!(result["reason"], "missing");
+    assert!(!home.join("config.toml").exists());
+}
+
+#[test]
 fn native_switch_conflicts_and_profile_overrides_never_modify_files() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("codex");
@@ -432,6 +513,7 @@ fn native_switch_conflicts_and_profile_overrides_never_modify_files() {
     fs::write(home.join("config.toml"), &changed).unwrap();
     assert!(config::use_official(&home, &state).is_err());
     assert!(config::attach(&home, &state, 17863, "key").is_err());
+    assert!(config::apply_model_settings(&home, &state, &[rule("gpt-6.1-sol", 60000, None)], &Default::default()).is_err());
     assert!(config::restore(&home, &state).is_err());
     assert_eq!(
         fs::read_to_string(home.join("config.toml")).unwrap(),
@@ -463,13 +545,13 @@ fn pool_aliases_resume_provider_ids_and_restore_original_tables_without_history_
         .unwrap()
         .contains("https://custom.invalid/v1"));
     let preview =
-        config::preview_with_origins(&home, &state, 17863, "private-local", &[], &origins).unwrap();
+        config::preview_with_origins(&home, &state, 17863, "private-local", &[], &origins, &Default::default()).unwrap();
     assert_eq!(
         preview["compatibility_provider_ids"],
         serde_json::json!(["custom", "second"])
     );
     assert!(!preview.to_string().contains("private-local"));
-    config::attach_with_origins(&home, &state, 17863, "private-local", &[], &origins).unwrap();
+    config::attach_with_origins(&home, &state, 17863, "private-local", &[], &origins, &Default::default()).unwrap();
     let active = fs::read_to_string(home.join("config.toml")).unwrap();
     let doc = active.parse::<toml_edit::DocumentMut>().unwrap();
     for id in ["custom", "second", "codexpress"] {
@@ -495,9 +577,9 @@ fn pool_aliases_resume_provider_ids_and_restore_original_tables_without_history_
         }
     }
     // Idempotent application and official roundtrips keep the real originals.
-    config::attach_with_origins(&home, &state, 17863, "private-local", &[], &origins).unwrap();
+    config::attach_with_origins(&home, &state, 17863, "private-local", &[], &origins, &Default::default()).unwrap();
     config::use_official(&home, &state).unwrap();
-    config::attach_with_origins(&home, &state, 17863, "private-local", &[], &origins).unwrap();
+    config::attach_with_origins(&home, &state, 17863, "private-local", &[], &origins, &Default::default()).unwrap();
     let active = fs::read_to_string(home.join("config.toml")).unwrap();
     fs::write(home.join("config.toml"), format!("{active}\n[model_providers.new]\nname = \"Added later\"\nbase_url = \"https://new.invalid/v1\"\nwire_api = \"responses\"\n")).unwrap();
     config::restore(&home, &state).unwrap();
@@ -511,7 +593,7 @@ fn pool_aliases_resume_provider_ids_and_restore_original_tables_without_history_
         fs::read_to_string(home.join("history.jsonl")).unwrap(),
         "unchanged-conversation"
     );
-    config::attach_with_origins(&home, &state, 17863, "private-local", &[], &origins).unwrap();
+    config::attach_with_origins(&home, &state, 17863, "private-local", &[], &origins, &Default::default()).unwrap();
     let active = fs::read_to_string(home.join("config.toml")).unwrap();
     let changed = active.replacen("name = \"Codexpress\"", "name = \"External edit\"", 1);
     fs::write(home.join("config.toml"), &changed).unwrap();

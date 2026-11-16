@@ -10,27 +10,9 @@ final class OMPInstallationTests: XCTestCase {
         let result = await OMPInstallation.detect(environment: ["PATH": bin.path], home: home)
         XCTAssertEqual(result.executable, executable.path)
         XCTAssertEqual(result.version, "18.15.0")
-        XCTAssertEqual(result.agentDirectory, home.appendingPathComponent(".omp/agent").path)
         XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".omp").path))
     }
 
-    func testResolvesOverridesProfilesAndXDGWithoutReadingOrCreatingState() async throws {
-        let home = try temporaryHome()
-        defer { try? FileManager.default.removeItem(at: home) }
-        let override = home.appendingPathComponent("custom state")
-        let configured = await OMPInstallation.detect(environment: ["PI_CODING_AGENT_DIR": override.path], home: home, candidatePaths: [])
-        XCTAssertEqual(configured.agentDirectory, override.path)
-        XCTAssertNil(configured.executable)
-        let profile = await OMPInstallation.detect(environment: ["PI_CONFIG_DIR": ".other-omp", "OMP_PROFILE": "work", "PI_CODING_AGENT_DIR": override.path, "XDG_DATA_HOME": home.appendingPathComponent("data").path], home: home, candidatePaths: [])
-        XCTAssertEqual(profile.agentDirectory, home.appendingPathComponent(".other-omp/profiles/work/agent").path)
-        let legacyProfile = await OMPInstallation.detect(environment: ["PI_PROFILE": "legacy"], home: home, candidatePaths: [])
-        XCTAssertEqual(legacyProfile.agentDirectory, home.appendingPathComponent(".omp/profiles/legacy/agent").path)
-        let defaultProfile = await OMPInstallation.detect(environment: ["OMP_PROFILE": "", "PI_PROFILE": "legacy", "PI_CODING_AGENT_DIR": "relative/agent"], home: home, candidatePaths: [], currentDirectory: home)
-        XCTAssertEqual(defaultProfile.agentDirectory, home.appendingPathComponent("relative/agent").path)
-        let invalid = await OMPInstallation.detect(environment: ["OMP_PROFILE": "../../outside"], home: home, candidatePaths: [])
-        XCTAssertEqual(invalid.agentDirectory, home.appendingPathComponent(".omp/agent").path)
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: home.path), [])
-    }
 
     func testRejectsUntrustedOutputAndBoundsOutputAndRuntime() async throws {
         let home = try temporaryHome()

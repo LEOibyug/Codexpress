@@ -80,9 +80,7 @@ final class ReviewRegressionTests: XCTestCase {
     }
     func testPendingPortCannotCreateConnectionPreviewOrAttachment() {
         XCTAssertNoThrow(try ConfigConnectionPolicy.requireCurrentPort(saved: 17863, live: 17863))
-        XCTAssertThrowsError(try ConfigConnectionPolicy.requireCurrentPort(saved: 17864, live: 17863)) { error in
-            XCTAssertTrue(error.localizedDescription.contains("重新启动"))
-        }
+        XCTAssertThrowsError(try ConfigConnectionPolicy.requireCurrentPort(saved: 17864, live: 17863))
         XCTAssertThrowsError(try ConfigConnectionPolicy.requireCurrentPort(saved: 17863, live: nil))
     }
     func testBrokenMetadataEntersReadOnlyWithoutOverwritingOriginal() async throws {

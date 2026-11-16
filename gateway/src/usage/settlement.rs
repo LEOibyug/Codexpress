@@ -202,27 +202,32 @@ impl UsageStore {
         }
         Ok(())
     }
-    pub(crate) fn failed_balance(&self, source: &Source, checked_at: u64) -> Result<()> {
+    pub(crate) fn failed_balance(&self, source: &Source, failed: &Snapshot) -> Result<()> {
         let mut data = self
             .data
             .lock()
             .map_err(|_| anyhow::anyhow!("用量数据库不可用"))?;
-        if let Some(snapshot) = data
-            .settlements
-            .ensure(source)
-            .and_then(|l| l.balance.as_mut())
-        {
-            snapshot.stale = true;
-            snapshot.checked_at = checked_at;
+        if let Some(ledger) = data.settlements.ensure(source) {
+            if let Some(snapshot) = &mut ledger.balance {
+                snapshot.stale = snapshot.amount.is_some();
+                snapshot.checked_at = failed.checked_at;
+                snapshot.failure_count = failed.failure_count;
+                snapshot.next_retry_at = failed.next_retry_at;
+            } else {
+                ledger.balance = Some(failed.clone());
+            }
         }
         Ok(())
     }
     pub(crate) fn cached_balance(&self, source: &Source) -> Result<Option<Snapshot>> {
-        let mut data = self
+        if source.kind != "api" {
+            return Ok(None);
+        }
+        let data = self
             .data
             .lock()
             .map_err(|_| anyhow::anyhow!("用量数据库不可用"))?;
-        let Some(ledger) = data.settlements.ensure(source) else {
+        let Some(ledger) = data.settlements.ledgers.get(&source.id).filter(|l| l.identity == identity(source)) else {
             return Ok(None);
         };
         let Some(mut snapshot) = ledger.balance.clone() else {

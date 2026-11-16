@@ -116,7 +116,11 @@ struct AppSettings: Codable, Sendable {
     var codexHome = ""
     // Optional for backwards-compatible decoding of existing sources.json files.
     var modelCompaction: [ModelCompactionRule]? = nil
+    var modelPolicies: [ModelPolicy]? = nil
+    var localCodexAppliedModelSettingsRevision: String? = nil
     var officialLowQuotaPercent: Int? = nil
+    var officialQuotaRefreshMinutes: Int? = nil
+    var autoResetWeeklyQuota: Bool? = nil
     var legacyProviderOrigins: [LegacyProviderOrigin]? = nil
     var degradedContextFallback: Bool? = nil
     var loadBalance: Bool? = nil
@@ -127,6 +131,8 @@ struct AppSettings: Codable, Sendable {
     var historyCache: HistoryCacheSettings? = nil
     var sshRemoteProfiles: [SSHRemoteProfile]? = nil
     var lowQuotaPercent: Int { officialLowQuotaPercent ?? 10 }
+    var officialQuotaRefreshInterval: Int { max(officialQuotaRefreshMinutes ?? 30, 1) }
+    var autoResetWeeklyQuotaEnabled: Bool { autoResetWeeklyQuota ?? false }
     var loadBalanceEnabled: Bool { loadBalance ?? false }
     var idleReturnDelay: Int { conversationStickyMinutes ?? 5 }
     var upstreamAttemptLimit: Int { min(max(upstreamAttempts ?? 3, 1), 10) }

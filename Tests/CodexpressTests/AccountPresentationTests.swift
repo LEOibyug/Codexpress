@@ -19,6 +19,12 @@ final class AccountPresentationTests: XCTestCase {
         XCTAssertEqual(AccountLevel.quota(.infinity), .unknown)
         let invalid = QuotaWindow(.object(["used_percent": .number(.nan)]), index: 0)
         XCTAssertEqual(invalid.remainingLabel, "未知")
+        for (remaining, expected): (Double, AccountLevel) in [(55, .unknown), (45.1, .unknown), (45, .caution), (40.1, .caution), (40, .low), (0, .low)] {
+            XCTAssertEqual(AccountLevel.quotaReference(50, remaining: remaining), expected)
+        }
+        XCTAssertEqual(AccountLevel.quotaReference(50, remaining: nil), .unknown)
+        XCTAssertEqual(AccountLevel.quotaReference(.nan, remaining: 40), .unknown)
+        XCTAssertEqual(AccountLevel.quota(40), .healthy)
     }
 
     func testCurrencyUnitIsSeparateAndPrecisionIsPreserved() {

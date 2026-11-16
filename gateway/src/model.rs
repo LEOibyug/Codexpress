@@ -235,6 +235,8 @@ pub struct RoutingSettings {
     pub load_balance: bool,
     #[serde(default = "default_low_quota")]
     pub official_low_quota_percent: u8,
+    #[serde(default)]
+    pub auto_reset_weekly_quota: bool,
     #[serde(default = "default_fallback")]
     pub degraded_context_fallback: bool,
     #[serde(default = "default_idle_return")]
@@ -268,7 +270,11 @@ pub struct AppState {
     pub routing_sync: Mutex<()>,
     pub sources: RwLock<Vec<SourceRuntime>>,
     pub settings: RwLock<RoutingSettings>,
+    pub(crate) model_compaction: RwLock<Arc<[crate::compaction::ModelCompactionRule]>>,
+    pub(crate) model_compaction_revision: RwLock<String>,
+    pub(crate) model_policies: RwLock<Arc<[crate::model_policy::ModelPolicy]>>,
     pub(crate) role_capabilities: crate::relay::RoleCapabilities,
+    pub(crate) omp_cache_groups: Mutex<crate::omp_ingress::CacheGroups>,
     pub bindings: Mutex<HashMap<String, String>>,
     pub usage: Arc<crate::usage::UsageStore>,
     pub affinity: Arc<crate::affinity::AffinityStore>,
@@ -285,6 +291,7 @@ pub struct AppState {
     pub state_dir: PathBuf,
     pub inflight: AtomicUsize,
     pub official_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    pub official_queries: Mutex<HashMap<String, crate::official::QuerySchedule>>,
     pub config_lock: Mutex<()>,
     credential_store: Option<Arc<dyn crate::credentials::CredentialStore>>,
 }
@@ -315,14 +322,19 @@ impl AppState {
                 fixed_source_id: None,
                 load_balance: false,
                 official_low_quota_percent: 10,
+                auto_reset_weekly_quota: false,
                 degraded_context_fallback: true,
                 idle_return_minutes: default_idle_return(),
                 upstream_attempts: default_upstream_attempts(),
                 upstream_retry_delay_seconds: default_retry_delay(),
             }),
+            model_compaction: RwLock::new(Arc::from([])),
+            model_compaction_revision: RwLock::new(crate::compaction::revision(&[])),
+            model_policies: RwLock::new(Arc::from([])),
             role_capabilities: crate::relay::RoleCapabilities::open(
                 state_dir.join("source-compatibility.json"),
             ),
+            omp_cache_groups: Mutex::new(Default::default()),
             bindings: Mutex::new(HashMap::new()),
             usage: Arc::new(usage),
             affinity: crate::affinity::AffinityStore::open(&state_dir.join("affinity.sqlite"))?,
@@ -341,6 +353,7 @@ impl AppState {
             state_dir,
             inflight: AtomicUsize::new(0),
             official_locks: Mutex::new(HashMap::new()),
+            official_queries: Mutex::new(HashMap::new()),
             config_lock: Mutex::new(()),
             credential_store,
         }))

@@ -117,6 +117,39 @@ fn whole_window_filters_daily_zeroes_options_and_timings_are_consistent() {
 }
 
 #[test]
+fn rolling_hours_use_five_minute_buckets_and_exclude_outside_requests() {
+    for hours in [1, 5] {
+        let (_dir, mut data) = fixture();
+        let from = 100_000;
+        let to = from + hours * 3600;
+        for (id, started_at) in [
+            ("before", from - 1),
+            ("first", from),
+            ("first-end", from + 299),
+            ("second", from + 300),
+            ("last", to - 1),
+            ("after", to),
+        ] {
+            persist(&data, &record(id, started_at), Some("native"));
+        }
+        let boundaries: Vec<_> = (from..=to).step_by(300).collect();
+        let result = build(
+            &mut data,
+            &json!({"from":from,"to":to,"day_starts":boundaries}),
+        )
+        .unwrap();
+        assert_eq!(result["groups"][0]["requests"], 4);
+        let buckets = result["daily"].as_array().unwrap();
+        assert_eq!(buckets.len(), hours as usize * 12);
+        assert_eq!(buckets[0]["requests"], 2);
+        assert_eq!(buckets[1]["requests"], 1);
+        assert_eq!(buckets[1]["start_at"], from + 300);
+        assert_eq!(buckets.last().unwrap()["requests"], 1);
+        assert_eq!(result["performance"]["p50_latency_ms"], 100.0);
+    }
+}
+
+#[test]
 fn invalid_days_are_read_only_and_active_timings_never_become_completed_samples() {
     let (_dir, mut data) = fixture();
     let from = 100_000;

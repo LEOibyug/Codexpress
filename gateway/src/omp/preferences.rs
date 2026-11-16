@@ -100,7 +100,7 @@ fn selector_valid(selector: &str) -> bool {
             .is_none_or(|star| star == selector.len() - 1)
 }
 
-fn threshold_valid(value: &Json) -> bool {
+pub(super) fn threshold_valid(value: &Json) -> bool {
     if value.is_null() || safe_integer(value, true) {
         return true;
     }

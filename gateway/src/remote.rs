@@ -34,6 +34,8 @@ pub struct RemotePreview {
     compaction_base: Option<String>,
     #[serde(default)]
     catalog: Option<Value>,
+    #[serde(skip)]
+    pub(crate) excluded_models: std::collections::HashSet<String>,
 }
 
 pub fn compaction_source(config: &str) -> Result<Value> {
@@ -89,7 +91,8 @@ fn prepare_compaction(
         Some(catalog) => catalog.clone(),
         None => crate::compaction::bundled_catalog()?,
     };
-    let catalog = crate::compaction::catalog_from_value(source, &base, &preview.model_compaction)?;
+    let mut catalog = crate::compaction::catalog_from_value(source, &base, &preview.model_compaction)?;
+    crate::model_policy::filter_codex_catalog(&mut catalog, &preview.excluded_models);
     let exported = serde_json::to_string_pretty(&catalog)?;
     if exported.len() > 4 * 1024 * 1024 {
         bail!("生成的远端模型目录超过 4 MiB，请减少模型规则");

@@ -327,6 +327,11 @@ fn query(raw: Option<&str>) -> Result<Value, Fault> {
                 json!(value.parse::<u64>().map_err(|_| Fault::invalid())?)
             }
             "day_starts" => serde_json::from_str::<Value>(&value).map_err(|_| Fault::invalid())?,
+            "include_usage" => match value.as_ref() {
+                "true" => json!(true),
+                "false" => json!(false),
+                _ => return Err(Fault::invalid()),
+            },
             "source_id" | "model" | "ingress" | "status" => Value::String(value.into_owned()),
             _ => return Err(Fault::invalid()),
         };
@@ -367,20 +372,42 @@ async fn dispatch(state: &Arc<AppState>, request: Request) -> Result<(StatusCode
         let payload = query(request.uri().query())?;
         let value = match path.as_str() {
             "/v1/status" | "/v1/sources" => {
-                safety::fields(&payload, &[]).map_err(|_| Fault::invalid())?;
+                safety::fields(&payload, if path == "/v1/status" { &["include_usage"] } else { &[] })
+                    .map_err(|_| Fault::invalid())?;
                 let mut status = crate::management::status(state)
                     .await
                     .map_err(|_| Fault::failed())?;
                 if path == "/v1/sources" {
                     json!({"sources":status["sources"]})
                 } else {
-                    status["usage"] = usage(state, json!({}), "summary").await?;
+                    let mut errors = Map::new();
+                    if payload["include_usage"] != false {
+                        status["usage"] = match usage(state, json!({}), "summary").await {
+                            Ok(value) => value,
+                            Err(_) => {
+                                errors.insert("usage".into(), json!("unavailable"));
+                                Value::Null
+                            }
+                        };
+                    }
                     status["reconciliation"] = crate::balance::billing::status(state);
-                    status["control"] =
-                        state.control.status().await.map_err(|_| Fault::failed())?;
-                    status["chatbot"] =
-                        state.chatbot.status().await.map_err(|_| Fault::failed())?;
-                    status["images"] = state.images.status().await.map_err(|_| Fault::failed())?;
+                    let (control, chatbot, images) = tokio::join!(
+                        state.control.status(),
+                        state.chatbot.status(),
+                        state.images.status(),
+                    );
+                    for (name, result) in [("control", control), ("chatbot", chatbot), ("images", images)] {
+                        status[name] = match result {
+                            Ok(value) => value,
+                            Err(_) => {
+                                errors.insert(name.into(), json!("unavailable"));
+                                Value::Null
+                            }
+                        };
+                    }
+                    if !errors.is_empty() {
+                        status["component_errors"] = Value::Object(errors);
+                    }
                     status
                 }
             }

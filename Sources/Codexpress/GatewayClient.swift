@@ -16,7 +16,7 @@ struct GatewayClient: Sendable {
             defer { close(fd) }
             var noSig: Int32 = 1
             setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSig, socklen_t(MemoryLayout.size(ofValue: noSig)))
-            let receiveSeconds: Int = ["official.credits.consume", "control.reset.confirm"].contains(op) || op.hasPrefix("credentials.") ? 180 : ["official.refresh", "models.list", "balance.query"].contains(op) || op.hasPrefix("config.") ? 90 : op.hasPrefix("official.login.") ? 40 : 12
+            let receiveSeconds = Self.receiveTimeoutSeconds(for: op)
             var receiveTimeout = timeval(tv_sec: receiveSeconds, tv_usec: 0)
             var sendTimeout = timeval(tv_sec: 12, tv_usec: 0)
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout, socklen_t(MemoryLayout.size(ofValue: receiveTimeout)))
@@ -51,5 +51,18 @@ struct GatewayClient: Sendable {
             guard result["ok"].bool == true else { throw AppError.message(result["error"].string ?? "网关操作失败。") }
             return result["data"]
         }.value
+    }
+
+    private static func receiveTimeoutSeconds(for op: String) -> Int {
+        if ["official.credits.consume", "control.reset.confirm"].contains(op) || op.hasPrefix("credentials.") {
+            return 180
+        }
+        if ["official.refresh", "models.list", "balance.query"].contains(op) || op.hasPrefix("config.") {
+            return 90
+        }
+        if op.hasPrefix("official.login.") {
+            return 40
+        }
+        return 12
     }
 }

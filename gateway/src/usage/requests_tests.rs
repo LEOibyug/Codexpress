@@ -29,6 +29,7 @@ pub(in crate::usage) fn record(id: &str, at: u64) -> UsageRecord {
     UsageRecord {
         attempt_id: id.into(),
         request_id: format!("request-{id}"),
+        ingress: crate::usage::Ingress::Unknown,
         source_id: "a".into(),
         source_name: "来源 A".into(),
         model: "gpt-6.1-sol".into(),
@@ -109,6 +110,9 @@ fn history_is_bounded_stable_and_searches_metadata_without_bodies() {
     assert_eq!(filtered["records"][0]["http_status"], 429);
     assert_eq!(filtered["records"][0]["error_code"], "rate_limited");
     assert_eq!(filtered["records"][0]["diagnostic_available"], true);
+    let recent = summary::build(&data, 100, None, None).unwrap();
+    assert_eq!(recent["recent"].as_array().unwrap().iter().find(|r| r["attempt_id"] == "second").unwrap()["ingress"], "ssh");
+    assert_eq!(crate::usage::diagnostics::detail(&data, &json!({"attempt_id":"first","record_only":true})).unwrap()["record"]["ingress"], "unknown");
     let body = build(
         &data,
         &json!({"from":100,"to":200,"search":"body-only-needle"}),

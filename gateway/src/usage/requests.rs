@@ -1,12 +1,12 @@
 //! Bounded request history queries. Error bodies are deliberately absent here.
-use super::{summary, StoreData};
+use super::{summary, Ingress, StoreData};
 use anyhow::{bail, ensure, Result};
 use rusqlite::types::Value as SqlValue;
 use serde_json::{json, Value};
 
 pub(super) const ATTEMPTS: &str = r#"WITH attempts AS (
     SELECT u.*, COALESCE(NULLIF(json_extract(u.metadata,'$.attempt_id'),''),'legacy:'||u.attempt) AS attempt_id_key,
-        COALESCE(NULLIF(json_extract(d.metadata,'$.ingress'),''),'unknown') AS ingress,
+        COALESCE(NULLIF(json_extract(u.metadata,'$.ingress'),''),NULLIF(json_extract(d.metadata,'$.ingress'),''),'unknown') AS ingress,
         json_extract(d.metadata,'$.http_status') AS http_status,
         json_extract(d.metadata,'$.error_code') AS error_code,
         json_extract(d.metadata,'$.error_kind') AS error_kind,
@@ -21,7 +21,7 @@ pub(super) const ATTEMPTS: &str = r#"WITH attempts AS (
 pub(super) const FILTERS: &str = r#"(?3 IS NULL OR source_id=?3) AND (?4 IS NULL OR model=?4) AND (?5 IS NULL OR ingress=?5)
     AND (?6 IS NULL OR status=?6 OR (?6='unsuccessful' AND status IN ('failed','interrupted')))
     AND (?7 IS NULL OR instr(lower(request_id||char(10)||attempt_id_key||char(10)||source_id||char(10)||source_name||char(10)||model||char(10)||status||char(10)||ingress||char(10)||COALESCE(http_status,'')||char(10)||COALESCE(error_code,'')||char(10)||COALESCE(error_kind,'')||char(10)||COALESCE(error_message,'')||char(10)||COALESCE(error_param,'')),lower(?7))>0)"#;
-const RECORD_COLUMNS: &str = "attempt,request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata";
+pub(super) const RECORD_COLUMNS: &str = "attempt,request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata";
 const MAX_INTERVAL: u64 = 366 * 26 * 3600;
 const MAX_ACTIVE: usize = 10_000;
 
@@ -84,11 +84,16 @@ impl Query {
                 days.first() == Some(&from) && days.last() == Some(&to),
                 "日期边界必须与查询范围一致"
             );
+            let short_window = matches!(to - from, 3600 | 18_000);
             ensure!(
                 days.windows(2).all(|pair| pair[1]
                     .checked_sub(pair[0])
-                    .is_some_and(|duration| (22 * 3600..=26 * 3600).contains(&duration))),
-                "日期边界必须递增且间隔 22 至 26 小时"
+                    .is_some_and(|duration| if short_window {
+                        duration == 300
+                    } else {
+                        (22 * 3600..=26 * 3600).contains(&duration)
+                    })),
+                "时间边界须递增：1 或 5 小时窗口每 5 分钟分段，日历日间隔 22 至 26 小时"
             );
         }
         let source = optional_text(payload, "source_id", 256)?;
@@ -97,7 +102,7 @@ impl Query {
         ensure!(
             ingress.as_deref().is_none_or(|value| matches!(
                 value,
-                "native" | "ssh" | "chatbot" | "image" | "unknown"
+                "native" | "ssh" | "omp" | "chatbot" | "image" | "unknown"
             )),
             "入口筛选无效"
         );
@@ -220,10 +225,12 @@ pub(super) fn active_records(data: &StoreData, query: &Query) -> Result<Vec<Valu
             .unwrap_or_else(|| json!({}));
         value["active"] = json!(true);
         value["sequence"] = Value::Null;
-        value["ingress"] = json!(diagnostic["ingress"]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .unwrap_or("unknown"));
+        if record.ingress == Ingress::Unknown {
+            value["ingress"] = json!(diagnostic["ingress"]
+                .as_str()
+                .and_then(Ingress::parse)
+                .unwrap_or_default());
+        }
         for field in [
             "http_status",
             "error_code",

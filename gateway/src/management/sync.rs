@@ -10,6 +10,8 @@ struct SyncRequest {
     sources: Vec<Source>,
     ids: HashSet<String>,
     settings: RoutingSettings,
+    model_compaction: Vec<crate::compaction::ModelCompactionRule>,
+    model_policies: Vec<crate::model_policy::ModelPolicy>,
 }
 
 impl SyncRequest {
@@ -43,6 +45,11 @@ impl SyncRequest {
             .map(|v| v.as_bool().context("负载均衡须为布尔值"))
             .transpose()?
             .unwrap_or(false);
+        let auto_reset_weekly_quota = payload
+            .get("auto_reset_weekly_quota")
+            .map(|v| v.as_bool().context("自动使用重置卡须为布尔值"))
+            .transpose()?
+            .unwrap_or(false);
         let idle_return_minutes = match payload.get("idle_return_minutes") {
             None => 5,
             Some(value) => value
@@ -64,6 +71,14 @@ impl SyncRequest {
                 .filter(|v| *v <= 300)
                 .context("重试等待时间须为 0–300 秒的整数")?,
         };
+        let model_compaction = serde_json::from_value::<Vec<crate::compaction::ModelCompactionRule>>(
+            payload.get("model_compaction").cloned().unwrap_or_else(|| serde_json::json!([])),
+        ).context("模型压缩规则格式错误")?;
+        crate::compaction::validate(&model_compaction)?;
+        let model_policies = serde_json::from_value::<Vec<crate::model_policy::ModelPolicy>>(
+            payload.get("model_policies").cloned().unwrap_or_else(|| serde_json::json!([])),
+        ).context("模型策略格式错误")?;
+        crate::model_policy::validate(&model_policies)?;
         if !["auto", "fixed"].contains(&mode) {
             bail!("未知路由模式");
         }
@@ -87,12 +102,15 @@ impl SyncRequest {
         Ok(Self {
             sources,
             ids,
+            model_compaction,
+            model_policies,
             settings: RoutingSettings {
                 strict_priority: true,
                 mode: mode.into(),
                 fixed_source_id: fixed,
                 load_balance,
                 official_low_quota_percent: threshold,
+                auto_reset_weekly_quota,
                 degraded_context_fallback,
                 idle_return_minutes,
                 upstream_attempts,
@@ -194,6 +212,8 @@ pub(super) async fn handle(state: &Arc<AppState>, payload: Value) -> Result<Valu
         sources,
         ids,
         settings,
+        model_compaction,
+        model_policies,
     } = SyncRequest::parse(&payload)?;
     let mut current = state.sources.write().await;
     let (next, invalidated) = prepare_sources(sources, &current);
@@ -228,6 +248,7 @@ pub(super) async fn handle(state: &Arc<AppState>, payload: Value) -> Result<Valu
     tokio::task::spawn_blocking(move || usage.reprice_historical(&pricing_sources))
         .await
         .context("历史费用更新失败")??;
+    let model_compaction_revision = crate::compaction::revision(&model_compaction);
     // Odd revisions describe publication in progress. Readers must not
     // submit using a mixture of old routing settings and new sources.
     state.routing_revision.fetch_add(1, Ordering::AcqRel);
@@ -241,7 +262,15 @@ pub(super) async fn handle(state: &Arc<AppState>, payload: Value) -> Result<Valu
         .await
         .retain(|_, source| ids.contains(source) && !invalidated.contains(source));
     drop(current);
+    let enable_auto_reset = settings.auto_reset_weekly_quota
+        && !state.settings.read().await.auto_reset_weekly_quota;
     *state.settings.write().await = settings;
+    *state.model_compaction.write().await = model_compaction.into();
+    *state.model_compaction_revision.write().await = model_compaction_revision;
+    *state.model_policies.write().await = model_policies.into();
     state.routing_revision.fetch_add(1, Ordering::Release);
+    if enable_auto_reset {
+        crate::official::schedule_auto_reset(state).await;
+    }
     Ok(super::credentials(state).await)
 }

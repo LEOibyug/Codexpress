@@ -156,6 +156,9 @@ pub async fn mark_rejection(
             }
         }
     }
+    if exhausted {
+        crate::official::confirm_auto_reset(state, source).await;
+    }
 }
 
 #[cfg(test)]

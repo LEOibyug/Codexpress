@@ -26,6 +26,9 @@ pub(super) fn retry_request(parts: &Parts, bytes: Bytes) -> Request<Body> {
     if let Some(ingress) = parts.extensions.get::<crate::chatbot::ChatbotIngress>() {
         retry.extensions_mut().insert(ingress.clone());
     }
+    if let Some(ingress) = parts.extensions.get::<crate::omp_ingress::OmpIngress>() {
+        retry.extensions_mut().insert(ingress.clone());
+    }
     if let Some(session) = parts.extensions.get::<PreservedScopedSession>() {
         retry.extensions_mut().insert(session.clone());
     }

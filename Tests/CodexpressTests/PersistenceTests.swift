@@ -65,16 +65,41 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(settings.lowQuotaPercent,10)
         settings.officialLowQuotaPercent=10
         XCTAssertNil(settings.modelCompaction)
+        XCTAssertNil(settings.modelPolicies)
         let first = try ModelCompactionRule.parse(model: "model-a", threshold: "180000", window: "300000")
         let second = try ModelCompactionRule.parse(model: "model-b", threshold: "45000", window: "")
         settings.modelCompaction = [first, second]
+        let policy = ModelPolicy(model: first.model, sourceIDs: [], clients: [])
+        settings.modelPolicies = [policy]
         let restored = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
         XCTAssertEqual(restored.modelCompaction, [first, second])
+        XCTAssertEqual(restored.modelPolicies, [policy], "Explicit empty sources and clients must remain disabled, not inherit defaults")
+        let inherited = try JSONDecoder().decode(ModelPolicy.self, from: Data(#"{"model":"legacy-model"}"#.utf8))
+        XCTAssertNil(inherited.sourceIDs)
+        XCTAssertEqual(inherited.clients, ModelClient.allCases)
         XCTAssertThrowsError(try ModelCompactionRule.validate([first, first]))
         XCTAssertThrowsError(try ModelCompactionRule.parse(model: "m", threshold: "90001", window: "100000"))
         XCTAssertThrowsError(try ModelCompactionRule.parse(model: "m", threshold: "1.5", window: ""))
         XCTAssertThrowsError(try ModelCompactionRule.parse(model: "m", threshold: "0", window: ""))
     }
+    func testModelSettingsRevisionIgnoresSetOrderingButPreservesSourcePriority() throws {
+        var first = AppSettings()
+        XCTAssertEqual(try ModelSettingsRevision.value(for: first), ModelSettingsRevision.empty)
+        first.modelCompaction = [try .parse(model: "b", threshold: "100", window: ""), try .parse(model: "a", threshold: "200", window: "")]
+        first.modelPolicies = [ModelPolicy(model: "b", sourceIDs: ["one", "two"], clients: [.omp, .codex]), ModelPolicy(model: "a", clients: [])]
+        let revision = try ModelSettingsRevision.value(for: first)
+        var reordered = first
+        reordered.modelCompaction?.reverse()
+        reordered.modelPolicies?.reverse()
+        reordered.modelPolicies?[1].clients.reverse()
+        XCTAssertEqual(try ModelSettingsRevision.value(for: reordered), revision)
+        reordered.modelPolicies?[1].sourceIDs?.reverse()
+        XCTAssertNotEqual(try ModelSettingsRevision.value(for: reordered), revision)
+        reordered = first
+        reordered.modelCompaction?[0].auto_compact_token_limit += 1
+        XCTAssertNotEqual(try ModelSettingsRevision.value(for: reordered), revision)
+    }
+
     func testMetadataPersistsWithoutSecretAndRestrictsPermissions() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codexpress-test-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }

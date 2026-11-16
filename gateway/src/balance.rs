@@ -17,9 +17,9 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::{sync::Mutex as AsyncMutex, time::Instant};
 
 const BODY_LIMIT: usize = 256 * 1024;
 
@@ -36,6 +36,8 @@ pub struct Snapshot {
     pub(crate) local_spend: Option<f64>,
     pub(crate) unknown_spend_requests: u64,
     pub(crate) projection_supported: bool,
+    pub(crate) failure_count: u32,
+    pub(crate) next_retry_at: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -59,7 +61,7 @@ enum Protocol {
 
 struct Session {
     cookie: String,
-    expires: Instant,
+    expires: std::time::Instant,
 }
 
 #[derive(Default)]
@@ -68,6 +70,9 @@ struct Entry {
     proxy: Option<ProxyPolicy>,
     snapshot: Option<Snapshot>,
     attempted: Option<Instant>,
+    failures: u32,
+    billing_failures: u32,
+    billing_attempted: Option<Instant>,
     preferred: Option<Protocol>,
     session: Option<Session>,
 }
@@ -80,6 +85,7 @@ pub struct BalanceStore {
 
 impl BalanceStore {
     async fn query(&self, state: &Arc<AppState>, source: &Source, force: bool) -> Result<Snapshot> {
+        let requested = Instant::now();
         let entry = {
             let mut entries = self
                 .entries
@@ -114,20 +120,16 @@ impl BalanceStore {
             entry.snapshot = None;
             entry.attempted = None;
         }
-        let ttl = if entry
-            .snapshot
-            .as_ref()
-            .is_some_and(|s| s.status == "available" && !s.stale)
-        {
-            15
+        let ttl = if force {
+            0
+        } else if entry.failures > 0 {
+            failure_delay(entry.failures)
         } else {
-            60
+            15
         };
-        if !force
-            && entry
-                .attempted
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(ttl))
-        {
+        if entry.attempted.is_some_and(|at| {
+            at >= requested || at.elapsed() < Duration::from_secs(ttl)
+        }) {
             if let Some(snapshot) = &entry.snapshot {
                 return Ok(snapshot.clone());
             }
@@ -137,7 +139,8 @@ impl BalanceStore {
             .ok()
             .flatten();
         entry.attempted = Some(Instant::now());
-        let snapshot = if let Some(amount) = found {
+        entry.failures = if found.is_some() { 0 } else { entry.failures.saturating_add(1) };
+        let mut snapshot = if let Some(amount) = found {
             Snapshot {
                 status: "available",
                 amount: Some(amount.value),
@@ -160,6 +163,8 @@ impl BalanceStore {
                 ..Default::default()
             }
         };
+        snapshot.failure_count = entry.failures;
+        snapshot.next_retry_at = (entry.failures > 0).then(|| now() + failure_delay(entry.failures));
         let sources = state.sources.read().await;
         if !sources.iter().any(|r| {
             r.source.id == source.id
@@ -173,11 +178,15 @@ impl BalanceStore {
         if snapshot.amount.is_some() && !snapshot.stale {
             state.usage.reset_balance(source, snapshot.clone())?;
         } else {
-            state.usage.failed_balance(source, snapshot.checked_at)?;
+            state.usage.failed_balance(source, &snapshot)?;
         }
         entry.snapshot = Some(snapshot.clone());
         Ok(snapshot)
     }
+}
+
+fn failure_delay(failures: u32) -> u64 {
+    60_u64.saturating_mul(1 << failures.saturating_sub(1).min(4)).min(900)
 }
 
 pub async fn query(state: &Arc<AppState>, payload: Value) -> Result<Value> {
@@ -190,6 +199,21 @@ pub async fn query(state: &Arc<AppState>, payload: Value) -> Result<Value> {
         .find(|r| r.source.id == id)
         .map(|r| r.source.clone())
         .context("来源不存在")?;
+    query_for_source(state, &source, payload["force"] == true).await
+}
+
+pub(crate) async fn query_for_source(
+    state: &Arc<AppState>,
+    source: &Source,
+    force: bool,
+) -> Result<Value> {
+    if !state.sources.read().await.iter().any(|r| {
+        r.source.id == source.id
+            && r.source.identity() == source.identity()
+            && r.source.proxy == source.proxy
+    }) {
+        bail!("来源已变化，请重新查询余额");
+    }
     if source.kind != "api" {
         bail!("此接口仅查询自定义来源余额");
     }
@@ -197,10 +221,7 @@ pub async fn query(state: &Arc<AppState>, payload: Value) -> Result<Value> {
     if source.secret["api_key"].as_str().is_none_or(str::is_empty) {
         bail!("来源未配置密钥");
     }
-    let snapshot = state
-        .balances
-        .query(state, &source, payload["force"] == true)
-        .await?;
+    let snapshot = state.balances.query(state, source, force).await?;
     // Never publish another key's result after an edit/deletion while awaiting HTTP.
     let sources = state.sources.read().await;
     if !sources.iter().any(|r| {
@@ -210,9 +231,10 @@ pub async fn query(state: &Arc<AppState>, payload: Value) -> Result<Value> {
     }) {
         bail!("来源已变化，请重新查询余额");
     }
-    Ok(serde_json::to_value(
-        state.usage.cached_balance(&source)?.unwrap_or(snapshot),
-    )?)
+    let mut projected = state.usage.cached_balance(source)?.unwrap_or_else(|| snapshot.clone());
+    projected.failure_count = snapshot.failure_count;
+    projected.next_retry_at = snapshot.next_retry_at;
+    Ok(serde_json::to_value(projected)?)
 }
 
 /// Cached local state only; this path never discovers or refreshes an upstream.
@@ -345,7 +367,7 @@ impl<'a> Probe<'a> {
                     }
                     Some(Session {
                         cookie: first.to_owned(),
-                        expires: Instant::now() + Duration::from_secs(lifetime),
+                        expires: std::time::Instant::now() + Duration::from_secs(lifetime),
                     })
                 })
         } else {
@@ -365,7 +387,7 @@ impl<'a> Probe<'a> {
         if entry
             .session
             .as_ref()
-            .is_some_and(|s| s.expires <= Instant::now())
+            .is_some_and(|s| s.expires <= std::time::Instant::now())
         {
             entry.session = None;
         }

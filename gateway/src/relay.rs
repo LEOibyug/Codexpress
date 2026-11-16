@@ -17,6 +17,7 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode},
+    response::IntoResponse,
     routing::{get, post},
     Router,
 };
@@ -227,6 +228,10 @@ fn scoped_session(parsed: &Value, parts: &axum::http::request::Parts) -> Option<
         // removed wire state, not the identity of the local conversation.
         return Some(session.0.clone());
     }
+    if let Some(ingress) = parts.extensions.get::<crate::omp_ingress::OmpIngress>() {
+        return session_binding(parsed, &parts.headers)
+            .map(|session| format!("omp:{}:{session}", ingress.namespace));
+    }
     let session = session_binding(parsed, &parts.headers);
     match parts.extensions.get::<crate::remote::RemoteIngress>() {
         Some(ingress) => session
@@ -269,8 +274,8 @@ fn explicit_context_rejection(value: &Value) -> bool {
     if matches!(
         problem
             .get("code")
-            .or_else(|| problem.get("type"))
-            .and_then(Value::as_str),
+            .and_then(Value::as_str)
+            .or_else(|| problem.get("type").and_then(Value::as_str)),
         Some(
             "invalid_encrypted_content"
                 | "invalid_previous_response_id"
@@ -458,6 +463,11 @@ struct ManualAcceptance {
 }
 
 fn history_scope(parts: &axum::http::request::Parts, parsed: &Value) -> String {
+    if let Some(ingress) = parts.extensions.get::<crate::omp_ingress::OmpIngress>() {
+        return crate::continuity::digest("omp-history", &serde_json::to_string(
+            &(&ingress.namespace, scoped_session(parsed, parts))
+        ).expect("strings"));
+    }
     let session = scoped_session(parsed, parts).or_else(|| {
         parsed["prompt_cache_key"]
             .as_str()
@@ -551,6 +561,7 @@ async fn forward_once(
     let mut prepared_route = rebuild.as_mut().and_then(|context| context.route.take());
     let planned_return = prepared_route.is_some();
     let remote_ingress = request.extensions().get::<crate::remote::RemoteIngress>();
+    let omp_ingress = request.extensions().get::<crate::omp_ingress::OmpIngress>().is_some();
     let remote_peer = state.remote.peer(request.headers());
     if remote_ingress.is_some_and(|ingress| remote_peer.as_ref() != Some(&ingress.peer_id)) {
         return error(StatusCode::UNAUTHORIZED, "远端网关认证失败");
@@ -584,7 +595,7 @@ async fn forward_once(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case(&expected_local) || v == expected_ip)
         && hosts.next().is_none();
-    if !valid_host && remote_ingress.is_none() {
+    if !valid_host && remote_ingress.is_none() && !omp_ingress {
         return error(
             StatusCode::MISDIRECTED_REQUEST,
             "网关只接受匹配端口的本机 Host",
@@ -600,7 +611,8 @@ async fn forward_once(
         .cloned()
         .unwrap_or_default();
     parts.extensions.insert(request_retries.clone());
-    let mut bytes = match crate::request_body::read(body, "codex").await {
+    let ingress = crate::usage::Ingress::from_extensions(&parts.extensions);
+    let mut bytes = match crate::request_body::read(body, ingress.as_str()).await {
         Ok(body) => body,
         Err(problem) => return error(problem.status, problem.message),
     };
@@ -613,8 +625,48 @@ async fn forward_once(
             _ => return error(StatusCode::BAD_REQUEST, "Responses 请求需要 JSON 对象"),
         }
     };
+    let client_kind = crate::model_catalog::client(&parts);
+    if discovery {
+        return match crate::model_catalog::load(&state, client_kind).await.and_then(|catalog| catalog.codex()) {
+            Ok(catalog) => axum::Json(catalog).into_response(),
+            Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "无法获取来源模型列表，请先在来源页刷新或手动填写"),
+        };
+    }
     let native_compaction =
         parts.uri.path() == "/v1/responses/compact" || crate::chatbot::is_compaction_v2(&parsed);
+    if let Some(ingress) = parts.extensions.get::<crate::omp_ingress::OmpIngress>().filter(|ingress| !ingress.normalized) {
+        let private = parsed.get_mut("client_metadata").and_then(Value::as_object_mut)
+            .and_then(|metadata| metadata.remove("codexpress_session_id"));
+        let cache_hint = parsed.get_mut("client_metadata").and_then(Value::as_object_mut)
+            .and_then(|metadata| metadata.remove("codexpress_cache_group"));
+        let canonical = parsed["client_metadata"]["session_id"].as_str();
+        let identity = crate::omp_ingress::session_identity(&ingress.namespace, &parts.headers,
+            private.as_ref().and_then(Value::as_str).or(canonical));
+        let had_cache_hint = cache_hint.is_some();
+        let cache_group = if had_cache_hint || native_compaction {
+            state.omp_cache_groups.lock().await.resolve(identity.as_deref(), cache_hint, native_compaction)
+        } else { None };
+        if let Some(identity) = identity {
+            parts.headers.remove("thread_id");
+            parts.headers.insert("thread-id", HeaderValue::from_str(&identity).expect("session digest"));
+        }
+        if private.is_some() || had_cache_hint {
+            bytes = Bytes::from(serde_json::to_vec(&parsed).expect("JSON"));
+            clear_body_headers(&mut parts.headers);
+        }
+        let ingress = parts.extensions.get_mut::<crate::omp_ingress::OmpIngress>().expect("OMP ingress");
+        ingress.cache_group = cache_group;
+        ingress.normalized = true;
+    }
+    if parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some()
+        && parts.uri.path() == "/v1/responses"
+        && crate::images::native::is_request(&parsed)
+    {
+        return crate::images::native::handle(state, parsed, parts).await;
+    }
+    if let Some(problem) = crate::model_catalog::check_client(&state, parsed["model"].as_str().unwrap_or(""), client_kind).await {
+        return problem;
+    }
     // Each client request can join the same takeover. Internal replans retain
     // their marker and cannot pick up a newer operation or retry a failed probe.
     let mut manual = match parts.extensions.get::<ManualRequest>().cloned() {
@@ -645,17 +697,18 @@ async fn forward_once(
     };
     parts.extensions.insert(manual.clone());
     let route_settings = state.settings.read().await.clone();
+    let custom_sources = crate::model_policy::has_custom_sources(
+        &state.model_policies.read().await, parsed["model"].as_str().unwrap_or(""));
     let priority_probe = !discovery
         && !native_compaction
         && parts.uri.path() == "/v1/responses"
         && route_settings.strict_priority
         && route_settings.mode == "auto"
-        && !route_settings.load_balance;
+        && (!route_settings.load_balance || custom_sources);
     let stored_key = scoped_session(&parsed, &parts)
         .or_else(|| {
-            parsed["prompt_cache_key"]
-                .as_str()
-                .map(|s| format!("cache:{s}"))
+            if omp_ingress { return None; }
+            parsed["prompt_cache_key"].as_str().map(|s| format!("cache:{s}"))
         })
         .map(|session| crate::affinity::key(&session, parsed["model"].as_str().unwrap_or("")));
     let exclusions = stored_key
@@ -735,9 +788,10 @@ async fn forward_once(
         return error(StatusCode::BAD_REQUEST, "previous_response_id 格式无效");
     }
     let affinity_session = session_key.clone().or_else(|| {
-        parsed
-            .get("prompt_cache_key")
-            .and_then(Value::as_str)
+        if parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some() {
+            return None;
+        }
+        parsed.get("prompt_cache_key").and_then(Value::as_str)
             .filter(|key| !key.is_empty() && key.len() <= 4096)
             .map(|key| format!("cache:{key}"))
     });
@@ -774,7 +828,7 @@ async fn forward_once(
     {
         if let Some(key) = affinity_key.as_deref() {
             let has_state = binding.is_some() || opaque_state;
-            if !has_state || state.settings.read().await.degraded_context_fallback {
+            if !has_state || route_settings.degraded_context_fallback {
                 if let Some(route) = routing::reserve_idle_return(&state, model, key).await {
                     let prepared = if has_state {
                         // A missing cache chain must leave the working route in
@@ -944,7 +998,7 @@ async fn forward_once(
         // state before rebuilding. Normal alternatives keep all origin checks.
         sources = vec![target.clone()];
     }
-    let retry_limit = state.settings.read().await.upstream_attempts;
+    let retry_limit = route_settings.upstream_attempts;
     let had_candidates = !sources.is_empty();
     sources.retain(|source| !request_retries.exhausted(source, retry_limit));
     if had_candidates && sources.is_empty() {
@@ -954,7 +1008,7 @@ async fn forward_once(
         );
     }
     if sources.is_empty() {
-        let settings = state.settings.read().await.clone();
+        let settings = &route_settings;
         let diagnostics =
             routing::rejection_diagnostics(&state, model, affinity_key.as_deref()).await;
         eprintln!(
@@ -1173,6 +1227,20 @@ async fn forward_once(
                 }
             }
         };
+        if omp_ingress && parts.uri.path() == "/v1/responses"
+            && crate::chatbot::is_compaction_v2(&parsed)
+            && crate::omp_ingress::compaction_capability(&candidate) == Some(false)
+        {
+            let mut response = (StatusCode::BAD_REQUEST, axum::Json(json!({"error":{
+                "code":"unsupported_compaction","type":"invalid_request_error",
+                "message":"This source does not support remote compaction V2",
+                "param":"compaction_trigger"}}))).into_response();
+            for (name, value) in [("x-codexpress-source-id", candidate.id.clone()),
+                ("x-codexpress-source-identity", candidate.identity())] {
+                if let Ok(value) = HeaderValue::from_str(&value) { response.headers_mut().insert(name, value); }
+            }
+            return response;
+        }
         let mut source = if candidate.kind == "official" {
             match crate::official::ensure_access(&state, &candidate.id).await {
                 Ok(source) if source.identity() == candidate.identity() => source,
@@ -1211,7 +1279,7 @@ async fn forward_once(
         );
         let mut auth_refreshed = false;
         let retries =
-            retries::UpstreamRetries::new(&request_retries, &source, &*state.settings.read().await);
+            retries::UpstreamRetries::new(&request_retries, &source, &route_settings);
         let attempt_limit = (if compatibility { 6 } else { 3 }) + retries.extra_attempts();
         for _attempt_number in 0..attempt_limit {
             let eligible = if manual_candidate {
@@ -1256,7 +1324,15 @@ async fn forward_once(
                     )
                 }
             };
-            let mut attempt = Attempt::new(state.clone(), &source, &request_id, model, input_units);
+            let wire_bytes = if source.kind == "official" && !native_compaction
+                && parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some() {
+                let mut body: Value = serde_json::from_slice(&wire_bytes).expect("validated JSON");
+                body["stream"] = json!(true);
+                body["store"] = json!(false);
+                if body.get("instructions").is_none() { body["instructions"] = json!(""); }
+                Bytes::from(serde_json::to_vec(&body).expect("JSON"))
+            } else { wire_bytes };
+            let mut attempt = Attempt::new(state.clone(), &source, &request_id, model, input_units, ingress);
             if let Some(record) = &mut attempt.record {
                 record.token_details.service_tier = parsed["service_tier"]
                     .as_str()
@@ -1288,23 +1364,8 @@ async fn forward_once(
                 Ok(url) => url,
                 Err(_) => return error(StatusCode::BAD_GATEWAY, "来源地址无效"),
             };
-            let ingress = if parts
-                .extensions
-                .get::<crate::chatbot::ChatbotIngress>()
-                .is_some()
-            {
-                "chatbot"
-            } else if parts
-                .extensions
-                .get::<crate::remote::RemoteIngress>()
-                .is_some()
-            {
-                "ssh"
-            } else {
-                "native"
-            };
             attempt.diagnostic.request(
-                ingress,
+                ingress.as_str(),
                 parts.method.as_str(),
                 parts.uri.path(),
                 url.as_str(),
@@ -1312,7 +1373,8 @@ async fn forward_once(
             );
             attempt.save_diagnostic(false);
             let mut headers = clean_headers(&parts.headers, true);
-            if payload.role_repaired() {
+            if payload.role_repaired() || (source.kind == "official" && !native_compaction
+                && parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some()) {
                 clear_body_headers(&mut headers);
             }
             let credential = source
@@ -1336,7 +1398,7 @@ async fn forward_once(
                 if parts
                     .extensions
                     .get::<crate::chatbot::ChatbotIngress>()
-                    .is_some()
+                    .is_some() || parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some()
                 {
                     headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
                     headers.insert("version", HeaderValue::from_static("0.162.1"));
@@ -1346,9 +1408,13 @@ async fn forward_once(
                         return error(StatusCode::BAD_GATEWAY, "来源账号标识无效");
                     };
                     headers.insert(HeaderName::from_static("chatgpt-account-id"), value);
+                    if let Some(session) = parts.extensions.get::<crate::omp_ingress::OmpIngress>()
+                        .and_then(|ingress| ingress.cache_session(account, model, parsed["service_tier"].as_str())) {
+                        headers.insert("session-id", HeaderValue::from_str(&session).expect("cache UUID"));
+                    }
                 }
             }
-            let settings = state.settings.read().await.clone();
+            let settings = &route_settings;
             let source_index = state.sources.read().await.iter().position(|runtime| {
                 runtime.source.id == source.id && runtime.source.identity() == source.identity()
             });
@@ -1366,14 +1432,15 @@ async fn forward_once(
                 "conversation_affinity"
             } else if settings.mode == "fixed" {
                 "fixed"
-            } else if settings.load_balance {
+            } else if settings.load_balance && !custom_sources {
                 "load_balance"
             } else {
                 "priority"
             };
             eprintln!(
-                "routing_attempt unix={} source_index={} selection={} rebuilt={} bound={} opaque={}",
+                "routing_attempt unix={} ingress={} source_index={} selection={} rebuilt={} bound={} opaque={}",
                 crate::model::now(),
+                ingress.as_str(),
                 source_index.map_or(-1, |index| index as i64),
                 selection,
                 degraded,
@@ -1390,18 +1457,32 @@ async fn forward_once(
                     .notifications
                     .fallback(context.key.as_deref().unwrap_or(&request_id));
             }
+            let submission = state.routing_sync.lock().await;
+            if let Some(problem) = crate::model_catalog::check_client(&state, model, client_kind).await {
+                return problem;
+            }
+            let current_revision = state.routing_revision.load(Ordering::Acquire);
+            if current_revision != selected_revision {
+                drop(submission);
+                drop(route_lease.take());
+                if current_revision % 2 != 0 || replans >= 3 {
+                    return error(StatusCode::SERVICE_UNAVAILABLE, "来源设置已变化，请稍后重试");
+                }
+                let retry = Request::from_parts(parts, Body::from(bytes));
+                return Box::pin(forward_once(state, retry, rebuild, replans + 1)).await;
+            }
             if manual_candidate {
                 manual.attempted = true;
                 parts.extensions.insert(manual.clone());
             }
-            let upstream = tokio::time::timeout(
+            let upstream = crate::model_catalog::start_submission(submission, tokio::time::timeout(
                 std::time::Duration::from_secs(120),
                 client
                     .request(parts.method.clone(), url)
                     .headers(headers)
                     .body(wire_bytes)
                     .send(),
-            )
+            ))
             .await;
             let upstream = match upstream {
                 Ok(result) => result,
@@ -1467,7 +1548,7 @@ async fn forward_once(
                         && !degraded
                         && !probe_unknown_id
                         && (binding.is_some() || opaque_state || origin.is_some())
-                        && state.settings.read().await.degraded_context_fallback
+                        && route_settings.degraded_context_fallback
                         && !routing::candidates_with_session(
                             &state,
                             model,
@@ -1587,7 +1668,7 @@ async fn forward_once(
                             break;
                         }
                         if !degraded
-                            && state.settings.read().await.degraded_context_fallback
+                            && route_settings.degraded_context_fallback
                             && !routing::candidates_with_session(
                                 &state,
                                 model,
@@ -1621,11 +1702,24 @@ async fn forward_once(
                     }
                 }
             }
+            let compaction_error = if parts.uri.path() == "/v1/responses" && crate::chatbot::is_compaction_v2(&parsed)
+                && parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some()
+                && matches!(status.as_u16(), 400 | 404 | 422 | 501) {
+                let value = read_error_prefix(&mut upstream, &mut prefix).await;
+                if let Some(value) = &value {
+                    crate::omp_ingress::observe_compaction_rejection(&source, status, value);
+                }
+                value
+            } else { None };
             let mut context_rejected = false;
             if matches!(status.as_u16(), 400 | 404 | 409 | 422)
                 && (binding.is_some() || opaque_state || payload.may_repair())
             {
-                if let Some(value) = read_error_prefix(&mut upstream, &mut prefix).await {
+                let rejection = match compaction_error {
+                    Some(value) => Some(value),
+                    None => read_error_prefix(&mut upstream, &mut prefix).await,
+                };
+                if let Some(value) = rejection {
                     if payload.repair_rejection(status, &value, &source, &state.role_capabilities) {
                         attempt.finish("failed", None);
                         attempt.collect_error(&mut upstream, &mut prefix).await;
@@ -1641,7 +1735,7 @@ async fn forward_once(
                         && (binding.is_some() || opaque_state)
                         && (priority_probe
                             || probe_unknown_id
-                            || state.settings.read().await.degraded_context_fallback)))
+                            || route_settings.degraded_context_fallback)))
             {
                 // Hold only an initial bounded prefix. A failed Responses SSE
                 // can use HTTP 200, so headers alone do not prove acceptance.
@@ -1746,7 +1840,7 @@ async fn forward_once(
                 // context once before abandoning the takeover.
                 if context_rejected
                     && !degraded
-                    && state.settings.read().await.degraded_context_fallback
+                    && route_settings.degraded_context_fallback
                 {
                     if let Ok((mut retry, context)) =
                         portable_request(&state, &parts, &parsed, affinity_key.as_deref()).await
@@ -1808,7 +1902,7 @@ async fn forward_once(
                 && (context_rejected
                     || matches!(status.as_u16(), 401 | 402 | 403 | 429)
                     || retries::transient_status(status.as_u16()))
-                && state.settings.read().await.degraded_context_fallback
+                && route_settings.degraded_context_fallback
                 && if priority_probe {
                     !routing::priority::candidates(&state, model, affinity_key.as_deref())
                         .await
@@ -1915,7 +2009,7 @@ async fn forward_once(
                     source_id: record.source_id.clone(),
                     source_name: record.source_name.clone(),
                     model: record.model.clone(),
-                    ingress: ingress.into(),
+                    ingress: ingress.as_str().into(),
                     request_id: record.request_id.clone(),
                     attempt_id: record.attempt_id.clone(),
                 });
@@ -1938,6 +2032,12 @@ async fn forward_once(
                 route_lease.take(),
             )
             .await;
+            for (name, value) in [("x-codexpress-source-id", source.id.clone()),
+                ("x-codexpress-source-identity", source.identity())] {
+                if let Ok(value) = HeaderValue::from_str(&value) {
+                    response.headers_mut().insert(name, value);
+                }
+            }
             if !ignored_parameters.is_empty() {
                 if let Ok(value) = HeaderValue::from_str(&ignored_parameters.join(", ")) {
                     response
@@ -2005,5 +2105,24 @@ mod recovery_tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod omp_thread_tests {
+    use super::*;
+    #[test]
+    fn omp_thread_identity_never_uses_shared_cache_key() {
+        let parsed = json!({"session_id":"real-session","prompt_cache_key":"shared-cache"});
+        let mut request = Request::new(Body::empty());
+        request.extensions_mut().insert(crate::omp_ingress::OmpIngress { namespace:"client".into(), normalized:false, cache_group:None });
+        request.headers_mut().insert("thread-id", HeaderValue::from_static("thread-a"));
+        let (mut parts, _) = request.into_parts();
+        let first = scoped_session(&parsed, &parts).unwrap();
+        parts.headers.insert("thread-id", HeaderValue::from_static("thread-b"));
+        assert_ne!(Some(first), scoped_session(&parsed, &parts));
+        parts.headers.remove("thread-id");
+        assert_eq!(scoped_session(&parsed, &parts).as_deref(), Some("omp:client:session:real-session"));
+        assert_eq!(scoped_session(&json!({"prompt_cache_key":"shared-cache"}), &parts), None);
     }
 }

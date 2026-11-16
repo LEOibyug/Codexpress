@@ -1,6 +1,7 @@
 //! Loopback-only subscription image API. Only official sources are eligible;
 //! local access keys and upstream OAuth credentials never cross that boundary.
 mod payload;
+pub(crate) mod native;
 
 use crate::{
     chatbot,
@@ -126,6 +127,20 @@ impl ImageAccess {
             json!({"enabled":s.enabled,"running":listener.as_ref().is_some_and(|l|!l.task.is_finished()),"port":s.port,"base_url":format!("http://127.0.0.1:{}/v1",s.port),"key_set":true,"source_id":s.source_id,"model":MODEL}),
         )
     }
+}
+
+pub(crate) async fn discoverable_for(state: &Arc<AppState>, client: crate::model_policy::ClientKind) -> bool {
+    if !state.images.settings().is_ok_and(|settings| settings.enabled) { return false; }
+    let _sync = state.routing_sync.lock().await;
+    let policies = state.model_policies.read().await;
+    if !crate::model_policy::client_allowed(&policies, MODEL, client) { return false; }
+    let selected = state.images.settings().ok().and_then(|settings| settings.source_id);
+    state.sources.read().await.iter().any(|runtime| {
+        let source = &runtime.source;
+        source.enabled && source.kind == "official"
+            && selected.as_ref().is_none_or(|id| id == &source.id)
+            && crate::model_policy::source_allowed(&policies, MODEL, &source.id)
+    })
 }
 pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
     let _configuration = state.config_lock.lock().await;
@@ -286,8 +301,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, gate))
 }
-async fn models() -> Json<Value> {
-    Json(json!({"object":"list","data":[{"id":MODEL,"object":"model","owned_by":"openai"}]}))
+async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let data = if discoverable_for(&state, crate::model_policy::ClientKind::Images).await {
+        vec![json!({"id":MODEL,"object":"model","owned_by":"openai"})]
+    } else { Vec::new() };
+    Json(json!({"object":"list","data":data}))
 }
 async fn generate(State(state): State<Arc<AppState>>, request: Request) -> Response {
     handle(state, request, false).await
@@ -305,13 +323,15 @@ fn source_available(runtime: &SourceRuntime) -> bool {
 }
 async fn candidates(state: &Arc<AppState>) -> Vec<Source> {
     let selected = state.images.settings().ok().and_then(|s| s.source_id);
+    let policies = state.model_policies.read().await.clone();
     let sources = state.sources.read().await;
     let mut candidates: Vec<_> = sources
         .iter()
-        .filter(|r| source_available(r) && selected.as_ref().is_none_or(|id| *id == r.source.id))
+        .filter(|r| source_available(r) && selected.as_ref().is_none_or(|id| *id == r.source.id)
+            && crate::model_policy::source_allowed(&policies, MODEL, &r.source.id))
         .map(|r| r.source.clone())
         .collect();
-    candidates.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.id.cmp(&b.id)));
+    crate::model_policy::sort_sources(&policies, MODEL, &mut candidates);
     candidates
 }
 struct Attempt {
@@ -321,10 +341,11 @@ struct Attempt {
     diagnostic: Capture,
 }
 impl Attempt {
-    fn new(state: Arc<AppState>, source: &Source, request_id: &str) -> Self {
+    fn new(state: Arc<AppState>, source: &Source, request_id: &str, ingress: crate::usage::Ingress) -> Self {
         let record = UsageRecord {
             attempt_id: uuid::Uuid::new_v4().to_string(),
             request_id: request_id.into(),
+            ingress,
             source_id: source.id.clone(),
             source_name: source.name.clone(),
             model: MODEL.into(),
@@ -349,6 +370,7 @@ impl Attempt {
             record.started_at,
             source,
             &state.gateway_key,
+            ingress,
         );
         Self {
             state,
@@ -415,8 +437,7 @@ impl Drop for Attempt {
 }
 async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response {
     let (parts, body) = request.into_parts();
-    #[cfg(test)]
-    let target_override = parts.extensions.get::<TestTarget>().cloned();
+    let extensions = parts.extensions.clone();
     let mime = parts
         .headers
         .get(header::CONTENT_TYPE)
@@ -427,10 +448,32 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
         Ok(b) => b,
         Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "图片请求过大或无法读取"),
     };
-    let payload = match payload::adapt(&mime, bytes, edit, parts.extensions).await {
+    let payload = match payload::adapt(&mime, bytes, edit, extensions).await {
         Ok(v) => v,
         Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+    execute(state, payload, edit, parts, None).await
+}
+
+async fn execute(
+    state: Arc<AppState>,
+    payload: Value,
+    edit: bool,
+    parts: axum::http::request::Parts,
+    native_stream: Option<bool>,
+) -> Response {
+    let client_kind = if native_stream.is_some() { crate::model_catalog::client(&parts) } else { crate::model_policy::ClientKind::Images };
+    let ingress = if native_stream.is_some() {
+        crate::usage::Ingress::from_extensions(&parts.extensions)
+    } else {
+        crate::usage::Ingress::Image
+    };
+    if let Some(problem) = crate::model_catalog::check_client(&state, MODEL, client_kind).await { return problem; }
+    if !state.images.settings().is_ok_and(|settings| settings.enabled) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "图片生成功能已关闭");
+    }
+    #[cfg(test)]
+    let target_override = parts.extensions.get::<TestTarget>().cloned();
     let request_id = uuid::Uuid::new_v4().to_string();
     let mut rate_limited_accounts = HashSet::new();
     for candidate in candidates(&state).await {
@@ -460,7 +503,11 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
         };
         // Recheck the independent selection and enabled switch after OAuth waits.
         {
-            let selected = state.images.settings().ok().and_then(|s| s.source_id);
+            let settings = match state.images.settings() {
+                Ok(settings) if settings.enabled => settings,
+                _ => return error(StatusCode::SERVICE_UNAVAILABLE, "图片生成功能已关闭"),
+            };
+            let selected = settings.source_id;
             let sources = state.sources.read().await;
             if !sources.iter().any(|r| {
                 r.source.id == source.id
@@ -509,6 +556,14 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             "x-codex-image-turn-id",
             HeaderValue::from_str(&request_id).unwrap(),
         );
+        if native_stream.is_some() {
+            if let Some(thread) = parts.headers.get("thread-id") {
+                headers.insert("thread-id", thread.clone());
+            }
+            if let Some(session) = parts.headers.get("session_id") {
+                headers.insert("session_id", session.clone());
+            }
+        }
         if let Some(account) = source
             .account_id
             .as_deref()
@@ -519,9 +574,9 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             };
             headers.insert("chatgpt-account-id", value);
         }
-        let mut attempt = Attempt::new(state.clone(), &source, &request_id);
+        let mut attempt = Attempt::new(state.clone(), &source, &request_id, ingress);
         attempt.diagnostic.request(
-            "image",
+            ingress.as_str(),
             "POST",
             if edit {
                 "/v1/images/edits"
@@ -532,12 +587,27 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             &[],
         );
         let _ = state.usage.diagnostic(&attempt.diagnostic, false);
-        let response = client
+        let submission = state.routing_sync.lock().await;
+        if let Some(problem) = crate::model_catalog::check_client(&state, MODEL, client_kind).await { return problem; }
+        let settings = match state.images.settings() {
+            Ok(settings) if settings.enabled => settings,
+            _ => return error(StatusCode::SERVICE_UNAVAILABLE, "图片生成功能已关闭"),
+        };
+        let policies = state.model_policies.read().await;
+        let still_selected = crate::model_policy::source_allowed(&policies, MODEL, &source.id)
+            && settings.source_id.as_ref().is_none_or(|id| id == &source.id)
+            && state.sources.read().await.iter().any(|runtime| {
+                source_available(runtime) && runtime.source.id == source.id
+                    && runtime.source.identity() == source.identity() && runtime.source.proxy == source.proxy
+            });
+        drop(policies);
+        if !still_selected { continue; }
+        let response = crate::model_catalog::start_submission(submission, client
             .post(endpoint)
             .headers(headers)
             .json(&payload)
             .timeout(Duration::from_secs(300))
-            .send()
+            .send())
             .await;
         let mut upstream = match response {
             Ok(r) => r,
@@ -625,10 +695,18 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
             attempt.finish("failed");
             return error(StatusCode::BAD_GATEWAY, "官方未返回可保存的图片内容");
         }
+        if native_stream.is_some() && data.iter().any(|item|
+            item["b64_json"].as_str().and_then(native::output_format).is_none()) {
+            attempt.finish("failed");
+            return error(StatusCode::BAD_GATEWAY, "官方返回了无法识别的图片格式");
+        }
         let clean: Vec<Value> = data
             .iter()
             .map(|item| {
                 let mut out = json!({"b64_json":item["b64_json"]});
+                if native_stream.is_some() {
+                    out["output_format"] = json!(native::output_format(item["b64_json"].as_str().expect("validated image")));
+                }
                 for key in ["generation_id", "revised_prompt"] {
                     if item[key].is_string() {
                         out[key] = item[key].clone();
@@ -644,8 +722,26 @@ async fn handle(state: Arc<AppState>, request: Request, edit: bool) -> Response 
                 result_out[key] = result[key].clone();
             }
         }
+        if let Some(record) = attempt.record.as_mut() {
+            if let Some(usage) = result_out.get("usage") {
+                record.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
+                record.output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
+                record.cached_input_tokens = usage["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+                record.token_details.output_available = usage["output_tokens"].is_u64();
+                record.token_details.cached_input_reported = usage["input_tokens_details"]["cached_tokens"].is_u64();
+                record.token_details.reported_total_tokens = usage["total_tokens"].as_u64();
+            }
+        }
         attempt.finish("success");
-        return Json(result_out).into_response();
+        let mut response = match native_stream {
+            Some(stream) => native::respond(result_out, &request_id, stream),
+            None => Json(result_out).into_response(),
+        };
+        for (name, value) in [("x-codexpress-source-id", source.id.clone()),
+            ("x-codexpress-source-identity", source.identity())] {
+            if let Ok(value) = HeaderValue::from_str(&value) { response.headers_mut().insert(name, value); }
+        }
+        return response;
     }
     if !rate_limited_accounts.is_empty() {
         error(
