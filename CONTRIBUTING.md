@@ -50,6 +50,10 @@ rm -rf .runtime/build .runtime/cache .runtime/tmp
 bash scripts/package.sh
 ```
 
+## 本地替换与安装
+
+每次替换或安装本地应用版本，都必须提交并推送该版本对应的完整源码、测试、文档、资源及版本号，确保可从远端提交重建。提交或推送失败时须明确报告，不能将该版本视为交付完成。`dist/` 等安装包与构建产物仍不提交；本地替换不要求自动创建 Release 标签。
+
 ## 发布
 
 1. 更新 `Resources/Info.plist` 的应用版本与构建号，并同步 `gateway/Cargo.toml` 和 `gateway/Cargo.lock` 中网关包的版本。
