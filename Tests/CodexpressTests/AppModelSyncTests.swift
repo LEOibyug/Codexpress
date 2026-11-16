@@ -296,6 +296,29 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertEqual(try analyticsCalls(directory), count)
     }
 
+    @MainActor func testModelDiscoveryDiscardsResultAfterCredentialChange() async throws {
+        try await withUsageAnalyticsModel { model, directory in
+            var source = Source(); source.name = "API"; source.models = ["original"]; source.automaticModelDiscovery = true
+            var settings = model.settings; settings.sources = [source]
+            try model.persistSettings(settings)
+            try model.credentialSnapshot.apply(.object(["items": .array([.object(["source_id": .string(source.id), "secret": .object(["api_key": .string("old-key")])])])]), requested: [source.id])
+            let hold = directory.appendingPathComponent("hold-models")
+            try Data().write(to: hold)
+            defer { try? FileManager.default.removeItem(at: hold) }
+            let pending = Task { await model.refreshModels(source.id) }
+            let started = directory.appendingPathComponent("models-started")
+            let deadline = Date().addingTimeInterval(3)
+            while !FileManager.default.fileExists(atPath: started.path), Date() < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: started.path))
+            try model.credentialSnapshot.apply(.object(["items": .array([.object(["source_id": .string(source.id), "secret": .object(["api_key": .string("new-key")])])])]), requested: [source.id])
+            try FileManager.default.removeItem(at: hold)
+            await pending.value
+            XCTAssertEqual(model.settings.sources.first?.models, ["original"])
+        }
+    }
+
     private static let helperScript = #"""
     #!/usr/bin/env python3
     import json, os, pathlib, socket, sys, time
@@ -314,6 +337,10 @@ final class AppModelSyncTests: XCTestCase {
                     data = dict(process_id=os.getpid(), port=17863, sources=[], connection_mode=mode.read_text() if mode.exists() else 'unmanaged')
                 elif operation == 'credentials.storage.status':
                     data = dict(mode='file')
+                elif operation == 'models.list':
+                    (directory / 'models-started').touch()
+                    while (directory / 'hold-models').exists(): time.sleep(0.01)
+                    data = dict(models=['old-account-model'])
                 elif operation == 'usage.analytics':
                     counter = directory / 'analytics-count'
                     count = int(counter.read_text()) + 1 if counter.exists() else 1

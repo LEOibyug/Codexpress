@@ -86,7 +86,7 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
                 .store(false, Ordering::Release);
             return;
         }
-        progress(&state, 0, 0, 0);
+        let mut started = false;
         let (mut pages, mut updated, mut errors) = (0, 0, 0);
         for source in sources {
             let cached = state
@@ -101,15 +101,23 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
                     && saved.proxy.as_ref() == Some(&source.proxy)
                     && saved.billing_failures > 0
                     && saved.billing_attempted.is_some_and(|at| {
-                        at.elapsed() < Duration::from_secs(super::failure_delay(saved.billing_failures))
+                        at.elapsed()
+                            < Duration::from_secs(super::failure_delay(saved.billing_failures))
                     })
                 {
                     continue;
                 }
             }
-            if !state.usage.billing_claim(&source, full) {
+            let current = state.sources.read().await;
+            if !current.iter().any(|runtime| {
+                runtime.source.id == source.id
+                    && runtime.source.identity() == source.identity()
+                    && runtime.source.proxy == source.proxy
+            }) || !state.usage.billing_claim(&source, full)
+            {
                 continue;
             }
+            drop(current);
             let recognized = state
                 .balances
                 .entries
@@ -160,6 +168,10 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
             let Ok(probe) = Probe::new(&source) else {
                 continue;
             };
+            if !started {
+                progress(&state, 0, 0, 0);
+                started = true;
+            }
             let errors_before = errors;
             let mut cursor = None;
             let mut cursors = HashSet::new();
@@ -286,7 +298,9 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
             drop(saved);
             progress(&state, pages, updated, errors);
         }
-        progress(&state, pages, updated, errors);
+        if started {
+            progress(&state, pages, updated, errors);
+        }
         state
             .balances
             .billing

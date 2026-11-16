@@ -80,54 +80,82 @@ pub(super) struct Snapshot {
     pub(super) performance: Value,
 }
 
+// Positive IEEE-754 bit patterns have the same ordering as their numeric values.
+// Frequencies preserve exact percentiles without retaining every request sample.
+const MAX_TIMING_VALUES: usize = 8192;
+
 #[derive(Clone, Default)]
 struct Timings {
-    latency: Vec<f64>,
-    first_token: Vec<f64>,
+    latency: BTreeMap<u64, u64>,
+    first_token: BTreeMap<u64, u64>,
+    exhausted: bool,
 }
 impl Timings {
-    fn extend(&mut self, other: Self) {
-        fn merge(target: &mut Vec<f64>, mut added: Vec<f64>) {
-            if added.is_empty() {
-                return;
-            }
-            added.sort_unstable_by(f64::total_cmp);
-            if target.is_empty() {
-                *target = added;
-                return;
-            }
-            let mut left = target.len();
-            let mut right = added.len();
-            target.resize(left + right, 0.0);
-            let mut destination = target.len();
-            while right > 0 {
-                destination -= 1;
-                if left > 0 && target[left - 1] > added[right - 1] {
-                    left -= 1;
-                    target[destination] = target[left];
-                } else {
-                    right -= 1;
-                    target[destination] = added[right];
-                }
-            }
+    fn insert(&mut self, value: f64, first_token: bool) {
+        if self.exhausted {
+            return;
         }
-        merge(&mut self.latency, other.latency);
-        merge(&mut self.first_token, other.first_token);
+        let key = if value == 0.0 { 0 } else { value.to_bits() };
+        let distinct = self.latency.len() + self.first_token.len();
+        let target = if first_token {
+            &mut self.first_token
+        } else {
+            &mut self.latency
+        };
+        if !target.contains_key(&key) && distinct == MAX_TIMING_VALUES {
+            self.latency.clear();
+            self.first_token.clear();
+            self.exhausted = true;
+            return;
+        }
+        *target.entry(key).or_default() += 1;
     }
 
     fn performance(&self) -> Value {
-        fn percentile(values: &[f64], percent: usize) -> Value {
-            if values.is_empty() {
+        fn percentile(values: &BTreeMap<u64, u64>, percent: u64) -> Value {
+            let count: u64 = values.values().sum();
+            if count == 0 {
                 return Value::Null;
             }
-            let rank = (values.len() - 1) * percent;
-            let low = values[rank / 100];
-            let high = values[rank.div_ceil(100)];
-            json!(low + (high - low) * (rank % 100) as f64 / 100.0)
+            let rank = (count - 1) * percent;
+            let mut seen = 0;
+            let mut low = 0.0;
+            for (&bits, &frequency) in values {
+                let end = seen + frequency;
+                if seen <= rank / 100 && rank / 100 < end {
+                    low = f64::from_bits(bits);
+                }
+                if rank.div_ceil(100) < end {
+                    let high = f64::from_bits(bits);
+                    return json!(low + (high - low) * (rank % 100) as f64 / 100.0);
+                }
+                seen = end;
+            }
+            unreachable!("percentile rank lies within sample count")
         }
         json!({"p50_latency_ms":percentile(&self.latency,50),"p95_latency_ms":percentile(&self.latency,95),
             "p50_first_token_ms":percentile(&self.first_token,50),"p95_first_token_ms":percentile(&self.first_token,95)})
     }
+}
+
+fn sql_performance(connection: &Connection, query: &Query) -> Result<Value> {
+    let mut performance = json!({});
+    for (name, expression, condition) in [
+        ("latency_ms", "latency_ms", "latency_ms>0"),
+        ("first_token_ms", "json_extract(metadata,'$.first_token_latency_ms')",
+            "json_type(metadata,'$.first_token_latency_ms') IN ('integer','real') AND json_extract(metadata,'$.first_token_latency_ms')>=0"),
+    ] {
+        let percentile = |percent| format!(
+            "MAX(CASE WHEN position=((count-1)*{percent})/100+1 THEN value END) + (MAX(CASE WHEN position=((count-1)*{percent}+99)/100+1 THEN value END)-MAX(CASE WHEN position=((count-1)*{percent})/100+1 THEN value END))*(((MAX(count)-1)*{percent})%100)/100.0"
+        );
+        let sql = format!("WITH attempts AS ({ATTEMPT_ROWS}), samples AS (SELECT {expression} AS value FROM attempts WHERE {FILTERS} AND status!='active' AND {condition}), ranked AS (SELECT value,ROW_NUMBER() OVER (ORDER BY value) AS position,COUNT(*) OVER () AS count FROM samples) SELECT {},{} FROM ranked", percentile(50), percentile(95));
+        let (p50, p95) = connection.query_row(&sql, rusqlite::params_from_iter(query.bindings()), |row| {
+            Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<f64>>(1)?))
+        })?;
+        performance[format!("p50_{name}")] = json!(p50);
+        performance[format!("p95_{name}")] = json!(p95);
+    }
+    Ok(performance)
 }
 
 #[derive(Clone)]
@@ -203,6 +231,7 @@ fn load(
     connection: &Connection,
     query: &Query,
     base: Option<&Cached>,
+    mut timings: Timings,
 ) -> Result<(Snapshot, Timings)> {
     let mut bindings = query.bindings();
     bindings.extend([
@@ -265,18 +294,22 @@ fn load(
             target.insert(value?);
         }
     }
-    let mut timings = Timings::default();
-    let sql = format!("{attempts} SELECT latency_ms,CASE WHEN json_type(metadata,'$.first_token_latency_ms') IN ('integer','real') AND json_extract(metadata,'$.first_token_latency_ms')>=0 THEN json_extract(metadata,'$.first_token_latency_ms') END FROM attempts WHERE {FILTERS} AND status!='active'");
-    let mut statement = connection.prepare(&sql)?;
-    for row in statement.query_map(rusqlite::params_from_iter(&bindings), |row| {
-        Ok((row.get::<_, f64>(0)?, row.get::<_, Option<f64>>(1)?))
-    })? {
-        let (latency, first_token) = row?;
-        if latency > 0.0 {
-            timings.latency.push(latency);
-        }
-        if let Some(value) = first_token {
-            timings.first_token.push(value);
+    if !timings.exhausted {
+        let sql = format!("{attempts} SELECT latency_ms,CASE WHEN json_type(metadata,'$.first_token_latency_ms') IN ('integer','real') AND json_extract(metadata,'$.first_token_latency_ms')>=0 THEN json_extract(metadata,'$.first_token_latency_ms') END FROM attempts WHERE {FILTERS} AND status!='active'");
+        let mut statement = connection.prepare(&sql)?;
+        for row in statement.query_map(rusqlite::params_from_iter(&bindings), |row| {
+            Ok((row.get::<_, f64>(0)?, row.get::<_, Option<f64>>(1)?))
+        })? {
+            let (latency, first_token) = row?;
+            if latency > 0.0 {
+                timings.insert(latency, false);
+            }
+            if let Some(value) = first_token {
+                timings.insert(value, true);
+            }
+            if timings.exhausted {
+                break;
+            }
         }
     }
     Ok((
@@ -334,10 +367,15 @@ pub(super) fn snapshot(data: &mut StoreData, query: &Query) -> Result<Snapshot> 
         .as_ref()
         .is_none_or(|(cached, _)| cached.cursor != cursor || cached.query.days != query.days)
     {
+        let timings = cached
+            .as_mut()
+            .map(|(base, _)| std::mem::take(&mut base.timings))
+            .unwrap_or_default();
         let (added, timings) = load(
             &transaction,
             query,
             cached.as_ref().map(|(cached, _)| cached),
+            timings,
         )?;
         if let Some((base, offset)) = &mut cached {
             if *offset > 0 {
@@ -372,10 +410,8 @@ pub(super) fn snapshot(data: &mut StoreData, query: &Query) -> Result<Snapshot> 
                 merge_totals(day, added);
             }
             base.snapshot.options.extend(added.options);
-            base.timings.extend(timings);
+            base.timings = timings;
         } else {
-            let mut sorted = Timings::default();
-            sorted.extend(timings);
             cached = Some((
                 Cached {
                     query: query.clone(),
@@ -383,7 +419,7 @@ pub(super) fn snapshot(data: &mut StoreData, query: &Query) -> Result<Snapshot> 
                     data_version,
                     cursor,
                     snapshot: added,
-                    timings: sorted,
+                    timings,
                 },
                 0,
             ));
@@ -391,10 +427,24 @@ pub(super) fn snapshot(data: &mut StoreData, query: &Query) -> Result<Snapshot> 
         let base = &mut cached.as_mut().expect("loaded snapshot").0;
         base.query = query.clone();
         base.cursor = cursor;
-        base.snapshot.performance = base.timings.performance();
+        base.snapshot.performance = if base.timings.exhausted {
+            sql_performance(&transaction, query)?
+        } else {
+            base.timings.performance()
+        };
     }
     transaction.commit()?;
     let cached = cached.expect("loaded snapshot").0;
+    ensure!(
+        cached.snapshot.groups.len() <= MAX_OPTIONS,
+        "统计分组过多，请缩小查询范围"
+    );
+    ensure!(
+        cached.snapshot.options.sources.len() <= MAX_OPTIONS
+            && cached.snapshot.options.models.len() <= MAX_OPTIONS
+            && cached.snapshot.options.ingresses.len() <= MAX_OPTIONS,
+        "筛选选项过多，请缩小查询范围"
+    );
     let result = cached.snapshot.clone();
     if data.analytics_cache.len() == 8 {
         data.analytics_cache.pop_front();

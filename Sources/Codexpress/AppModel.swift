@@ -534,19 +534,22 @@ import ServiceManagement
     func refreshVisibleModels() { scheduleModelRefresh(maximumAge: 300) }
     func refreshModels(_ id: String) async {
         guard !refreshingModels.contains(id), let before = settings.sources.first(where: { $0.id == id }), before.discoversModels else { return }
+        let credential = try? credentialSnapshot.load(id)
         refreshingModels.insert(id); lastModelRefresh[id] = Date(); modelErrors[id] = nil
         defer { refreshingModels.remove(id) }
         do {
             let models = try await fetchModels(for: before)
             // Discard a response if the editor, login or deletion changed its source.
-            guard !Task.isCancelled, running, !busy, let index = settings.sources.firstIndex(where: { $0.id == id }), settings.sources[index] == before else { lastModelRefresh[id] = nil; return }
+            guard !Task.isCancelled, running, !busy, let index = settings.sources.firstIndex(where: { $0.id == id }), settings.sources[index] == before,
+                  (try? credentialSnapshot.load(id)) == credential else { lastModelRefresh[id] = nil; return }
             guard before.models != models || before.automaticModelDiscovery != true else { return }
             try await updateSettingsAndSync { next in
                 next.sources[index].automaticModelDiscovery = true
                 next.sources[index].models = models
             }
         } catch {
-            if settings.sources.contains(where: { $0 == before }) { modelErrors[id] = error.localizedDescription }
+            if !Task.isCancelled, settings.sources.contains(where: { $0 == before }),
+               (try? credentialSnapshot.load(id)) == credential { modelErrors[id] = error.localizedDescription }
         }
     }
     func removeSource(_ id: String) {

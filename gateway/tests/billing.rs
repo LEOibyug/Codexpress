@@ -117,9 +117,15 @@ async fn paginated_ledger_backfills_only_mutually_unique_requests_and_does_not_p
     );
     fail_second.store(false, Ordering::SeqCst);
     let before = hits.load(Ordering::SeqCst);
-    management::dispatch(&state, "usage.reconcile", json!({"source_id":"cch"})).await.unwrap();
+    management::dispatch(&state, "usage.reconcile", json!({"source_id":"cch"}))
+        .await
+        .unwrap();
     finish_sync(&state).await;
-    assert_eq!(hits.load(Ordering::SeqCst), before, "手动核对不能绕过失败冷却");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        before,
+        "手动核对不能绕过失败冷却"
+    );
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(60)).await;
     tokio::time::resume();
@@ -326,7 +332,8 @@ async fn automatic_idle_waits_300_seconds_after_last_end_and_failure_needs_new_w
     let failed = finish_sync(&state).await;
     assert_eq!(failed["errors"], 1);
     tokio::time::advance(Duration::from_secs(600)).await;
-    finish_sync(&state).await;
+    let idle = finish_sync(&state).await;
+    assert_eq!(idle["errors"], 1, "没有新核对时保留上次失败进度");
     assert_eq!(hits.load(Ordering::SeqCst), 1, "失败不能在idle热重试");
     // Editing credentials abandons the previous identity's pending count.
     settle(&state, &source, "old-identity");

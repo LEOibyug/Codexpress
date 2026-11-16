@@ -185,7 +185,9 @@ fn invalid_days_are_read_only_and_active_timings_never_become_completed_samples(
 #[test]
 fn appended_and_late_completions_extend_aligned_history_without_double_counting() {
     let (_dir, data) = fixture();
-    let store = crate::usage::UsageStore { data: std::sync::Mutex::new(data) };
+    let store = crate::usage::UsageStore {
+        data: std::sync::Mutex::new(data),
+    };
     let from = 100_000;
     let day = 86_400;
     for (id, at, latency, first_token) in [
@@ -194,7 +196,9 @@ fn appended_and_late_completions_extend_aligned_history_without_double_counting(
         ("after", from + 2 * day, 5000, Some(500)),
     ] {
         let mut row = record(id, at);
-        if id == "middle" { row.model = "unknown-model".into(); }
+        if id == "middle" {
+            row.model = "unknown-model".into();
+        }
         row.latency_ms = latency;
         row.first_token_latency_ms = first_token;
         store.record(row).unwrap();
@@ -217,9 +221,15 @@ fn appended_and_late_completions_extend_aligned_history_without_double_counting(
     older.first_token_latency_ms = Some(0);
     store.record(older).unwrap();
     store.record(record("outside", from + 3 * day)).unwrap();
-    let expanded = json!({"from":from,"to":from+3*day,"day_starts":[from,from+day,from+2*day,from+3*day]});
+    let expanded =
+        json!({"from":from,"to":from+3*day,"day_starts":[from,from+day,from+2*day,from+3*day]});
     let result = store.analytics(&expanded).unwrap();
-    let known = result["groups"].as_array().unwrap().iter().find(|group| group["model"] == "gpt-6.1-sol").unwrap();
+    let known = result["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["model"] == "gpt-6.1-sol")
+        .unwrap();
     assert_eq!(known["requests"], 4);
     assert_eq!(known["source_name"], "最终名称");
     assert_eq!(known["active_requests"], 0);
@@ -227,7 +237,15 @@ fn appended_and_late_completions_extend_aligned_history_without_double_counting(
     assert_eq!(known["output_tokens"], 40);
     assert_eq!(known["cached_input_tokens"], 80);
     assert_eq!(known["priced_requests"], 4);
-    assert_eq!(result["daily"].as_array().unwrap().iter().map(|day| day["requests"].as_u64().unwrap()).collect::<Vec<_>>(), [2,2,1]);
+    assert_eq!(
+        result["daily"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|day| day["requests"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [2, 2, 1]
+    );
     assert!(result["daily"][1]["total_usd"].as_f64().unwrap() > 0.0);
     assert_eq!(result["performance"]["p50_latency_ms"], 3000.0);
     assert_eq!(result["performance"]["p95_latency_ms"], 4800.0);
@@ -235,19 +253,36 @@ fn appended_and_late_completions_extend_aligned_history_without_double_counting(
     assert_eq!(result["performance"]["p95_first_token_ms"], 470.0);
     assert_eq!(result["options"]["sources"][0]["name"], "最终名称");
     let repeated = store.analytics(&expanded).unwrap();
-    for field in ["groups", "daily", "performance", "options"] { assert_eq!(repeated[field], result[field]); }
+    for field in ["groups", "daily", "performance", "options"] {
+        assert_eq!(repeated[field], result[field]);
+    }
 }
 
 #[test]
 fn corrections_diagnostics_and_shifted_windows_do_not_reuse_stale_totals() {
     let (dir, data) = fixture();
     persist(&data, &record("legacy", 100_000), Some("native"));
-    let store = crate::usage::UsageStore { data: std::sync::Mutex::new(data) };
-    let payload = json!({"from":100_000,"to":186_400,"day_starts":[100_000,186_400],"ingress":"native"});
-    assert_eq!(store.analytics(&payload).unwrap()["groups"][0]["requests"], 1);
-    let source = serde_json::from_value(json!({"id":"a","name":"来源 A","kind":"api","base_url":"http://127.0.0.1:1",
-        "enabled":true,"priority":0,"proxy":{"mode":"direct"},"secret":{"api_key":"fixture"}})).unwrap();
-    let capture = crate::usage::diagnostics::Capture::new("legacy", 100_000, &source, "fixture", crate::usage::Ingress::Ssh);
+    let store = crate::usage::UsageStore {
+        data: std::sync::Mutex::new(data),
+    };
+    let payload =
+        json!({"from":100_000,"to":186_400,"day_starts":[100_000,186_400],"ingress":"native"});
+    assert_eq!(
+        store.analytics(&payload).unwrap()["groups"][0]["requests"],
+        1
+    );
+    let source = serde_json::from_value(
+        json!({"id":"a","name":"来源 A","kind":"api","base_url":"http://127.0.0.1:1",
+        "enabled":true,"priority":0,"proxy":{"mode":"direct"},"secret":{"api_key":"fixture"}}),
+    )
+    .unwrap();
+    let capture = crate::usage::diagnostics::Capture::new(
+        "legacy",
+        100_000,
+        &source,
+        "fixture",
+        crate::usage::Ingress::Ssh,
+    );
     store.diagnostic(&capture, false).unwrap();
     let changed = store.analytics(&payload).unwrap();
     assert!(changed["groups"].as_array().unwrap().is_empty());
@@ -263,7 +298,13 @@ fn corrections_diagnostics_and_shifted_windows_do_not_reuse_stale_totals() {
     assert_eq!(corrected["daily"][0]["total_usd"], 7.5);
     assert_eq!(corrected["daily"][0]["requests"], 2);
     assert_eq!(corrected["daily"][0]["upstream_priced_requests"], 1);
-    store.data.lock().unwrap().connection.execute("DELETE FROM usage WHERE attempt=1", []).unwrap();
+    store
+        .data
+        .lock()
+        .unwrap()
+        .connection
+        .execute("DELETE FROM usage WHERE attempt=1", [])
+        .unwrap();
     store.record(record("after-delete", 100_002)).unwrap();
     let after_delete = store.analytics(&all).unwrap();
     assert_eq!(after_delete["daily"][0]["requests"], 2);
@@ -274,4 +315,142 @@ fn corrections_diagnostics_and_shifted_windows_do_not_reuse_stale_totals() {
     assert_eq!(shifted["groups"][0]["requests"], 1);
     assert_eq!(shifted["daily"][0]["requests"], 1);
     assert_eq!(shifted["options"]["models"], json!(["gpt-6.1-sol"]));
+}
+
+#[test]
+fn same_name_costs_preserve_mixed_json_numbers_in_both_orders() {
+    let (_dir, mut data) = fixture();
+    for (id, model, name, cost) in [
+        ("a", "fraction-first", " 同名 ", json!(0.25)),
+        ("b", "fraction-first", "同名", json!(2)),
+        ("c", "integer-first", " 同名 ", json!(2)),
+        ("d", "integer-first", "同名", json!(0.25)),
+    ] {
+        let mut row = record(id, 100_000);
+        row.source_id = id.into();
+        row.source_name = name.into();
+        row.model = model.into();
+        let attempt = persist(&data, &row, None);
+        data.connection.execute(
+            "UPDATE usage SET metadata=json_set(metadata,'$.cost.total_usd',json(?1)) WHERE attempt=?2",
+            rusqlite::params![cost.to_string(), attempt],
+        ).unwrap();
+    }
+    let result = build(
+        &mut data,
+        &json!({"from":100_000,"to":186_400,"day_starts":[100_000,186_400]}),
+    )
+    .unwrap();
+    let groups = result["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    for group in groups {
+        assert_eq!(group["source_name"], "同名");
+        assert_eq!(group["requests"], 2);
+        assert_eq!(group["total_usd"], 2.25);
+        assert!(group["source_id"].is_null());
+        assert_eq!(group["source_ids"].as_array().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn high_cardinality_timings_stay_exact_after_appends_and_aligned_expansion() {
+    let (dir, _) = fixture();
+    let store = crate::usage::UsageStore::open(&dir.path().join("usage.sqlite")).unwrap();
+    let from = 100_000;
+    let day = 86_400;
+    store
+        .data
+        .lock()
+        .unwrap()
+        .connection
+        .execute_batch("BEGIN")
+        .unwrap();
+    for (id, at, latency) in [("before", from, 4099), ("after", from + 2 * day, 4100)] {
+        let mut row = record(id, at);
+        row.model = "unknown-model".into();
+        row.latency_ms = latency;
+        row.first_token_latency_ms = Some(latency + 10_000);
+        store.record(row).unwrap();
+    }
+    for latency in 1..=4096 {
+        let mut row = record(&format!("sample-{latency}"), from + day);
+        row.model = "unknown-model".into();
+        row.latency_ms = latency;
+        row.first_token_latency_ms = Some(latency + 10_000);
+        store.record(row).unwrap();
+    }
+    store
+        .data
+        .lock()
+        .unwrap()
+        .connection
+        .execute_batch("COMMIT")
+        .unwrap();
+    let middle = json!({"from":from+day,"to":from+2*day,"day_starts":[from+day,from+2*day]});
+    assert_eq!(
+        store.analytics(&middle).unwrap()["performance"]["p50_latency_ms"],
+        2048.5
+    );
+    for latency in [4097, 4098] {
+        let mut row = record(&format!("sample-{latency}"), from + day);
+        row.model = "unknown-model".into();
+        row.latency_ms = latency;
+        row.first_token_latency_ms = Some(latency + 10_000);
+        store.record(row).unwrap();
+        let result = store.analytics(&middle).unwrap();
+        assert_eq!(
+            result["performance"]["p50_latency_ms"],
+            (latency + 1) as f64 / 2.0
+        );
+        assert!(
+            (result["performance"]["p95_latency_ms"].as_f64().unwrap()
+                - (1.0 + (latency - 1) as f64 * 0.95))
+                .abs()
+                < 0.00001
+        );
+        assert_eq!(
+            result["performance"]["p50_first_token_ms"],
+            10_000.0 + (latency + 1) as f64 / 2.0
+        );
+        assert!(
+            (result["performance"]["p95_first_token_ms"]
+                .as_f64()
+                .unwrap()
+                - (10_001.0 + (latency - 1) as f64 * 0.95))
+                .abs()
+                < 0.00001
+        );
+        let cold = crate::usage::UsageStore::open(&dir.path().join("usage.sqlite"))
+            .unwrap()
+            .analytics(&middle)
+            .unwrap();
+        for field in ["groups", "daily", "performance", "options"] {
+            assert_eq!(result[field], cold[field]);
+        }
+    }
+    let expanded =
+        json!({"from":from,"to":from+3*day,"day_starts":[from,from+day,from+2*day,from+3*day]});
+    let result = store.analytics(&expanded).unwrap();
+    assert_eq!(result["performance"]["p50_latency_ms"], 2050.5);
+    assert!((result["performance"]["p95_latency_ms"].as_f64().unwrap() - 3895.05).abs() < 0.00001);
+    assert_eq!(result["performance"]["p50_first_token_ms"], 12050.5);
+    assert!(
+        (result["performance"]["p95_first_token_ms"]
+            .as_f64()
+            .unwrap()
+            - 13895.05)
+            .abs()
+            < 0.00001
+    );
+    let cold = crate::usage::UsageStore::open(&dir.path().join("usage.sqlite"))
+        .unwrap()
+        .analytics(&expanded)
+        .unwrap();
+    for field in ["groups", "daily", "performance", "options"] {
+        assert_eq!(result[field], cold[field]);
+    }
+    assert_eq!(
+        store.analytics(&middle).unwrap()["performance"]["p50_latency_ms"],
+        2049.5
+    );
 }

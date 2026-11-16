@@ -2,10 +2,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Merge only output aggregates, after each caller has selected names and filtered IDs.
-pub(super) fn merge<'a>(
-    groups: impl IntoIterator<Item = &'a Value>,
-    by_model: bool,
-) -> Vec<Value> {
+pub(super) fn merge<'a>(groups: impl IntoIterator<Item = &'a Value>, by_model: bool) -> Vec<Value> {
     let mut indices = BTreeMap::new();
     let mut rows: Vec<(Value, BTreeSet<&str>)> = Vec::new();
     for group in groups {
@@ -27,10 +24,15 @@ pub(super) fn merge<'a>(
         });
         let row = &mut rows[index].0;
         for (field, value) in group.as_object().expect("aggregate") {
-            if let Some(number) = value.as_u64() {
-                row[field] = json!(row[field].as_u64().unwrap_or(0).saturating_add(number));
-            } else if let Some(number) = value.as_f64() {
-                row[field] = json!(row[field].as_f64().unwrap_or(0.0) + number);
+            if value.is_number() {
+                row[field] = match (row[field].as_u64(), value.as_u64()) {
+                    (Some(old), Some(added)) => json!(old.saturating_add(added)),
+                    _ if row[field].is_null() => value.clone(),
+                    _ => json!(
+                        row[field].as_f64().unwrap_or(0.0)
+                            + value.as_f64().expect("numeric aggregate")
+                    ),
+                };
             } else if value.is_null() && row.get(field).is_none() {
                 row[field] = Value::Null;
             }
