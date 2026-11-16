@@ -14,6 +14,10 @@ import ServiceManagement
     @Published private(set) var usageRefreshing = false
     @Published private(set) var usageError: String?
     @Published private(set) var usageUpdatedAt: Date?
+    @Published var usageSelection = UsageSelection()
+    @Published var usageActivityPeriod: UsageActivityPeriod = .month
+    @Published var usagePerformanceSourceID = ""
+    @Published private var usageAnalyticsCache: [UsageQuery.CacheKey: UsageAnalyticsSnapshot] = [:]
     @Published private(set) var historyStatus: JSONValue = .null
     @Published var error: String?
     @Published var notice: String?
@@ -45,7 +49,6 @@ import ServiceManagement
     let client: GatewayClient
     private var helper: Process?
     private var logPipe: Pipe?
-    private var logBuffer: GatewayLogBuffer?
     private var timerTask: Task<Void, Never>?
     private var accountTimerTask: Task<Void, Never>?
     private var officialAccountTimerTask: Task<Void, Never>?
@@ -66,6 +69,8 @@ import ServiceManagement
     private var usageDays = 30
     private var usageSourceID: String?
     private var usageModelID: String?
+    private var usageAnalyticsRecency: [UsageQuery.CacheKey] = []
+    private var usageAnalyticsTasks: [UsageQuery.CacheKey: Task<JSONValue, Error>] = [:]
     private var lastPollingError: String?
     private var balanceWarnings: BalanceWarnings?
     var sources: [Source] { settings.sources.sorted { $0.priority < $1.priority } }
@@ -156,16 +161,15 @@ import ServiceManagement
                 let pipe = Pipe(); process.standardError = pipe; process.standardOutput = FileHandle.nullDevice
                 // Helper errors are bounded and protected; never append IPC payloads.
                 let logURL = directory.appendingPathComponent("gateway.log")
-                let buffer = GatewayLogBuffer(url: logURL)
-                logBuffer = buffer
                 pipe.fileHandleForReading.readabilityHandler = { handle in
                     let data = handle.availableData
-                    guard !data.isEmpty else {
-                        handle.readabilityHandler = nil
-                        buffer.flush()
-                        return
-                    }
-                    buffer.append(data)
+                    guard !data.isEmpty else { handle.readabilityHandler = nil; return }
+                    // The helper contract guarantees secret-free diagnostics; cap retention at 256 KiB.
+                    var previous = (try? Data(contentsOf: logURL)) ?? Data()
+                    previous.append(data)
+                    if previous.count > 262_144 { previous = previous.suffix(262_144) }
+                    let temp = logURL.deletingLastPathComponent().appendingPathComponent(".gateway-log-\(UUID().uuidString)")
+                    if FileManager.default.createFile(atPath: temp.path, contents: previous, attributes: [.posixPermissions: 0o600]) { _ = rename(temp.path, logURL.path) }
                 }
                 try process.run(); helper = process; logPipe = pipe
                 process.terminationHandler = { [weak self] _ in Task { @MainActor in await self?.helperStopped() } }
@@ -215,7 +219,7 @@ import ServiceManagement
         }
         return Int(count)
     }
-    func stop() { shuttingDown = true; timerTask?.cancel(); accountTimerTask?.cancel(); officialAccountTimerTask?.cancel(); modelRefreshTask?.cancel(); controlResetPollTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil; logBuffer?.flush() }
+    func stop() { shuttingDown = true; timerTask?.cancel(); accountTimerTask?.cancel(); officialAccountTimerTask?.cancel(); modelRefreshTask?.cancel(); controlResetPollTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
     func retry() { restartCount = 0; Task { await startHelper() } }
     func requireWritableMetadata() throws {
         guard !metadataLoadFailed else { throw AppError.message("来源文件无法读取，已禁止保存。请先从备份修复 sources.json，再重新启动应用；原文件保持不变。") }
@@ -235,11 +239,6 @@ import ServiceManagement
             $0.id == source.id && $0.kind == source.kind && $0.base_url == source.base_url
                 && $0.proxy == source.proxy && $0.account_id == source.account_id
         }) { apiBalances[source.id] = nil }
-        let nextIDs = Set(next.sources.map(\.id))
-        for source in settings.sources where !nextIDs.contains(source.id) {
-            lastModelRefresh[source.id] = nil
-            modelErrors[source.id] = nil
-        }
         if next.codexHome != settings.codexHome { configurationBackups = [] }
         if next.codexHome != settings.codexHome || revision != modelSettingsRevision { localModelSettingsSyncError = nil }
         let officialIntervalChanged = next.officialQuotaRefreshInterval != settings.officialQuotaRefreshInterval
@@ -658,8 +657,37 @@ import ServiceManagement
             if !Task.isCancelled, usageDays == days, usageSourceID == sourceID, usageModelID == modelID { usageError = error.localizedDescription }
         }
     }
-    func usageAnalytics(_ query: UsageQuery) async throws -> JSONValue {
-        try await client.call("usage.analytics", .object(query.payload))
+    func cachedUsageAnalytics(_ query: UsageQuery?) -> UsageAnalyticsSnapshot? {
+        guard let query else { return nil }
+        return usageAnalyticsCache[query.cacheKey]
+    }
+    func usageAnalytics(_ query: UsageQuery, refresh: Bool = false) async throws -> JSONValue {
+        let key = query.cacheKey
+        if usageAnalyticsCache[key] != nil { touchUsageAnalytics(key) }
+        if let task = usageAnalyticsTasks[key] {
+            return try await task.value
+        }
+        if !refresh, let snapshot = usageAnalyticsCache[key], Date().timeIntervalSince(snapshot.updatedAt) < 5 {
+            return snapshot.value
+        }
+        // This task owns the request and cache write, independently of any page's cancellation.
+        let task = Task {
+            defer { usageAnalyticsTasks[key] = nil }
+            let value = try await client.call("usage.analytics", .object(query.payload))
+            usageAnalyticsCache[key] = UsageAnalyticsSnapshot(query: query, value: value)
+            touchUsageAnalytics(key)
+            if usageAnalyticsCache.count > 8 {
+                let oldest = usageAnalyticsRecency.removeFirst()
+                usageAnalyticsCache.removeValue(forKey: oldest)
+            }
+            return value
+        }
+        usageAnalyticsTasks[key] = task
+        return try await task.value
+    }
+    private func touchUsageAnalytics(_ key: UsageQuery.CacheKey) {
+        usageAnalyticsRecency.removeAll { $0 == key }
+        usageAnalyticsRecency.append(key)
     }
     func usageRequests(_ query: UsageQuery, status: String = "", search: String = "", before: Double? = nil) async throws -> JSONValue {
         var payload = query.payload
@@ -896,67 +924,5 @@ import ServiceManagement
     func setLaunchAtLogin(_ value: Bool) {
         do { if value { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }; launchAtLogin = SMAppService.mainApp.status == .enabled }
         catch { self.error = "无法更新登录启动设置：\(error.localizedDescription)" }
-    }
-}
-
-private final class GatewayLogBuffer: @unchecked Sendable {
-    private static let maxBytes = 262_144
-    private let url: URL
-    private let queue = DispatchQueue(label: "local.codexpress.gateway-log")
-    private var buffer: Data?
-    private var dirty = false
-    private var pendingFlush: DispatchWorkItem?
-
-    init(url: URL) {
-        self.url = url
-    }
-
-    func append(_ data: Data) {
-        queue.async {
-            var current = self.loadIfNeeded()
-            current.append(data)
-            if current.count > Self.maxBytes {
-                current = current.suffix(Self.maxBytes)
-            }
-            self.buffer = current
-            self.dirty = true
-            self.scheduleFlush()
-        }
-    }
-
-    func flush() {
-        queue.sync {
-            pendingFlush?.cancel()
-            pendingFlush = nil
-            writeIfDirty()
-        }
-    }
-
-    private func loadIfNeeded() -> Data {
-        if let buffer { return buffer }
-        let existing = (try? Data(contentsOf: url)) ?? Data()
-        let bounded = existing.count > Self.maxBytes ? existing.suffix(Self.maxBytes) : existing
-        buffer = bounded
-        return bounded
-    }
-
-    private func scheduleFlush() {
-        guard pendingFlush == nil else { return }
-        let item = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.pendingFlush = nil
-            self.writeIfDirty()
-        }
-        pendingFlush = item
-        queue.asyncAfter(deadline: .now() + .milliseconds(500), execute: item)
-    }
-
-    private func writeIfDirty() {
-        guard dirty, let data = buffer else { return }
-        dirty = false
-        let temp = url.deletingLastPathComponent().appendingPathComponent(".gateway-log-\(UUID().uuidString)")
-        if FileManager.default.createFile(atPath: temp.path, contents: data, attributes: [.posixPermissions: 0o600]) {
-            _ = rename(temp.path, url.path)
-        }
     }
 }

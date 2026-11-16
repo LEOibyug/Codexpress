@@ -21,15 +21,16 @@ struct UsageSelection: Equatable {
 
 struct UsageView: View {
     @EnvironmentObject var model: AppModel
-    @State private var selection = UsageSelection()
-    @State private var snapshot: JSONValue = .null
-    @State private var snapshotQuery: UsageQuery?
+    private var selection: UsageSelection { model.usageSelection }
+    private var cachedSnapshot: UsageAnalyticsSnapshot? { model.cachedUsageAnalytics(selection.query) }
+    private var snapshot: JSONValue { cachedSnapshot?.value ?? .null }
+    private var snapshotQuery: UsageQuery? { cachedSnapshot?.query }
     @State private var loadError: String?
-    @State private var updatedAt: Date?
+    private var updatedAt: Date? { cachedSnapshot?.updatedAt }
     @State private var showingLogs = false
     @State private var showingPrices = false
     private var totals: UsageTotals { UsageTotals(rows: snapshot["groups"].array) }
-    private var daily: [UsageDaily] { snapshot["daily"].array.map(UsageDaily.init) }
+    private var daily: [UsageDaily] { cachedSnapshot?.daily ?? [] }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -45,7 +46,7 @@ struct UsageView: View {
             }
             Group {
                 if showingLogs {
-                    UsageLogsView(selection: $selection, options: snapshot["options"]) { showingLogs = false }
+                    UsageLogsView(selection: $model.usageSelection, options: snapshot["options"]) { showingLogs = false }
                 } else { overview }
             }
         }
@@ -54,14 +55,14 @@ struct UsageView: View {
     }
     private var overview: some View {
         VStack(alignment: .leading, spacing: 16) {
-            UsageFilters(selection: $selection, options: snapshot["options"])
+            UsageFilters(selection: $model.usageSelection, options: snapshot["options"])
             if selection.query == nil { InfoNote(text: "请选择不超过 366 天的日期范围，结束日期须晚于或等于开始日期。", color: .orange) }
             if let loadError { InfoNote(text: loadError, color: .orange) }
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     summary
                     breakdown
-                    UsageActivityCard(selection: selection, snapshot: snapshot, overviewQuery: snapshotQuery)
+                    UsageActivityCard(selection: selection)
                     UsageTrendChart(days: daily, intraday: snapshotQuery?.isIntraday == true)
                     HStack {
                         Button("API 价格表") { showingPrices = true }.buttonStyle(.link)
@@ -72,17 +73,21 @@ struct UsageView: View {
             }
         }
         .task(id: UsageRefreshKey(selection: selection, active: model.settingsWindowActive)) {
-            guard model.settingsWindowActive, selection.query != nil else { return }
+            let requested = selection
+            loadError = nil
+            guard model.settingsWindowActive, requested.query != nil else { return }
+            var refresh = false
             while !Task.isCancelled {
-                guard let query = selection.query else { break }
+                guard let query = requested.query else { break }
                 do {
-                    let next = try await model.usageAnalytics(query)
-                    guard !Task.isCancelled else { break }
-                    snapshot = next; snapshotQuery = query; loadError = nil; updatedAt = Date()
+                    _ = try await model.usageAnalytics(query, refresh: refresh)
+                    guard !Task.isCancelled, requested == selection else { break }
+                    loadError = nil
                 } catch {
-                    guard !Task.isCancelled else { break }
+                    guard !Task.isCancelled, requested == selection else { break }
                     loadError = error.localizedDescription
                 }
+                refresh = true
                 do { try await Task.sleep(for: .milliseconds(1500)) } catch { break }
             }
         }

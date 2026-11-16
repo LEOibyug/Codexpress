@@ -5,8 +5,7 @@ struct OverviewView: View {
     let openSources: () -> Void
     let openUsage: () -> Void
     let openConnection: (ConnectionSection) -> Void
-    @State private var usageSnapshot: JSONValue = .null
-    @State private var usageDay: Double?
+    private var usageSnapshot: JSONValue { model.cachedUsageAnalytics(UsageQuery.last(days: 1))?.value ?? .null }
     @State private var usageError: String?
     private var totals: UsageTotals { UsageTotals(rows: usageSnapshot["groups"].array) }
     private var available: Int {
@@ -60,17 +59,18 @@ struct OverviewView: View {
         .task(id: "\(model.running):\(model.settingsWindowActive)") {
             guard model.running, model.settingsWindowActive else { return }
             await model.refreshAccountInfo()
+            var refresh = false
             while !Task.isCancelled {
                 let query = UsageQuery.last(days: 1)
-                if usageDay != query.from { usageSnapshot = .null; usageDay = query.from }
                 do {
-                    let next = try await model.usageAnalytics(query)
+                    _ = try await model.usageAnalytics(query, refresh: refresh)
                     guard !Task.isCancelled else { break }
-                    usageSnapshot = next; usageError = nil
+                    usageError = nil
                 } catch {
                     guard !Task.isCancelled else { break }
                     usageError = usageSnapshot == .null ? "今日用量暂时无法读取。" : "用量更新失败，显示上次统计。"
                 }
+                refresh = true
                 do { try await Task.sleep(for: .seconds(15)) } catch { break }
             }
         }

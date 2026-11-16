@@ -108,12 +108,28 @@ struct UsageRefreshKey<Selection: Equatable>: Equatable {
 }
 
 struct UsageQuery: Equatable, Sendable {
+    struct CacheKey: Hashable {
+        enum Window: Hashable {
+            case fixed(from: Double, to: Double, dayStarts: [Double])
+            case rolling(hours: Int)
+        }
+        let window: Window
+        let sourceID: String
+        let modelID: String
+        let ingress: String
+    }
     let from: Double
     let to: Double
     let dayStarts: [Double]
     var sourceID = ""
     var modelID = ""
     var ingress = ""
+    private let rollingHours: Int?
+
+    var cacheKey: CacheKey {
+        let window: CacheKey.Window = rollingHours.map { .rolling(hours: $0) } ?? .fixed(from: from, to: to, dayStarts: dayStarts)
+        return CacheKey(window: window, sourceID: sourceID, modelID: modelID, ingress: ingress)
+    }
 
     init(start: Date, end: Date, calendar: Calendar = .current, sourceID: String = "", modelID: String = "", ingress: String = "") throws {
         let first = calendar.startOfDay(for: start), last = calendar.startOfDay(for: end)
@@ -123,12 +139,14 @@ struct UsageQuery: Equatable, Sendable {
         guard dates.count == count + 1, let from = dates.first, let to = dates.last, from >= 0 else { throw AppError.message("无法读取所选日期，请重新选择。") }
         self.from = from; self.to = to; dayStarts = dates
         self.sourceID = sourceID; self.modelID = modelID; self.ingress = ingress
+        rollingHours = nil
     }
     init(lastHours: Int, now: Date = Date(), sourceID: String = "", modelID: String = "") {
         to = floor(now.timeIntervalSince1970) + 1
         from = to - Double(lastHours * 3600)
         dayStarts = Array(stride(from: from, through: to, by: 300))
         self.sourceID = sourceID; self.modelID = modelID
+        rollingHours = lastHours
     }
     var isIntraday: Bool { to - from <= 5 * 3600 }
     static func last(days: Int, now: Date = Date(), calendar: Calendar = .current, sourceID: String = "", modelID: String = "") -> UsageQuery {
@@ -152,6 +170,18 @@ struct UsageQuery: Equatable, Sendable {
         let first = Date(timeIntervalSince1970: from).formatted(.dateTime.month().day())
         let last = Date(timeIntervalSince1970: dayStarts.dropLast().last ?? from).formatted(.dateTime.month().day())
         return "\(first) – \(last)"
+    }
+}
+
+struct UsageAnalyticsSnapshot {
+    let query: UsageQuery
+    let value: JSONValue
+    let updatedAt: Date
+    let daily: [UsageDaily]
+
+    init(query: UsageQuery, value: JSONValue, updatedAt: Date = Date()) {
+        self.query = query; self.value = value; self.updatedAt = updatedAt
+        daily = value["daily"].array.map(UsageDaily.init)
     }
 }
 

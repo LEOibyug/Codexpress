@@ -1,13 +1,11 @@
 //! Window-wide aggregates; neither this module nor request lists fetch error bodies.
-use super::{
-    grouping,
-    requests::{self, Query, ATTEMPTS, FILTERS},
-    StoreData,
-};
+use super::{grouping, requests::{self, Query}, StoreData};
 use anyhow::{ensure, Result};
-use rusqlite::{types::Value as SqlValue, Connection};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+
+#[path = "analytics_cache.rs"]
+mod cache;
+pub(super) use cache::{preserve_after_write, Cached};
 
 const MAX_OPTIONS: usize = 10_000;
 const COST_FIELDS: [&str; 6] = [
@@ -163,193 +161,15 @@ fn merge_active(target: &mut Value, active: &Value) {
     }
 }
 
-fn performance(connection: &Connection, query: &Query) -> Result<Value> {
-    // Only scalar timings enter the window sort; no raw records or diagnostic payloads.
-    let sql = format!(
-        r#"{ATTEMPTS}, samples AS (
-        SELECT 'latency' kind,latency_ms value FROM attempts WHERE {FILTERS} AND status!='active' AND latency_ms>0
-        UNION ALL SELECT 'first_token',json_extract(metadata,'$.first_token_latency_ms') FROM attempts
-            WHERE {FILTERS} AND status!='active' AND json_type(metadata,'$.first_token_latency_ms') IN ('integer','real') AND json_extract(metadata,'$.first_token_latency_ms')>=0
-    ), ranked AS (SELECT kind,value,ROW_NUMBER() OVER(PARTITION BY kind ORDER BY value) AS rank,COUNT(*) OVER(PARTITION BY kind) AS count FROM samples)
-    SELECT kind,MAX(count),
-        MAX(CASE WHEN rank=1+(count-1)*50/100 THEN value END),MAX(CASE WHEN rank=1+((count-1)*50+99)/100 THEN value END),
-        MAX(CASE WHEN rank=1+(count-1)*95/100 THEN value END),MAX(CASE WHEN rank=1+((count-1)*95+99)/100 THEN value END)
-        FROM ranked GROUP BY kind"#
-    );
-    let mut result = json!({"p50_latency_ms":null,"p95_latency_ms":null,"p50_first_token_ms":null,"p95_first_token_ms":null});
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map(rusqlite::params_from_iter(query.bindings()), |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, u64>(1)?,
-            row.get::<_, f64>(2)?,
-            row.get::<_, f64>(3)?,
-            row.get::<_, f64>(4)?,
-            row.get::<_, f64>(5)?,
-        ))
-    })?;
-    for row in rows {
-        let (kind, count, p50_low, p50_high, p95_low, p95_high) = row?;
-        for (percentile, low, high) in [(50, p50_low, p50_high), (95, p95_low, p95_high)] {
-            let fraction = ((count - 1) * percentile % 100) as f64 / 100.0;
-            result[format!("p{percentile}_{kind}_ms")] = json!(low + (high - low) * fraction);
-        }
-    }
-    Ok(result)
-}
-
-fn options(data: &StoreData, query: &Query) -> Result<Options> {
-    let mut sources = BTreeMap::new();
-    let mut models = BTreeSet::new();
-    let mut ingresses = BTreeSet::new();
-    let mut statement = data.connection.prepare(&format!("{ATTEMPTS} SELECT source_id,source_name,MAX(attempt) FROM attempts GROUP BY source_id ORDER BY source_id LIMIT {}", MAX_OPTIONS + 1))?;
-    for row in statement.query_map([query.from, query.to], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })? {
-        let (id, name) = row?;
-        sources.insert(id, name);
-    }
-    for (column, target) in [("model", &mut models), ("ingress", &mut ingresses)] {
-        let mut statement = data.connection.prepare(&format!(
-            "{ATTEMPTS} SELECT DISTINCT {column} FROM attempts ORDER BY {column} LIMIT {}",
-            MAX_OPTIONS + 1
-        ))?;
-        for value in statement.query_map([query.from, query.to], |row| row.get::<_, String>(0))? {
-            target.insert(value?);
-        }
-    }
-    Ok(Options {
-        sources,
-        models,
-        ingresses,
-    })
-}
-
-#[derive(Clone)]
-struct Options {
-    sources: BTreeMap<String, String>,
-    models: BTreeSet<String>,
-    ingresses: BTreeSet<String>,
-}
-impl Options {
-    fn with_active(mut self, active: &[Value]) -> Result<Value> {
-        for record in active {
-            self.sources.insert(
-                record["source_id"].as_str().unwrap_or("").into(),
-                record["source_name"].as_str().unwrap_or("").into(),
-            );
-            self.models
-                .insert(record["model"].as_str().unwrap_or("").into());
-            self.ingresses
-                .insert(record["ingress"].as_str().unwrap_or("unknown").into());
-        }
-        ensure!(
-            self.sources.len() <= MAX_OPTIONS
-                && self.models.len() <= MAX_OPTIONS
-                && self.ingresses.len() <= MAX_OPTIONS,
-            "筛选选项过多，请缩小查询范围"
-        );
-        Ok(
-            json!({"sources":self.sources.into_iter().map(|(id,name)|json!({"id":id,"name":name})).collect::<Vec<_>>(),"models":self.models,"ingresses":self.ingresses}),
-        )
-    }
-}
-
-#[derive(Clone)]
-struct Snapshot {
-    groups: BTreeMap<(String, String), Value>,
-    daily: Vec<Value>,
-    options: Options,
-    performance: Value,
-}
-
-pub(super) struct Cached {
-    payload: Value,
-    changes: u64,
-    data_version: i64,
-    snapshot: Snapshot,
-}
-
-fn load_snapshot(data: &StoreData, query: &Query) -> Result<Snapshot> {
-    let aggregate = aggregate_json();
-    let mut statement = data.connection.prepare(&format!("{ATTEMPTS} SELECT source_id,source_name,model,MAX(attempt),{aggregate} FROM attempts WHERE {FILTERS} GROUP BY source_id,model ORDER BY source_id,model LIMIT {}", MAX_OPTIONS + 1))?;
-    let mut groups: BTreeMap<(String, String), Value> = BTreeMap::new();
-    for row in statement.query_map(rusqlite::params_from_iter(query.bindings()), |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(4)?,
-        ))
-    })? {
-        let (source, name, model, totals) = row?;
-        let mut totals: Value = serde_json::from_str(&totals)?;
-        totals["source_id"] = json!(source);
-        totals["source_name"] = json!(name);
-        totals["model"] = json!(model);
-        groups.insert((source, model), totals);
-    }
-    let mut zero_day = empty_totals();
-    zero_day["total_usd"] = json!(0);
-    let mut daily = vec![zero_day; query.days.len() - 1];
-    let mut bindings = query.bindings();
-    bindings.push(SqlValue::Text(serde_json::to_string(&query.days)?));
-    let sql = format!("{ATTEMPTS} SELECT CAST(days.key AS INTEGER),{aggregate} FROM json_each(?8) days JOIN attempts ON started_at>=days.value AND started_at<json_extract(?8,'$['||(CAST(days.key AS INTEGER)+1)||']') WHERE {FILTERS} GROUP BY days.key ORDER BY CAST(days.key AS INTEGER)");
-    let mut statement = data.connection.prepare(&sql)?;
-    for row in statement.query_map(rusqlite::params_from_iter(bindings), |row| {
-        Ok((row.get::<_, usize>(0)?, row.get::<_, String>(1)?))
-    })? {
-        let (index, totals) = row?;
-        if let Some(day) = daily.get_mut(index) {
-            *day = serde_json::from_str(&totals)?;
-        }
-    }
-    Ok(Snapshot {
-        groups,
-        daily,
-        options: options(data, query)?,
-        performance: performance(&data.connection, query)?,
-    })
-}
 
 pub(super) fn build(data: &mut StoreData, payload: &Value) -> Result<Value> {
     let query = Query::parse(payload, true)?;
-    let changes = data.connection.total_changes();
-    let data_version = data
-        .connection
-        .pragma_query_value(None, "data_version", |row| row.get(0))?;
-    // Completed history is stable while tokens stream. Cache its aggregates;
-    // active counters and elapsed timings are overlaid fresh on every call.
-    data.analytics_cache
-        .retain(|cached| cached.changes == changes && cached.data_version == data_version);
-    let stored = if let Some(index) = data
-        .analytics_cache
-        .iter()
-        .position(|cached| cached.payload == *payload)
-    {
-        let cached = data.analytics_cache.remove(index).expect("cached query");
-        let snapshot = cached.snapshot.clone();
-        data.analytics_cache.push_back(cached);
-        snapshot
-    } else {
-        let snapshot = load_snapshot(data, &query)?;
-        if data.analytics_cache.len() == 8 {
-            data.analytics_cache.pop_front();
-        }
-        data.analytics_cache.push_back(Cached {
-            payload: payload.clone(),
-            changes,
-            data_version,
-            snapshot: snapshot.clone(),
-        });
-        snapshot
-    };
-    let Snapshot {
+    let cache::Snapshot {
         mut groups,
         mut daily,
         options,
         performance,
-    } = stored;
+    } = cache::snapshot(data, &query)?;
     let active = requests::active_records(data, &query)?;
     let options = options.with_active(&active)?;
     for record in active.iter().filter(|record| requests::log_matches(&query, record)) {
@@ -358,14 +178,14 @@ pub(super) fn build(data: &mut StoreData, payload: &Value) -> Result<Value> {
             record["model"].as_str().unwrap_or("").to_owned(),
         );
         let group = groups.entry(key).or_insert_with(|| {
-            let mut value = empty_totals();
+            let mut totals = empty_totals();
             for field in ["source_id", "source_name", "model"] {
-                value[field] = record[field].clone();
+                totals[field] = record[field].clone();
             }
-            value
+            cache::Group { attempt: 0, totals }
         });
-        group["source_name"] = record["source_name"].clone();
-        merge_active(group, record);
+        group.totals["source_name"] = record["source_name"].clone();
+        merge_active(&mut group.totals, record);
         let index = query
             .days
             .partition_point(|start| *start <= record["started_at"].as_u64().unwrap_or(0))
@@ -375,7 +195,7 @@ pub(super) fn build(data: &mut StoreData, payload: &Value) -> Result<Value> {
         }
     }
     ensure!(groups.len() <= MAX_OPTIONS, "统计分组过多，请缩小查询范围");
-    let groups = grouping::merge(groups.values(), true);
+    let groups = grouping::merge(groups.values().map(|group| &group.totals), true);
     let daily: Vec<_> = daily
         .into_iter()
         .zip(&query.days)

@@ -4,7 +4,7 @@ use anyhow::{bail, ensure, Result};
 use rusqlite::types::Value as SqlValue;
 use serde_json::{json, Value};
 
-pub(super) const ATTEMPTS: &str = r#"WITH attempts AS (
+pub(super) const ATTEMPT_ROWS: &str = r#"
     SELECT u.*, COALESCE(NULLIF(json_extract(u.metadata,'$.attempt_id'),''),'legacy:'||u.attempt) AS attempt_id_key,
         COALESCE(NULLIF(json_extract(u.metadata,'$.ingress'),''),NULLIF(json_extract(d.metadata,'$.ingress'),''),'unknown') AS ingress,
         json_extract(d.metadata,'$.http_status') AS http_status,
@@ -15,8 +15,7 @@ pub(super) const ATTEMPTS: &str = r#"WITH attempts AS (
         d.attempt_id IS NOT NULL AS diagnostic_available
     FROM usage u LEFT JOIN diagnostics d ON d.attempt_id=
         COALESCE(NULLIF(json_extract(u.metadata,'$.attempt_id'),''),'legacy:'||u.attempt)
-    WHERE u.started_at>=?1 AND u.started_at<?2
-)"#;
+    WHERE u.started_at>=?1 AND u.started_at<?2"#;
 
 pub(super) const FILTERS: &str = r#"(?3 IS NULL OR source_id=?3) AND (?4 IS NULL OR model=?4) AND (?5 IS NULL OR ingress=?5)
     AND (?6 IS NULL OR status=?6 OR (?6='unsuccessful' AND status IN ('failed','interrupted')))
@@ -25,7 +24,7 @@ pub(super) const RECORD_COLUMNS: &str = "attempt,request_id,source_id,source_nam
 const MAX_INTERVAL: u64 = 366 * 26 * 3600;
 const MAX_ACTIVE: usize = 10_000;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Query {
     pub from: u64,
     pub to: u64,
@@ -311,7 +310,7 @@ pub(super) fn build(data: &StoreData, payload: &Value) -> Result<Value> {
     let query = Query::parse(payload, false)?;
     let mut bindings = query.bindings();
     let count_sql =
-        format!("{ATTEMPTS} SELECT COUNT(*) FROM attempts WHERE {FILTERS}");
+        format!("WITH attempts AS ({ATTEMPT_ROWS}) SELECT COUNT(*) FROM attempts WHERE {FILTERS}");
     let total: u64 = data.connection.query_row(
         &count_sql,
         rusqlite::params_from_iter(bindings.iter()),
@@ -337,7 +336,7 @@ pub(super) fn build(data: &StoreData, payload: &Value) -> Result<Value> {
         query.before.map_or(SqlValue::Null, SqlValue::Integer),
         SqlValue::Integer((stored_limit + 1) as i64),
     ]);
-    let list_sql = format!("{ATTEMPTS} SELECT {RECORD_COLUMNS},ingress,http_status,error_code,diagnostic_available FROM attempts WHERE {FILTERS} AND (?8 IS NULL OR attempt<?8) ORDER BY attempt DESC LIMIT ?9");
+    let list_sql = format!("WITH attempts AS ({ATTEMPT_ROWS}) SELECT {RECORD_COLUMNS},ingress,http_status,error_code,diagnostic_available FROM attempts WHERE {FILTERS} AND (?8 IS NULL OR attempt<?8) ORDER BY attempt DESC LIMIT ?9");
     let mut statement = data.connection.prepare(&list_sql)?;
     let mut stored = statement
         .query_map(rusqlite::params_from_iter(bindings.iter()), |row| {

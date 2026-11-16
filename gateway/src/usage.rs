@@ -246,9 +246,11 @@ impl UsageStore {
         let metadata = json!({"attempt_id":record.attempt_id,"ingress":record.ingress,"token_details":record.token_details,
             "first_token_latency_ms":record.first_token_latency_ms,"generation_ms":record.generation_ms,
             "billing_identity":billing_identity,"cost":cost}).to_string();
+        let changes = data.connection.total_changes();
         let result = data.connection.execute("INSERT INTO usage (request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)", params![record.request_id,record.source_id,record.source_name,record.model,number(record.started_at),record.status,number(record.input_tokens),number(record.output_tokens),number(cached),record.complete,number(record.latency_ms),metadata]);
         data.active.remove(&record.attempt_id);
         result?;
+        analytics::preserve_after_write(&mut data, changes, None);
         let attempt = data.connection.last_insert_rowid();
         data.last_attempt = data.last_attempt.max(attempt);
         if let Some(identity) = billing_identity {
@@ -335,11 +337,26 @@ impl UsageStore {
         diagnostics::detail(&data, payload)
     }
     pub fn diagnostic(&self, capture: &diagnostics::Capture, include_body: bool) -> Result<()> {
-        let data = self
+        let mut data = self
             .data
             .lock()
             .map_err(|_| anyhow::anyhow!("用量数据库不可用"))?;
-        diagnostics::save(&data.connection, capture, include_body)
+        let changes = data.connection.total_changes();
+        let affected = if data.analytics_cache.is_empty() {
+            None
+        } else {
+            let legacy = capture.attempt_id.strip_prefix("legacy:").and_then(|id| id.parse::<i64>().ok());
+            data.connection.query_row(
+                "SELECT MIN(attempt) FROM (
+                    SELECT attempt FROM usage WHERE json_extract(metadata,'$.attempt_id')=?1
+                    UNION ALL SELECT attempt FROM usage WHERE attempt=?2 AND NULLIF(json_extract(metadata,'$.attempt_id'),'') IS NULL
+                )",
+                params![capture.attempt_id, legacy], |row| row.get(0),
+            )?
+        };
+        let result = diagnostics::save(&data.connection, capture, include_body);
+        analytics::preserve_after_write(&mut data, changes, affected);
+        result
     }
     pub fn summary_filtered(
         &self,

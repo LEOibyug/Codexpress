@@ -163,6 +163,139 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertEqual(unchangedModel.modelCompaction, [revisedRule])
     }
 
+    @MainActor func testUsageAnalyticsSharesRequestsAndKeepsSnapshotsAcrossPageCancellationAndRefreshFailure() async throws {
+        try await withUsageAnalyticsModel { model, directory in
+            let query = UsageQuery.last(days: 30)
+            let hold = directory.appendingPathComponent("hold-analytics")
+            defer { try? FileManager.default.removeItem(at: hold) }
+            try Data().write(to: hold)
+            let first = Task { try await model.usageAnalytics(query) }
+            try await Self.waitForAnalyticsCalls(1, directory: directory)
+            var secondStarted = false
+            let second = Task {
+                secondStarted = true
+                return try await model.usageAnalytics(query)
+            }
+            while !secondStarted { await Task.yield() }
+            first.cancel()
+            try FileManager.default.removeItem(at: hold)
+            let initial = try await second.value
+            _ = try? await first.value
+            XCTAssertEqual(initial["groups"].array.first?["requests"].number, 1)
+            let reopened = try await model.usageAnalytics(query)
+            XCTAssertEqual(reopened, initial)
+            XCTAssertEqual(try Self.analyticsCalls(directory), 1, "Concurrent and reopened pages must reuse the same result")
+
+            var closedQuery = query; closedQuery.sourceID = "closed-page"
+            try Data().write(to: hold)
+            let closedPage = Task { try await model.usageAnalytics(closedQuery) }
+            try await Self.waitForAnalyticsCalls(2, directory: directory)
+            closedPage.cancel()
+            try FileManager.default.removeItem(at: hold)
+            let deadline = Date().addingTimeInterval(3)
+            while model.cachedUsageAnalytics(closedQuery) == nil, Date() < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let closedSnapshot = try XCTUnwrap(model.cachedUsageAnalytics(closedQuery), "A page with no remaining waiter must still populate the cache")
+            _ = try? await closedPage.value
+            let reopenedClosedPage = try await model.usageAnalytics(closedQuery)
+            XCTAssertEqual(reopenedClosedPage, closedSnapshot.value)
+            XCTAssertEqual(try Self.analyticsCalls(directory), 2)
+
+            let refreshed = try await model.usageAnalytics(query, refresh: true)
+            XCTAssertEqual(refreshed["groups"].array.first?["requests"].number, 3)
+            let failure = directory.appendingPathComponent("fail-analytics")
+            try Data().write(to: failure)
+            do {
+                _ = try await model.usageAnalytics(query, refresh: true)
+                XCTFail("A failed refresh must report its error")
+            } catch {}
+            XCTAssertEqual(model.cachedUsageAnalytics(query)?.value, refreshed)
+            let afterFailure = try await model.usageAnalytics(query)
+            XCTAssertEqual(afterFailure, refreshed)
+            XCTAssertEqual(try Self.analyticsCalls(directory), 4)
+            try FileManager.default.removeItem(at: failure)
+
+            try await Task.sleep(for: .milliseconds(5100))
+            XCTAssertEqual(model.cachedUsageAnalytics(query)?.value, refreshed, "Expired snapshots remain available for the first frame")
+            let expiredRefresh = try await model.usageAnalytics(query)
+            XCTAssertEqual(expiredRefresh["groups"].array.first?["requests"].number, 5)
+        }
+    }
+
+    @MainActor func testUsageAnalyticsSeparatesFiltersAndCalendarWindowsButReusesRollingWindows() async throws {
+        try await withUsageAnalyticsModel { model, directory in
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+            let now = Date(timeIntervalSince1970: 1_800_000_123)
+            let fixed = try UsageQuery(start: now, end: now, calendar: calendar)
+            var source = fixed; source.sourceID = "source"
+            var modelFilter = fixed; modelFilter.modelID = "model"
+            var ingress = fixed; ingress.ingress = "omp"
+            let tomorrow = calendar.date(byAdding: .day, value: 1, to: now)!
+            let nextDate = try UsageQuery(start: tomorrow, end: tomorrow, calendar: calendar)
+            var otherCalendar = calendar
+            otherCalendar.timeZone = TimeZone(secondsFromGMT: 8 * 3600)!
+            let otherDayBoundary = try UsageQuery(start: now, end: now, calendar: otherCalendar)
+            let rolling = UsageQuery(lastHours: 1, now: now)
+            let fiveHours = UsageQuery(lastHours: 5, now: now)
+            for (index, query) in [fixed, source, modelFilter, ingress, nextDate, otherDayBoundary, rolling, fiveHours].enumerated() {
+                let value = try await model.usageAnalytics(query)
+                XCTAssertEqual(value["groups"].array.first?["requests"].number, Double(index + 1), "Distinct filters and time windows must not share analytics")
+            }
+            let laterRolling = UsageQuery(lastHours: 1, now: now.addingTimeInterval(60))
+            let reused = try await model.usageAnalytics(laterRolling)
+            XCTAssertEqual(reused["groups"].array.first?["requests"].number, 7)
+            let snapshot = try XCTUnwrap(model.cachedUsageAnalytics(laterRolling))
+            XCTAssertEqual(snapshot.query, rolling, "A rolling cache hit must expose its actual requested window")
+            XCTAssertNotEqual(snapshot.query.from, laterRolling.from)
+            XCTAssertEqual(snapshot.daily.first?.requests, 7)
+
+            _ = try await model.usageAnalytics(fixed)
+            var extraSource = fixed; extraSource.sourceID = "another-source"
+            let additional = try await model.usageAnalytics(extraSource)
+            XCTAssertEqual(additional["groups"].array.first?["requests"].number, 9)
+            XCTAssertNotNil(model.cachedUsageAnalytics(fixed), "Recently reused snapshots must survive eviction")
+            XCTAssertNil(model.cachedUsageAnalytics(source), "Only eight recently used snapshots are retained")
+            XCTAssertEqual(try Self.analyticsCalls(directory), 9)
+        }
+    }
+
+    @MainActor private func withUsageAnalyticsModel(_ body: @MainActor (AppModel, URL) async throws -> Void) async throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let directory = root.appendingPathComponent(".runtime/u-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("gateway-fixture")
+        try Self.helperScript.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let previousHelper = ProcessInfo.processInfo.environment["CODEXPRESS_GATEWAY_PATH"]
+        setenv("CODEXPRESS_GATEWAY_PATH", helper.path, 1)
+        defer {
+            if let previousHelper { setenv("CODEXPRESS_GATEWAY_PATH", previousHelper, 1) }
+            else { unsetenv("CODEXPRESS_GATEWAY_PATH") }
+        }
+        var settings = AppSettings(); settings.codexHome = directory.appendingPathComponent("codex").path
+        try MetadataStore(directory: directory).save(settings)
+        let model = AppModel(stateDirectory: directory)
+        defer { model.stop() }
+        await model.startHelper()
+        XCTAssertTrue(model.running, model.error ?? "Fixture helper did not start")
+        try await body(model, directory)
+    }
+
+    private static func analyticsCalls(_ directory: URL) throws -> Int {
+        Int(try String(contentsOf: directory.appendingPathComponent("analytics-count"))) ?? -1
+    }
+
+    private static func waitForAnalyticsCalls(_ count: Int, directory: URL) async throws {
+        let deadline = Date().addingTimeInterval(3)
+        while (try? analyticsCalls(directory)) != count, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(try analyticsCalls(directory), count)
+    }
+
     private static let helperScript = #"""
     #!/usr/bin/env python3
     import json, os, pathlib, socket, sys, time
@@ -181,6 +314,14 @@ final class AppModelSyncTests: XCTestCase {
                     data = dict(process_id=os.getpid(), port=17863, sources=[], connection_mode=mode.read_text() if mode.exists() else 'unmanaged')
                 elif operation == 'credentials.storage.status':
                     data = dict(mode='file')
+                elif operation == 'usage.analytics':
+                    counter = directory / 'analytics-count'
+                    count = int(counter.read_text()) + 1 if counter.exists() else 1
+                    counter.write_text(str(count))
+                    while (directory / 'hold-analytics').exists(): time.sleep(0.01)
+                    if (directory / 'fail-analytics').exists():
+                        raise ValueError('Fixture analytics failed')
+                    data = dict(groups=[dict(requests=count)], daily=[dict(start_at=request['payload']['from'], requests=count)])
                 elif operation == 'config.backups':
                     if (directory / 'hold-backups').exists():
                         (directory / 'backups-started').touch()

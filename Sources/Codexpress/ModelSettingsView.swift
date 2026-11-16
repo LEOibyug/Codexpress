@@ -1,0 +1,269 @@
+import SwiftUI
+
+private struct EditingModel {
+    let id: String
+    let isNew: Bool
+}
+
+struct ModelSettingsView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var search = ""
+    @State private var editing: EditingModel?
+    private var visibleModels: [String] {
+        search.isEmpty ? model.configuredModelIDs : model.configuredModelIDs.filter { $0.localizedCaseInsensitiveContains(search) }
+    }
+
+    var body: some View {
+        if let item = editing {
+            ModelEditor(settings: model.settings, modelID: item.id, isNew: item.isNew, onBack: { editing = nil })
+                .id(item.id)
+        } else {
+            modelList
+        }
+    }
+
+    private var modelList: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            PageHeading("模型") {
+                Button { editing = EditingModel(id: "", isNew: true) } label: { Label("添加模型", systemImage: "plus") }
+                    .buttonStyle(.borderedProminent).disabled(model.busy || model.metadataLoadFailed)
+            }
+            Text("管理各模型的来源顺序、可用接入端和上下文设置。")
+                .foregroundStyle(.secondary)
+            TextField("搜索模型", text: $search).settingsField().accessibilityLabel("搜索模型")
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(visibleModels, id: \.self) { id in
+                        modelRow(id)
+                        Divider()
+                    }
+                    if visibleModels.isEmpty { Text("暂无匹配模型，可手动添加模型 ID。").foregroundStyle(.secondary).padding(24) }
+                }.cardSurface()
+            }
+            Text("OMP 自动同步预算；本地 Codex 请在「接入」中手动同步，远端 Codex 在「远端 SSH」中预览并应用。聊天客户端请刷新模型列表。")
+                .font(AppTypography.caption).foregroundStyle(.secondary)
+            Button("前往接入") { NotificationCenter.default.post(name: .codexpressNavigate, object: SettingsPage.connections) }
+        }.settingsPage()
+    }
+
+    private func modelRow(_ id: String) -> some View {
+        let policy = model.settings.modelPolicies?.first { $0.model == id }
+        let rule = model.settings.modelCompaction?.first { $0.model == id }
+        let clients = (policy?.clients ?? ModelClient.allCases).lazy.filter { $0.isApplicable(to: id) }
+        let window = rule?.context_window.map { $0.formatted() + " Token" } ?? "模型默认"
+        let threshold = rule.map { $0.auto_compact_token_limit.formatted() + " Token" } ?? "客户端默认"
+        return Button { editing = EditingModel(id: id, isNew: false) } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text(id).font(.system(size: 14, weight: .medium, design: .monospaced)).foregroundStyle(.primary).lineLimit(1)
+                    Spacer()
+                    if clients.isEmpty || policy?.sourceIDs?.isEmpty == true {
+                        Text("未启用").font(AppTypography.caption).foregroundStyle(.secondary)
+                    }
+                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
+                }
+                Text("来源：\(sourceSummary(policy))").lineLimit(1)
+                Text("接入端：\(clients.isEmpty ? "未启用" : clients.map(\.label).joined(separator: "、"))")
+                HStack(spacing: 24) {
+                    Text("窗口：\(window)")
+                    Text("压缩点：\(threshold)")
+                }.monospacedDigit()
+            }.font(AppTypography.caption).foregroundStyle(.secondary)
+                .padding(16).frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+        }.buttonStyle(.plain).accessibilityLabel("编辑模型 \(id)")
+    }
+
+    private func sourceSummary(_ policy: ModelPolicy?) -> String {
+        guard let ids = policy?.sourceIDs else { return "跟随来源池" }
+        guard !ids.isEmpty else { return "未启用来源" }
+        return ids.map { id in model.settings.sources.first { $0.id == id }?.name ?? "已移除来源" }.joined(separator: " → ")
+    }
+}
+
+private struct ModelEditor: View {
+    @EnvironmentObject var model: AppModel
+    let isNew: Bool
+    let onBack: () -> Void
+    @State private var modelID: String
+    @State private var customPolicy: Bool
+    @State private var customSources: Bool
+    @State private var sourceIDs: [String]
+    @State private var sourceSelectionInitialized: Bool
+    @State private var clients: [ModelClient]
+    @State private var customCompaction: Bool
+    @State private var threshold: String
+    @State private var window: String
+    @State private var saving = false
+    @State private var error: String?
+    @State private var savedModelID: String?
+
+    init(settings: AppSettings, modelID: String, isNew: Bool, onBack: @escaping () -> Void) {
+        self.isNew = isNew; self.onBack = onBack
+        let policy = settings.modelPolicies?.first { $0.model == modelID }
+        let rule = settings.modelCompaction?.first { $0.model == modelID }
+        _modelID = State(initialValue: modelID)
+        _customPolicy = State(initialValue: policy != nil || isNew)
+        _customSources = State(initialValue: policy?.sourceIDs != nil)
+        _sourceIDs = State(initialValue: policy?.sourceIDs ?? [])
+        _sourceSelectionInitialized = State(initialValue: policy?.sourceIDs != nil)
+        _clients = State(initialValue: policy?.clients ?? ModelClient.allCases)
+        _customCompaction = State(initialValue: rule != nil)
+        _threshold = State(initialValue: rule.map { String($0.auto_compact_token_limit) } ?? "")
+        _window = State(initialValue: rule?.context_window.map(String.init) ?? "")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Button(action: onBack) { Label("模型列表", systemImage: "chevron.left") }
+                .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("返回模型列表")
+            PageHeading(isNew && savedModelID == nil ? "添加模型" : "模型设置")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("模型 ID").font(AppTypography.caption).foregroundStyle(.secondary)
+                        TextField("模型 ID", text: $modelID).settingsField().accessibilityLabel("模型 ID").disabled(!isNew || savedModelID != nil)
+                    }
+                    sourceSection
+                    clientSection
+                    compactionSection
+                    if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
+                    Text("来源顺序用于新对话；已有会话优先沿用已选来源。图片生成沿用其独立来源选择。")
+                        .font(AppTypography.caption).foregroundStyle(.secondary)
+                }.padding(20).frame(maxWidth: .infinity, alignment: .leading).cardSurface()
+            }
+            HStack {
+                Button("恢复模型默认") {
+                    customPolicy = isNew; customSources = false; sourceIDs = []; sourceSelectionInitialized = false; clients = ModelClient.allCases
+                    customCompaction = false; threshold = ""; window = ""
+                }
+                Spacer()
+                Button(saving ? "保存中…" : "保存模型设置") { save() }
+                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+            }
+        }.settingsPage().disabled(saving || model.metadataLoadFailed)
+    }
+
+    private var sourceSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("来源及优先级").font(.headline)
+            Toggle("自定义来源及顺序", isOn: Binding(get: { customSources }, set: { enabled in
+                customPolicy = true; customSources = enabled
+                if enabled && !sourceSelectionInitialized {
+                    sourceIDs = model.sources.filter(supports).map(\.id)
+                    sourceSelectionInitialized = true
+                }
+            }))
+            if customSources {
+                Text(sourceIDs.isEmpty ? "未选择来源：此模型不可用，不会回退到来源池。" : "由上到下优先使用；未勾选来源不会用于此模型。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
+                ForEach(Array(sourceIDs.enumerated()), id: \.element) { index, id in selectedSource(id, index: index) }
+                ForEach(model.sources.filter { !sourceIDs.contains($0.id) }) { source in
+                    Toggle(isOn: Binding(get: { false }, set: { selected in
+                        if selected { sourceIDs.append(source.id); customPolicy = true }
+                    })) {
+                        VStack(alignment: .leading) {
+                            Text(source.name)
+                            if !supports(source) { Text("来源未声明支持此模型").font(AppTypography.caption).foregroundStyle(.secondary) }
+                        }
+                    }.disabled(!supports(source))
+                }
+            } else {
+                Text("继承来源池中的可用来源和顺序，仅使用来源声明支持的模型。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func selectedSource(_ id: String, index: Int) -> some View {
+        let source = model.settings.sources.first { $0.id == id }
+        return HStack {
+            Toggle(isOn: Binding(get: { true }, set: { selected in
+                if !selected { sourceIDs.removeAll { $0 == id }; customPolicy = true }
+            })) {
+                VStack(alignment: .leading) {
+                    Text(source?.name ?? "已移除来源：\(id)")
+                    if source.map({ !supports($0) }) ?? true {
+                        Text(source == nil ? "取消失效来源后，可选择其他来源。" : "请先在来源池中更新此来源的模型列表。")
+                            .font(AppTypography.caption).foregroundStyle(.orange)
+                    } else if source?.enabled == false {
+                        Text("来源池中已停用").font(AppTypography.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Button { sourceIDs.swapAt(index, index - 1); customPolicy = true } label: { Image(systemName: "arrow.up") }
+                .disabled(index == 0).accessibilityLabel("上移来源 \(source?.name ?? id)")
+            Button { sourceIDs.swapAt(index, index + 1); customPolicy = true } label: { Image(systemName: "arrow.down") }
+                .disabled(index == sourceIDs.count - 1).accessibilityLabel("下移来源 \(source?.name ?? id)")
+        }
+    }
+
+    private var clientSection: some View {
+        let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("可用接入端").font(.headline)
+            ForEach(ModelClient.allCases, id: \.self) { client in
+                if client.isApplicable(to: id) {
+                    Toggle(client.label, isOn: Binding(get: { clients.contains(client) }, set: { selected in
+                        customPolicy = true
+                        clients.removeAll { $0 == client }
+                        if selected { clients.append(client) }
+                    }))
+                }
+            }
+            if !clients.contains(where: { $0.isApplicable(to: id) }) {
+                Text("未选择接入端：所有客户端均禁用此模型。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var compactionSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("自定义上下文压缩", isOn: $customCompaction).font(.headline)
+            if customCompaction {
+                HStack(alignment: .top, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("压缩阈值 · Token").font(AppTypography.caption).foregroundStyle(.secondary)
+                        TextField("必填", text: $threshold).settingsField().accessibilityLabel("压缩阈值 Token")
+                    }.frame(maxWidth: .infinity)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("上下文窗口 · Token").font(AppTypography.caption).foregroundStyle(.secondary)
+                        TextField("模型默认", text: $window).settingsField().accessibilityLabel("上下文窗口 Token，可选")
+                    }.frame(maxWidth: .infinity)
+                }
+                Text("阈值须为正整数；填写窗口时，阈值不能超过窗口的 90%。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func supports(_ source: Source) -> Bool {
+        let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if id == "gpt-image-2" { return source.official }
+        return source.models.isEmpty || source.models.contains(id)
+    }
+    private func save() {
+        guard !saving else { return }
+        do {
+            let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+            try ModelPolicy.validateModelID(id)
+            if isNew, savedModelID != id, model.configuredModelIDs.contains(id) { throw AppError.message("此模型已存在，请从列表中编辑。") }
+            let policy = customPolicy ? ModelPolicy(model: id, sourceIDs: customSources ? sourceIDs : nil, clients: clients.filter { $0.isApplicable(to: id) }) : nil
+            let rule = customCompaction ? try ModelCompactionRule.parse(model: id, threshold: threshold, window: window) : nil
+            saving = true; error = nil
+            Task {
+                do {
+                    try await model.saveModelSettings(model: id, policy: policy, compaction: rule)
+                    modelID = id; savedModelID = id
+                }
+                catch {
+                    if model.settings.modelPolicies?.first(where: { $0.model == id }) == policy,
+                        model.settings.modelCompaction?.first(where: { $0.model == id }) == rule,
+                        model.configuredModelIDs.contains(id) { savedModelID = id }
+                    self.error = error.localizedDescription
+                }
+                saving = false
+            }
+        } catch { self.error = error.localizedDescription }
+    }
+}

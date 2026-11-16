@@ -9,11 +9,15 @@ struct UsagePerformanceCard: View {
     let selection: UsageSelection
     let snapshot: JSONValue
     @EnvironmentObject var model: AppModel
-    @State private var sourceID = ""
-    @State private var sourceSnapshot: JSONValue = .null
+    private var sourceID: String { model.usagePerformanceSourceID }
+    private var query: UsageQuery? {
+        guard var query = selection.query else { return nil }
+        query.sourceID = sourceID
+        return query
+    }
     @State private var loadError: String?
     @State private var loadingSource = false
-    private var data: JSONValue { sourceID.isEmpty ? snapshot : sourceSnapshot }
+    private var data: JSONValue { sourceID.isEmpty ? snapshot : model.cachedUsageAnalytics(query)?.value ?? .null }
     private var totals: UsageTotals { UsageTotals(rows: data["groups"].array) }
     private var options: [JSONValue] { snapshot["options"]["sources"].array }
     private var refreshID: UsagePerformanceSelection { UsagePerformanceSelection(selection: selection, sourceID: sourceID) }
@@ -24,7 +28,7 @@ struct UsagePerformanceCard: View {
                 Text("性能").font(.system(size: 14, weight: .semibold))
                 if loadingSource { ProgressView().controlSize(.mini) }
                 Spacer(minLength: 4)
-                Picker("性能来源", selection: $sourceID) {
+                Picker("性能来源", selection: $model.usagePerformanceSourceID) {
                     Text("汇总").tag("")
                     if !sourceID.isEmpty && !options.contains(where: { $0["id"].string == sourceID }) { Text("已选来源").tag(sourceID) }
                     ForEach(Array(options.enumerated()), id: \.offset) { _, source in Text(source["name"].string ?? "已移除来源").tag(source["id"].string ?? "") }
@@ -41,21 +45,23 @@ struct UsagePerformanceCard: View {
             if let loadError { Text(loadError).font(.system(size: 11)).foregroundStyle(.orange).lineLimit(2).help(loadError) }
         }.padding(20)
         .task(id: UsageRefreshKey(selection: refreshID, active: model.settingsWindowActive)) {
+            let requested = refreshID
             guard model.settingsWindowActive, !sourceID.isEmpty else { loadError = nil; loadingSource = false; return }
-            sourceSnapshot = .null; loadError = nil; loadingSource = true
-            defer { loadingSource = false }
-            let selectedSource = sourceID
+            loadError = nil; loadingSource = model.cachedUsageAnalytics(query) == nil
+            defer { if !Task.isCancelled, requested == refreshID { loadingSource = false } }
+            var refresh = false
             while !Task.isCancelled {
-                guard var query = selection.query else { break }
-                query.sourceID = selectedSource
+                guard var query = requested.selection.query else { break }
+                query.sourceID = requested.sourceID
                 do {
-                    let result = try await model.usageAnalytics(query)
-                    guard !Task.isCancelled, sourceID == selectedSource else { break }
-                    sourceSnapshot = result; loadError = nil; loadingSource = false
+                    _ = try await model.usageAnalytics(query, refresh: refresh)
+                    guard !Task.isCancelled, requested == refreshID else { break }
+                    loadError = nil; loadingSource = false
                 } catch {
-                    guard !Task.isCancelled else { break }
+                    guard !Task.isCancelled, requested == refreshID else { break }
                     loadError = error.localizedDescription; loadingSource = false
                 }
+                refresh = true
                 do { try await Task.sleep(for: .milliseconds(1500)) } catch { break }
             }
         }

@@ -67,7 +67,7 @@ fn build_client(source: &Source) -> Result<reqwest::Client> {
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .pool_idle_timeout(Duration::from_secs(60))
-        .pool_max_idle_per_host(12)
+        .pool_max_idle_per_host(2)
         .connect_timeout(std::time::Duration::from_secs(15));
     match source.proxy.mode.as_str() {
         "direct" if source.kind != "official" => {}

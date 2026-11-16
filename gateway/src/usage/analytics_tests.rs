@@ -181,3 +181,97 @@ fn invalid_days_are_read_only_and_active_timings_never_become_completed_samples(
     assert_eq!(snapshot, data.connection.total_changes());
     assert_eq!(data.active.len(), 1);
 }
+
+#[test]
+fn appended_and_late_completions_extend_aligned_history_without_double_counting() {
+    let (_dir, data) = fixture();
+    let store = crate::usage::UsageStore { data: std::sync::Mutex::new(data) };
+    let from = 100_000;
+    let day = 86_400;
+    for (id, at, latency, first_token) in [
+        ("before", from, 1000, Some(100)),
+        ("middle", from + day, 2000, None),
+        ("after", from + 2 * day, 5000, Some(500)),
+    ] {
+        let mut row = record(id, at);
+        if id == "middle" { row.model = "unknown-model".into(); }
+        row.latency_ms = latency;
+        row.first_token_latency_ms = first_token;
+        store.record(row).unwrap();
+    }
+    let middle = json!({"from":from+day,"to":from+2*day,"day_starts":[from+day,from+2*day]});
+    let initial = store.analytics(&middle).unwrap();
+    assert_eq!(initial["daily"][0]["requests"], 1);
+    assert!(initial["daily"][0]["total_usd"].is_null());
+    let mut late = record("late", from + day + 1);
+    late.latency_ms = 3000;
+    late.first_token_latency_ms = Some(300);
+    late.source_name = "新名称".into();
+    store.start(&late);
+    assert_eq!(store.analytics(&middle).unwrap()["daily"][0]["requests"], 2);
+    store.record(late).unwrap();
+    assert_eq!(store.analytics(&middle).unwrap()["daily"][0]["requests"], 2);
+    let mut older = record("older", from + 1);
+    older.source_name = "最终名称".into();
+    older.latency_ms = 4000;
+    older.first_token_latency_ms = Some(0);
+    store.record(older).unwrap();
+    store.record(record("outside", from + 3 * day)).unwrap();
+    let expanded = json!({"from":from,"to":from+3*day,"day_starts":[from,from+day,from+2*day,from+3*day]});
+    let result = store.analytics(&expanded).unwrap();
+    let known = result["groups"].as_array().unwrap().iter().find(|group| group["model"] == "gpt-6.1-sol").unwrap();
+    assert_eq!(known["requests"], 4);
+    assert_eq!(known["source_name"], "最终名称");
+    assert_eq!(known["active_requests"], 0);
+    assert_eq!(known["input_tokens"], 400);
+    assert_eq!(known["output_tokens"], 40);
+    assert_eq!(known["cached_input_tokens"], 80);
+    assert_eq!(known["priced_requests"], 4);
+    assert_eq!(result["daily"].as_array().unwrap().iter().map(|day| day["requests"].as_u64().unwrap()).collect::<Vec<_>>(), [2,2,1]);
+    assert!(result["daily"][1]["total_usd"].as_f64().unwrap() > 0.0);
+    assert_eq!(result["performance"]["p50_latency_ms"], 3000.0);
+    assert_eq!(result["performance"]["p95_latency_ms"], 4800.0);
+    assert_eq!(result["performance"]["p50_first_token_ms"], 200.0);
+    assert_eq!(result["performance"]["p95_first_token_ms"], 470.0);
+    assert_eq!(result["options"]["sources"][0]["name"], "最终名称");
+    let repeated = store.analytics(&expanded).unwrap();
+    for field in ["groups", "daily", "performance", "options"] { assert_eq!(repeated[field], result[field]); }
+}
+
+#[test]
+fn corrections_diagnostics_and_shifted_windows_do_not_reuse_stale_totals() {
+    let (dir, data) = fixture();
+    persist(&data, &record("legacy", 100_000), Some("native"));
+    let store = crate::usage::UsageStore { data: std::sync::Mutex::new(data) };
+    let payload = json!({"from":100_000,"to":186_400,"day_starts":[100_000,186_400],"ingress":"native"});
+    assert_eq!(store.analytics(&payload).unwrap()["groups"][0]["requests"], 1);
+    let source = serde_json::from_value(json!({"id":"a","name":"来源 A","kind":"api","base_url":"http://127.0.0.1:1",
+        "enabled":true,"priority":0,"proxy":{"mode":"direct"},"secret":{"api_key":"fixture"}})).unwrap();
+    let capture = crate::usage::diagnostics::Capture::new("legacy", 100_000, &source, "fixture", crate::usage::Ingress::Ssh);
+    store.diagnostic(&capture, false).unwrap();
+    let changed = store.analytics(&payload).unwrap();
+    assert!(changed["groups"].as_array().unwrap().is_empty());
+    assert_eq!(changed["options"]["ingresses"], json!(["ssh"]));
+    let all = json!({"from":100_000,"to":186_400,"day_starts":[100_000,186_400]});
+    store.analytics(&all).unwrap();
+    let external = rusqlite::Connection::open(dir.path().join("usage.sqlite")).unwrap();
+    external.execute("UPDATE usage SET metadata=json_set(metadata,'$.cost.total_usd',7.5,'$.cost.billing_basis','upstream_charge')", []).unwrap();
+    let mut appended = record("append", 100_001);
+    appended.model = "unknown-model".into();
+    store.record(appended).unwrap();
+    let corrected = store.analytics(&all).unwrap();
+    assert_eq!(corrected["daily"][0]["total_usd"], 7.5);
+    assert_eq!(corrected["daily"][0]["requests"], 2);
+    assert_eq!(corrected["daily"][0]["upstream_priced_requests"], 1);
+    store.data.lock().unwrap().connection.execute("DELETE FROM usage WHERE attempt=1", []).unwrap();
+    store.record(record("after-delete", 100_002)).unwrap();
+    let after_delete = store.analytics(&all).unwrap();
+    assert_eq!(after_delete["daily"][0]["requests"], 2);
+    assert_eq!(after_delete["daily"][0]["upstream_priced_requests"], 0);
+    let rolling = |from| json!({"from":from,"to":from+3600,"day_starts":(from..=from+3600).step_by(300).collect::<Vec<_>>()});
+    store.analytics(&rolling(100_001)).unwrap();
+    let shifted = store.analytics(&rolling(100_002)).unwrap();
+    assert_eq!(shifted["groups"][0]["requests"], 1);
+    assert_eq!(shifted["daily"][0]["requests"], 1);
+    assert_eq!(shifted["options"]["models"], json!(["gpt-6.1-sol"]));
+}

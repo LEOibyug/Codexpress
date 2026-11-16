@@ -828,7 +828,7 @@ async fn forward_once(
     {
         if let Some(key) = affinity_key.as_deref() {
             let has_state = binding.is_some() || opaque_state;
-            if !has_state || route_settings.degraded_context_fallback {
+            if !has_state || state.settings.read().await.degraded_context_fallback {
                 if let Some(route) = routing::reserve_idle_return(&state, model, key).await {
                     let prepared = if has_state {
                         // A missing cache chain must leave the working route in
@@ -998,7 +998,7 @@ async fn forward_once(
         // state before rebuilding. Normal alternatives keep all origin checks.
         sources = vec![target.clone()];
     }
-    let retry_limit = route_settings.upstream_attempts;
+    let retry_limit = state.settings.read().await.upstream_attempts;
     let had_candidates = !sources.is_empty();
     sources.retain(|source| !request_retries.exhausted(source, retry_limit));
     if had_candidates && sources.is_empty() {
@@ -1008,7 +1008,7 @@ async fn forward_once(
         );
     }
     if sources.is_empty() {
-        let settings = &route_settings;
+        let settings = state.settings.read().await.clone();
         let diagnostics =
             routing::rejection_diagnostics(&state, model, affinity_key.as_deref()).await;
         eprintln!(
@@ -1279,7 +1279,7 @@ async fn forward_once(
         );
         let mut auth_refreshed = false;
         let retries =
-            retries::UpstreamRetries::new(&request_retries, &source, &route_settings);
+            retries::UpstreamRetries::new(&request_retries, &source, &*state.settings.read().await);
         let attempt_limit = (if compatibility { 6 } else { 3 }) + retries.extra_attempts();
         for _attempt_number in 0..attempt_limit {
             let eligible = if manual_candidate {
@@ -1414,7 +1414,7 @@ async fn forward_once(
                     }
                 }
             }
-            let settings = &route_settings;
+            let settings = state.settings.read().await.clone();
             let source_index = state.sources.read().await.iter().position(|runtime| {
                 runtime.source.id == source.id && runtime.source.identity() == source.identity()
             });
@@ -1548,7 +1548,7 @@ async fn forward_once(
                         && !degraded
                         && !probe_unknown_id
                         && (binding.is_some() || opaque_state || origin.is_some())
-                        && route_settings.degraded_context_fallback
+                        && state.settings.read().await.degraded_context_fallback
                         && !routing::candidates_with_session(
                             &state,
                             model,
@@ -1668,7 +1668,7 @@ async fn forward_once(
                             break;
                         }
                         if !degraded
-                            && route_settings.degraded_context_fallback
+                            && state.settings.read().await.degraded_context_fallback
                             && !routing::candidates_with_session(
                                 &state,
                                 model,
@@ -1735,7 +1735,7 @@ async fn forward_once(
                         && (binding.is_some() || opaque_state)
                         && (priority_probe
                             || probe_unknown_id
-                            || route_settings.degraded_context_fallback)))
+                            || state.settings.read().await.degraded_context_fallback)))
             {
                 // Hold only an initial bounded prefix. A failed Responses SSE
                 // can use HTTP 200, so headers alone do not prove acceptance.
@@ -1840,7 +1840,7 @@ async fn forward_once(
                 // context once before abandoning the takeover.
                 if context_rejected
                     && !degraded
-                    && route_settings.degraded_context_fallback
+                    && state.settings.read().await.degraded_context_fallback
                 {
                     if let Ok((mut retry, context)) =
                         portable_request(&state, &parts, &parsed, affinity_key.as_deref()).await
@@ -1902,7 +1902,7 @@ async fn forward_once(
                 && (context_rejected
                     || matches!(status.as_u16(), 401 | 402 | 403 | 429)
                     || retries::transient_status(status.as_u16()))
-                && route_settings.degraded_context_fallback
+                && state.settings.read().await.degraded_context_fallback
                 && if priority_probe {
                     !routing::priority::candidates(&state, model, affinity_key.as_deref())
                         .await

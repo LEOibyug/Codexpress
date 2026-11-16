@@ -17,7 +17,6 @@ struct UsageLogsView: View {
     @Binding var selection: UsageSelection
     let options: JSONValue
     let onBack: () -> Void
-    @State private var logOptions: JSONValue = .null
     @State private var ingress = ""
     @State private var status = ""
     @State private var search = ""
@@ -31,7 +30,7 @@ struct UsageLogsView: View {
     @State private var loadedPages = 1
     @State private var loadingMore = false
     @State private var selected: UsageItem?
-    private var availableOptions: JSONValue { logOptions == .null ? options : logOptions }
+    private var availableOptions: JSONValue { model.cachedUsageAnalytics(filter.query)?.value["options"] ?? options }
     private var filter: UsageLogFilter { UsageLogFilter(selection: selection, ingress: ingress, status: status, search: search.trimmingCharacters(in: .whitespacesAndNewlines)) }
 
     var body: some View {
@@ -80,14 +79,19 @@ struct UsageLogsView: View {
         .task(id: UsageRefreshKey(selection: filter, active: model.settingsWindowActive)) {
             guard model.settingsWindowActive else { return }
             let requested = filter
+            guard model.cachedUsageAnalytics(requested.query) == nil else { return }
+            do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+            guard !Task.isCancelled, let query = requested.query else { return }
+            _ = try? await model.usageAnalytics(query)
+        }
+        .task(id: UsageRefreshKey(selection: filter, active: model.settingsWindowActive)) {
+            guard model.settingsWindowActive else { return }
+            let requested = filter
             guard requested.query != nil else { return }
             do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
             while !Task.isCancelled {
                 guard let query = requested.query else { break }
                 do {
-                    if loadedQuery?.from != query.from || loadedQuery?.to != query.to {
-                        if let analytics = try? await model.usageAnalytics(query), !Task.isCancelled { logOptions = analytics["options"] }
-                    }
                     let result = try await model.usageRequests(query, status: requested.status, search: requested.search)
                     guard !Task.isCancelled else { break }
                     let incoming = result["records"].array.enumerated().map { UsageItem($0.element, index: $0.offset) }
