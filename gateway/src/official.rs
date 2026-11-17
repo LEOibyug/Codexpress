@@ -42,6 +42,8 @@ pub(crate) fn update_quota_reference(quota: &mut Value, at: u64) {
     }
 }
 
+pub(crate) const CODEX_CLIENT_VERSION: &str = "0.169.0";
+
 const PERSISTENCE_FAILURE: &str = "新凭据保存失败，账号已暂停；请检查凭据存储后重新登录";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REDIRECT: &str = "http://localhost:1455/auth/callback";

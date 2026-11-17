@@ -1401,7 +1401,7 @@ async fn forward_once(
                     .is_some() || parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some()
                 {
                     headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
-                    headers.insert("version", HeaderValue::from_static("0.162.1"));
+                    headers.insert("version", HeaderValue::from_static(crate::official::CODEX_CLIENT_VERSION));
                 }
                 if let Some(account) = &source.account_id {
                     let Ok(value) = HeaderValue::from_str(account) else {

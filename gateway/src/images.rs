@@ -551,7 +551,7 @@ async fn execute(
         };
         headers.insert(header::AUTHORIZATION, auth);
         headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
-        headers.insert("version", HeaderValue::from_static("0.162.1"));
+        headers.insert("version", HeaderValue::from_static(crate::official::CODEX_CLIENT_VERSION));
         headers.insert(
             "x-codex-image-turn-id",
             HeaderValue::from_str(&request_id).unwrap(),

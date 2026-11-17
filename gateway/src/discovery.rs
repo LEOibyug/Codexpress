@@ -16,7 +16,7 @@ fn endpoint(source: &Source) -> Result<url::Url> {
         url::Url::parse(&format!("{base}/models")).map_err(|_| anyhow!("模型列表地址无效"))?;
     if source.kind == "official" {
         url.query_pairs_mut()
-            .append_pair("client_version", "0.162.1");
+            .append_pair("client_version", official::CODEX_CLIENT_VERSION);
     }
     Ok(url)
 }
@@ -83,7 +83,7 @@ async fn fetch(source: &Source) -> Result<(Vec<String>, Option<Value>)> {
         request = request
             .header("chatgpt-account-id", account)
             .header("originator", "codex_cli_rs")
-            .header("version", "0.162.1");
+            .header("version", official::CODEX_CLIENT_VERSION);
     }
     let mut response = request
         .send()
@@ -202,11 +202,13 @@ mod tests {
     }
 
     #[test]
-    fn official_endpoint_matches_codex_catalog_request() {
+    fn official_catalog_version_meets_new_model_compatibility_floor() {
         let source: Source = serde_json::from_value(json!({"id":"official","name":"Official","kind":"official","base_url":"https://chatgpt.com/backend-api/codex/","enabled":true,"priority":0,"proxy":{"mode":"explicit","url":"http://127.0.0.1:7890"}})).unwrap();
-        assert_eq!(
-            endpoint(&source).unwrap().as_str(),
-            "https://chatgpt.com/backend-api/codex/models?client_version=0.162.1"
-        );
+        let url = endpoint(&source).unwrap();
+        assert_eq!(url.path(), "/backend-api/codex/models");
+        let version = url.query_pairs().find(|(key, _)| key == "client_version").unwrap().1;
+        let version: Vec<u32> = version.split('.').map(|part| part.parse().unwrap()).collect();
+        assert_eq!(version.len(), 3);
+        assert!(version.as_slice() >= [0, 166, 0].as_slice(), "6.2 官方目录要求至少 0.166.0 客户端协议");
     }
 }
