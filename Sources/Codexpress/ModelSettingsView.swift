@@ -94,7 +94,7 @@ struct ModelSettingsView: View {
                     Button("清除搜索") { search = "" }
                 }
             } else {
-                Text("按累计 Token 排序，速度与缓存取每个模型最近最多 500 条已结束请求。")
+                Text("按全局最近 1,000 条已结束请求的 Token 用量排序；模型不足 10 条时不显示速度和缓存命中率。")
                     .font(AppTypography.caption).foregroundStyle(.secondary)
                     .help("生成 TPS 按首个输出到生成结束的耗时计算。缺少生成计时的旧记录沿用请求总耗时。")
             }
@@ -147,8 +147,9 @@ struct ModelSettingsView: View {
         let usage = modelUsage?[id]
         let emptyCount = modelUsage != nil && usage == nil ? "0" : "—"
         let total = usage?["total_tokens"].number?.formatted(Self.tokenFormat) ?? emptyCount
-        let rate = usageRate(usage?["tps"].number)
-        let cache = usage?["cache_rate"].number.map { $0.formatted(.number.precision(.fractionLength(0...1))) + "%" } ?? "—"
+        let showPerformance = (usage?["attempts"].number ?? 0) >= 10
+        let rate = showPerformance ? usageRate(usage?["tps"].number) : ""
+        let cache = showPerformance ? (usage?["cache_rate"].number.map { $0.formatted(.number.precision(.fractionLength(0...1))) + "%" } ?? "—") : ""
         let disabled = clients.isEmpty || policy?.sourceIDs?.isEmpty == true
         let imported = information["local_metadata"].bool == true
         return Button { editing = EditingModel(id: id, isNew: false) } label: {
@@ -165,15 +166,17 @@ struct ModelSettingsView: View {
                 }.frame(maxWidth: .infinity, alignment: .leading)
                     .help("\(id)\n最大输入：\(window) · 压缩点：\(threshold)")
                 HStack(spacing: 18) {
-                    modelMetric(total, symbol: "number", help: "累计 Token")
-                    modelMetric(rate, symbol: "speedometer", help: "生成 TPS")
-                    modelMetric(cache, symbol: "bolt.circle", help: "缓存命中率")
+                    modelMetric(total, symbol: "number", help: "近期 Token")
+                    if showPerformance {
+                        modelMetric(rate, symbol: "speedometer", help: "生成 TPS")
+                        modelMetric(cache, symbol: "bolt.circle", help: "缓存命中率")
+                    }
                 }
                 Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).frame(width: 8)
             }.font(AppTypography.caption).foregroundStyle(.secondary)
                 .padding(.horizontal, 14).padding(.vertical, 12).contentShape(Rectangle())
         }.buttonStyle(.plain).accessibilityLabel("编辑模型 \(id)")
-            .accessibilityValue("\(disabled ? "未启用" : clients.map(\.label).joined(separator: "、"))，\(sourceSummary(policy))，累计 Token \(total)，生成 TPS \(rate)，缓存命中 \(cache)")
+            .accessibilityValue("\(disabled ? "未启用" : clients.map(\.label).joined(separator: "、"))，\(sourceSummary(policy))，近期 Token \(total)" + (showPerformance ? "，生成 TPS \(rate)，缓存命中 \(cache)" : ""))
     }
 
     private func sourceSummary(_ policy: ModelPolicy?) -> String {
