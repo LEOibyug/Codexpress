@@ -63,7 +63,6 @@ struct GatewayMenuIcon: View {
             let window = NSWindow(contentViewController: NSHostingController(rootView: content))
             window.title = "Codexpress"
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-            window.titlebarAppearsTransparent = true
             window.titleVisibility = .visible
             window.toolbarStyle = .unified
             window.setContentSize(NSSize(width: 1040, height: 800))

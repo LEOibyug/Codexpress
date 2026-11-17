@@ -16,26 +16,29 @@ struct SourceRoutingActions: View {
         return takingOver ? "正在接管后续请求" : "从后续请求开始尝试此来源"
     }
 
-    var body: some View {
-        HStack(spacing: compact ? 4 : 8) {
-            if cooling {
-                action("立即恢复", symbol: "arrow.clockwise") { model.recoverSource(source.id) }
-                    .help(source.enabled ? "解除临时冷却，重新参与分配" : "请先启用此来源")
-                    .disabled(!source.enabled)
-            }
-            action("立即抢占", symbol: "bolt.fill") { model.startSourceTakeover(source.id) }
-                .help(takeoverHelp)
-                .disabled(takingOver || exhausted || needsLogin || !source.enabled)
-            if takingOver {
-                if !compact {
-                    Label("正在抢占", systemImage: "clock")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                }
-                action("停止抢占", symbol: "xmark.circle") { model.cancelSourceTakeover() }
-                    .help("停止抢占")
-            }
-        }.controlSize(.small)
-            .disabled(model.busy || !model.running)
+    @ViewBuilder var body: some View {
+        if compact {
+            HStack(spacing: 4) { actions }.controlSize(.small)
+        } else {
+            actions
+        }
+    }
+
+    private var unavailable: Bool { model.busy || !model.running }
+
+    @ViewBuilder private var actions: some View {
+        if cooling {
+            action("立即恢复", symbol: "arrow.clockwise") { model.recoverSource(source.id) }
+                .help(source.enabled ? "解除临时冷却，重新参与分配" : "请先启用此来源")
+                .disabled(unavailable || !source.enabled)
+        }
+        action("立即抢占", symbol: "bolt.fill") { model.startSourceTakeover(source.id) }
+            .help(takeoverHelp)
+            .disabled(unavailable || takingOver || exhausted || needsLogin || !source.enabled)
+        if takingOver {
+            action("停止抢占", symbol: "xmark.circle") { model.cancelSourceTakeover() }
+                .help("停止抢占").disabled(unavailable)
+        }
     }
 
     @ViewBuilder private func action(_ title: String, symbol: String, perform: @escaping () -> Void) -> some View {
@@ -45,7 +48,7 @@ struct SourceRoutingActions: View {
                     .frame(width: 22, height: 22).contentShape(Rectangle())
             }.buttonStyle(.plain).accessibilityLabel(title)
         } else {
-            Button(title, action: perform)
+            Button(action: perform) { Label(title, systemImage: symbol) }
         }
     }
 }

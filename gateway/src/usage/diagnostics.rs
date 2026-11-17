@@ -648,13 +648,7 @@ pub(super) fn detail(data: &StoreData, payload: &Value) -> Result<Value> {
         value["active"] = json!(true);
         let elapsed = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         value["latency_ms"] = json!(elapsed);
-        if let Some(first) = record
-            .first_token_latency_ms
-            .filter(|_| !record.token_details.stream_complete)
-        {
-            value["generation_ms"] = json!(elapsed.saturating_sub(first));
-        }
-        summary::add_rate(&mut value);
+        summary::add_rate(&mut value, false);
         value["cost"] = crate::pricing::estimate(&value, false);
         value
     });

@@ -22,14 +22,12 @@ struct UsageRequestDetailView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("请求详情").font(.system(size: 22, weight: .semibold))
-                    Text(record["model"].string ?? "未知模型").font(.system(size: 13)).foregroundStyle(.secondary)
+            PageHeading("请求详情", subtitle: record["model"].string ?? "未知模型") {
+                if failed {
+                    Button(copied ? "已复制" : "复制错误反馈") { copyTask?.cancel(); copyTask = Task { await copyFeedback() } }
+                        .disabled(loading || copying || detail == .null)
                 }
-                Spacer()
-                Button(copied ? "已复制" : "复制错误反馈") { copyTask?.cancel(); copyTask = Task { await copyFeedback() } }.disabled(!failed || loading || copying || detail == .null)
-                Button("完成") { dismiss() }.keyboardShortcut(.defaultAction)
+                Button("完成") { dismiss() }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
             }
             if let loadError { InfoNote(text: loadError, color: .orange) }
             ScrollView {
@@ -84,7 +82,7 @@ struct UsageRequestDetailView: View {
                 GridRow { field("时间", Date(timeIntervalSince1970: record["started_at"].number ?? 0).formatted(date: .numeric, time: .standard)); field("入口", usageIngressName(record["ingress"].string ?? diagnostic["ingress"].string)) }
                 GridRow { field("HTTP 状态", (record["http_status"].number ?? diagnostic["http_status"].number).map { String(Int($0)) } ?? "—"); field("请求耗时", usageSeconds(record["latency_ms"].number)) }
                 GridRow { field("输入 / 输出", usageCount(record["input_tokens"].number ?? 0) + " / " + usageCount(record["output_tokens"].number ?? 0)); field("首 Token", usageSeconds(record["first_token_latency_ms"].number)) }
-                GridRow { field("费用", usageCostMoney(record["cost"])); field("输出速度", usageRate(record["output_tps"].number) + " TPS") }
+                GridRow { field("费用", usageCostMoney(record["cost"])); field(outputRateLabel, outputRate) }
             }
             if let path = diagnostic["path"].string {
                 Divider()
@@ -92,6 +90,12 @@ struct UsageRequestDetailView: View {
             }
             if let url = diagnostic["upstream_url"].string { Text(url).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
         }.padding(18).cardSurface()
+    }
+    private var outputRateLabel: String {
+        record["output_tps"].number != nil && record["generation_tps"].number == nil ? "输出速度 · 按总耗时" : "生成速度"
+    }
+    private var outputRate: String {
+        record["output_tps"].number.map { usageRate($0, estimated: record["token_details"]["output_estimated"].bool == true) + " TPS" } ?? "—"
     }
     private var tokenAndPricing: some View {
         let tokens = record["token_details"], cost = record["cost"]
@@ -104,7 +108,7 @@ struct UsageRequestDetailView: View {
                 detailRow("推理 Token", tokens["reasoning_output_tokens"].number.map { usageCount($0) } ?? "未报告")
                 detailRow("上游报告总量", tokens["reported_total_tokens"].number.map { usageCount($0) } ?? "未报告")
                 detailRow("计数状态", record["complete"].bool == true ? "完整" : "未完整报告")
-                detailRow("传输阶段速度", usageRate(record["generation_tps"].number) + " TPS")
+                if record["generation_tps"].number != nil { detailRow("生成耗时", usageSeconds(record["generation_ms"].number)) }
                 Divider()
                 if cost == .null { Text("此记录未保存计价详情。").foregroundStyle(.secondary) }
                 else {

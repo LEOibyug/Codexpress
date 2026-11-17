@@ -25,8 +25,32 @@ const COST_COUNTS: [&str; 6] = [
     "upstream_priced_requests",
 ];
 
+const CURRENT_TIMING: &str = "COALESCE(json_extract(metadata,'$.generation_timing_version'),0)>=1";
+const OUTPUT_AVAILABLE: &str = "COALESCE(json_extract(metadata,'$.token_details.output_available'),complete=1 OR (json_extract(metadata,'$.token_details') IS NULL AND output_tokens>0))=1";
+pub(super) const CACHE_SAMPLE: &str = "((json_extract(metadata,'$.token_details.cached_input_reported')=1 AND COALESCE(json_extract(metadata,'$.token_details.input_estimated'),0)=0) OR (json_extract(metadata,'$.token_details') IS NULL AND cached_input_tokens>0))";
+
+// Both durations are NULL for ineligible samples. Old incomplete streams could
+// include time spent waiting for EOF; only their terminal timing is usable.
+pub(super) fn rate_durations() -> (String, String) {
+    const DURATION: &str = "json_extract(metadata,'$.generation_ms')";
+    let measured = format!("CASE WHEN status='success' AND {OUTPUT_AVAILABLE} AND {DURATION}>0 AND (CASE WHEN {CURRENT_TIMING} THEN json_extract(metadata,'$.token_details.output_estimated')=0 ELSE json_extract(metadata,'$.token_details.stream_complete')=1 END) THEN {DURATION} END");
+    let throughput = format!("COALESCE({measured}, CASE WHEN status='success' AND NOT ({CURRENT_TIMING}) AND {OUTPUT_AVAILABLE} AND latency_ms>0 THEN latency_ms END)");
+    (measured, throughput)
+}
+
+pub(super) fn rate_sums() -> [String; 4] {
+    let (measured, throughput) = rate_durations();
+    [
+        format!("SUM(CASE WHEN ({measured}) IS NOT NULL THEN output_tokens ELSE 0 END)"),
+        format!("SUM(COALESCE({measured},0))"),
+        format!("SUM(CASE WHEN ({throughput}) IS NOT NULL THEN output_tokens ELSE 0 END)"),
+        format!("SUM(COALESCE({throughput},0))"),
+    ]
+}
+
 /// These are fixed SQL expressions; every caller-controlled value is bound.
 fn aggregate_json() -> String {
+    let [timed_tokens, generation_ms, throughput_tokens, throughput_ms] = rate_sums();
     let mut fields = vec![
         ("requests", "COUNT(*)".to_owned()),
         ("active_requests", "SUM(status='active')".into()),
@@ -42,12 +66,12 @@ fn aggregate_json() -> String {
         ("total_latency_ms", "SUM(CASE WHEN status!='active' THEN latency_ms ELSE 0 END)".into()),
         ("total_first_token_ms", "SUM(CASE WHEN status!='active' THEN json_extract(metadata,'$.first_token_latency_ms') END)".into()),
         ("first_token_samples", "COUNT(CASE WHEN status!='active' THEN json_extract(metadata,'$.first_token_latency_ms') END)".into()),
-        ("timed_output_tokens", "SUM(CASE WHEN status='success' AND json_extract(metadata,'$.generation_ms')>0 THEN output_tokens ELSE 0 END)".into()),
-        ("total_generation_ms", "SUM(CASE WHEN status='success' AND json_extract(metadata,'$.generation_ms')>0 THEN json_extract(metadata,'$.generation_ms') ELSE 0 END)".into()),
-        ("throughput_output_tokens", "SUM(CASE WHEN status='success' AND latency_ms>0 AND (json_extract(metadata,'$.token_details.output_available')=1 OR complete=1) THEN output_tokens ELSE 0 END)".into()),
-        ("throughput_latency_ms", "SUM(CASE WHEN status='success' AND latency_ms>0 AND (json_extract(metadata,'$.token_details.output_available')=1 OR complete=1) THEN latency_ms ELSE 0 END)".into()),
-        ("cached_reported_input_tokens", "SUM(CASE WHEN (json_extract(metadata,'$.token_details.cached_input_reported')=1 AND COALESCE(json_extract(metadata,'$.token_details.input_estimated'),0)=0) OR (json_extract(metadata,'$.token_details') IS NULL AND cached_input_tokens>0) THEN input_tokens ELSE 0 END)".into()),
-        ("cached_reported_tokens", "SUM(CASE WHEN (json_extract(metadata,'$.token_details.cached_input_reported')=1 AND COALESCE(json_extract(metadata,'$.token_details.input_estimated'),0)=0) OR (json_extract(metadata,'$.token_details') IS NULL AND cached_input_tokens>0) THEN cached_input_tokens ELSE 0 END)".into()),
+        ("timed_output_tokens", timed_tokens),
+        ("total_generation_ms", generation_ms),
+        ("throughput_output_tokens", throughput_tokens),
+        ("throughput_latency_ms", throughput_ms),
+        ("cached_reported_input_tokens", format!("SUM(CASE WHEN {CACHE_SAMPLE} THEN input_tokens ELSE 0 END)")),
+        ("cached_reported_tokens", format!("SUM(CASE WHEN {CACHE_SAMPLE} THEN cached_input_tokens ELSE 0 END)")),
     ];
     for field in COST_FIELDS {
         fields.push((

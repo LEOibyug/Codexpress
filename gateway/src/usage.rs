@@ -2,6 +2,7 @@ mod analytics;
 pub(crate) mod billing;
 pub mod diagnostics;
 mod grouping;
+mod models;
 mod requests;
 mod settlement;
 mod summary;
@@ -134,7 +135,8 @@ impl UsageStore {
                 cached_input_tokens INTEGER NOT NULL, complete INTEGER NOT NULL, latency_ms INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS usage_time ON usage(started_at);
             CREATE INDEX IF NOT EXISTS usage_source ON usage(source_id);
-            CREATE INDEX IF NOT EXISTS usage_source_time ON usage(source_id,started_at);")?;
+            CREATE INDEX IF NOT EXISTS usage_source_time ON usage(source_id,started_at);
+            CREATE INDEX IF NOT EXISTS usage_model_recent ON usage(model,started_at DESC,attempt DESC,input_tokens,output_tokens);")?;
         let has_metadata = connection
             .prepare("PRAGMA table_info(usage)")?
             .query_map([], |row| row.get::<_, String>(1))?
@@ -245,6 +247,7 @@ impl UsageStore {
         let billing_identity = data.settlements.finish(&record);
         let metadata = json!({"attempt_id":record.attempt_id,"ingress":record.ingress,"token_details":record.token_details,
             "first_token_latency_ms":record.first_token_latency_ms,"generation_ms":record.generation_ms,
+            "generation_timing_version":1,
             "billing_identity":billing_identity,"cost":cost}).to_string();
         let changes = data.connection.total_changes();
         let result = data.connection.execute("INSERT INTO usage (request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)", params![record.request_id,record.source_id,record.source_name,record.model,number(record.started_at),record.status,number(record.input_tokens),number(record.output_tokens),number(cached),record.complete,number(record.latency_ms),metadata]);
@@ -321,6 +324,13 @@ impl UsageStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("用量数据库不可用"))?;
         analytics::build(&mut data, payload)
+    }
+    pub fn models(&self) -> Result<Value> {
+        let data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("用量数据库不可用"))?;
+        models::build(&data.connection)
     }
     pub fn requests(&self, payload: &Value) -> Result<Value> {
         let data = self
@@ -421,14 +431,7 @@ pub fn estimated_tokens(units: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{summary::add_rate, *};
-    #[test]
-    fn buffered_output_uses_total_duration_not_tiny_delivery_window_or_input_tokens() {
-        let mut record = json!({"input_tokens":348804,"output_tokens":375,"latency_ms":18179,"generation_ms":342,"token_details":{"output_available":true}});
-        add_rate(&mut record);
-        assert!((record["output_tps"].as_f64().unwrap() - 20.628197).abs() < 0.00001);
-        assert!(record["generation_tps"].as_f64().unwrap() > 1000.0);
-    }
+    use super::*;
     #[test]
     fn ingress_survives_active_updates_completion_and_reopen_without_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
@@ -559,8 +562,8 @@ mod tests {
         assert_eq!(supplier["active_requests"], 1);
         assert_eq!(supplier["timed_output_tokens"], 40);
         assert_eq!(supplier["total_generation_ms"], 250);
-        assert_eq!(supplier["throughput_output_tokens"], 44);
-        assert_eq!(supplier["throughput_latency_ms"], 1200);
+        assert_eq!(supplier["throughput_output_tokens"], 40);
+        assert_eq!(supplier["throughput_latency_ms"], 250);
         assert_eq!(supplier["total_first_token_ms"], 40);
         assert_eq!(supplier["first_token_samples"], 2);
         assert_eq!(supplier["cached_reported_input_tokens"], 100);
@@ -582,9 +585,13 @@ mod tests {
             assert_eq!(known["estimated_cost_requests"], 1);
             assert_eq!(known["timed_output_tokens"], 40);
             assert_eq!(known["total_generation_ms"], 250);
+            assert_eq!(known["throughput_output_tokens"], 40);
+            assert_eq!(known["throughput_latency_ms"], 250);
             let unknown = groups.iter().find(|row| row["model"] == live.model).unwrap();
             assert_eq!(unknown["source_ids"], json!(["b", "c"]));
             assert_eq!(unknown["requests"], 2);
+            assert_eq!(unknown["throughput_output_tokens"], 0);
+            assert_eq!(unknown["throughput_latency_ms"], 0);
             assert_eq!(unknown["unpriced_requests"], 2);
             assert_eq!(unknown["priced_requests"], 0);
             assert!(unknown["total_usd"].is_null());
@@ -894,6 +901,8 @@ mod tests {
             .record(UsageRecord {
                 attempt_id: "new-b-2".into(),
                 output_tokens: 100,
+                latency_ms: 12_000,
+                first_token_latency_ms: Some(7000),
                 generation_ms: Some(5000),
                 ..record
             })
@@ -911,13 +920,12 @@ mod tests {
         assert_eq!(b["total_generation_ms"], 6000);
         assert_eq!(b["first_token_samples"], 2);
         assert_eq!(selected["recent"][0]["generation_tps"], 20.0);
-        assert!(
-            (selected["recent"][0]["output_tps"].as_f64().unwrap() - 100000.0 / 1500.0).abs()
-                < 1e-9
-        );
+        assert_eq!(selected["recent"][0]["output_tps"], 20.0);
         let legacy = store.summary_for(1, Some("a")).unwrap();
         assert_eq!(legacy["recent"][0]["attempt_id"], "legacy:1");
         assert_eq!(legacy["recent"][0]["output_tps"], 40.0);
+        assert_eq!(legacy["rows"][0]["throughput_output_tokens"], 20);
+        assert_eq!(legacy["rows"][0]["throughput_latency_ms"], 500);
         assert!(legacy["recent"][0]["generation_tps"].is_null());
         assert!(legacy["recent"][0]["token_details"]["legacy"]
             .as_bool()

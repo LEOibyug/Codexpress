@@ -475,6 +475,8 @@ final class OfficialResetStateTests: XCTestCase {
                 return dict(account_id=source['account_id'], access_token='fixture-token') if source['kind'] == 'official' else dict(api_key='fixture-api-key')
             if operation == 'status':
                 data = dict(process_id=os.getpid(), port=17863, sources=sources)
+            elif operation == 'gateway.update.info':
+                data = dict(version='0.8.26', protocol=1)
             elif operation == 'credentials.storage.status':
                 data = dict(mode='keychain')
             elif operation == 'credentials.read':

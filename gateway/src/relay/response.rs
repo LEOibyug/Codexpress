@@ -31,15 +31,16 @@ const EVENT_LIMIT: usize = crate::usage::diagnostics::BODY_LIMIT;
 /// Inspect a bounded JSON prefix while preserving full chunks for forwarding.
 pub(super) async fn read_error_prefix(
     upstream: &mut reqwest::Response,
-    prefix: &mut Vec<Bytes>,
+    prefix: &mut Vec<(Bytes, Instant)>,
 ) -> Option<Value> {
     let mut observed = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while observed.len() < 65536 {
         match tokio::time::timeout_at(deadline, upstream.chunk()).await {
             Ok(Ok(Some(chunk))) => {
+                let received_at = Instant::now();
                 observed.extend_from_slice(&chunk[..chunk.len().min(65536 - observed.len())]);
-                prefix.push(chunk);
+                prefix.push((chunk, received_at));
                 if serde_json::from_slice::<Value>(&observed).is_ok() {
                     break;
                 }
@@ -58,7 +59,7 @@ pub(super) struct ResponseProbe {
 
 pub(super) async fn probe_context_rejection(
     upstream: &mut reqwest::Response,
-    prefix: &mut Vec<Bytes>,
+    prefix: &mut Vec<(Bytes, Instant)>,
     request_is_stream: bool,
     attempt: &mut Attempt,
 ) -> Result<ResponseProbe, ()> {
@@ -71,14 +72,15 @@ pub(super) async fn probe_context_rejection(
     while observed < 65536 {
         match tokio::time::timeout_at(deadline, upstream.chunk()).await {
             Ok(Ok(Some(chunk))) => {
+                let received_at = Instant::now();
                 observed = observed.saturating_add(chunk.len());
-                probe.push(&chunk);
+                probe.push(&chunk, received_at);
                 if !probe.sse {
                     if let Ok(value) = serde_json::from_slice::<Value>(&probe.buffer) {
-                        probe.value(&value);
+                        probe.value(&value, received_at);
                     }
                 }
-                prefix.push(chunk);
+                prefix.push((chunk, received_at));
                 if probe.replay_blocked || probe.failed || probe.terminal {
                     break;
                 }
@@ -120,7 +122,6 @@ pub(super) struct Attempt {
     pub(super) record: Option<UsageRecord>,
     started: Instant,
     published: Instant,
-    first_output: Option<Instant>,
     pub(super) diagnostic: Capture,
     captured_prefix: usize,
     captured_transport_error: bool,
@@ -175,7 +176,6 @@ impl Attempt {
             started: Instant::now(),
             published: Instant::now(),
             record: Some(record),
-            first_output: None,
             diagnostic,
             captured_prefix: 0,
             captured_transport_error: false,
@@ -192,16 +192,16 @@ impl Attempt {
     pub(super) async fn collect_error(
         &mut self,
         upstream: &mut reqwest::Response,
-        prefix: &mut Vec<Bytes>,
+        prefix: &mut Vec<(Bytes, Instant)>,
     ) {
         if !upstream.status().is_client_error() && !upstream.status().is_server_error() {
             return;
         }
-        for chunk in prefix.iter().skip(self.captured_prefix) {
+        for (chunk, _) in prefix.iter().skip(self.captured_prefix) {
             self.diagnostic.chunk(chunk);
         }
         self.captured_prefix = prefix.len();
-        let mut received: u64 = prefix.iter().map(|chunk| chunk.len() as u64).sum();
+        let mut received: u64 = prefix.iter().map(|(chunk, _)| chunk.len() as u64).sum();
         let length = upstream.content_length();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -214,9 +214,10 @@ impl Attempt {
             }
             match tokio::time::timeout_at(deadline, upstream.chunk()).await {
                 Ok(Ok(Some(chunk))) => {
+                    let received_at = Instant::now();
                     received = received.saturating_add(chunk.len() as u64);
                     self.diagnostic.chunk(&chunk);
-                    prefix.push(chunk);
+                    prefix.push((chunk, received_at));
                     self.captured_prefix += 1;
                 }
                 Ok(Ok(None)) => {
@@ -256,22 +257,14 @@ impl Attempt {
             record.status = status.into();
             if let Some(observer) = observer {
                 changed |= observer.terminal && !record.token_details.stream_complete;
-                if observer.streaming_output && self.first_output.is_none() {
-                    changed = true;
-                    let first = Instant::now();
+                if let Some(first) = observer.first_output {
+                    changed |= record.first_token_latency_ms.is_none();
                     record.first_token_latency_ms = Some(
-                        first
-                            .duration_since(self.started)
-                            .as_millis()
-                            .min(u64::MAX as u128) as u64,
+                        first.saturating_duration_since(self.started).as_millis() as u64,
                     );
-                    self.first_output = Some(first);
-                }
-                if let Some(first) = self.first_output {
-                    if !record.token_details.stream_complete {
-                        record.generation_ms =
-                            Some(first.elapsed().as_millis().min(u64::MAX as u128) as u64);
-                    }
+                    record.generation_ms = observer.terminal_at.map(|terminal| {
+                        terminal.saturating_duration_since(first).as_millis() as u64
+                    });
                 }
                 if let Some(input) = observer.input {
                     record.input_tokens = input;
@@ -331,13 +324,6 @@ impl Drop for Attempt {
                 }
             }
             record.latency_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            if let Some(first) = self
-                .first_output
-                .filter(|_| !record.token_details.stream_complete)
-            {
-                record.generation_ms =
-                    Some(first.elapsed().as_millis().min(u64::MAX as u128) as u64);
-            }
             self.save_diagnostic(true);
             // Persistence failures cannot justify replaying a billable request.
             // No upstream data or database error is logged here.
@@ -380,7 +366,8 @@ pub(super) struct Observer {
     item_units: HashMap<String, u64>,
     final_units: Option<u64>,
     output_observed: bool,
-    streaming_output: bool,
+    first_output: Option<Instant>,
+    terminal_at: Option<Instant>,
     ids: Vec<String>,
     history_request: Option<HistoryCapture>,
     history_response: Option<Value>,
@@ -427,7 +414,7 @@ impl Observer {
             })
             .unwrap_or_else(|| "0".into())
     }
-    fn value(&mut self, value: &Value) {
+    fn value(&mut self, value: &Value, received_at: Instant) {
         let mut opaque_keys = Vec::new();
         opaque_bindings(value, &mut opaque_keys);
         for key in opaque_keys {
@@ -519,7 +506,7 @@ impl Observer {
                     self.history_invalid = true;
                 }
             } else if snapshot["output"].as_array().is_some_and(Vec::is_empty)
-                && self.streaming_output
+                && self.first_output.is_some()
             {
                 self.history_invalid = true;
             }
@@ -543,8 +530,8 @@ impl Observer {
                     *units = units.saturating_add(text_units(text));
                 }
                 self.output_observed = true;
-                if !text.is_empty() {
-                    self.streaming_output = true;
+                if self.sse && !text.is_empty() && self.terminal_at.is_none() {
+                    self.first_output.get_or_insert(received_at);
                 }
             }
         }
@@ -584,6 +571,9 @@ impl Observer {
         ) || !self.sse
         {
             self.terminal = true;
+            if self.sse {
+                self.terminal_at.get_or_insert(received_at);
+            }
             self.upstream_cost =
                 crate::pricing::response_charge(response).or_else(|| self.upstream_cost.clone());
         }
@@ -630,19 +620,19 @@ impl Observer {
                 .or(self.total);
         }
     }
-    fn event(&mut self) {
+    fn event(&mut self, received_at: Instant) {
         if self.discarding_event {
             self.history_invalid = true;
         }
         if !self.discarding_event {
             if let Ok(value) = serde_json::from_slice::<Value>(&self.data) {
-                self.value(&value);
+                self.value(&value, received_at);
             }
         }
         self.data.clear();
         self.discarding_event = false;
     }
-    fn push(&mut self, bytes: &[u8]) {
+    fn push(&mut self, bytes: &[u8], received_at: Instant) {
         if !self.sse {
             if !self.oversized && self.buffer.len().saturating_add(bytes.len()) <= EVENT_LIMIT {
                 self.buffer.extend_from_slice(bytes);
@@ -661,7 +651,7 @@ impl Observer {
                         self.line.pop();
                     }
                     if self.line.is_empty() {
-                        self.event();
+                        self.event(received_at);
                     } else if let Some(raw) = self.line.strip_prefix(b"data:") {
                         let raw = raw.strip_prefix(b" ").unwrap_or(raw);
                         if self.data.len().saturating_add(raw.len() + 1) <= EVENT_LIMIT {
@@ -692,7 +682,7 @@ impl Observer {
             // An SSE event is dispatched only at its blank-line boundary.
         } else if !self.oversized {
             if let Ok(value) = serde_json::from_slice::<Value>(&self.buffer) {
-                self.value(&value);
+                self.value(&value, Instant::now());
             }
         }
     }
@@ -830,7 +820,7 @@ pub(super) async fn stream_response(
     state: Arc<AppState>,
     source: Source,
     upstream: reqwest::Response,
-    prefix: Vec<Bytes>,
+    prefix: Vec<(Bytes, Instant)>,
     mut attempt: Attempt,
     context: ResponseContext,
     mut route_lease: Option<crate::affinity::RouteLease>,
@@ -934,16 +924,18 @@ pub(super) async fn stream_response(
         let mut route_lease=route_lease;
         let captured_prefix = attempt.captured_prefix;
         let prefix = futures_util::stream::iter(prefix.into_iter().map(Ok));
-        let mut upstream = prefix.chain(upstream.bytes_stream());
+        let mut upstream = prefix.chain(upstream.bytes_stream().map(|result| {
+            result.map(|chunk| (chunk, Instant::now()))
+        }));
         let mut received = 0u64;
         let mut finalized = content_length == Some(0);
         let mut chunk_index = 0usize;
         while let Some(chunk) = upstream.next().await {
             match chunk {
-                Ok(chunk) => {
+                Ok((chunk, received_at)) => {
                     if chunk_index >= captured_prefix { attempt.diagnostic.chunk(&chunk); }
                     chunk_index += 1;
-                    observer.push(&chunk);
+                    observer.push(&chunk, received_at);
                     persist_history(&state, &mut observer).await;
                     bind_ids(&state, &source, &mut observer).await;
                     received = received.saturating_add(chunk.len() as u64);
@@ -1003,15 +995,15 @@ mod observation_tests {
             }),
             ..Default::default()
         };
-        observer.value(&json!({"type":"response.output_item.done","output_index":0,"item":{"role":"assistant","content":"full answer"}}));
-        observer.value(&json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[]}}));
+        observer.value(&json!({"type":"response.output_item.done","output_index":0,"item":{"role":"assistant","content":"full answer"}}), Instant::now());
+        observer.value(&json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[]}}), Instant::now());
         assert_eq!(
             observer.history_response.as_ref().unwrap()["output"][0]["content"],
             "full answer"
         );
         observer.history_response = None;
         observer.history_invalid = true;
-        observer.value(&json!({"type":"response.completed","response":{"id":"r","output":[]}}));
+        observer.value(&json!({"type":"response.completed","response":{"id":"r","output":[]}}), Instant::now());
         assert!(observer.history_response.is_none());
     }
 
@@ -1021,13 +1013,12 @@ mod observation_tests {
             sse: true,
             ..Default::default()
         };
-        observer.value(&json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"abcdefgh"}]}}));
-        observer
-            .value(&json!({"type":"response.output_text.delta","output_index":1,"delta":"你好"}));
+        observer.value(&json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"abcdefgh"}]}}), Instant::now());
+        observer.value(&json!({"type":"response.output_text.delta","output_index":1,"delta":"你好"}), Instant::now());
         assert_eq!(estimated_tokens(observer.output_units()), 4);
-        observer.value(&json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":"你好"}]}}));
+        observer.value(&json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":"你好"}]}}), Instant::now());
         assert_eq!(estimated_tokens(observer.output_units()), 4);
-        observer.value(&json!({"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"abcdefgh"}]},{"type":"message","content":[{"type":"output_text","text":"你好"}]}]}}));
+        observer.value(&json!({"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"abcdefgh"}]},{"type":"message","content":[{"type":"output_text","text":"你好"}]}]}}), Instant::now());
         assert_eq!(estimated_tokens(observer.output_units()), 4);
     }
 
@@ -1041,25 +1032,22 @@ mod observation_tests {
             sse: true,
             ..Default::default()
         };
-        observer.value(
-            &json!({"type":"response.output_text.delta","output_index":0,"delta":"abcdefgh"}),
-        );
+        use std::time::Duration;
+        let start = attempt.started;
+        observer.push(b"data: {\"type\":\"response.output_item.added\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\"}\n\n", start + Duration::from_millis(100));
         attempt.finish("streaming", Some(&observer));
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        observer.value(&json!({"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":2}}}));
+        assert!(state.usage.summary(1).unwrap()["recent"][0]["first_token_latency_ms"].is_null());
+        observer.push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"abcdefgh\"}\n\n", start + Duration::from_secs(2));
         attempt.finish("streaming", Some(&observer));
-        let before = state.usage.summary(1).unwrap();
-        assert_eq!(
-            before["recent"][0]["token_details"]["stream_complete"],
-            true
-        );
-        let generation = before["recent"][0]["generation_ms"].clone();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let during = state.usage.summary(1).unwrap();
-        assert_eq!(during["recent"][0]["generation_ms"], generation);
+        let active = state.usage.summary(1).unwrap();
+        assert_eq!(active["recent"][0]["first_token_latency_ms"], 2000);
+        assert!(active["recent"][0]["output_tps"].is_null());
+        observer.push(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n", start + Duration::from_millis(2020));
         attempt.finish("success", Some(&observer));
+        observer.push(b": trailer\n\n", start + Duration::from_secs(20));
         drop(attempt);
         let final_usage = state.usage.summary(1).unwrap();
-        assert_eq!(final_usage["recent"][0]["generation_ms"], generation);
+        assert_eq!(final_usage["recent"][0]["generation_ms"], 20);
+        assert_eq!(final_usage["recent"][0]["output_tps"], 100.0);
     }
 }

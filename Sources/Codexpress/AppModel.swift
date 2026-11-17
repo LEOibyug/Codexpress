@@ -27,7 +27,9 @@ import ServiceManagement
     @Published private(set) var busy = false
     @Published private(set) var running = false
     @Published private(set) var gatewayVersion: String?
-    @Published private(set) var gatewayUpdateWaiting = false
+    @Published private(set) var installedGatewayUpdate: GatewayExecutable.Update?
+    @Published private var pendingGatewayUpdate: GatewayUpdate?
+    var gatewayUpdateWaiting: Bool { pendingGatewayUpdate != nil }
     @Published private(set) var settingsWindowActive = false
     @Published var loginSource: String?
     @Published var loginFlow: String?
@@ -54,7 +56,11 @@ import ServiceManagement
     let client: GatewayClient
     private var helper: Process?
     private var stagedGateway: URL?
-    private var gatewayUpdateCancelled = false
+    private struct GatewayUpdate {
+        let version: String
+        let process: Process
+        let candidate: URL
+    }
     private var logPipe: Pipe?
     private var timerTask: Task<Void, Never>?
     private var accountTimerTask: Task<Void, Never>?
@@ -90,7 +96,9 @@ import ServiceManagement
     var localModelSettingsNeedsSync: Bool {
         localModelSettingsSyncError != nil || (connectionMode != "unmanaged" && (pendingSync || settings.localCodexAppliedModelSettingsRevision != modelSettingsRevision))
     }
+    var showsLocalModelSettingsWarning: Bool { connectionMode != "official" && localModelSettingsNeedsSync }
     var localModelSettingsStatus: String {
+        if connectionMode == "official" { return "本地 Codex 当前直接连接官方。" }
         if let failure = localModelSettingsSyncError { return "本地 Codex 模型设置待同步：\(failure)" }
         if connectionMode == "unmanaged" { return "本地 Codex 未连接，请先完成接入。" }
         if localModelSettingsNeedsSync { return "模型设置已变更，请手动同步到本地 Codex。" }
@@ -133,11 +141,13 @@ import ServiceManagement
         timerTask = Task { [weak self] in
             var tick = 0
             while !Task.isCancelled {
-                let interval = self?.settingsWindowActive == true || self?.gatewayHasActivity == true ? 1 : 3
+                let interval = self?.settingsWindowActive == true || self?.gatewayHasActivity == true || self?.gatewayUpdateWaiting == true ? 1 : 3
                 try? await Task.sleep(for: .seconds(interval))
                 guard !Task.isCancelled, let self else { break }
                 tick = (tick + 1) % 5
                 await self.poll(refreshCredentials: tick == 0)
+                if tick == 0 { await self.refreshInstalledGatewayUpdate() }
+                await self.applyPendingGatewayUpdateIfIdle()
             }
         }
         accountTimerTask = Task { [weak self] in
@@ -238,72 +248,108 @@ import ServiceManagement
     private var gatewayExecutables: GatewayExecutable {
         GatewayExecutable(directory: directory.appendingPathComponent("gateway-runtime", isDirectory: true))
     }
+    private func refreshInstalledGatewayUpdate() async {
+        let update = gatewayVersion.flatMap { try? GatewayExecutable.installedUpdate(after: $0) }
+        guard update != installedGatewayUpdate else { return }
+        // A bundle being copied may expose its version before its signed contents are ready.
+        if let update, await Task.detached(priority: .utility, operation: {
+            (try? GatewayExecutable.validateInstalledBundle()) != nil
+        }).value {
+            installedGatewayUpdate = update
+        } else {
+            installedGatewayUpdate = nil
+        }
+    }
     func updateGateway() {
+        guard pendingGatewayUpdate == nil else { return }
         perform {
             guard self.running, !self.restarting, let old = self.helper, old.isRunning,
-                  let previous = self.stagedGateway, let currentVersion = self.gatewayVersion,
-                  let currentPort = self.status["port"].number else {
+                  let previous = self.stagedGateway, let currentVersion = self.gatewayVersion else {
                 throw AppError.message("请先启动网关。")
             }
-            let version = try GatewayExecutable.installedVersion()
-            guard version.compare(currentVersion, options: .numeric) == .orderedDescending else {
+            guard let update = try GatewayExecutable.installedUpdate(after: currentVersion) else {
                 self.notice = "当前没有可应用的新版网关。请先替换磁盘上的 Codexpress.app。"
                 return
             }
-            guard version.split(separator: ".").prefix(2).elementsEqual(currentVersion.split(separator: ".").prefix(2)) else {
-                throw AppError.message("此版本需重启 Codexpress 后生效。")
-            }
+            guard !update.requiresRestart else { throw AppError.message("此版本需重启 Codexpress 后生效。") }
+            try GatewayExecutable.validateInstalledBundle()
             let candidate = try self.gatewayExecutables.stage(GatewayExecutable.bundled(), replacing: previous.lastPathComponent == "gateway-a" ? "gateway-b" : "gateway-a")
             try GatewayExecutable.validate(candidate)
-            var requiredEntries: [String] = []
-            for entry in ["chatbot.status", "images.status", "control.status"] {
-                if try await self.client.call(entry)["running"].bool == true { requiredEntries.append(entry) }
+            guard try GatewayExecutable.installedUpdate(after: currentVersion) == update else {
+                throw AppError.message("磁盘上的 Codexpress.app 已变更，请重新应用更新。")
             }
-            self.gatewayUpdateCancelled = false
-            self.gatewayUpdateWaiting = true
-            defer { self.gatewayUpdateWaiting = false; self.restarting = false }
-            while !self.gatewayUpdateCancelled {
-                guard !self.shuttingDown, self.helper === old, old.isRunning else {
-                    throw AppError.message("网关已停止或重新启动，请重新应用更新。")
-                }
-                if self.loginFlow == nil, self.creditResetRequest == nil, self.consuming.subtracting(["all"]).isEmpty {
-                    self.restarting = true
-                    do {
-                        if try await self.client.call("gateway.update.stop_when_idle")["stopping"].bool == true { break }
-                    } catch {
-                        self.restarting = false
-                        if !old.isRunning { await self.startHelper(port: Int(currentPort)) }
-                        throw error
-                    }
-                    self.restarting = false
-                }
-                try await Task.sleep(for: .seconds(1))
-            }
-            guard self.restarting, !self.shuttingDown else { return }
-            self.gatewayUpdateWaiting = false
-            try await self.waitForGatewayExit(old)
-            guard !self.shuttingDown else { return }
-            self.stagedGateway = candidate
-            await self.startHelper(port: Int(currentPort), expectedVersion: version, requiredEntries: requiredEntries)
-            if self.running, !self.pendingSync, self.gatewayVersion == version, self.helper?.isRunning == true {
-                self.restartCount = 0
-                self.notice = "网关已更新至 \(version)。"
-                return
-            }
-            guard !self.shuttingDown else { return }
-            let failure = self.error ?? "新版网关未就绪。"
-            if let failed = self.helper { try await self.waitForGatewayExit(failed, terminate: true) }
-            guard !self.shuttingDown else { return }
-            self.stagedGateway = previous
-            await self.startHelper(port: Int(currentPort), expectedVersion: currentVersion, requiredEntries: requiredEntries)
-            if self.running, !self.pendingSync, self.gatewayVersion == currentVersion, self.helper?.isRunning == true {
-                throw AppError.message("更新失败，已恢复网关 \(currentVersion)：\(failure)")
-            }
-            if let failed = self.helper { try await self.waitForGatewayExit(failed, terminate: true) }
-            throw AppError.message("更新失败，旧网关未能恢复：\(self.error ?? failure)")
+            self.pendingGatewayUpdate = GatewayUpdate(version: update.version, process: old, candidate: candidate)
         }
     }
-    func cancelGatewayUpdate() { gatewayUpdateCancelled = true }
+    func cancelGatewayUpdate() {
+        if !restarting { pendingGatewayUpdate = nil }
+    }
+    private var gatewayUpdateUIIdle: Bool {
+        loginFlow == nil && creditResetRequest == nil && consuming.subtracting(["all"]).isEmpty
+    }
+    private func applyPendingGatewayUpdateIfIdle() async {
+        guard !shuttingDown, let update = pendingGatewayUpdate else { return }
+        guard helper === update.process, update.process.isRunning else {
+            pendingGatewayUpdate = nil
+            error = "网关已停止或重新启动，请重新应用更新。"
+            return
+        }
+        guard running, !busy, !restarting, !startInProgress, gatewayUpdateUIIdle,
+              status["inflight"].number == 0, let currentPort = status["port"].number,
+              let previous = stagedGateway, let currentVersion = gatewayVersion else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            var requiredEntries: [String] = []
+            for entry in ["chatbot.status", "images.status", "control.status"] {
+                if try await client.call(entry)["running"].bool == true { requiredEntries.append(entry) }
+            }
+            guard !shuttingDown, pendingGatewayUpdate != nil, gatewayUpdateUIIdle else { return }
+            guard helper === update.process, update.process.isRunning else {
+                throw AppError.message("网关已停止或重新启动，请重新应用更新。")
+            }
+            restarting = true
+            defer { restarting = false }
+            do {
+                guard let stopping = try await client.call("gateway.update.stop_when_idle")["stopping"].bool else {
+                    throw AppError.message("无法确认网关是否已空闲。")
+                }
+                guard stopping else { return }
+            } catch {
+                if !update.process.isRunning { await startHelper(port: Int(currentPort)) }
+                throw error
+            }
+            pendingGatewayUpdate = nil
+            guard !shuttingDown else { return }
+            try await waitForGatewayExit(update.process)
+            guard !shuttingDown else { return }
+            try await switchGateway(to: update, replacing: previous, version: currentVersion, port: Int(currentPort), requiredEntries: requiredEntries)
+        } catch {
+            pendingGatewayUpdate = nil
+            if !shuttingDown { self.error = error.localizedDescription }
+        }
+    }
+    private func switchGateway(to update: GatewayUpdate, replacing previous: URL, version currentVersion: String, port: Int, requiredEntries: [String]) async throws {
+        stagedGateway = update.candidate
+        await startHelper(port: port, expectedVersion: update.version, requiredEntries: requiredEntries)
+        if running, !pendingSync, gatewayVersion == update.version, helper?.isRunning == true {
+            restartCount = 0
+            notice = "网关已更新至 \(update.version)。"
+            installedGatewayUpdate = nil
+            return
+        }
+        guard !shuttingDown else { return }
+        let failure = error ?? "新版网关未就绪。"
+        stagedGateway = previous
+        if let failed = helper { try await waitForGatewayExit(failed, terminate: true) }
+        guard !shuttingDown else { return }
+        await startHelper(port: port, expectedVersion: currentVersion, requiredEntries: requiredEntries)
+        if running, !pendingSync, gatewayVersion == currentVersion, helper?.isRunning == true {
+            throw AppError.message("更新失败，已恢复网关 \(currentVersion)：\(failure)")
+        }
+        if let failed = helper { try await waitForGatewayExit(failed, terminate: true) }
+        throw AppError.message("更新失败，旧网关未能恢复：\(error ?? failure)")
+    }
     private func waitForGatewayExit(_ process: Process, terminate: Bool = false) async throws {
         if terminate && process.isRunning { process.terminate() }
         for _ in 0..<30 where process.isRunning { try await Task.sleep(for: .milliseconds(100)) }
@@ -925,7 +971,8 @@ import ServiceManagement
         } catch {
             throw AppError.message("模型设置已保存在本机，但同步网关失败：\(error.localizedDescription) 请保留当前选择并重试保存。")
         }
-        notice = "模型设置已保存，OMP 会自动同步预算；本地和远端 Codex 请在接入页手动同步。聊天客户端请刷新模型列表。"
+        let codexSyncNote = connectionMode == "official" ? "远端 Codex 请在接入页手动同步。" : "本地和远端 Codex 请在接入页手动同步。"
+        notice = "模型设置已保存，OMP 会自动同步预算。\(codexSyncNote)聊天客户端请刷新模型列表。"
     }
     func retryLocalModelSettingsSync() {
         perform {

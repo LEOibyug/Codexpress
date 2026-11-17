@@ -1,4 +1,4 @@
-use super::{grouping, requests::RECORD_COLUMNS, Ingress, StoreData};
+use super::{analytics::rate_sums, grouping, requests::RECORD_COLUMNS, Ingress, StoreData};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -48,19 +48,18 @@ pub(super) fn build(
 }
 
 fn load_groups(connection: &Connection, since: u64) -> Result<Vec<Value>> {
-    let mut grouped = connection.prepare(r#"SELECT source_id,
+    let [timed_tokens, generation_ms, throughput_tokens, throughput_ms] = rate_sums();
+    let mut grouped = connection.prepare(&format!(r#"SELECT source_id,
         (SELECT latest.source_name FROM usage AS latest WHERE latest.source_id=usage.source_id ORDER BY latest.attempt DESC LIMIT 1),
         COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cached_input_tokens), SUM(complete=0), SUM(status!='success'),
         SUM(COALESCE(json_extract(metadata,'$.token_details.input_estimated'),0) OR COALESCE(json_extract(metadata,'$.token_details.output_estimated'),0)),
         SUM(json_extract(metadata,'$.token_details.reasoning_output_tokens')), SUM(status='success'), SUM(latency_ms),
         SUM(json_extract(metadata,'$.first_token_latency_ms')), COUNT(json_extract(metadata,'$.first_token_latency_ms')),
-        SUM(CASE WHEN status='success' AND json_extract(metadata,'$.generation_ms')>0 THEN output_tokens ELSE 0 END),
-        SUM(CASE WHEN status='success' AND json_extract(metadata,'$.generation_ms')>0 THEN json_extract(metadata,'$.generation_ms') ELSE 0 END),
+        {timed_tokens}, {generation_ms},
         SUM(CASE WHEN (json_extract(metadata,'$.token_details.cached_input_reported')=1 AND json_extract(metadata,'$.token_details.input_estimated')=0) OR (json_extract(metadata,'$.token_details') IS NULL AND cached_input_tokens>0) THEN input_tokens ELSE 0 END),
         SUM(CASE WHEN (json_extract(metadata,'$.token_details.cached_input_reported')=1 AND json_extract(metadata,'$.token_details.input_estimated')=0) OR (json_extract(metadata,'$.token_details') IS NULL AND cached_input_tokens>0) THEN cached_input_tokens ELSE 0 END), model,
-        SUM(CASE WHEN status='success' AND latency_ms>0 AND (json_extract(metadata,'$.token_details.output_available')=1 OR complete=1) THEN output_tokens ELSE 0 END),
-        SUM(CASE WHEN status='success' AND latency_ms>0 AND (json_extract(metadata,'$.token_details.output_available')=1 OR complete=1) THEN latency_ms ELSE 0 END)
-        FROM usage WHERE started_at>=?1 GROUP BY source_id,model ORDER BY source_id,model"#)?;
+        {throughput_tokens}, {throughput_ms}
+        FROM usage WHERE started_at>=?1 GROUP BY source_id,model ORDER BY source_id,model"#))?;
     let mut rows = grouped.query_map([since], |r| Ok(json!({"source_id":r.get::<_, String>(0)?,"source_name":r.get::<_, String>(1)?,"requests":r.get::<_,u64>(2)?,"input_tokens":r.get::<_,u64>(3)?,"output_tokens":r.get::<_,u64>(4)?,"cached_input_tokens":r.get::<_,u64>(5)?,"incomplete_requests":r.get::<_,u64>(6)?,"failures":r.get::<_,u64>(7)?,"estimated_requests":r.get::<_,u64>(8)?,"reasoning_output_tokens":r.get::<_,Option<u64>>(9)?,"successes":r.get::<_,u64>(10)?,"total_latency_ms":r.get::<_,u64>(11)?,"total_first_token_ms":r.get::<_,Option<u64>>(12)?,"first_token_samples":r.get::<_,u64>(13)?,"timed_output_tokens":r.get::<_,u64>(14)?,"total_generation_ms":r.get::<_,u64>(15)?,"cached_reported_input_tokens":r.get::<_,u64>(16)?,"cached_reported_tokens":r.get::<_,u64>(17)?,"active_requests":0,"model":r.get::<_,String>(18)?,"throughput_output_tokens":r.get::<_,u64>(19)?,"throughput_latency_ms":r.get::<_,u64>(20)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let sums = COST_FIELDS
         .iter()
@@ -120,16 +119,7 @@ fn active_records(data: &StoreData, since: u64) -> Vec<Value> {
             let mut value = serde_json::to_value(record).expect("serializable usage metadata");
             value["active"] = json!(true);
             value["latency_ms"] = json!(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
-            if let Some(first) = record
-                .first_token_latency_ms
-                .filter(|_| !record.token_details.stream_complete)
-            {
-                value["generation_ms"] = json!(
-                    started.elapsed().as_millis().min(u64::MAX as u128) as u64
-                        - first.min(started.elapsed().as_millis() as u64)
-                );
-            }
-            add_rate(&mut value);
+            add_rate(&mut value, false);
             value["cost"] = crate::pricing::estimate(&value, false);
             value
         })
@@ -216,7 +206,8 @@ pub(super) fn stored_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     let details=metadata.get("token_details").cloned().unwrap_or_else(||json!({"output_available":complete || r.get::<_,u64>(8).unwrap_or(0)>0,"input_available":complete || r.get::<_,u64>(7).unwrap_or(0)>0,"cached_input_reported":r.get::<_,u64>(9).unwrap_or(0)>0,"legacy":true}));
     let mut record = json!({"attempt_id":metadata.get("attempt_id").cloned().unwrap_or_else(||json!(format!("legacy:{}",r.get::<_,i64>(0).unwrap_or(0)))),"request_id":r.get::<_,String>(1)?,"source_id":r.get::<_,String>(2)?,"source_name":r.get::<_,String>(3)?,"model":r.get::<_,String>(4)?,"started_at":r.get::<_,u64>(5)?,"status":r.get::<_,String>(6)?,"input_tokens":r.get::<_,u64>(7)?,"output_tokens":r.get::<_,u64>(8)?,"cached_input_tokens":r.get::<_,u64>(9)?,"complete":complete,"latency_ms":r.get::<_,u64>(11)?,"token_details":details,"active":false,"first_token_latency_ms":metadata["first_token_latency_ms"],"generation_ms":metadata["generation_ms"],"cost":metadata["cost"]});
     record["ingress"] = json!(metadata["ingress"].as_str().and_then(Ingress::parse).unwrap_or_default());
-    add_rate(&mut record);
+    let legacy_timing = metadata["generation_timing_version"].as_u64().unwrap_or(0) < 1;
+    add_rate(&mut record, legacy_timing);
     Ok(record)
 }
 
@@ -226,18 +217,23 @@ pub(super) fn stored_record_with_ingress(r: &rusqlite::Row<'_>) -> rusqlite::Res
     Ok(record)
 }
 
-pub(super) fn add_rate(record: &mut Value) {
-    let duration = record["generation_ms"].as_u64().unwrap_or(0);
-    record["generation_tps"] =
-        if duration > 0 && record["token_details"]["output_available"] == true {
-            json!(record["output_tokens"].as_f64().unwrap_or(0.0) * 1000.0 / duration as f64)
-        } else {
-            Value::Null
-        };
-    let elapsed = record["latency_ms"].as_u64().unwrap_or(0);
-    record["output_tps"] = if elapsed > 0 && record["token_details"]["output_available"] == true {
-        json!(record["output_tokens"].as_f64().unwrap_or(0.0) * 1000.0 / elapsed as f64)
-    } else {
-        Value::Null
+pub(super) fn add_rate(record: &mut Value, legacy_timing: bool) {
+    let trusted_timing = !legacy_timing || record["token_details"]["stream_complete"] == true;
+    if !trusted_timing {
+        record["generation_ms"] = Value::Null;
+    }
+    let duration = record["generation_ms"].as_u64().filter(|&ms| ms > 0);
+    let output_available = record["token_details"]["output_available"]
+        .as_bool()
+        .unwrap_or(record["complete"] == true);
+    let output = record["output_tokens"].as_f64().filter(|_| {
+        output_available && (legacy_timing || record["token_details"]["output_estimated"] == false)
+    });
+    let rate = |duration: Option<u64>| {
+        json!(output.zip(duration).map(|(tokens, ms)| tokens * 1000.0 / ms as f64))
     };
+    record["generation_tps"] = rate(duration);
+    record["output_tps"] = rate(duration.or_else(|| {
+        record["latency_ms"].as_u64().filter(|&ms| legacy_timing && ms > 0)
+    }));
 }

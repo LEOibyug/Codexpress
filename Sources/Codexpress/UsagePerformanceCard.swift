@@ -35,7 +35,8 @@ struct UsagePerformanceCard: View {
                 }.labelsHidden().controlSize(.regular).frame(maxWidth: 160)
             }
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), alignment: .leading), count: 2), alignment: .leading, spacing: 22) {
-                metric("平均输出速度", value: usageRate(totals.tps, estimated: totals.estimated) + " TPS")
+                metric("输出速度", value: totals.tps.map { usageRate($0) + " TPS" } ?? "—")
+                    .help("按首个输出 Token 到生成结束的耗时计算。没有生成计时的旧记录沿用请求总耗时。")
                 metric("缓存命中率", value: totals.cacheRate.map { String(format: "%.1f%%", $0) } ?? "—")
                 metric("首 Token · P50", value: usageSeconds(data["performance"]["p50_first_token_ms"].number), detail: "P95 " + usageSeconds(data["performance"]["p95_first_token_ms"].number))
                 metric("请求耗时 · P50", value: usageSeconds(data["performance"]["p50_latency_ms"].number), detail: "P95 " + usageSeconds(data["performance"]["p95_latency_ms"].number))

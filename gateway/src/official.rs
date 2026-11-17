@@ -838,9 +838,12 @@ async fn confirm_with_endpoints(state: &Arc<AppState>, expected: &Source, endpoi
     Ok(())
 }
 
+#[cfg(test)]
+#[path = "official/tests.rs"]
+mod tests;
+
 // Test-only endpoint injection never exists in the production library or management IPC.
 #[cfg(test)]
-#[allow(dead_code)] // Private seam is exercised by the separate #[path] integration test crate.
 pub(crate) mod fixture {
     use super::*;
     pub(crate) fn parse_quota(value: &Value) -> Result<Value> {

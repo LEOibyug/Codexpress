@@ -174,12 +174,13 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
         )),
         "usage.reconcile.status" => Ok(crate::balance::billing::status(state)),
         "sync" => sync::handle(state, payload).await,
-        "usage.analytics" | "usage.requests" | "usage.detail" => {
+        "usage.analytics" | "usage.requests" | "usage.detail" | "usage.models" => {
             let usage = state.usage.clone();
             let operation = op.to_owned();
             tokio::task::spawn_blocking(move || match operation.as_str() {
                 "usage.analytics" => usage.analytics(&payload),
                 "usage.requests" => usage.requests(&payload),
+                "usage.models" => usage.models(),
                 _ => usage.detail(&payload),
             })
             .await

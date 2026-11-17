@@ -47,7 +47,7 @@
         <div id="kpis" class="kpi-grid"></div>
         <section class="card"><div class="card-heading"><div><h2 id="daily-title">每日请求走势</h2><p id="daily-note" class="hint">本地日历日 · 请求次数（含进行中）</p></div><span id="daily-summary" class="hint"></span></div><div id="daily-chart" class="chart" role="img" aria-label="每日请求次数图"></div><details><summary id="daily-table-title">每日完整数据表</summary><div id="daily-table" class="table-scroll"></div></details></section>
         <section class="card"><div class="card-heading"><div><h2>来源 × 模型</h2><p class="hint">当前筛选范围的分组统计。</p></div></div><div id="groups" class="table-scroll"></div></section>
-        <details class="card"><summary>统计口径与本地网关状态</summary><p class="hint">成功率 = 成功 / 已结束请求；加权输出 TPS = 有效成功样本输出 token / 对应请求总耗时（秒），包含首 token 等待。TTFT 为首 token 延迟。缓存命中率仅使用明确报告缓存量、且输入未估算的样本；推理 token 属于输出 token，不额外累加。费用为已知部分 USD；上游账单与按价格估算的条数分别显示，缺失不代表免费。</p><div id="status-details"></div></details>
+        <details class="card"><summary>统计口径与本地网关状态</summary><p class="hint">成功率 = 成功 / 已结束请求。加权生成 TPS = 有效成功样本的输出 token 总量 / 对应计时之和（秒）。从首个输出 token 计到生成结束；旧记录缺少可靠生成计时时使用完整耗时。新记录缺少有效计时或确切输出 token 数时不计入。TTFT 为首 token 延迟。缓存命中率仅统计报告了缓存量且未估算输入的样本；推理 token 已计入输出。费用只显示已知的 USD 金额，缺失不代表免费。</p><div id="status-details"></div></details>
       </section>
 
       <section id="panel-requests" role="tabpanel" aria-labelledby="tab-requests" hidden>

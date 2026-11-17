@@ -28,26 +28,18 @@ struct SettingsView: View {
         NavigationSplitView {
             VStack(spacing: 0) {
                 List(selection: $page) {
-                    Section {
+                    Section("工作台") {
                         ForEach([SettingsPage.overview, .sources, .models, .usage]) { navigationItem($0) }
                     }
-                    Section {
+                    Section("配置") {
                         navigationItem(.connections)
                         navigationItem(.general)
                     }
                 }.listStyle(.sidebar).scrollContentBackground(.hidden)
-                    .padding(.top, 10)
+                    .padding(.top, 6)
 
-                VStack(alignment: .leading, spacing: 10) {
-                    Divider()
-                    HStack(spacing: 8) {
-                        ActivityDot(color: model.running ? .green : .orange, active: model.gatewayHasActivity)
-                        Text(model.running ? "网关运行中" : "网关未连接").font(.system(size: 12))
-                        Spacer(minLength: 0)
-                    }
-                    Text("端口 \(model.settings.port)").font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
-                }.frame(maxWidth: .infinity, alignment: .leading).padding(16)
-            }.navigationSplitViewColumnWidth(min: 190, ideal: 206, max: 230)
+                gatewayFooter
+            }.navigationSplitViewColumnWidth(min: 180, ideal: 194, max: 218)
         } detail: {
             VStack(spacing: 0) {
                 notices
@@ -62,12 +54,11 @@ struct SettingsView: View {
                     }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }.background(AppPalette.canvas)
+                .overlay(alignment: .bottomTrailing) { AppFeedbackOverlay() }
         }.navigationSplitViewStyle(.balanced)
-            .toolbarBackground(AppPalette.canvas, for: .windowToolbar)
-            .toolbarBackground(.visible, for: .windowToolbar)
+            .background(AppPalette.canvas)
             .font(AppTypography.body).frame(minWidth: 960, minHeight: 700)
             .environment(\.windowIsActive, model.settingsWindowActive)
-            .overlay(alignment: .bottomLeading) { AppFeedbackOverlay() }
             .sheet(item: $model.creditResetRequest, onDismiss: { model.controlResetDismissed() }) { request in
                 ResetCreditsSheet(request: request).environmentObject(model)
             }
@@ -76,12 +67,33 @@ struct SettingsView: View {
             }
     }
 
+    private var gatewayFooter: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                ActivityDot(color: model.running ? .green : .orange, active: model.gatewayHasActivity)
+                Text(model.running ? "网关运行中" : "网关未连接").font(AppTypography.caption.weight(.medium))
+                Spacer(minLength: 0)
+            }
+            if let port = model.status["port"].number, model.running {
+                Text("端口 \(Int(port).formatted(.number.grouping(.never)))").monospacedDigit().foregroundStyle(.secondary)
+            }
+            if model.installedGatewayUpdate != nil && page != .general {
+                Button { page = .general } label: {
+                    Label("有可用更新", systemImage: "arrow.down.circle")
+                }.buttonStyle(.plain).foregroundStyle(Color.accentColor)
+            }
+        }.font(AppTypography.small)
+            .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+            .background(AppPalette.well, in: RoundedRectangle(cornerRadius: 9))
+            .padding(.horizontal, 12).padding(.vertical, 14)
+    }
+
     private func navigationItem(_ item: SettingsPage) -> some View {
         Label {
             Text(item.rawValue).font(.system(size: 13, weight: page == item ? .medium : .regular))
         } icon: {
             Image(systemName: item.symbol).font(.system(size: 14)).frame(width: 20)
-        }.padding(.vertical, 4).tag(item)
+        }.padding(.vertical, 5).tag(item)
     }
 
     @ViewBuilder private var notices: some View {
@@ -91,20 +103,19 @@ struct SettingsView: View {
                     banner("来源文件无法读取，已进入只读保护。请从备份修复 sources.json 后重启。", symbol: "lock.shield", color: .orange)
                 }
                 if model.pendingSync {
-                    banner("配置尚未应用到网关，当前路由仍使用上次设置。请重试启动。", symbol: "arrow.triangle.2.circlepath", color: .orange)
+                    HStack(spacing: 8) {
+                        banner("配置尚未应用到网关，当前仍使用上次设置。", symbol: "arrow.triangle.2.circlepath", color: .orange)
+                        Button("重试同步") { model.retry() }.disabled(model.busy)
+                    }
                 }
             }.padding(.horizontal, AppMetrics.pageInset).padding(.top, 18).frame(minWidth: 700, maxWidth: 1120)
         }
     }
 
-    private func banner(_ text: String, symbol: String, color: Color, dismiss: (() -> Void)? = nil) -> some View {
+    private func banner(_ text: String, symbol: String, color: Color) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: symbol).foregroundStyle(color)
             Text(text).font(.system(size: 12)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-            if let dismiss {
-                Button(action: dismiss) { Image(systemName: "xmark").font(.system(size: 10, weight: .medium)) }
-                    .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("关闭提示")
-            }
-        }.padding(12).background(color.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        }.padding(11).background(color.opacity(0.09), in: RoundedRectangle(cornerRadius: 9))
     }
 }

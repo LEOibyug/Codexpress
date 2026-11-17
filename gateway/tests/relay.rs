@@ -283,13 +283,15 @@ async fn live_usage_estimates_stream_then_replaces_with_reported_tokens_without_
         );
         let duration = recent["generation_ms"].as_f64().unwrap();
         assert!(duration >= 20.0);
-        let expected_tps = recent["output_tokens"].as_f64().unwrap() * 1000.0
-            / recent["latency_ms"].as_f64().unwrap();
-        assert!((recent["output_tps"].as_f64().unwrap() - expected_tps).abs() < 0.001);
-        assert_eq!(
-            final_usage["rows"][0]["timed_output_tokens"],
-            recent["output_tokens"]
-        );
+        if reported {
+            assert_eq!(recent["output_tps"], json!(20_000.0 / duration));
+            assert_eq!(final_usage["rows"][0]["throughput_latency_ms"], recent["generation_ms"]);
+            assert_eq!(final_usage["rows"][0]["throughput_output_tokens"], 20);
+        } else {
+            assert!(recent["output_tps"].is_null());
+            assert_eq!(final_usage["rows"][0]["throughput_latency_ms"], 0);
+            assert_eq!(final_usage["rows"][0]["throughput_output_tokens"], 0);
+        }
         task.abort();
     }
 }
@@ -314,6 +316,7 @@ async fn partial_usage_keeps_reported_zero_and_estimates_only_missing_input() {
     assert_eq!(row["token_details"]["reasoning_output_tokens"], 0);
     assert_eq!(row["token_details"]["cached_input_reported"], true);
     assert!(row["generation_tps"].is_null());
+    assert!(row["output_tps"].is_null());
     task.abort();
 }
 

@@ -2,83 +2,122 @@ import SwiftUI
 
 struct GeneralSettingsView: View {
     @EnvironmentObject var model: AppModel
-    @State private var port = 17863
+    @State private var port = "17863"
     @State private var officialQuotaMinutes = "30"
 
-    private var preferencesChanged: Bool { port != model.settings.port }
+    private var preferencesChanged: Bool { port != String(model.settings.port) }
+    private var validPort: Int? { Int(port).flatMap { (1024...65535).contains($0) ? $0 : nil } }
+    private var validQuotaInterval: Bool { Int(officialQuotaMinutes.trimmingCharacters(in: .whitespacesAndNewlines)).map { $0 > 0 } ?? false }
+    private var canSavePreferences: Bool { !model.busy && !model.metadataLoadFailed }
     private var officialQuotaIntervalChanged: Bool { officialQuotaMinutes != String(model.settings.officialQuotaRefreshInterval) }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                PageHeading("设置")
+                PageHeading("设置", subtitle: "管理应用启动、本机网关和后台查询。")
+                appCard
                 gatewayCard
+                quotaCard
                 CredentialStorageView()
                 HistoryCacheView()
             }.settingsPage()
         }.onAppear {
-            port = model.settings.port
+            port = String(model.settings.port)
             officialQuotaMinutes = String(model.settings.officialQuotaRefreshInterval)
         }
-            .onChange(of: model.settings.port) { _, value in port = value }
+            .onChange(of: model.settings.port) { _, value in port = String(value) }
             .onChange(of: model.settings.officialQuotaRefreshInterval) { _, value in officialQuotaMinutes = String(value) }
     }
 
-    private var gatewayCard: some View {
-        SettingsCard("应用与网关", symbol: "network", accessory: {
-            StatusPill(text: model.running ? "运行中" : "未连接", color: model.running ? .green : .orange)
-        }) {
-            VStack(alignment: .leading, spacing: 16) {
-                SettingRow(title: "监听端口") {
-                    HStack(spacing: 8) {
-                        TextField("端口", value: $port, format: .number.grouping(.never))
-                            .font(.system(size: 13, design: .monospaced)).multilineTextAlignment(.trailing).settingsField().frame(width: 120)
-                            .onSubmit { if preferencesChanged { model.savePreferences(port: port, codexHome: model.settings.codexHome) } }
-                        if !model.running { Button("重试") { model.retry() } }
-                        Button("应用端口") { model.savePreferences(port: port, codexHome: model.settings.codexHome) }
-                            .disabled(model.busy || model.metadataLoadFailed || !preferencesChanged)
-                    }
-                }
-                Divider().overlay(AppPalette.border)
-                SettingRow(title: "官方额度后台查询间隔（分钟）") {
-                    HStack(spacing: 8) {
-                        TextField("30", text: $officialQuotaMinutes)
-                            .font(.system(size: 13, design: .monospaced)).multilineTextAlignment(.trailing).settingsField().frame(width: 120)
-                            .accessibilityLabel("官方额度后台查询间隔（分钟）")
-                            .onSubmit { if officialQuotaIntervalChanged { model.saveOfficialQuotaRefresh(minutes: officialQuotaMinutes) } }
-                        Button("保存间隔") { model.saveOfficialQuotaRefresh(minutes: officialQuotaMinutes) }
-                            .disabled(model.busy || model.metadataLoadFailed || !officialQuotaIntervalChanged)
-                    }
-                }
-                Text("正整数分钟，保存后立即生效；仅调整官方账户后台查询，API 余额仍每 30 分钟查询。前台和手动刷新不受此间隔限制，失败重试仍遵循退避。")
-                    .font(.caption).foregroundStyle(.secondary)
-                Divider().overlay(AppPalette.border)
-                SettingRow(title: "登录时启动") {
-                    Toggle("登录时启动 Codexpress", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
-                        .toggleStyle(.switch).labelsHidden()
-                }
-                LabeledContent("网关地址") {
-                    Text(model.baseURL).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
-                }.foregroundStyle(.secondary)
-                if let version = model.gatewayVersion {
-                    SettingRow(title: "网关版本") {
-                        HStack(spacing: 10) {
-                            Text(version).monospacedDigit().foregroundStyle(.secondary)
-                            if model.gatewayUpdateWaiting {
-                                Button("取消等待") { model.cancelGatewayUpdate() }
-                            } else {
-                                Button("空闲后更新网关") { model.updateGateway() }
-                                    .disabled(model.busy || !model.running)
-                            }
-                        }
-                    }
-                    if model.gatewayUpdateWaiting {
-                        InfoNote(text: "正在等待请求和后台操作结束。", symbol: "clock")
-                    }
-                }
-                if model.portNeedsRestart { InfoNote(text: "端口已保存，重启 Codexpress 后生效。", symbol: "arrow.clockwise", color: .orange) }
+    private var appCard: some View {
+        SettingsCard("Codexpress", symbol: "app.badge") {
+            SettingRow(title: "登录时启动") {
+                Toggle("登录时启动 Codexpress", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
+                    .toggleStyle(.switch).labelsHidden()
             }
         }
     }
 
+    private var gatewayCard: some View {
+        SettingsCard("本机网关", symbol: "network", accessory: {
+            StatusPill(text: model.running ? "运行中" : "未连接", color: model.running ? .green : .orange, active: model.gatewayHasActivity)
+        }) {
+            VStack(alignment: .leading, spacing: 16) {
+                SettingRow(title: "监听端口", subtitle: "保存后重启 Codexpress 生效。") {
+                    HStack(spacing: 8) {
+                        TextField("端口", text: $port)
+                            .font(.system(size: 13, design: .monospaced)).multilineTextAlignment(.trailing).settingsField().frame(width: 100)
+                            .onSubmit(savePort)
+                        Button("保存端口", action: savePort)
+                            .disabled(!canSavePreferences || !preferencesChanged || validPort == nil)
+                    }
+                }
+                if preferencesChanged && validPort == nil {
+                    InfoNote(text: "请输入 1024–65535 之间的整数。", symbol: "exclamationmark.triangle", color: .orange)
+                }
+                if model.portNeedsRestart {
+                    InfoNote(text: "新端口已保存，重启前继续使用当前地址。", symbol: "arrow.clockwise", color: .orange)
+                }
+                if model.running {
+                    LabeledContent("当前地址") {
+                        Text(model.baseURL).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
+                    }.foregroundStyle(.secondary)
+                } else {
+                    SettingRow(title: "网关尚未运行", subtitle: "启动后才能处理本机请求。") {
+                        Button("重试启动") { model.retry() }.buttonStyle(.borderedProminent).disabled(model.busy)
+                    }
+                }
+                if model.gatewayUpdateWaiting {
+                    Divider()
+                    SettingRow(title: "等待网关空闲", subtitle: "请求和后台操作结束后开始更新。") {
+                        Button("取消等待") { model.cancelGatewayUpdate() }
+                    }
+                } else if let update = model.installedGatewayUpdate {
+                    Divider()
+                    if update.requiresRestart {
+                        InfoNote(text: "已检测到 Codexpress \(update.version)，重启应用后生效。", symbol: "arrow.clockwise", color: .orange)
+                    } else {
+                        SettingRow(title: "网关 \(update.version) 可用", subtitle: model.gatewayVersion.map { "当前版本 \($0)。可在网关空闲后手动切换。" } ?? "可在网关空闲后手动切换。") {
+                            if model.running {
+                                Button("空闲后更新网关") { model.updateGateway() }
+                                    .buttonStyle(.borderedProminent).disabled(model.busy)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var quotaCard: some View {
+        SettingsCard("官方额度", symbol: "clock") {
+            SettingRow(title: "后台查询间隔", subtitle: "保存后立即生效，不影响前台或手动刷新。") {
+                HStack(spacing: 8) {
+                    TextField("分钟数", text: $officialQuotaMinutes)
+                        .font(.system(size: 13, design: .monospaced)).multilineTextAlignment(.trailing).settingsField().frame(width: 80)
+                        .accessibilityLabel("官方额度后台查询间隔（分钟）")
+                        .onSubmit(saveQuotaInterval)
+                    Text("分钟").foregroundStyle(.secondary)
+                    Button("保存间隔", action: saveQuotaInterval)
+                        .disabled(!canSavePreferences || !officialQuotaIntervalChanged || !validQuotaInterval)
+                }
+            }
+            if officialQuotaIntervalChanged && !validQuotaInterval {
+                InfoNote(text: "请输入大于 0 的整数分钟。", symbol: "exclamationmark.triangle", color: .orange)
+            } else {
+                Text("API 余额仍每 30 分钟查询。查询失败时会延迟重试。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func savePort() {
+        guard canSavePreferences, preferencesChanged, let value = validPort else { return }
+        model.savePreferences(port: value, codexHome: model.settings.codexHome)
+    }
+
+    private func saveQuotaInterval() {
+        guard canSavePreferences, officialQuotaIntervalChanged, validQuotaInterval else { return }
+        model.saveOfficialQuotaRefresh(minutes: officialQuotaMinutes)
+    }
 }

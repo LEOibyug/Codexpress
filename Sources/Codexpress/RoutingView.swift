@@ -11,7 +11,7 @@ struct RoutingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: AppMetrics.sectionSpacing) {
-                PageHeading("分配策略")
+                PageHeading("分配策略", subtitle: "设置来源选择和失败重试。更改后自动应用，无需另行保存。")
                 SettingsCard("分配方式", symbol: "arrow.triangle.branch") {
                     SettingRow(title: "路由模式", subtitle: enabledSources.isEmpty ? "启用至少一个来源后可固定分配。" : nil) {
                         Picker("路由模式", selection: Binding(get: { model.routingMode }, set: { model.changeRouting(mode: $0, fixed: preferredFixedSourceID) })) {
@@ -28,7 +28,7 @@ struct RoutingView: View {
                             }.labelsHidden().frame(width: 230).disabled(model.busy)
                         }
                     } else {
-                        SettingRow(title: "负载均衡") {
+                        SettingRow(title: "负载均衡", subtitle: "按来源余量分配请求。") {
                             Toggle("负载均衡", isOn: Binding(get: { model.settings.loadBalanceEnabled }, set: { model.changeLoadBalance($0) }))
                                 .labelsHidden().toggleStyle(.switch).controlSize(.small).disabled(model.busy)
                         }
@@ -62,8 +62,8 @@ struct RoutingView: View {
                     }
                 }.disabled(model.busy)
                 SettingsCard("对话接续", symbol: "arrow.triangle.2.circlepath") {
-                    SettingRow(title: "来源粘性", subtitle: model.routingMode == "fixed" ? "固定来源时使用所选来源。" : model.settings.loadBalanceEnabled ? "负载均衡按各来源余量分配。" : nil) {
-                        Picker("粘性保持时间", selection: Binding(get: { model.settings.idleReturnDelay }, set: { model.changeIdleReturnDelay($0) })) {
+                    SettingRow(title: "空闲后回切", subtitle: model.routingMode == "fixed" ? "固定来源时使用所选来源。" : model.settings.loadBalanceEnabled ? "负载均衡按各来源余量分配。" : "对话空闲达到所选时长后，可回到优先来源。") {
+                        Picker("空闲后回切", selection: Binding(get: { model.settings.idleReturnDelay }, set: { model.changeIdleReturnDelay($0) })) {
                             Text("5 分钟").tag(5)
                             Text("10 分钟").tag(10)
                             Text("15 分钟").tag(15)
@@ -80,8 +80,10 @@ struct RoutingView: View {
                             .disabled(model.busy || model.routingMode == "fixed" || model.settings.loadBalanceEnabled)
                     }
                     Divider()
-                    Toggle("无法续接时移除加密块并重建上下文", isOn: Binding(get: { model.settings.degradedContextFallback ?? true }, set: { model.changeContextFallback($0) }))
-                        .disabled(model.busy)
+                    SettingRow(title: "允许重建上下文", subtitle: "无法续接时移除加密块，然后重建上下文。") {
+                        Toggle("允许重建上下文", isOn: Binding(get: { model.settings.degradedContextFallback ?? true }, set: { model.changeContextFallback($0) }))
+                            .labelsHidden().toggleStyle(.switch).controlSize(.small).disabled(model.busy)
+                    }
                 }
             }.settingsPage().disabled(!model.running || model.metadataLoadFailed)
         }

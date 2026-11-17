@@ -241,6 +241,10 @@
     }
     return result;
   }
+  function weightedTps(row) {
+    return row.throughput_latency_ms > 0 && isNumber(row.throughput_output_tokens)
+      ? row.throughput_output_tokens * 1000 / row.throughput_latency_ms : null;
+  }
   function kpi(label, value, note) {
     const card = node('div', 'kpi');
     card.append(node('p', 'kpi-label', label), node('p', 'kpi-value', value), node('p', 'kpi-note', note));
@@ -249,7 +253,6 @@
   function renderOverviewMetrics(groups, p) {
     const t = totals(groups);
     const ended = (t.requests || 0) - (t.active_requests || 0);
-    const tps = t.throughput_latency_ms > 0 ? t.throughput_output_tokens / (t.throughput_latency_ms / 1000) : null;
     $('kpis').replaceChildren(
       kpi('请求总数', n(t.requests), '整个筛选窗口 · 按尝试计数'),
       kpi('成功率', pct(t.successes, ended), n(t.successes) + ' 成功 / ' + n(ended) + ' 已结束'),
@@ -260,7 +263,7 @@
       kpi('输出 token', n(t.output_tokens), '已知输出；不重复累加推理 token'),
       kpi('缓存输入 token', n(t.cached_input_tokens), '记录的缓存量；未报告不等于未命中'),
       kpi('推理 token', n(t.reasoning_output_tokens), '仅统计上游明确报告的推理量'),
-      kpi('加权输出 TPS', n(tps), '有效输出 token / 对应成功请求总耗时（秒）'),
+      kpi('加权生成 TPS', n(weightedTps(t)), '从首个输出计时；缺少计时的旧记录沿用完整耗时'),
       kpi('首 token · P50 / P95', ms(p.p50_first_token_ms) + ' / ' + ms(p.p95_first_token_ms), 'TTFT · 仅有首 token 时序的已结束样本'),
       kpi('完整耗时 · P50 / P95', ms(p.p50_latency_ms) + ' / ' + ms(p.p95_latency_ms), '完整请求耗时 · 非仅生成阶段'),
       kpi('已报告缓存命中率', pct(t.cached_reported_tokens, t.cached_reported_input_tokens), n(t.cached_reported_tokens) + ' / ' + n(t.cached_reported_input_tokens) + ' 可用输入 token'),
@@ -279,8 +282,8 @@
     if (groupsChanged || performanceChanged) renderOverviewMetrics(groups, p);
     if (groupsChanged) {
       $('groups').replaceChildren(table(
-        ['来源', '模型', '请求', '成功率', '进行中', '输入', '输出', '缓存', '推理', 'USD（已知）', '实际 / 参考', '输出 TPS'],
-        groups.map((g) => [g.source_name || g.source_id || '未记录', g.model || '未记录', n(g.requests), pct(g.successes, g.requests - g.active_requests), n(g.active_requests), n(g.input_tokens), n(g.output_tokens), n(g.cached_input_tokens), n(g.reasoning_output_tokens), usd(g.total_usd), n(g.upstream_priced_requests) + ' / ' + n(Math.max(0, (g.priced_requests || 0) - (g.upstream_priced_requests || 0))), n(g.throughput_latency_ms > 0 ? g.throughput_output_tokens / (g.throughput_latency_ms / 1000) : null)]),
+        ['来源', '模型', '请求', '成功率', '进行中', '输入', '输出', '缓存', '推理', 'USD（已知）', '实际 / 参考', '生成 TPS'],
+        groups.map((g) => [g.source_name || g.source_id || '未记录', g.model || '未记录', n(g.requests), pct(g.successes, g.requests - g.active_requests), n(g.active_requests), n(g.input_tokens), n(g.output_tokens), n(g.cached_input_tokens), n(g.reasoning_output_tokens), usd(g.total_usd), n(g.upstream_priced_requests) + ' / ' + n(Math.max(0, (g.priced_requests || 0) - (g.upstream_priced_requests || 0))), n(weightedTps(g))]),
       ));
     }
     if (dailyChanged) renderDaily(daily);
@@ -363,7 +366,7 @@
   function renderRequests() {
     $('requests-count').textContent = '已加载 ' + state.records.length + ' / ' + n(state.total) + ' 条 · 进行中 ' + n(state.active) + ' 条 · 每页最多 100 条';
     $('requests-table').replaceChildren(table(
-      ['时间', '来源', '模型', '入口', '状态', 'HTTP', '输入 / 输出 token', 'USD', '完整耗时', 'TTFT', '输出 TPS'],
+      ['时间', '来源', '模型', '入口', '状态', 'HTTP', '输入 / 输出 token', 'USD', '完整耗时', 'TTFT', '生成 TPS'],
       state.records.map((r) => [button(stamp(r.started_at), () => openRequest(r.attempt_id), 'row-link'), r.source_name || r.source_id || '未记录', r.model || '未记录', ingressName(r.ingress), statusBadge(r.status), r.http_status ?? '未记录', tokenLabel(r), costLabel(r.cost), ms(r.latency_ms), ms(r.first_token_latency_ms), n(r.output_tps)]),
       '当前筛选范围内没有请求记录。',
       state.records.map((r) => () => openRequest(r.attempt_id)),
@@ -552,9 +555,12 @@
       ['状态', statusNames[r.status] || r.status || '未知'], ['HTTP', String(r.http_status ?? d?.http_status ?? '未记录')],
       ['输入 / 输出', tokenLabel(r)], ['缓存输入', r.token_details?.cached_input_reported ? n(r.cached_input_tokens) : '未报告'],
       ['推理 token', n(r.token_details?.reasoning_output_tokens)], ['完整耗时', ms(r.latency_ms)], ['首 token 延迟', ms(r.first_token_latency_ms)],
-      ['输出 TPS', n(r.output_tps)], ['输出阶段耗时', ms(r.generation_ms)], ['输出阶段 TPS', n(r.generation_tps)], ['费用 USD', costLabel(r.cost)],
+      ['生成耗时', ms(r.generation_ms)], ['生成 TPS', n(r.output_tps)], ['费用 USD', costLabel(r.cost)],
     ]));
-    top.append(node('p', 'compact-note', '输出 TPS 使用完整请求耗时；输出阶段 TPS 从首个输出计时。'));
+    const rateNote = !isNumber(r.output_tps) ? '缺少有效生成计时或确切的输出 token 数，无法计算 TPS。'
+      : !isNumber(r.generation_tps) ? '旧记录没有可靠的生成计时，此处使用完整请求耗时。'
+        : '生成 TPS 从首个输出 token 计到生成结束，不含首 token 等待。';
+    top.append(node('p', 'compact-note', rateNote));
     top.append(button('查看该尝试的原文缓存', () => linkCache(detail.id)));
     content.append(top);
     const token = section('Token 可用性与估算标记');

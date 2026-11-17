@@ -136,13 +136,14 @@ fn failed_events_preserve_errors_but_never_generated_output() {
 }
 
 #[test]
-fn live_details_have_rates_and_costs_and_empty_legacy_ids_are_repairable() {
+fn live_details_do_not_invent_rates_and_empty_legacy_ids_are_repairable() {
     use std::time::{Duration, Instant};
     let (_dir, mut data) = fixture();
     let mut live = record("live-detail", crate::model::now());
     live.status = "streaming".into();
     live.first_token_latency_ms = Some(100);
     live.token_details.stream_complete = false;
+    live.generation_ms = None;
     data.active.insert(
         live.attempt_id.clone(),
         (live, Instant::now() - Duration::from_secs(2)),
@@ -150,8 +151,8 @@ fn live_details_have_rates_and_costs_and_empty_legacy_ids_are_repairable() {
     let value = detail(&data, &json!({"attempt_id":"live-detail"})).unwrap();
     assert_eq!(value["record"]["active"], true);
     assert!(value["record"]["latency_ms"].as_u64().unwrap() >= 2000);
-    assert!(value["record"]["generation_ms"].as_u64().unwrap() >= 1900);
-    assert!(value["record"]["output_tps"].is_number());
+    assert!(value["record"]["generation_ms"].is_null());
+    assert!(value["record"]["output_tps"].is_null());
     assert!(value["record"]["cost"].is_object());
     let row = persist(&data, &record("empty-id", crate::model::now()), None);
     data.connection

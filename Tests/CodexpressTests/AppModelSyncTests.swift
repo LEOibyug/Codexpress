@@ -51,7 +51,8 @@ final class AppModelSyncTests: XCTestCase {
     }
 
     @MainActor func testSettingChangePersistsWhenSyncFailsAndCanBeRetried() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("s-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        let temp = ProcessInfo.processInfo.environment["CODEXPRESS_TEST_TMPDIR"].map(URL.init(fileURLWithPath:)) ?? FileManager.default.temporaryDirectory
+        let directory = temp.appendingPathComponent("s-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let helper = directory.appendingPathComponent("gateway-fixture")
@@ -75,6 +76,7 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertTrue(model.running, model.error ?? "Fixture helper did not start")
         XCTAssertNil(model.localModelSettingsSyncError)
         XCTAssertTrue(model.localModelSettingsNeedsSync)
+        XCTAssertFalse(model.showsLocalModelSettingsWarning)
         let applied = directory.appendingPathComponent("applied-settings.json")
         let initial = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
         XCTAssertEqual(initial["auto_reset_weekly_quota"].bool, false)
@@ -153,6 +155,10 @@ final class AppModelSyncTests: XCTestCase {
         try await model.updateStatus()
         XCTAssertEqual(model.status["process_id"], helperPID)
         XCTAssertEqual(model.connectionMode, "official")
+        XCTAssertFalse(model.showsLocalModelSettingsWarning)
+        try "gateway".write(to: directory.appendingPathComponent("connection-mode"), atomically: true, encoding: .utf8)
+        try await model.updateStatus()
+        XCTAssertTrue(model.showsLocalModelSettingsWarning)
         let invalidRules = [
             ModelCompactionRule(model: policy.model, auto_compact_token_limit: 0, context_window: nil),
             ModelCompactionRule(model: policy.model, auto_compact_token_limit: nil, context_window: 200001)
@@ -343,6 +349,8 @@ final class AppModelSyncTests: XCTestCase {
                 if operation == 'status':
                     mode = directory / 'connection-mode'
                     data = dict(process_id=os.getpid(), port=17863, sources=[], connection_mode=mode.read_text() if mode.exists() else 'unmanaged')
+                elif operation == 'gateway.update.info':
+                    data = dict(protocol=1, version='0.8.26')
                 elif operation == 'credentials.storage.status':
                     data = dict(mode='file')
                 elif operation == 'models.list':

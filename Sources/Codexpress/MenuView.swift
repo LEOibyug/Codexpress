@@ -6,7 +6,7 @@ struct MenuView: View {
     @State private var windowActive = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 13) {
             header
             connection
             if model.sources.isEmpty {
@@ -16,21 +16,24 @@ struct MenuView: View {
                         .buttonStyle(.borderedProminent).controlSize(.small)
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6)
             } else {
+                HStack {
+                    Text("来源池").font(AppTypography.caption.weight(.semibold))
+                    Spacer()
+                    Button(model.sources.count > 4 ? "查看全部 \(model.sources.count) 个" : "管理来源") { showSettings(.sources) }
+                        .buttonStyle(.link).font(AppTypography.small)
+                }.padding(.horizontal, 2)
                 VStack(spacing: 0) {
                     ForEach(Array(model.sources.prefix(4).enumerated()), id: \.element.id) { index, source in
                         if index > 0 { Divider().padding(.leading, 13) }
                         sourceRow(source)
                     }
-                }.padding(.horizontal, 10)
-                    .background(AppPalette.well, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                }.padding(.horizontal, 11).cardSurface()
             }
             if model.pendingSync {
-                Label("配置尚未应用，当前使用上次设置。", systemImage: "clock")
-                    .font(.system(size: 10)).foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
+                InfoNote(text: "配置尚未应用，当前使用上次设置。", symbol: "clock", color: .orange)
             }
             footer
-        }.padding(14).frame(width: 340)
+        }.padding(16).frame(width: 364)
             .background(.regularMaterial)
             .environment(\.windowIsActive, windowActive)
             .background(AccountWindowOpenRefresh(refresh: {
@@ -43,16 +46,16 @@ struct MenuView: View {
     private var header: some View {
         HStack(spacing: 9) {
             Image(systemName: "arrow.triangle.branch")
-                .font(.system(size: 15, weight: .medium)).foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
-                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 7))
+                .font(.system(size: 16, weight: .medium)).foregroundStyle(Color.accentColor)
+                .frame(width: 34, height: 34)
+                .background(Color.accentColor.opacity(0.11), in: RoundedRectangle(cornerRadius: 9))
             VStack(alignment: .leading, spacing: 3) {
-                Text("Codexpress").font(.system(size: 13, weight: .semibold))
+                Text("Codexpress").font(.system(size: 15, weight: .semibold))
                 Text(model.routingMode == "auto" ? "来源池 · 自动切换" : "固定来源 · \(model.fixedName)")
                     .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 8)
-            StatusPill(text: model.running ? "运行中" : "未连接", color: model.running ? .green : .orange, compact: true)
+            StatusPill(text: model.running ? "运行中" : "未连接", color: model.running ? .green : .orange, active: model.gatewayHasActivity, compact: true)
         }
     }
 
@@ -67,14 +70,14 @@ struct MenuView: View {
             VStack(alignment: .trailing, spacing: 4) {
                 if model.connectionMode == "official" {
                     Button { model.switchCodexConnection(.gateway) } label: {
-                        Label(model.codexConnectionPhase ?? "使用 API 模式", systemImage: "arrow.triangle.branch")
+                        Label(model.codexConnectionPhase ?? "使用来源池", systemImage: "arrow.triangle.branch")
                     }.disabled(model.busy || !model.running || model.metadataLoadFailed)
                         .help("重启 Codex，使用已配置的来源池")
                 } else {
                     DirectOfficialLoginButton()
                 }
             }.buttonStyle(.bordered).controlSize(.small)
-        }.padding(.horizontal, 2).padding(.vertical, 1)
+        }.padding(10).background(AppPalette.well, in: RoundedRectangle(cornerRadius: 9))
     }
 
     private func sourceRow(_ source: Source) -> some View {
@@ -154,7 +157,7 @@ struct MenuView: View {
             Divider()
             HStack(spacing: 10) {
                 Button { showSettings() } label: { Label("打开主窗口", systemImage: "macwindow") }
-                if !model.running { Button("重试启动") { model.retry() } }
+                if !model.running { Button("重试启动") { model.retry() }.disabled(model.busy) }
                 Spacer(minLength: 4)
                 Button { showSettings(.usage) } label: { Image(systemName: "chart.bar.xaxis") }
                     .help("查看用量与连接日志").accessibilityLabel("查看用量")

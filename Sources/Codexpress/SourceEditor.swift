@@ -20,6 +20,7 @@ struct SourceEditor: View {
     @State private var capacityLimitEnabled = false
     @State private var maxActiveConversations = "3"
     @State private var activityWindowSeconds = "15"
+    @FocusState private var nameFocused: Bool
 
     init(source: Source, isNew: Bool) {
         _source = State(initialValue: source); self.isNew = isNew
@@ -47,41 +48,19 @@ struct SourceEditor: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 14) {
-                Image(systemName: source.official ? "person.crop.circle" : "terminal")
-                    .font(.system(size: 28, weight: .regular)).foregroundStyle(.secondary).frame(width: 36)
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(isNew ? "添加来源" : "编辑来源").font(.system(size: 22, weight: .semibold))
-                    Text(source.official ? "ChatGPT 账号" : "Responses API")
-                        .font(.system(size: 12)).foregroundStyle(.secondary)
-                }
-                Spacer()
-            }.padding(.horizontal, 28).padding(.top, 28).padding(.bottom, 10)
+            PageHeading(isNew ? "添加来源" : "编辑来源", subtitle: source.official ? "ChatGPT 官方账号" : "Responses API")
+                .padding(.horizontal, 24).padding(.top, 20).padding(.bottom, 8)
 
             Form {
                 Section("基本信息") {
-                    TextField("名称", text: $source.name)
-                    TextField("API 基址", text: $source.base_url).textContentType(.URL).disabled(source.official)
+                    TextField("名称", text: $source.name).focused($nameFocused)
                     if !source.official {
+                        TextField("API 基址", text: $source.base_url).textContentType(.URL)
                         SecureField(isNew ? "API 密钥" : "新 API 密钥", text: $apiKey, prompt: Text(isNew ? "API 密钥" : "留空保留现有密钥"))
                     }
                     Toggle("启用此来源", isOn: $source.enabled).toggleStyle(.switch)
                     if isNew && source.official && model.loginFlow != nil {
                         Text("完成当前登录后，可在来源池登录此账号。").font(.system(size: 12)).foregroundStyle(.secondary)
-                    }
-                }
-                conversationCapacitySection
-                if !source.official {
-                    Section("余额预警") {
-                        Toggle("余额不足时通知", isOn: $balanceWarningEnabled)
-                            .toggleStyle(.switch)
-                        if balanceWarningEnabled {
-                            TextField("预警余额", text: $balanceWarningAmount, prompt: Text("例如 10"))
-                        }
-                    }
-                    Section("费用估算") {
-                        Toggle("订阅来源", isOn: Binding(get: { source.is_subscription ?? false }, set: { source.is_subscription = $0 }))
-                            .toggleStyle(.switch)
                     }
                 }
                 Section("网络") {
@@ -121,25 +100,42 @@ struct SourceEditor: View {
                                 }.font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
                             }.frame(height: min(CGFloat(source.models.count) * 24, 144))
                         }
-                        if let modelError { Text(modelError).font(.system(size: 12)).foregroundStyle(.orange) }
+                        if let modelError { InfoNote(text: modelError, symbol: "exclamationmark.triangle", color: .orange) }
                     } else {
                         TextField("支持模型", text: $modelsText, prompt: Text("模型 ID，以逗号分隔；留空不限"))
+                    }
+                }
+                conversationCapacitySection
+                if !source.official {
+                    Section("余额预警") {
+                        Toggle("余额不足时通知", isOn: $balanceWarningEnabled)
+                            .toggleStyle(.switch)
+                        if balanceWarningEnabled {
+                            TextField("预警余额", text: $balanceWarningAmount, prompt: Text("例如 10"))
+                        }
+                    }
+                    Section("费用估算") {
+                        Toggle("订阅来源", isOn: Binding(get: { source.is_subscription ?? false }, set: { source.is_subscription = $0 }))
+                            .toggleStyle(.switch)
                     }
                 }
             }.formStyle(.grouped).scrollContentBackground(.hidden).disabled(saving)
 
             Divider()
-            VStack(spacing: 14) {
-                if let localError { InfoNote(text: localError, symbol: "exclamationmark.triangle", color: .orange).frame(maxWidth: .infinity, alignment: .leading) }
-                HStack {
+            VStack(alignment: .leading, spacing: 10) {
+                if let localError { InfoNote(text: localError, symbol: "exclamationmark.triangle", color: .orange) }
+                HStack(spacing: 12) {
+                    Text("保存后，来源设置才会生效。")
+                        .font(AppTypography.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Button("取消") { dismiss() }.keyboardShortcut(.cancelAction).disabled(saving)
+                    Button("取消", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction).disabled(saving)
                     Button(saving ? "保存中…" : isNew && source.official && model.loginFlow == nil ? "添加并登录…" : isNew ? "添加来源" : "保存来源") { save() }
                         .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(saving || !model.running || model.busy || model.metadataLoadFailed)
                 }
-            }.padding(.horizontal, 28).padding(.bottom, 24).padding(.top, 18)
-        }.font(.system(size: 13)).background(AppPalette.canvas).frame(width: 660, height: 760)
+            }.padding(.horizontal, 24).padding(.vertical, 14)
+        }.font(AppTypography.body).background(AppPalette.canvas).frame(width: 640, height: 600)
             .interactiveDismissDisabled(saving)
+            .defaultFocus($nameFocused, true)
             .task(id: discoveryInput) {
                 fetchID = UUID(); loadingModels = false; modelError = nil
                 guard automaticModels, canFetch, !saving else { return }

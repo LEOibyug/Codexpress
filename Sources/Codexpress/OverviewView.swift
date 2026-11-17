@@ -14,45 +14,46 @@ struct OverviewView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                PageHeading("概览", subtitle: Date().formatted(.dateTime.month(.wide).day().weekday(.wide)))
+            VStack(alignment: .leading, spacing: AppMetrics.sectionSpacing) {
+                PageHeading("概览", subtitle: Date().formatted(.dateTime.month(.wide).day().weekday(.wide))) {
+                    Button(action: openUsage) { Label("查看用量", systemImage: "chart.bar.xaxis") }
+                }
                 connection
                 HStack(spacing: 14) {
-                    metric("今日费用", value: usageMoney(totals.cost, estimated: totals.costEstimated), detail: totals.cost == nil ? "暂无已计价请求" : totals.costEstimated ? "含参考价估算" : "上游实际扣费")
-                    metric("今日 Token", value: usageSnapshot == .null ? "—" : usageCount(totals.total, estimated: totals.estimated), detail: usageSnapshot == .null ? "等待用量数据" : "\(usageCount(totals.sum("requests"))) 次请求")
-                    metric("进行中", value: model.running ? usageCount(model.status["inflight"].number ?? 0) : "—", detail: model.running ? "\(available) / \(model.sources.count) 个来源可接新对话" : "网关未连接")
+                    metric("今日费用", symbol: "dollarsign.circle", value: usageMoney(totals.cost, estimated: totals.costEstimated), detail: totals.cost == nil ? "暂无已计价请求" : totals.costEstimated ? "含参考价估算" : "上游实际扣费")
+                    metric("今日 Token", symbol: "number", value: usageSnapshot == .null ? "—" : usageCount(totals.total, estimated: totals.estimated), detail: usageSnapshot == .null ? "等待用量数据" : "\(usageCount(totals.sum("requests"))) 次请求")
+                    metric("进行中的请求", symbol: "waveform.path", value: model.running ? usageCount(model.status["inflight"].number ?? 0) : "—", detail: model.running ? "\(available) / \(model.sources.count) 个来源可用" : "网关未连接")
                 }
                 if let usageError { InfoNote(text: usageError, symbol: "clock", color: .orange) }
                 SettingsCard("来源状态", symbol: "server.rack", accessory: {
-                    Button("管理来源池", action: openSources)
+                    if !model.sources.isEmpty { Button("管理来源池", action: openSources) }
                 }) {
                     if model.sources.isEmpty {
-                        HStack {
-                            Text("暂无来源")
-                                .foregroundStyle(.secondary)
-                            Spacer()
+                        SettingRow(title: "还没有来源", subtitle: "添加官方账号或 Responses API 后即可接收请求。") {
                             Button("添加来源", action: openSources).buttonStyle(.borderedProminent)
-                        }.padding(.vertical, 10)
+                        }
                     } else {
                         VStack(spacing: 0) {
                             ForEach(Array(model.sources.prefix(4).enumerated()), id: \.element.id) { index, source in
                                 if index > 0 { Divider() }
                                 accountRow(source, index: index).padding(.vertical, 14)
                             }
+                            if model.sources.count > 4 {
+                                Divider()
+                                Button("查看全部 \(model.sources.count) 个来源", action: openSources)
+                                    .buttonStyle(.link).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 12)
+                            }
                         }
                     }
                 }
-                SettingsCard("接入与服务", symbol: "point.3.connected.trianglepath.dotted") {
-                    LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)], spacing: 12) {
-                        entry(.omp, symbol: "chevron.left.forwardslash.chevron.right")
+                SettingsCard("客户端与服务", symbol: "point.3.connected.trianglepath.dotted") {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3), spacing: 10) {
+                        entry(.omp, symbol: "terminal")
                         entry(.chatbot, symbol: "bubble.left.and.bubble.right")
                         entry(.remote, symbol: "desktopcomputer")
                         entry(.images, symbol: "photo")
+                        entry(.control, symbol: "curlybraces")
                     }
-                }
-                HStack {
-                    Spacer()
-                    Button("查看用量", action: openUsage).buttonStyle(.link)
                 }
             }.settingsPage()
         }
@@ -80,14 +81,17 @@ struct OverviewView: View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .top, spacing: 14) {
                 Image(systemName: model.connectionMode == "official" ? "person.crop.circle" : "arrow.triangle.branch")
-                    .font(.system(size: 22)).foregroundStyle(Color.accentColor)
-                    .frame(width: 38, height: 38)
-                    .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                    .font(.system(size: 21, weight: .medium)).foregroundStyle(Color.accentColor)
+                    .frame(width: 42, height: 42)
+                    .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 11))
                 VStack(alignment: .leading, spacing: 5) {
                     Text(model.connectionMode == "official" ? "Codex 直接官方登录" : model.connectionMode == "gateway" ? (model.running ? "Codex 已连接来源池" : "Codex 配置为来源池") : "尚未接入 Codex")
                         .font(.system(size: 17, weight: .semibold))
                     if model.connectionMode == "gateway" {
                         Text(model.routingMode == "auto" ? "自动切换" : "固定来源：\(model.fixedName)")
+                            .font(AppTypography.caption).foregroundStyle(.secondary)
+                    } else if model.connectionMode == "official" {
+                        Text("Codex 请求不经过网关，其它客户端仍可使用来源池。")
                             .font(AppTypography.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -95,8 +99,12 @@ struct OverviewView: View {
                 StatusPill(text: model.running ? "网关运行中" : "网关未连接", color: model.running ? .green : .orange, active: model.gatewayHasActivity)
             }
             HStack(spacing: 12) {
-                Button("连接设置") { openConnection(.codex) }.buttonStyle(.borderedProminent)
-                if !model.running { Button("启动网关") { model.retry() }.disabled(model.busy) }
+                if !model.running {
+                    Button("启动网关") { model.retry() }.buttonStyle(.borderedProminent).disabled(model.busy)
+                    Button("连接设置") { openConnection(.codex) }
+                } else {
+                    Button("连接设置") { openConnection(.codex) }.buttonStyle(.borderedProminent)
+                }
                 Spacer()
                 if model.connectionMode == "official" {
                     Button("使用来源池") { model.switchCodexConnection(.gateway) }
@@ -106,12 +114,12 @@ struct OverviewView: View {
         }.padding(20).cardSurface()
     }
 
-    private func metric(_ title: String, value: String, detail: String) -> some View {
+    private func metric(_ title: String, symbol: String, value: String, detail: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title).font(AppTypography.caption).foregroundStyle(.secondary)
-            Text(value).font(.system(size: 26, weight: .semibold)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.75)
+            Label(title, systemImage: symbol).font(AppTypography.caption).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 27, weight: .semibold)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.72)
             Text(detail).font(AppTypography.small).foregroundStyle(.secondary)
-        }.padding(18).frame(maxWidth: .infinity, alignment: .leading).cardSurface()
+        }.padding(17).frame(maxWidth: .infinity, alignment: .leading).cardSurface()
     }
 
     private func accountRow(_ source: Source, index: Int) -> some View {
@@ -147,12 +155,12 @@ struct OverviewView: View {
     private func entry(_ section: ConnectionSection, symbol: String) -> some View {
         Button { openConnection(section) } label: {
             HStack(spacing: 11) {
-                Image(systemName: symbol).font(.system(size: 16)).foregroundStyle(.secondary).frame(width: 24)
+                Image(systemName: symbol).font(.system(size: 15)).foregroundStyle(Color.accentColor).frame(width: 22)
                 Text(section.rawValue).font(.system(size: 13, weight: .medium))
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.tertiary)
             }.padding(12).frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                .background(AppPalette.well, in: RoundedRectangle(cornerRadius: 7)).contentShape(Rectangle())
+                .background(AppPalette.well, in: RoundedRectangle(cornerRadius: 8)).contentShape(Rectangle())
         }.buttonStyle(.plain)
     }
 }

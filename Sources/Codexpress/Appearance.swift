@@ -2,10 +2,10 @@ import AppKit
 import SwiftUI
 
 enum AppPalette {
-    static let canvas = Color(nsColor: .windowBackgroundColor)
-    static let card = Color(nsColor: .controlBackgroundColor)
-    static let well = Color(nsColor: .quaternaryLabelColor).opacity(0.35)
-    static let border = Color(nsColor: .separatorColor).opacity(0.55)
+    static let canvas = adaptive(light: 0xF4F6F9, dark: 0x1F2024)
+    static let card = adaptive(light: 0xFFFFFF, dark: 0x282A30)
+    static let well = adaptive(light: 0xEDF1F6, dark: 0x32353D)
+    static let border = adaptive(light: 0xD8DFE7, dark: 0x41444D)
     static let accountHealthy = adaptive(light: 0x228044, dark: 0x65D98A)
     static let accountCaution = adaptive(light: 0xA86B00, dark: 0xF6C659)
     static let accountLow = adaptive(light: 0xCE3434, dark: 0xFF7777)
@@ -21,17 +21,17 @@ enum AppPalette {
 }
 
 enum AppTypography {
-    static let pageTitle = Font.system(size: 22, weight: .semibold)
-    static let sectionTitle = Font.system(size: 14, weight: .semibold)
+    static let pageTitle = Font.system(size: 28, weight: .semibold)
+    static let sectionTitle = Font.system(size: 15, weight: .semibold)
     static let body = Font.system(size: 13)
     static let caption = Font.system(size: 12)
     static let small = Font.system(size: 11)
 }
 
 enum AppMetrics {
-    static let pageInset: CGFloat = 28
-    static let sectionSpacing: CGFloat = 20
-    static let cornerRadius: CGFloat = 10
+    static let pageInset: CGFloat = 30
+    static let sectionSpacing: CGFloat = 18
+    static let cornerRadius: CGFloat = 12
 }
 
 struct PageHeading<Actions: View>: View {
@@ -44,16 +44,16 @@ struct PageHeading<Actions: View>: View {
     }
 
     var body: some View {
-        HStack(alignment: .center, spacing: 16) {
+        HStack(alignment: .center, spacing: 20) {
             VStack(alignment: .leading, spacing: 5) {
-                Text(title).font(AppTypography.pageTitle)
+                Text(title).font(AppTypography.pageTitle).accessibilityAddTraits(.isHeader)
                 if let subtitle {
                     Text(subtitle).font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }
             Spacer(minLength: 0)
             actions.fixedSize(horizontal: true, vertical: false)
-        }.frame(minHeight: 34).padding(.bottom, 4)
+        }.frame(minHeight: 40).padding(.bottom, 6)
     }
 }
 
@@ -65,7 +65,7 @@ struct CardSurface: ViewModifier {
     func body(content: Content) -> some View {
         content
             .background(AppPalette.card, in: RoundedRectangle(cornerRadius: AppMetrics.cornerRadius, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: AppMetrics.cornerRadius, style: .continuous).strokeBorder(AppPalette.border, lineWidth: 0.5))
+            .overlay(RoundedRectangle(cornerRadius: AppMetrics.cornerRadius, style: .continuous).strokeBorder(AppPalette.border, lineWidth: 0.75).allowsHitTesting(false))
     }
 }
 
@@ -97,11 +97,13 @@ struct SettingsCard<Accessory: View, Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .firstTextBaseline, spacing: 9) {
+            HStack(alignment: .center, spacing: 11) {
                 Image(systemName: symbol).font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.secondary).frame(width: 18)
+                    .foregroundStyle(Color.accentColor).frame(width: 28, height: 28)
+                    .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(title).font(AppTypography.sectionTitle)
+                    Text(title).font(AppTypography.sectionTitle).accessibilityAddTraits(.isHeader)
                     if let subtitle {
                         Text(subtitle).font(AppTypography.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
@@ -147,8 +149,8 @@ struct StatusPill: View {
         HStack(spacing: 5) {
             ActivityDot(color: color, active: active)
             Text(text).font(.system(size: compact ? 10 : 11, weight: .medium))
-        }.foregroundStyle(color).padding(.horizontal, compact ? 6 : 8).padding(.vertical, compact ? 3 : 4)
-            .background(color.opacity(0.08), in: RoundedRectangle(cornerRadius: 5))
+        }.foregroundStyle(color).padding(.horizontal, compact ? 7 : 9).padding(.vertical, compact ? 3 : 5)
+            .background(color.opacity(0.10), in: Capsule())
             .accessibilityElement(children: .combine)
     }
 }

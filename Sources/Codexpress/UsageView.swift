@@ -28,13 +28,16 @@ struct UsageView: View {
     @State private var loadError: String?
     private var updatedAt: Date? { cachedSnapshot?.updatedAt }
     @State private var showingLogs = false
+    @State private var logIngress = ""
+    @State private var logStatus = ""
+    @State private var logSearch = ""
     @State private var showingPrices = false
     private var totals: UsageTotals { UsageTotals(rows: snapshot["groups"].array) }
     private var daily: [UsageDaily] { cachedSnapshot?.daily ?? [] }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            PageHeading("用量") {
+            PageHeading("用量", subtitle: showingLogs ? "查看单次请求、重试及错误详情" : "对比用量、费用与输出性能") {
                 Picker("用量视图", selection: $showingLogs) {
                     Text("统计概览").tag(false)
                     Text("连接日志").tag(true)
@@ -46,7 +49,8 @@ struct UsageView: View {
             }
             Group {
                 if showingLogs {
-                    UsageLogsView(selection: $model.usageSelection, options: snapshot["options"]) { showingLogs = false }
+                    UsageLogsView(selection: $model.usageSelection, options: snapshot["options"],
+                                  ingress: $logIngress, status: $logStatus, search: $logSearch)
                 } else { overview }
             }
         }
@@ -65,7 +69,7 @@ struct UsageView: View {
                     UsageActivityCard(selection: selection)
                     UsageTrendChart(days: daily, intraday: snapshotQuery?.isIntraday == true)
                     HStack {
-                        Button("API 价格表") { showingPrices = true }.buttonStyle(.link)
+                        Button { showingPrices = true } label: { Label("API 价格表", systemImage: "tablecells") }.buttonStyle(.link)
                         Spacer()
                         if let updatedAt { Text("更新于 " + updatedAt.formatted(date: .omitted, time: .standard)).foregroundStyle(.secondary).monospacedDigit() }
                     }.font(.system(size: 11)).padding(.horizontal, 2).padding(.top, 2)
@@ -151,9 +155,15 @@ struct UsageFilters: View {
                         ForEach(options["models"].array.compactMap(\.string), id: \.self) { Text($0).tag($0) }
                     }.labelsHidden().frame(maxWidth: .infinity)
                 }.frame(maxWidth: .infinity, alignment: .leading)
-                if !selection.sourceID.isEmpty || !selection.modelID.isEmpty {
-                    Button { selection.sourceID = ""; selection.modelID = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary).frame(width: 22, height: 22) }.buttonStyle(.plain).help("清除来源与模型筛选")
-                }
+                Button {
+                    var cleared = selection
+                    cleared.sourceID = ""
+                    cleared.modelID = ""
+                    selection = cleared
+                } label: {
+                    Text("清除")
+                }.accessibilityLabel("清除来源与模型筛选").help("清除来源与模型筛选")
+                    .disabled(selection.sourceID.isEmpty && selection.modelID.isEmpty)
             }.controlSize(.regular).font(.system(size: 13))
             if selection.period == .custom {
                 HStack(spacing: 16) {
@@ -163,7 +173,7 @@ struct UsageFilters: View {
                     Text("最多 366 天").font(.system(size: 11)).foregroundStyle(.secondary)
                 }.controlSize(.regular).font(.system(size: 13))
             }
-        }
+        }.padding(13).cardSurface()
     }
     private func filterLabel(_ title: String) -> some View {
         Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)

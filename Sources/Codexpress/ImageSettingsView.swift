@@ -13,86 +13,108 @@ struct ImageSettingsView: View {
     @State private var copyingKey = false
     @State private var exporting = false
     @State private var configNeedsSync = false
+    @State private var settingsError: String?
     @State private var error: String?
     @State private var confirmReset = false
-    private var address: String { status["base_url"].string ?? "—" }
+    @State private var showsSettings = false
+    private var address: String? { model.running ? status["base_url"].string : nil }
     private var canEdit: Bool { model.running && !working && !loading && !exporting && status != .null }
-    private var changed: Bool { !newKey.isEmpty || port != status["port"].number.map({ String(Int($0)) }) }
+    private var changed: Bool { !newKey.isEmpty || port != savedPort }
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                PageHeading("图片生成")
-                if !model.running { InfoNote(text: "请先启动本机网关。") }
-                if !model.sources.contains(where: { $0.official && $0.enabled }) { InfoNote(text: "请先在来源中添加并登录官方账号。", color: .orange) }
-                SettingsCard("官方套餐生图", symbol: "photo", accessory: {
-                    StatusPill(text: status["running"].bool == true ? "运行中" : status["enabled"].bool == false ? "已关闭" : "未启动", color: status["running"].bool == true ? .green : .secondary)
+                PageHeading("图片生成", subtitle: "使用启用的官方账号生成或编辑图片。")
+                SettingsCard("本机 Agent 接入", symbol: "photo", accessory: {
+                    ConnectionListenerStatus(gatewayRunning: model.running, loading: loading, status: status)
                 }) {
-                    SettingRow(title: "启用接入") {
-                        Toggle("启用图片生成", isOn: Binding(get: {status["enabled"].bool ?? true}, set: { update(.object(["enabled":.bool($0)])) })).toggleStyle(.switch).labelsHidden().disabled(!canEdit)
+                    SettingRow(title: "启用图片 API") {
+                        Toggle("启用图片生成", isOn: Binding(get: { status["enabled"].bool ?? true }, set: { update(.object(["enabled": .bool($0)])) }))
+                            .toggleStyle(.switch).labelsHidden().disabled(!canEdit)
                     }
-                    Divider()
-                    SettingRow(title: "监听端口") {
-                        TextField("17866", text: Binding(get: { port }, set: { port = $0; error = nil }))
-                            .font(.system(size: 13, design: .monospaced)).settingsField().frame(width: 130)
-                            .multilineTextAlignment(.trailing).disabled(!canEdit)
+                    SettingRow(title: "gpt-image-2", subtitle: "生成／编辑 · PNG。将接入提示词发送给本机 Agent。") {
+                        if exporting { ProgressView().controlSize(.small) }
+                        Button("复制接入提示词") { copyPrompt() }.buttonStyle(.borderedProminent)
+                            .disabled(!canEdit || address == nil)
                     }
-                    SettingRow(title: "官方账号") {
-                        Picker("官方账号", selection: Binding(get: { sourceID }, set: { update(.object(["source_id": $0.isEmpty ? .null : .string($0)])) })) {
-                            Text("按来源优先级").tag("")
-                            ForEach(model.sources.filter(\.official)) { Text($0.name + ($0.enabled ? "" : "（已停用）")).tag($0.id) }
-                            if !sourceID.isEmpty && !model.sources.contains(where: {$0.id == sourceID}) { Text("原账号已移除").tag(sourceID) }
-                        }.labelsHidden().frame(maxWidth: 360, alignment: .trailing).disabled(!canEdit)
+                    if !model.running {
+                        InfoNote(text: "请先在设置中启动本机网关。")
+                    } else if !model.sources.contains(where: { $0.official && $0.enabled }) {
+                        InfoNote(text: "请先在来源池添加并启用官方账号。", color: .orange)
                     }
-                    SettingRow(title: "新 API Key") {
-                        SecureField("留空保留原 Key", text: Binding(get: { newKey }, set: { newKey = $0; error = nil }))
-                            .settingsField().frame(maxWidth: 360).disabled(!canEdit)
-                    }
-                    if !newKey.isEmpty { InfoNote(text: "应用后旧 Key 将失效，请同步更新客户端。", color: .orange) }
-                    Divider()
-                    HStack(spacing: 12) {
-                        Button("复制当前 Key") { copyKey() }.disabled(!model.running || status == .null || working || copyingKey)
-                        Button("重新生成…") { confirmReset = true }.disabled(!canEdit)
-                        Spacer()
-                        if working { ProgressView().controlSize(.small) }
-                        Button("应用设置") { save() }.buttonStyle(.borderedProminent).disabled(!canEdit || !changed)
-                    }
-                    if let error { InfoNote(text: error, color: .orange) }
-                    if error != nil || status == .null && model.running {
-                        Button(loading ? "读取中…" : "重新读取") { Task { await load() } }.disabled(!model.running || loading || working || exporting)
-                    }
-                    if configNeedsSync {
-                        Button("重试更新本机接入配置") { retryExport() }.disabled(!canEdit)
-                    }
-                    if status["enabled"].bool == true && status["running"].bool == false {
-                        HStack {
-                            InfoNote(text: "图片入口未启动。", color: .orange)
+                    if model.running && status["enabled"].bool == true && status["running"].bool == false {
+                        SettingRow(title: "图片入口未启动") {
                             Button("重试启动") { update(.object([:])) }.disabled(!canEdit)
                         }
                     }
-                }
-                SettingsCard("接入 Codex 或其他 Agent", symbol: "doc.on.clipboard") {
-                    HStack {
-                        Text("gpt-image-2 · 生成／编辑 · PNG").font(.system(size: 12)).foregroundStyle(.secondary)
-                        Spacer()
-                        Button("复制接入提示词") { copyPrompt() }.buttonStyle(.borderedProminent).disabled(!canEdit)
+                    if configNeedsSync {
+                        Button("重试更新本机接入配置") { retryExport() }.disabled(!canEdit || address == nil)
+                    }
+                    if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
+                    if model.running && (error != nil || (status == .null && !loading)) {
+                        Button("重新读取") { Task { await load() } }.disabled(loading || working || exporting)
                     }
                 }
-                SettingsCard("其他 Images API 客户端", symbol: "link") {
-                    LabeledContent("API 基址") {
-                        HStack(spacing: 10) {
-                            Text(address).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
-                            Button { copy(address, message: "图片 API 地址已复制。") } label: { Image(systemName: "doc.on.doc") }
-                                .disabled(status == .null).accessibilityLabel("复制图片 API 地址").help("复制图片 API 地址")
-                        }
-                    }
-                }
+                apiSettings
             }.settingsPage()
         }.task(id: model.running) { await load() }
+            .onChange(of: port) { _, _ in settingsError = nil }
+            .onChange(of: newKey) { _, _ in settingsError = nil }
             .alert("重新生成图片 API Key？", isPresented: $confirmReset) {
                 Button("取消", role: .cancel) {}
                 Button("重新生成") { update(.object(["regenerate_key": .bool(true)])) }
             } message: { Text("旧 Key 将无法发起新请求，本机接入配置会同步更新。其他客户端需要更换密钥。") }
     }
+
+    private var apiSettings: some View {
+        SettingsCard("账号与 API 设置", symbol: "slider.horizontal.3") {
+            SettingRow(title: "官方账号", subtitle: "选择后立即生效。") {
+                Picker("官方账号", selection: Binding(get: { sourceID }, set: { update(.object(["source_id": $0.isEmpty ? .null : .string($0)]), fromAPISettings: true) })) {
+                    Text("按来源优先级").tag("")
+                    ForEach(model.sources.filter(\.official)) { Text($0.name + ($0.enabled ? "" : "（已停用）")).tag($0.id) }
+                    if !sourceID.isEmpty && !model.sources.contains(where: { $0.id == sourceID }) { Text("原账号已移除").tag(sourceID) }
+                }.labelsHidden().frame(maxWidth: 320, alignment: .trailing).disabled(!canEdit)
+            }
+            if let address {
+                SettingRow(title: "已应用的 Images API 基址") {
+                    HStack(spacing: 8) {
+                        Text(address).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
+                        Button { copy(address, message: "图片 API 地址已复制。") } label: { Image(systemName: "doc.on.doc") }
+                            .accessibilityLabel("复制图片 API 地址").help("复制图片 API 地址")
+                        Button("复制当前 Key") { copyKey() }.disabled(!canEdit || copyingKey)
+                    }
+                }
+            }
+            Divider()
+            advancedSettings
+            if let settingsError { InfoNote(text: settingsError, symbol: "exclamationmark.triangle", color: .orange) }
+        }
+    }
+
+    private var advancedSettings: some View {
+        DisclosureGroup(isExpanded: $showsSettings) {
+            VStack(alignment: .leading, spacing: 12) {
+                SettingRow(title: "监听端口") {
+                    TextField("17866", text: $port)
+                        .font(.system(size: 13, design: .monospaced)).settingsField().frame(width: 110)
+                        .accessibilityLabel("监听端口").multilineTextAlignment(.trailing).disabled(!canEdit)
+                }
+                SettingRow(title: "新 API Key") {
+                    SecureField("留空保留原 Key", text: $newKey)
+                        .settingsField().frame(maxWidth: 300).disabled(!canEdit)
+                }
+                if !newKey.isEmpty { InfoNote(text: "应用后旧 Key 将失效，请同步更新客户端。", color: .orange) }
+                HStack(spacing: 12) {
+                    Button("重新生成 Key…") { confirmReset = true }.disabled(!canEdit)
+                    Spacer(minLength: 0)
+                    if working { ProgressView().controlSize(.small) }
+                    Button("应用更改", action: save).buttonStyle(.borderedProminent).disabled(!canEdit || !changed)
+                }
+            }.padding(.top, 12)
+        } label: {
+            Text(changed ? "端口与密钥 · 有未应用的更改" : "端口与密钥")
+        }
+    }
+
     private func load() async {
         guard model.running else { status = .null; error = nil; return }
         loading = true
@@ -112,6 +134,7 @@ struct ImageSettingsView: View {
     }
     private func export() async throws -> URL {
         configNeedsSync = true
+        guard let address else { throw AppError.message("无法读取已应用的图片 API 地址。") }
         let key = try await model.remoteCall("images.key")
         guard let key = key["key"].string else {throw AppError.message("无法读取图片接入密钥。")}
         let file = try ImageClientAccess.export(baseURL: address, key: key)
@@ -119,13 +142,14 @@ struct ImageSettingsView: View {
         return file
     }
     private func save() {
-        guard let p = Int(port), (1...65535).contains(p) else {error = "端口须为 1–65535 的整数。"; return}
+        guard let p = Int(port), (1...65535).contains(p) else { settingsError = "端口须为 1–65535 的整数。"; return }
         var payload: [String: JSONValue] = ["port": .number(Double(p))]
         if !newKey.isEmpty { payload["key"] = .string(newKey) }
         update(.object(payload))
     }
-    private func update(_ payload: JSONValue) {
+    private func update(_ payload: JSONValue, fromAPISettings: Bool = false) {
         guard canEdit else {return}; working = true; error = nil
+        settingsError = nil
         Task {
             defer {working = false}
             do {
@@ -140,20 +164,21 @@ struct ImageSettingsView: View {
             } catch {
                 let message = error.localizedDescription
                 if let actual = try? await model.remoteCall("images.status") { apply(actual, updatingPort: false) }
-                self.error = message
+                if fromAPISettings || payload["port"] != .null || payload["regenerate_key"].bool == true { settingsError = message }
+                else { self.error = message }
             }
         }
     }
     private func copyKey() {
         guard model.running, status != .null, !working, !copyingKey else { return }
-        copyingKey = true; error = nil
+        copyingKey = true; settingsError = nil
         Task {
             defer { copyingKey = false }
             do {
                 let data = try await model.remoteCall("images.key")
                 guard let key = data["key"].string else { throw AppError.message("无法读取图片接入密钥。") }
                 copy(key, message: "图片 API Key 已复制。")
-            } catch { self.error = error.localizedDescription }
+            } catch { settingsError = error.localizedDescription }
         }
     }
     private func copyPrompt() {

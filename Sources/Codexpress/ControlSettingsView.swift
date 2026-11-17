@@ -11,86 +11,100 @@ struct ControlSettingsView: View {
     @State private var copyingKey = false
     @State private var confirmRotation = false
     @State private var error: String?
+    @State private var settingsError: String?
+    @State private var showsSettings = false
 
     private var canEdit: Bool { model.running && !working && !loading && status != .null }
-    private var address: String { status["base_url"].string ?? "http://127.0.0.1:17867" }
-    private var changed: Bool { port != status["port"].number.map { String(Int($0)) } }
+    private var address: String? { model.running ? status["base_url"].string : nil }
+    private var changed: Bool { port != savedPort }
     private var dashboardURL: URL? {
-        guard let base = URL(string: address) else { return nil }
+        guard let address, let base = URL(string: address) else { return nil }
         return base.deletingLastPathComponent().appendingPathComponent("dashboard", isDirectory: true)
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                PageHeading("管理 API")
-                if !model.running { InfoNote(text: "请先启动本机网关。") }
-                SettingsCard("本机管理", symbol: "switch.2", accessory: {
-                    StatusPill(text: status["running"].bool == true ? "运行中" : status["enabled"].bool == true ? "未启动" : "已关闭", color: status["running"].bool == true ? .green : .secondary)
+                PageHeading("管理 API", subtitle: "仅限本机：打开数据面板，或使用独立 Key 连接自动化工具。")
+                SettingsCard("本机数据面板", symbol: "chart.bar.xaxis", accessory: {
+                    ConnectionListenerStatus(gatewayRunning: model.running, loading: loading, status: status)
                 }) {
-                    SettingRow(title: "启用管理 API") {
+                    SettingRow(title: "启用管理 API", subtitle: "同时启用本机数据面板。") {
                         Toggle("启用管理 API", isOn: Binding(get: { status["enabled"].bool ?? false }, set: { enabled in
                             update(.object(["enabled": .bool(enabled)]))
                         })).toggleStyle(.switch).labelsHidden().disabled(!canEdit)
                     }
-                    Divider()
-                    SettingRow(title: "监听端口") {
-                        TextField("17867", text: $port).font(.system(size: 13, design: .monospaced))
-                            .multilineTextAlignment(.trailing).settingsField().frame(width: 130).disabled(!canEdit)
-                    }
-                    HStack {
-                        Button("复制独立 Key") { copyKey() }.disabled(!model.running || status == .null || working || copyingKey)
-                        Button("重新生成 Key…") { confirmRotation = true }.disabled(!canEdit)
-                        Spacer()
-                        if working { ProgressView().controlSize(.small) }
-                        Button("应用设置") { save() }.buttonStyle(.borderedProminent).disabled(!canEdit || !changed)
-                    }
-                    if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
-                    if error != nil || status == .null && model.running {
-                        Button(loading ? "读取中…" : "重新读取") { Task { await load() } }.disabled(!model.running || loading || working)
-                    }
-                    if status["enabled"].bool == true && status["running"].bool == false {
-                        HStack {
-                            InfoNote(text: "管理入口未启动。", color: .orange)
-                            Button("重试启动") { update(.object([:])) }.disabled(!canEdit)
-                        }
-                    }
-                }
-                SettingsCard("数据面板", symbol: "chart.bar.xaxis") {
-                    HStack {
-                        Text("在本机浏览器按时间、来源和模型筛选请求日志，查看性能与费用，阅读和导出缓存原文。")
-                            .foregroundStyle(.secondary)
-                        Spacer()
+                    SettingRow(title: "请求记录", subtitle: "在浏览器中筛选日志、查看性能与费用，并导出缓存原文。") {
                         Button("打开数据面板") {
                             guard let url = dashboardURL else { return }
                             if !NSWorkspace.shared.open(url) { error = "无法打开浏览器，请使用面板地址手动访问。" }
                         }.buttonStyle(.borderedProminent)
-                            .disabled(status["running"].bool != true || dashboardURL == nil)
+                            .disabled(!model.running || status["running"].bool != true || dashboardURL == nil)
                     }
-                }
-                SettingsCard("访问权限", symbol: "lock.shield") {
-                    LabeledContent("地址") {
-                        HStack(spacing: 10) {
-                            Text(address).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
-                            Button { copy(address, message: "管理 API 地址已复制。") } label: { Image(systemName: "doc.on.doc") }
-                                .accessibilityLabel("复制管理 API 地址").disabled(status == .null)
+                    if !model.running {
+                        InfoNote(text: "请先在设置中启动本机网关。")
+                    } else if status["enabled"].bool == false {
+                        InfoNote(text: "启用管理 API 后可打开面板。")
+                    } else if status["enabled"].bool == true && status["running"].bool == false {
+                        SettingRow(title: "管理入口未启动") {
+                            Button("重试启动") { update(.object([:])) }.disabled(!canEdit)
                         }
                     }
-                    LabeledContent("认证", value: "Authorization: Bearer <独立 Key>")
-                    Divider()
-                    Text("持有 Key 的程序可查看状态、余额和统计，进行来源抢占、停止抢占及主动刷新。")
-                        .foregroundStyle(.secondary)
-                    Text("通过 API 请求使用重置卡时，仍需在应用弹窗中确认；确认后将消耗卡片。")
-                        .foregroundStyle(.secondary)
+                    if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
+                    if model.running && (error != nil || (status == .null && !loading)) {
+                        Button("重新读取") { Task { await load() } }.disabled(loading || working)
+                    }
+                    if model.running, status["running"].bool == true, let dashboardURL {
+                        LabeledContent("面板地址") {
+                            Text(dashboardURL.absoluteString).font(AppTypography.small).textSelection(.enabled)
+                        }
+                    }
                 }
+                apiSettings
             }.settingsPage()
         }
         .task(id: model.running) { await load() }
-        .onChange(of: port) { _, _ in error = nil }
+        .onChange(of: port) { _, _ in settingsError = nil }
         .alert("重新生成管理 API Key？", isPresented: $confirmRotation) {
             Button("取消", role: .cancel) {}
             Button("重新生成") { update(.object(["regenerate_key": .bool(true)]), rotated: true) }
         } message: { Text("旧 Key 将立即失效，已接入的本机程序需要更新密钥。") }
+    }
+
+    private var apiSettings: some View {
+        SettingsCard("自动化接入", symbol: "lock.shield") {
+            if let address {
+                SettingRow(title: "已应用的 API 地址") {
+                    HStack(spacing: 8) {
+                        Text(address).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
+                        Button { copy(address, message: "管理 API 地址已复制。") } label: { Image(systemName: "doc.on.doc") }
+                            .accessibilityLabel("复制管理 API 地址").help("复制管理 API 地址")
+                    }
+                }
+            }
+            SettingRow(title: "独立 Key", subtitle: "认证方式：Authorization: Bearer <独立 Key>") {
+                Button("复制当前 Key") { copyKey() }.disabled(!canEdit || copyingKey)
+            }
+            Divider()
+            DisclosureGroup(isExpanded: $showsSettings) {
+                VStack(alignment: .leading, spacing: 12) {
+                    SettingRow(title: "监听端口") {
+                        HStack(spacing: 8) {
+                            TextField("17867", text: $port).font(.system(size: 13, design: .monospaced))
+                                .accessibilityLabel("监听端口").multilineTextAlignment(.trailing).settingsField().frame(width: 110)
+                                .disabled(!canEdit)
+                            Button("应用端口", action: save).buttonStyle(.borderedProminent).disabled(!canEdit || !changed)
+                        }
+                    }
+                    if working { ProgressView().controlSize(.small) }
+                    InfoNote(text: "持有 Key 的程序可以查询状态、余额和统计，启动或停止抢占，以及主动刷新。通过 API 请求使用重置卡时，仍需在应用中确认后才会消耗卡片。")
+                    Button("重新生成 Key…") { confirmRotation = true }.disabled(!canEdit)
+                }.padding(.top, 12)
+            } label: {
+                Text(changed ? "端口与权限 · 有未应用的更改" : "端口与权限")
+            }
+            if let settingsError { InfoNote(text: settingsError, symbol: "exclamationmark.triangle", color: .orange) }
+        }
     }
 
     private func apply(_ value: JSONValue, updatingPort: Bool = true) {
@@ -112,13 +126,14 @@ struct ControlSettingsView: View {
     }
 
     private func save() {
-        guard let number = Int(port), (1...65535).contains(number) else { error = "端口须为 1–65535 的整数。"; return }
+        guard let number = Int(port), (1...65535).contains(number) else { settingsError = "端口须为 1–65535 的整数。"; return }
         update(.object(["port": .number(Double(number))]))
     }
 
     private func update(_ payload: JSONValue, rotated: Bool = false) {
         guard canEdit else { return }
         working = true; error = nil
+        settingsError = nil
         Task {
             defer { working = false }
             do {
@@ -127,21 +142,22 @@ struct ControlSettingsView: View {
             } catch {
                 let message = error.localizedDescription
                 if let actual = try? await model.remoteCall("control.status") { apply(actual, updatingPort: false) }
-                self.error = message
+                if rotated || payload["port"] != .null { settingsError = message }
+                else { self.error = message }
             }
         }
     }
 
     private func copyKey() {
         guard model.running, status != .null, !working, !copyingKey else { return }
-        copyingKey = true; error = nil
+        copyingKey = true; settingsError = nil
         Task {
             defer { copyingKey = false }
             do {
                 let result = try await model.remoteCall("control.key")
                 guard let key = result["key"].string, !key.isEmpty else { throw AppError.message("无法读取管理 API Key。") }
                 copy(key, message: "管理 API Key 已复制。")
-            } catch { self.error = error.localizedDescription }
+            } catch { settingsError = error.localizedDescription }
         }
     }
 

@@ -10,38 +10,9 @@ struct ConnectionSettingsView: View {
     @Binding var section: ConnectionSection
 
     var body: some View {
-        let pendingProfiles = pendingRemoteProfiles
-        let showLocalNotice = model.localModelSettingsNeedsSync && section != .codex
         VStack(spacing: 0) {
-            HStack {
-                Text("接入方式").font(AppTypography.caption).foregroundStyle(.secondary)
-                Spacer(minLength: 16)
-                Picker("接入方式", selection: $section) {
-                    ForEach(ConnectionSection.allCases) { Text($0.rawValue).tag($0) }
-                }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 590)
-            }.padding(.horizontal, AppMetrics.pageInset).padding(.vertical, 16)
+            tabBar
             Divider()
-            if showLocalNotice || !pendingProfiles.isEmpty {
-                VStack(alignment: .leading, spacing: 10) {
-                    if showLocalNotice {
-                        HStack {
-                            InfoNote(text: model.localModelSettingsStatus, color: .orange)
-                            Spacer(minLength: 12)
-                            Button("查看本地 Codex") { section = .codex }
-                        }
-                    }
-                    if !pendingProfiles.isEmpty {
-                        HStack(alignment: .top) {
-                            InfoNote(text: "远端 Codex 模型设置需手动更新：" + pendingProfiles.map { profile in
-                                profile.displayName + "（" + (profile.modelSettingsSyncStatus(revision: model.modelSettingsRevision)?.title ?? "") + "）"
-                            }.joined(separator: "、") + "。请到远端 SSH 重新预览并应用模型设置。", color: .orange)
-                            Spacer(minLength: 12)
-                            Button("查看远端机器") { section = .remote }
-                        }
-                    }
-                }.padding(.horizontal, AppMetrics.pageInset).padding(.vertical, 12)
-                Divider()
-            }
             Group {
                 switch section {
                 case .codex: CodexSettingsView()
@@ -53,10 +24,54 @@ struct ConnectionSettingsView: View {
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 700, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    private var pendingRemoteProfiles: [SSHRemoteProfile] {
-        (model.settings.sshRemoteProfiles ?? []).filter { $0.modelSettingsSyncStatus(revision: model.modelSettingsRevision) != nil }
+    private var tabBar: some View {
+        let showLocal = section != .codex && model.showsLocalModelSettingsWarning
+        let remoteCount = section == .remote ? 0 : (model.settings.sshRemoteProfiles ?? []).lazy.filter { profile in
+            profile.modelSettingsSyncStatus(revision: model.modelSettingsRevision) != nil
+        }.count
+        return HStack(spacing: 16) {
+            Picker("接入方式", selection: $section) {
+                ForEach(ConnectionSection.allCases) { Text($0.rawValue).tag($0) }
+            }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 490)
+            Spacer(minLength: 0)
+            if showLocal || remoteCount > 0 {
+                Menu {
+                    if showLocal { Button("本机 Codex · 待同步") { section = .codex } }
+                    if remoteCount > 0 { Button("远端 Codex · \(remoteCount) 台待处理") { section = .remote } }
+                } label: {
+                    Label("模型同步", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                }
+                .fixedSize()
+                .help("查看需要手动同步的 Codex 连接")
+            }
+        }
+        .padding(.horizontal, AppMetrics.pageInset).padding(.vertical, 12)
+        .frame(maxWidth: 1120).frame(maxWidth: .infinity)
+        .background(AppPalette.canvas)
+    }
+}
+
+struct ConnectionListenerStatus: View {
+    let gatewayRunning: Bool
+    let loading: Bool
+    let status: JSONValue
+
+    var body: some View {
+        if !gatewayRunning {
+            StatusPill(text: "网关未运行", color: .orange)
+        } else if loading {
+            ProgressView().controlSize(.small).accessibilityLabel("正在读取入口状态")
+        } else if status["running"].bool == true {
+            StatusPill(text: "监听中", color: .green)
+        } else if status["enabled"].bool == true {
+            StatusPill(text: "未能启动", color: .orange)
+        } else if status["enabled"].bool == false {
+            StatusPill(text: "已关闭")
+        } else {
+            StatusPill(text: "状态未读取")
+        }
     }
 }

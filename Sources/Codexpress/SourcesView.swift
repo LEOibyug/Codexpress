@@ -10,45 +10,46 @@ struct SourcesView: View {
     @EnvironmentObject var model: AppModel
     @State private var editing: EditingSource?
     @State private var deleting: Source?
+    @State private var search = ""
     @State private var expandedSources = Set<String>()
     @State private var showingRouting = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            PageHeading("来源池") {
-                HStack(spacing: 10) {
-                    Button { showingRouting = true } label: {
-                        Label("分配策略", systemImage: "slider.horizontal.3")
-                    }
+        VStack(alignment: .leading, spacing: 14) {
+            PageHeading("来源池", subtitle: "管理官方账号和 API 来源。") {
+                if !model.sources.isEmpty {
                     Menu {
                         Button("官方账号") { addOfficial() }
                         Button("Responses API") { addAPI() }
                     } label: { Label("添加来源", systemImage: "plus") }
-                        .menuStyle(.borderedButton).buttonStyle(.borderedProminent)
-                        .fixedSize().disabled(!canEdit)
-                }.controlSize(.regular)
+                        .menuStyle(.borderedButton).buttonStyle(.borderedProminent).disabled(!canEdit)
+                }
+            }
+            HStack(spacing: 12) {
+                if !model.sources.isEmpty {
+                    TextField("搜索来源", text: $search).settingsField().frame(maxWidth: 240)
+                        .accessibilityLabel("搜索来源")
+                }
+                Spacer(minLength: 0)
+                Button { showingRouting = true } label: {
+                    Label("分配策略", systemImage: "slider.horizontal.3")
+                }.help(routingSummary)
             }
             if model.sources.isEmpty {
-                EmptyState("暂无来源", subtitle: "添加 ChatGPT 账号或 API 服务。", symbol: "server.rack") {
+                EmptyState("暂无来源", subtitle: model.running ? "添加 ChatGPT 账号或 Responses API 服务，开始分配请求。" : "网关启动后可添加 ChatGPT 账号或 Responses API 服务。", symbol: "server.rack") {
                     HStack(spacing: 10) {
                         Button("添加官方账号") { addOfficial() }.buttonStyle(.borderedProminent)
                         Button("添加 API") { addAPI() }.buttonStyle(.bordered)
-                    }.controlSize(.large).disabled(!canEdit)
+                    }.disabled(!canEdit)
                 }
             } else {
                 HStack(spacing: 8) {
-                    Label(routingSummary, systemImage: "arrow.triangle.branch")
+                    Label(routingSummary, systemImage: "arrow.triangle.branch").lineLimit(1)
                     Spacer()
-                    Text("\(model.sources.filter(\.enabled).count) 个已启用 · 共 \(model.sources.count) 个来源")
+                    Text("已启用 \(model.sources.filter(\.enabled).count) / \(model.sources.count)")
+                        .monospacedDigit().fixedSize()
                 }.font(AppTypography.caption).foregroundStyle(.secondary)
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(Array(model.sources.enumerated()), id: \.element.id) { index, source in
-                            if index > 0 { Divider().padding(.leading, 76) }
-                            sourceRow(source, index: index)
-                        }
-                    }.cardSurface().padding(.bottom, 2)
-                }
+                sourceList
             }
         }.settingsPage()
             .task(id: "\(model.running):\(model.accountRefreshGeneration)") { await model.refreshAccountInfo() }
@@ -60,7 +61,12 @@ struct SourcesView: View {
                 }
             }
             .onChange(of: model.loginSource) { _, sourceID in
-                if let sourceID { expandedSources.insert(sourceID) }
+                guard let sourceID else { return }
+                expandedSources.insert(sourceID)
+                let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !query.isEmpty, model.sources.first(where: { $0.id == sourceID })?.name.localizedCaseInsensitiveContains(query) != true {
+                    search = ""
+                }
             }
             .sheet(item: $editing) { item in SourceEditor(source: item.source, isNew: item.isNew).environmentObject(model) }
             .sheet(isPresented: $showingRouting) {
@@ -71,7 +77,8 @@ struct SourcesView: View {
                         Spacer()
                         Button("完成") { showingRouting = false }.keyboardShortcut(.defaultAction)
                     }.padding(16)
-                }.frame(width: 800, height: 700)
+                }.frame(width: 760, height: 620)
+                    .onExitCommand { showingRouting = false }
             }
             .alert("删除来源？", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
                 Button("取消", role: .cancel) { deleting = nil }
@@ -96,26 +103,50 @@ struct SourcesView: View {
     }
     private func addAPI() { editing = EditingSource(source: Source(), isNew: true) }
 
+    private var sourceList: some View {
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        let visible = model.sources.enumerated().filter { query.isEmpty || $0.element.name.localizedCaseInsensitiveContains(query) }
+        return Group {
+            if visible.isEmpty {
+                EmptyState("未找到来源", subtitle: "试试其他名称。", symbol: "magnifyingglass") {
+                    Button("清除搜索") { search = "" }
+                }
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(visible, id: \.element.id) { index, source in
+                            if index != visible.first?.offset { Divider().padding(.leading, 54) }
+                            sourceRow(source, index: index)
+                        }
+                    }.cardSurface()
+                }
+            }
+        }
+    }
+
     private func sourceRow(_ source: Source, index: Int) -> some View {
         let expanded = expandedSources.contains(source.id)
-        return HStack(alignment: .top, spacing: 14) {
-            priorityControls(source, index: index)
-            VStack(alignment: .leading, spacing: 12) {
-                sourceHeader(source)
-                HStack(alignment: .center, spacing: 16) {
+        return HStack(alignment: .top, spacing: 12) {
+            Text("\(index + 1)").font(AppTypography.caption.weight(.semibold)).monospacedDigit()
+                .foregroundStyle(.secondary).frame(width: 26, height: 26)
+                .background(AppPalette.well, in: RoundedRectangle(cornerRadius: 5))
+                .help("来源池优先级").accessibilityLabel("优先级 \(index + 1)")
+            VStack(alignment: .leading, spacing: 10) {
+                sourceHeader(source, index: index)
+                HStack(alignment: .center, spacing: 12) {
                     if source.official {
                         quotaSummary(source)
                         OfficialResetControl(source: source)
                     } else {
                         APIBalanceView(sourceID: source.id)
                     }
-                    Spacer(minLength: 8)
+                    Spacer(minLength: 4)
                     Button {
                         if expanded { expandedSources.remove(source.id) }
                         else { expandedSources.insert(source.id) }
                     } label: {
                         Label(expanded ? "收起" : "详情", systemImage: expanded ? "chevron.up" : "chevron.down")
-                    }.buttonStyle(.borderless).font(AppTypography.caption)
+                    }.buttonStyle(.borderless).font(AppTypography.caption).fixedSize()
                         .accessibilityLabel("\(expanded ? "收起" : "展开") \(source.name) 的详情")
                 }
                 if let reason = model.state(source.id)["last_error"].string {
@@ -133,51 +164,48 @@ struct SourcesView: View {
         }.padding(16)
     }
 
-    private func priorityControls(_ source: Source, index: Int) -> some View {
-        VStack(spacing: 9) {
-            Text("\(index + 1)").font(.system(size: 15, weight: .medium, design: .rounded))
-                .monospacedDigit().foregroundStyle(.secondary)
-                .accessibilityLabel("优先级 \(index + 1)")
-            HStack(spacing: 6) {
-                Button { model.move(IndexSet(integer: index), to: index - 1) } label: {
-                    Image(systemName: "chevron.up")
-                }.disabled(index == 0 || !canEdit)
-                    .help("提高优先级").accessibilityLabel("提高 \(source.name) 的优先级")
-                Button { model.move(IndexSet(integer: index), to: index + 2) } label: {
-                    Image(systemName: "chevron.down")
-                }.disabled(index == model.sources.count - 1 || !canEdit)
-                    .help("降低优先级").accessibilityLabel("降低 \(source.name) 的优先级")
-            }.buttonStyle(.borderless).font(.system(size: 10, weight: .semibold))
-        }.frame(width: 44).padding(.top, 3)
-    }
-
-    private func sourceHeader(_ source: Source) -> some View {
-        HStack(spacing: 10) {
+    private func sourceHeader(_ source: Source, index: Int) -> some View {
+        let needsLogin = source.official && source.account_id == nil
+        let takingOver = model.status["manual_route"]["source_id"].string == source.id
+        return HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(source.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                Text(source.name).font(AppTypography.sectionTitle).lineLimit(1).help(source.name)
                 Text(source.official ? "官方账号" : "Responses API").font(AppTypography.small).foregroundStyle(.secondary)
             }
-            Spacer(minLength: 8)
-            if source.official, source.account_id == nil {
-                Button("登录…") { model.login(source) }.buttonStyle(.borderedProminent).controlSize(.small)
+            Spacer(minLength: 4)
+            if takingOver {
+                StatusPill(text: "正在抢占", color: .accentColor).fixedSize()
+            }
+            StatusPill(text: source.enabled ? (needsLogin ? "需要登录" : healthLabel(model.state(source.id)["health"].string)) : "已停用",
+                       color: sourceColor(source), active: model.sourceHasActivity(source.id)).fixedSize()
+            if needsLogin {
+                Button("登录…") { model.login(source) }.buttonStyle(.borderedProminent)
                     .disabled(!canEdit || model.loginFlow != nil)
             }
-            SourceRoutingActions(source: source, compact: true).fixedSize()
-            StatusPill(text: source.enabled ? healthLabel(model.state(source.id)["health"].string) : "已停用",
-                       color: sourceColor(source), active: model.sourceHasActivity(source.id))
-            Toggle("启用 \(source.name)", isOn: Binding(get: { source.enabled }, set: { _ in model.toggle(source) }))
-                .toggleStyle(.switch).labelsHidden().controlSize(.small).disabled(!canEdit)
+            Button("编辑…") { editing = EditingSource(source: source, isNew: false) }
+                .accessibilityLabel("编辑来源 \(source.name)")
             Menu {
-                Button("编辑…") { editing = EditingSource(source: source, isNew: false) }
-                Button("删除…", role: .destructive) { deleting = source }.disabled(!canEdit)
-            } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).frame(width: 20)
-        }
+                Button(source.enabled ? "停用来源" : "启用来源") { model.toggle(source) }.disabled(!canEdit)
+                Divider()
+                SourceRoutingActions(source: source)
+                Divider()
+                Button("提高优先级") { model.move(IndexSet(integer: index), to: index - 1) }
+                    .disabled(index == 0 || !canEdit)
+                Button("降低优先级") { model.move(IndexSet(integer: index), to: index + 2) }
+                    .disabled(index == model.sources.count - 1 || !canEdit)
+                Divider()
+                Button("删除来源…", role: .destructive) { deleting = source }.disabled(!canEdit)
+            } label: {
+                Image(systemName: "ellipsis.circle").font(.system(size: 14))
+            }.menuStyle(.borderlessButton).fixedSize()
+                .accessibilityLabel("\(source.name) 的更多操作").help("更多操作")
+        }.controlSize(.small)
     }
 
     private func quotaSummary(_ source: Source) -> some View {
         let quota = model.state(source.id)["quota"]
         let overview = QuotaOverview(quota)
-        return HStack(alignment: .top, spacing: 24) {
+        return HStack(alignment: .top, spacing: 14) {
             ForEach(overview.mainWindows) { window in
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -235,6 +263,7 @@ struct SourcesView: View {
 
     private func sourceColor(_ source: Source) -> Color {
         guard source.enabled else { return .secondary }
+        if source.official && source.account_id == nil { return .orange }
         switch model.state(source.id)["health"].string { case "ready": return .green; case nil: return .secondary; default: return .orange }
     }
 }

@@ -9,15 +9,17 @@ struct CodexSettingsView: View {
 
     private var preferencesChanged: Bool { (home.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath != model.settings.codexHome }
     private var canConnect: Bool { !model.busy && model.running && !preferencesChanged && !model.portNeedsRestart && !model.metadataLoadFailed }
+    private var usesGateway: Bool { model.connectionMode == "gateway" }
+    private var usesOfficial: Bool { model.connectionMode == "official" }
 
     var body: some View {
         ScrollViewReader { scroll in
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
-                    PageHeading("Codex")
+                    PageHeading("本机 Codex", subtitle: "接入 Codexpress 来源池，或继续使用 Codex 官方登录。")
                     connectionCard
-                    modelSettingsCard
                     if model.preview != .null { previewCard.id("connection-preview") }
+                    directoryCard
                     backupCard
                 }.settingsPage()
             }.onChange(of: model.preview != .null) { _, visible in
@@ -44,64 +46,69 @@ struct CodexSettingsView: View {
     }
 
     private var connectionActions: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                Button { model.configPreview() } label: {
-                    Label("查看高级预览", systemImage: "doc.text.magnifyingglass")
-                }.disabled(!canConnect)
-                if model.connectionMode == "gateway" {
-                    Button("恢复原连接…") { confirming = "config.restore" }
-                        .disabled(model.busy || !model.running || preferencesChanged || model.metadataLoadFailed)
-                }
-                Spacer(minLength: 0)
-                Button(model.codexConnectionPhase ?? (model.connectionMode == "gateway" ? "更新连接设置" : "接入来源池")) {
-                    model.switchCodexConnection(.gateway)
-                }.buttonStyle(.borderedProminent).disabled(!canConnect)
-            }
-            InfoNote(text: preferencesChanged ? "请先提交配置目录。" : "接入时自动备份配置并重启 Codex，请先结束 Codex 中的操作。")
-            if model.portNeedsRestart {
-                InfoNote(text: "请重启 Codexpress 以启用新端口。", symbol: "arrow.clockwise", color: .orange)
-            }
+        HStack(spacing: 12) {
+            DirectOfficialLoginButton().disabled(preferencesChanged)
+            Button("预览配置") { model.configPreview() }.disabled(!canConnect)
+            Spacer(minLength: 0)
+            gatewayButton
         }
     }
 
-    private var modelSettingsCard: some View {
-        SettingsCard("模型设置同步", symbol: "arrow.triangle.2.circlepath", accessory: {
-            if model.localModelSettingsNeedsSync {
-                Button("同步模型设置") { model.retryLocalModelSettingsSync() }
-                    .disabled(model.busy || !model.running || preferencesChanged || model.metadataLoadFailed)
-            }
-        }) {
-            InfoNote(text: model.localModelSettingsStatus, symbol: model.localModelSettingsNeedsSync ? "exclamationmark.triangle" : "info.circle", color: model.localModelSettingsNeedsSync ? .orange : .secondary)
-        }
+    private var gatewayButton: some View {
+        Button(model.codexConnectionPhase ?? (usesGateway ? "更新来源池连接" : "接入来源池")) {
+            model.switchCodexConnection(.gateway)
+        }.buttonStyle(.borderedProminent).disabled(!canConnect)
     }
 
     private var connectionCard: some View {
-        SettingsCard("连接方式与配置", symbol: "link") {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(model.connectionMode == "official" ? "官方连接 · 系统代理" : model.connectionMode == "gateway" ? "来源池" : "连接方式")
-                            .font(.system(size: 13, weight: .medium))
-                    }
-                    Spacer()
-                    DirectOfficialLoginButton().disabled(preferencesChanged)
+        SettingsCard("当前连接", symbol: "link", accessory: {
+            StatusPill(text: usesOfficial ? "官方连接" : usesGateway ? "来源池" : "未接入 Codexpress",
+                       color: usesOfficial || usesGateway ? .green : .secondary)
+        }) {
+            if usesOfficial {
+                Text("通过系统代理连接官方；不使用来源池的模型设置。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
+            } else if usesGateway && !model.showsLocalModelSettingsWarning {
+                Text(model.localModelSettingsStatus).font(AppTypography.caption).foregroundStyle(.secondary)
+            }
+            if model.showsLocalModelSettingsWarning {
+                HStack(alignment: .top, spacing: 12) {
+                    InfoNote(text: model.localModelSettingsStatus, symbol: "arrow.triangle.2.circlepath", color: .orange)
+                    Spacer(minLength: 0)
+                    Button("同步模型设置") { model.retryLocalModelSettingsSync() }
+                        .disabled(model.busy || !model.running || preferencesChanged || model.metadataLoadFailed)
                 }
-                Divider().overlay(AppPalette.border)
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("配置目录").font(.system(size: 13, weight: .medium))
-                    HStack(spacing: 10) {
-                        TextField("Codex 配置目录（绝对路径）", text: $home)
-                            .font(.system(size: 13, design: .monospaced)).settingsField()
-                            .onSubmit { saveDirectory() }
-                        if preferencesChanged {
-                            Button("保存目录") { saveDirectory() }
-                                .disabled(model.busy || model.metadataLoadFailed)
-                        }
-                    }
+            }
+            connectionActions
+            if !model.running {
+                InfoNote(text: "网关未运行。请在设置中重试启动。", color: .orange)
+            } else if preferencesChanged {
+                InfoNote(text: "配置目录有未保存的更改。请先保存或撤销目录编辑。", color: .orange)
+            } else if model.portNeedsRestart {
+                InfoNote(text: "重启 Codexpress 后，才能使用新端口接入来源池。", symbol: "arrow.clockwise", color: .orange)
+            } else {
+                Text("切换连接会备份配置并重启 Codex，请先结束当前任务。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var directoryCard: some View {
+        SettingsCard("配置目录", symbol: "folder") {
+            if preferencesChanged {
+                LabeledContent("已保存目录", value: model.settings.codexHome)
+                    .font(AppTypography.small).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            HStack(spacing: 10) {
+                TextField("Codex 配置目录（绝对路径）", text: $home)
+                    .font(.system(size: 13, design: .monospaced)).settingsField()
+                    .accessibilityLabel("Codex 配置目录")
+                    .onSubmit { saveDirectory() }
+                if preferencesChanged {
+                    Button("撤销编辑") { home = model.settings.codexHome }
+                    Button("保存目录") { saveDirectory() }
+                        .disabled(model.busy || model.metadataLoadFailed)
                 }
-                Divider().overlay(AppPalette.border)
-                connectionActions
             }
         }
     }
@@ -112,17 +119,25 @@ struct CodexSettingsView: View {
         return timestampLabel(value["created_at"]) + " · " + (reasons[value["reason"].string ?? ""] ?? "配置备份")
     }
     private var backupCard: some View {
-        SettingsCard("配置备份", symbol: "clock.arrow.circlepath") {
+        SettingsCard("备份与还原", symbol: "clock.arrow.circlepath") {
+            if usesGateway {
+                SettingRow(title: "恢复原连接", subtitle: "恢复接入来源池前的连接设置。") {
+                    Button("恢复原连接…") { confirming = "config.restore" }
+                        .disabled(model.busy || !model.running || preferencesChanged || model.metadataLoadFailed)
+                }
+                Divider()
+            }
             VStack(alignment: .leading, spacing: 16) {
                 if model.configurationBackups.isEmpty {
-                    Text("暂无备份").font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text("暂无配置备份。切换连接或应用设置时会自动备份。")
+                        .font(AppTypography.caption).foregroundStyle(.secondary)
                 } else {
                     Picker("备份时间", selection: Binding(get: { backupID }, set: { selectedBackup = $0 })) {
                         ForEach(Array(model.configurationBackups.enumerated()), id: \.offset) { _, item in Text(backupLabel(item)).tag(item["id"].string ?? "") }
                     }
                 }
                 HStack {
-                    Button("刷新") { Task { await model.refreshConfigurationBackups() } }.disabled(model.busy || !model.running)
+                    Button("刷新备份") { Task { await model.refreshConfigurationBackups() } }.disabled(model.busy || !model.running)
                     Spacer()
                     Button("还原备份…") { confirming = "backup.restore" }
                         .disabled(backupID.isEmpty || model.busy || !model.running || preferencesChanged)
@@ -132,7 +147,7 @@ struct CodexSettingsView: View {
     }
 
     private var previewCard: some View {
-        SettingsCard("连接预览", symbol: "doc.text") {
+        SettingsCard("来源池配置预览", subtitle: "仅预览，不会修改 Codex。", symbol: "doc.text") {
             VStack(alignment: .leading, spacing: 16) {
                 HStack(alignment: .top, spacing: 20) {
                     configurationBlock("当前配置", value: model.preview["before"].string ?? "")
@@ -152,8 +167,9 @@ struct CodexSettingsView: View {
                 }
                 if !model.preview["legacy_providers"].array.isEmpty || model.preview["origin_error"].string != nil { LegacyProviderOriginsView() }
                 HStack {
-                    Spacer()
+                    Spacer(minLength: 0)
                     Button("收起预览") { model.preview = .null }
+                    gatewayButton
                 }
             }
         }

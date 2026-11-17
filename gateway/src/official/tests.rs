@@ -1,8 +1,5 @@
 //! These tests run only against a local simulated explicit proxy and temporary state.
-use codexpress_gateway::{model, routing, transport};
-#[allow(dead_code)]
-#[path = "../src/official.rs"]
-mod official;
+use crate::{credentials, model, official, routing};
 use axum::{
     extract::State,
     routing::{get, post},
@@ -1199,7 +1196,7 @@ struct CredentialFixture {
     saved: std::sync::Mutex<Vec<(String, Value)>>,
     fail: std::sync::atomic::AtomicBool,
 }
-impl codexpress_gateway::credentials::CredentialStore for CredentialFixture {
+impl credentials::CredentialStore for CredentialFixture {
     fn save(&self, id: &str, secret: &Value) -> anyhow::Result<()> {
         // install must hold the runtime write lock while durability is established.
         let state = self.owner.lock().unwrap().upgrade().unwrap();
@@ -1348,7 +1345,7 @@ async fn missing_low_quota_windows_never_reopen_admission_without_known_recovery
             .unwrap();
         assert_eq!(retained["observed_at"], 100);
         assert_eq!(
-            codexpress_gateway::routing::remaining(&state.sources.read().await[0]),
+            routing::remaining(&state.sources.read().await[0]),
             Some(0.0)
         );
     }
@@ -1359,7 +1356,7 @@ async fn missing_low_quota_windows_never_reopen_admission_without_known_recovery
         recovered.quota = json!({"fetched_at":101,"windows":[{"name":"secondary","used_percent":50,"observed_at":101}]});
         sources.push(recovered);
         assert_eq!(
-            codexpress_gateway::routing::account_remaining(&sources[0], &sources),
+            routing::account_remaining(&sources[0], &sources),
             Some(50.0)
         );
     }
@@ -1370,7 +1367,7 @@ async fn missing_low_quota_windows_never_reopen_admission_without_known_recovery
     {
         let sources = state.sources.read().await;
         assert_eq!(
-            codexpress_gateway::routing::account_remaining(&sources[0], &sources),
+            routing::account_remaining(&sources[0], &sources),
             Some(50.0)
         );
     }
@@ -1393,7 +1390,7 @@ async fn missing_low_quota_windows_never_reopen_admission_without_known_recovery
         .unwrap();
     assert_eq!(result["quota"]["stale"], false);
     assert_eq!(
-        codexpress_gateway::routing::remaining(&state.sources.read().await[0]),
+        routing::remaining(&state.sources.read().await[0]),
         Some(70.0)
     );
     {

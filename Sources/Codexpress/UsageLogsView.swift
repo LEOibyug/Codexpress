@@ -16,10 +16,9 @@ struct UsageLogsView: View {
     @EnvironmentObject var model: AppModel
     @Binding var selection: UsageSelection
     let options: JSONValue
-    let onBack: () -> Void
-    @State private var ingress = ""
-    @State private var status = ""
-    @State private var search = ""
+    @Binding var ingress: String
+    @Binding var status: String
+    @Binding var search: String
     @State private var records: [UsageItem] = []
     @State private var nextCursor: Double?
     @State private var total = 0
@@ -32,6 +31,7 @@ struct UsageLogsView: View {
     @State private var selected: UsageItem?
     private var availableOptions: JSONValue { model.cachedUsageAnalytics(filter.query)?.value["options"] ?? options }
     private var filter: UsageLogFilter { UsageLogFilter(selection: selection, ingress: ingress, status: status, search: search.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    private var showsCurrentResults: Bool { loadedFilter == filter }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
@@ -41,36 +41,53 @@ struct UsageLogsView: View {
                     Text("全部入口").tag("")
                     if !ingress.isEmpty && !availableOptions["ingresses"].array.compactMap(\.string).contains(ingress) { Text(usageIngressName(ingress)).tag(ingress) }
                     ForEach(availableOptions["ingresses"].array.compactMap(\.string), id: \.self) { Text(usageIngressName($0)).tag($0) }
-                }.frame(width: 164)
+                }.labelsHidden().frame(width: 142)
                 Picker("状态", selection: $status) {
                     Text("全部结果").tag(""); Text("成功").tag("success"); Text("未成功").tag("unsuccessful"); Text("进行中").tag("active")
-                }.frame(width: 152)
+                }.labelsHidden().frame(width: 132)
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                     TextField("搜索模型、来源或错误代码", text: $search).textFieldStyle(.plain)
-                    if !search.isEmpty { Button { search = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain) }
-                }.font(.system(size: 13)).padding(.horizontal, 9).padding(.vertical, 6).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6)).overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)))
+                    if !search.isEmpty {
+                        Button { search = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
+                            .buttonStyle(.plain).accessibilityLabel("清除搜索")
+                    }
+                }.padding(.horizontal, 10).padding(.vertical, 7)
+                    .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(AppPalette.border).allowsHitTesting(false))
             }.controlSize(.regular).font(.system(size: 13))
-            if selection.query == nil { InfoNote(text: "请选择不超过 366 天的日期范围。", color: .orange) }
-            if let loadError { InfoNote(text: loadError, color: .orange) }
+            if let loadError, showsCurrentResults { InfoNote(text: loadError, color: .orange) }
             HStack {
                 Text("请求记录").font(.system(size: 13, weight: .semibold))
                 Spacer()
-                Text("\(total) 次请求" + (activeCount > 0 ? " · \(activeCount) 次进行中" : ""))
-                    .font(.system(size: 12)).foregroundStyle(.secondary).monospacedDigit()
+                if showsCurrentResults {
+                    Text("\(total.formatted()) 次请求" + (activeCount > 0 ? " · \(activeCount.formatted()) 次进行中" : ""))
+                        .font(AppTypography.caption).foregroundStyle(.secondary).monospacedDigit()
+                }
             }
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    if records.isEmpty {
-                        EmptyState("暂无连接记录", subtitle: "当前筛选下没有请求", symbol: "list.bullet.rectangle").frame(height: 310)
+                    if !showsCurrentResults {
+                        if selection.query == nil {
+                            EmptyState("日期范围无效", subtitle: "请在筛选栏调整起止日期。", symbol: "calendar").frame(height: 230)
+                        } else if let loadError {
+                            EmptyState("暂时无法读取请求", subtitle: loadError, symbol: "exclamationmark.circle").frame(height: 230)
+                        } else if !model.running {
+                            EmptyState("网关未连接", subtitle: "启动网关后即可读取请求记录。", symbol: "network.slash").frame(height: 230)
+                        } else {
+                            ProgressView("正在载入请求…").controlSize(.small).frame(maxWidth: .infinity, minHeight: 230)
+                        }
+                    } else if records.isEmpty {
+                        EmptyState("没有匹配的请求", subtitle: "试试更长的时间范围或清除筛选。", symbol: "list.bullet.rectangle").frame(height: 230)
                     }
-                    ForEach(records) { item in
+                    ForEach(showsCurrentResults ? records : []) { item in
                         Button { selected = item } label: { requestRow(item) }.buttonStyle(.plain)
                         if item.id != records.last?.id { Divider().padding(.horizontal, 15) }
                     }
-                    if nextCursor != nil {
+                    if showsCurrentResults && nextCursor != nil {
                         Divider()
-                        Button("显示更多") { Task { await loadMore() } }.buttonStyle(.plain).foregroundStyle(Color.accentColor).font(.system(size: 13)).padding(16).disabled(loadingMore)
+                        Button(loadingMore ? "正在载入…" : "载入更多请求") { Task { await loadMore() } }
+                            .buttonStyle(.link).padding(16).disabled(loadingMore)
                     }
                 }.cardSurface().padding(.bottom, 4)
             }
@@ -87,6 +104,7 @@ struct UsageLogsView: View {
         .task(id: UsageRefreshKey(selection: filter, active: model.settingsWindowActive)) {
             guard model.settingsWindowActive else { return }
             let requested = filter
+            loadError = nil
             guard requested.query != nil else { return }
             do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
             while !Task.isCancelled {
@@ -95,7 +113,7 @@ struct UsageLogsView: View {
                     let result = try await model.usageRequests(query, status: requested.status, search: requested.search)
                     guard !Task.isCancelled else { break }
                     let incoming = result["records"].array.enumerated().map { UsageItem($0.element, index: $0.offset) }
-                    if !loadingMore {
+                    if !loadingMore || loadedFilter != requested {
                         let preserving = loadedFilter == requested && loadedPages > 1
                         let previous = preserving ? records.filter { (query.from..<query.to).contains($0.value["started_at"].number ?? 0) } : []
                         let merged = usageMergeFirstPage(previous: previous, incoming: incoming, previousCursor: nextCursor, incomingCursor: result["next_cursor"].number, preserving: preserving, capacity: loadedPages * 50)

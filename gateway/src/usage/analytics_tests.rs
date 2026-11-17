@@ -45,6 +45,7 @@ fn whole_window_filters_daily_zeroes_options_and_timings_are_consistent() {
         let mut record = record(&format!("stored-{index}"), from + 1);
         record.latency_ms = 100 + index;
         record.first_token_latency_ms = Some(10 + index);
+        record.token_details.stream_complete = index == 0;
         persist(&data, &record, Some("native"));
     }
     let mut unknown = record("unknown", from + 24 * 3600);
@@ -79,7 +80,9 @@ fn whole_window_filters_daily_zeroes_options_and_timings_are_consistent() {
     assert_eq!(a["input_tokens"], 22_505);
     assert_eq!(a["output_tokens"], 2_252);
     assert_eq!(a["throughput_output_tokens"], 2_250);
-    assert_eq!(a["throughput_latency_ms"], (100..325).sum::<u64>());
+    assert_eq!(a["throughput_latency_ms"], (100..325).sum::<u64>() - 100 + 50);
+    assert_eq!(a["timed_output_tokens"], 10);
+    assert_eq!(a["total_generation_ms"], 50);
     assert_eq!(a["total_latency_ms"], (100..325).sum::<u64>());
     assert_eq!(a["first_token_samples"], 225);
     assert_eq!(full["daily"][0]["requests"], 226);

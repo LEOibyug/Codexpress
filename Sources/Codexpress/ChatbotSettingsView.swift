@@ -12,64 +12,52 @@ struct ChatbotSettingsView: View {
     @State private var copyingKey = false
     @State private var confirmReset = false
     @State private var error: String?
+    @State private var showsSettings = false
 
     private var canEdit: Bool { model.running && status != .null && !working && !loading }
-    private var address: String { status["base_url"].string ?? "—" }
-    private var changed: Bool { !newKey.isEmpty || port != status["port"].number.map({ String(Int($0)) }) }
+    private var address: String? { model.running ? status["base_url"].string : nil }
+    private var changed: Bool { !newKey.isEmpty || port != savedPort }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                PageHeading("聊天客户端")
-                if !model.running { InfoNote(text: "请先启动本机网关。") }
-                SettingsCard("客户端 API", symbol: "bubble.left.and.bubble.right", accessory: {
-                    StatusPill(text: status["running"].bool == true ? "运行中" : status["enabled"].bool == false ? "已关闭" : "未启动", color: status["running"].bool == true ? .green : .secondary)
+                PageHeading("聊天客户端", subtitle: "将 Codexpress 添加为 OpenAI 兼容供应商，使用 Chat Completions 或 Responses。")
+                SettingsCard("接入地址与密钥", symbol: "bubble.left.and.bubble.right", accessory: {
+                    ConnectionListenerStatus(gatewayRunning: model.running, loading: loading, status: status)
                 }) {
-                    SettingRow(title: "启用接入") {
+                    SettingRow(title: "启用接入", subtitle: "与本机 OMP 共用此入口。") {
                         Toggle("启用聊天客户端接入", isOn: Binding(get: { status["enabled"].bool ?? true }, set: { enabled in update(.object(["enabled": .bool(enabled)])) }))
-                            .toggleStyle(.switch).labelsHidden().disabled(!canEdit || status == .null)
+                            .toggleStyle(.switch).labelsHidden().disabled(!canEdit)
                     }
-                    Divider()
-                    SettingRow(title: "监听端口") {
-                        TextField("17865", text: $port).font(.system(size: 13, design: .monospaced))
-                            .multilineTextAlignment(.trailing).settingsField().frame(width: 130).disabled(!canEdit || status == .null)
+                    if let address {
+                        SettingRow(title: "已应用的 API 基址") {
+                            HStack(spacing: 8) {
+                                Text(address).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
+                                Button { copy(address, message: "API 地址已复制。") } label: { Image(systemName: "doc.on.doc") }
+                                    .accessibilityLabel("复制 API 地址").help("复制 API 地址")
+                            }
+                        }
+                        HStack(spacing: 12) {
+                            Text("远端客户端请用此 Mac 的局域网或 VPN 地址替换 127.0.0.1。不要将 HTTP 端口直接暴露到公网。")
+                                .font(AppTypography.caption).foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                            Button("复制当前 Key") { copyKey() }.buttonStyle(.borderedProminent)
+                                .disabled(!canEdit || copyingKey)
+                        }
+                    } else if !model.running {
+                        InfoNote(text: "请先在设置中启动本机网关。")
                     }
-                    SettingRow(title: "新 API Key") {
-                        SecureField("留空保留原 Key", text: $newKey).settingsField().frame(maxWidth: 360).disabled(!canEdit || status == .null)
-                    }
-                    if !newKey.isEmpty { InfoNote(text: "应用后旧 Key 将失效，请同步更新客户端。", color: .orange) }
-                    Divider()
-                    HStack(spacing: 12) {
-                        Button("复制当前 Key") { copyKey() }.disabled(!model.running || status == .null || working || copyingKey)
-                        Button("重新生成…") { confirmReset = true }.disabled(!canEdit)
-                        Spacer()
-                        if working { ProgressView().controlSize(.small) }
-                        Button("应用设置") { save() }.buttonStyle(.borderedProminent).disabled(!canEdit || !changed)
-                    }
-                    if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
-                    if error != nil || status == .null && model.running {
-                        Button(loading ? "读取中…" : "重新读取") { Task { await load() } }.disabled(!model.running || loading || working)
-                    }
-                    if status["enabled"].bool == true && status["running"].bool == false {
-                        HStack {
-                            InfoNote(text: "聊天入口未启动。", color: .orange)
+                    if model.running && status["enabled"].bool == true && status["running"].bool == false {
+                        SettingRow(title: "聊天入口未启动") {
                             Button("重试启动") { update(.object([:])) }.disabled(!canEdit)
                         }
                     }
-                }
-                SettingsCard("供应商填写", symbol: "link") {
-                    LabeledContent("类型", value: "OpenAI 兼容")
-                    LabeledContent("API 基址") {
-                        HStack(spacing: 10) {
-                            Text(address).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
-                            Button { copy(address, message: "API 地址已复制。") } label: { Image(systemName: "doc.on.doc") }
-                                .accessibilityLabel("复制 API 地址").help("复制 API 地址").disabled(status == .null)
-                        }
-                    }
                     Divider()
-                    LabeledContent("接口", value: "Chat Completions / Responses")
-                    Text("OMP 与聊天客户端共用此端口，允许局域网访问。远端请将 127.0.0.1 替换为这台 Mac 的局域网或 VPN 地址，并使用独立 Key。不要将 HTTP 端口直接暴露到公网。")
-                        .foregroundStyle(.secondary)
+                    advancedSettings
+                    if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
+                    if model.running && (error != nil || (status == .null && !loading)) {
+                        Button("重新读取") { Task { await load() } }.disabled(loading || working)
+                    }
                 }
             }.settingsPage()
         }.task(id: model.running) { await load() }
@@ -80,6 +68,31 @@ struct ChatbotSettingsView: View {
                 Button("重新生成") { update(.object(["regenerate_key": .bool(true)])) }
             } message: { Text("旧 Key 将无法发起新请求，使用此入口的客户端需要更新密钥。") }
     }
+
+    private var advancedSettings: some View {
+        DisclosureGroup(isExpanded: $showsSettings) {
+            VStack(alignment: .leading, spacing: 12) {
+                SettingRow(title: "监听端口") {
+                    TextField("17865", text: $port).font(.system(size: 13, design: .monospaced))
+                        .accessibilityLabel("监听端口")
+                        .multilineTextAlignment(.trailing).settingsField().frame(width: 110).disabled(!canEdit)
+                }
+                SettingRow(title: "新 API Key") {
+                    SecureField("留空保留原 Key", text: $newKey).settingsField().frame(maxWidth: 300).disabled(!canEdit)
+                }
+                if !newKey.isEmpty { InfoNote(text: "应用后旧 Key 将失效，请同步更新客户端。", color: .orange) }
+                HStack(spacing: 12) {
+                    Button("重新生成 Key…") { confirmReset = true }.disabled(!canEdit)
+                    Spacer(minLength: 0)
+                    if working { ProgressView().controlSize(.small) }
+                    Button("应用更改", action: save).buttonStyle(.borderedProminent).disabled(!canEdit || !changed)
+                }
+            }.padding(.top, 12)
+        } label: {
+            Text(changed ? "端口与密钥 · 有未应用的更改" : "端口与密钥")
+        }
+    }
+
     private func load() async {
         guard model.running else { status = .null; error = nil; return }
         loading = true
