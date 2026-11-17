@@ -1,6 +1,7 @@
 //! Durable reset-credit operations and conservative handling of uncertain outcomes.
 use super::{
     account, field, json_response, lock, refresh_inner, same_binding,
+    auto_reset::Authorization,
     snapshots::{credits_snapshot, get, number, refresh_snapshots},
     source, token, Endpoints, REQUEST_TIMEOUT,
 };
@@ -12,7 +13,7 @@ use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Serialize, Deserialize)]
 struct Operation {
@@ -98,7 +99,7 @@ pub(super) async fn consume_locked(
     payload: &Value,
     endpoints: Endpoints<'_>,
     initial: &crate::model::Source,
-    automatic: Option<(&crate::model::Source, u64, u64)>,
+    automatic: Option<&Authorization>,
 ) -> Result<Value> {
     let id = field(payload, "source_id")?;
     let credit = if automatic.is_some() { "" } else { field(payload, "credit_id")? };
@@ -119,7 +120,7 @@ pub(super) async fn consume_locked(
             bail!("操作标识已经绑定其他来源、账号或重置卡");
         }
         let mut result = operation.result;
-        if ["pending_verification", "unknown"].contains(&result["code"].as_str().unwrap_or("")) {
+        if automatic.is_none() && ["pending_verification", "unknown"].contains(&result["code"].as_str().unwrap_or("")) {
             if let Ok(src) = refresh_inner(state, id, false, endpoints).await {
                 if let Ok(refreshed) = refresh_snapshots(state, &src, endpoints).await {
                     result["quota"] = refreshed["quota"].clone();
@@ -135,7 +136,7 @@ pub(super) async fn consume_locked(
     }
     // A previous uncertain operation for this card blocks new IDs, including after restart.
     let directory = state.state_dir.join("official-operations");
-    let mut uncertain_cards = Vec::new();
+    let mut excluded_cards = Vec::new();
     if directory.exists() {
         for entry in std::fs::read_dir(&directory).map_err(|_| anyhow!("无法核实待确认操作"))?
         {
@@ -147,24 +148,23 @@ pub(super) async fn consume_locked(
                 &std::fs::read(entry.path()).map_err(|_| anyhow!("无法读取待确认操作"))?,
             )
             .map_err(|_| anyhow!("重置操作记录损坏，禁止提交"))?;
-            if operation
-                .account_id
-                .as_deref()
-                .map_or(operation.source_id == id, |account_id| {
-                    Some(account_id) == account(&src)
-                })
-                && (automatic.is_some() || operation.credit_id == credit)
-                && ["pending_verification", "unknown"]
-                    .contains(&operation.result["code"].as_str().unwrap_or(""))
-            {
-                if automatic.is_none()
-                    || !super::auto_reset::allows_uncertain(state, &src, operation.weekly_generation).await?
-                {
-                    bail!("此重置卡有结果待核实的操作，请刷新核实，不能再次提交");
+            let same_account = operation.account_id.as_deref().map_or(operation.source_id == id, |account_id| {
+                Some(account_id) == account(&src)
+            });
+            if !same_account || (automatic.is_none() && operation.credit_id != credit) { continue; }
+            match operation.result["code"].as_str() {
+                Some("pending_verification" | "unknown") => {
+                    if automatic.is_none()
+                        || !super::auto_reset::allows_uncertain(state, &src, operation.weekly_generation).await?
+                    {
+                        bail!("此重置卡有结果待核实的操作，请刷新核实，不能再次提交");
+                    }
+                    // A later confirmed recovery/new cycle permits another event,
+                    // never a replay of the same uncertain card.
+                    excluded_cards.push(operation.credit_id);
                 }
-                // A later confirmed recovery/new cycle authorizes a new event,
-                // never a replay of an uncertain card's POST.
-                uncertain_cards.push(operation.credit_id);
+                Some("reset" | "already_redeemed") if automatic.is_some() => excluded_cards.push(operation.credit_id),
+                _ => {}
             }
         }
     }
@@ -174,8 +174,10 @@ pub(super) async fn consume_locked(
     let credits_guard = credits_mutex.lock().await;
     let cards = credits_snapshot(&get(&src, endpoints.credits).await?)?;
     let credit = if automatic.is_some() {
-        super::auto_reset::select_card(&cards, &uncertain_cards)
-            .ok_or_else(|| anyhow!("没有可用的重置卡"))?
+        let Some(credit) = super::auto_reset::select_card(&cards, &excluded_cards) else {
+            return Ok(reset_result("no_available_credit", Value::Null));
+        };
+        credit
     } else {
         credit
     };
@@ -211,22 +213,19 @@ pub(super) async fn consume_locked(
     let event_mutex = super::auto_reset::event_lock(state, &src).await;
     let event_guard = event_mutex.lock().await;
     let settings = state.settings.read().await;
-    let sources = state.sources.read().await;
+    let mut sources = state.sources.write().await;
     let latest = sources.iter().find(|r| r.source.id == id)
         .ok_or_else(|| anyhow!("来源已删除"))?;
     if account(&latest.source) != Some(expected_account) || !same_binding(&latest.source, &src) {
         bail!("来源在确认期间发生变化，请重新确认");
     }
-    if let Some((expected, reset_at, generation)) = automatic {
-        if !settings.auto_reset_weekly_quota
-            || !super::auto_reset::authorized_snapshot(&sources, expected, reset_at)
-            || super::auto_reset::current_generation(state, &src)? != Some(generation)
-        {
+    if let Some(proof) = automatic {
+        if !settings.auto_reset_weekly(&src) || !same_binding(initial, &src) || !proof.approved(state, latest)? {
             bail!("自动重置条件已变化");
         }
     }
     let weekly_generation = super::auto_reset::mark_submitted(
-        state, &src, operation_id, &latest.quota, settings.auto_reset_weekly_quota,
+        state, &src, operation_id, &latest.quota, settings.auto_reset_weekly(&src), automatic,
     )?;
     let mut operation = Operation {
         source_id: id.into(),
@@ -238,6 +237,13 @@ pub(super) async fn consume_locked(
         weekly_generation,
     };
     write_operation(state, &operation, true)?;
+    if automatic.is_some() {
+        // A usage query started before this durable dispatch cannot confirm it.
+        let identity = src.identity();
+        for runtime in sources.iter_mut().filter(|r| r.source.identity() == identity) {
+            runtime.health_revision = runtime.health_revision.wrapping_add(1);
+        }
+    }
     drop(sources);
     drop(settings);
     drop(event_guard);
@@ -245,7 +251,7 @@ pub(super) async fn consume_locked(
     // All errors after durable intent are uncertain. Never retry this POST, including on 401.
     let mut request = transport::client(&src)?
         .post(endpoints.consume)
-        .timeout(REQUEST_TIMEOUT)
+        .timeout(if automatic.is_some() { REQUEST_TIMEOUT.min(Duration::from_secs(4)) } else { REQUEST_TIMEOUT })
         .bearer_auth(token(&src.secret, "access_token"))
         .header("Accept", "application/json")
         .header("OpenAI-Beta", "codex-1")
@@ -273,9 +279,11 @@ pub(super) async fn consume_locked(
         }
     }
     drop(credits_guard);
-    if let Ok(refreshed) = refresh_snapshots(state, &src, endpoints).await {
-        operation.result["quota"] = refreshed["quota"].clone();
-        operation.result["credits"] = refreshed["credits"].clone();
+    if automatic.is_none() {
+        if let Ok(refreshed) = refresh_snapshots(state, &src, endpoints).await {
+            operation.result["quota"] = refreshed["quota"].clone();
+            operation.result["credits"] = refreshed["credits"].clone();
+        }
     }
     // If a final write fails the original durable pending marker remains, preventing another POST.
     if write_operation(state, &operation, false).is_err() {

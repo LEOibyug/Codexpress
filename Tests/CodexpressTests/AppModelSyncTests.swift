@@ -65,8 +65,15 @@ final class AppModelSyncTests: XCTestCase {
             else { unsetenv("CODEXPRESS_GATEWAY_PATH") }
         }
         var settings = AppSettings(); settings.codexHome = directory.appendingPathComponent("codex").path
+        var first = Source.newOfficial(); first.id = "source-1"; first.account_id = "account-z"
+        first.proxy.url = "http://127.0.0.1:7890"; first.automaticModelDiscovery = false
+        var second = first; second.id = "source-2"; second.account_id = "account-a"
+        settings.sources = [first, second]
         let metadata = MetadataStore(directory: directory)
         try metadata.save(settings)
+        var legacy = try JSONDecoder().decode([String: JSONValue].self, from: Data(contentsOf: metadata.file))
+        legacy["autoResetWeeklyQuota"] = .bool(true)
+        try JSONEncoder().encode(legacy).write(to: metadata.file)
         try "official".write(to: directory.appendingPathComponent("connection-mode"), atomically: true, encoding: .utf8)
         let localFailure = directory.appendingPathComponent("fail-local-models")
         try Data().write(to: localFailure)
@@ -79,25 +86,54 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertFalse(model.showsLocalModelSettingsWarning)
         let applied = directory.appendingPathComponent("applied-settings.json")
         let initial = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
-        XCTAssertEqual(initial["auto_reset_weekly_quota"].bool, false)
+        XCTAssertEqual(initial["auto_reset_weekly_accounts"], .array([]), "The old global opt-in must not enroll either account")
+        XCTAssertEqual(initial["auto_reset_weekly_quota"], .null)
 
         let failure = directory.appendingPathComponent("fail-sync")
         try Data().write(to: failure)
-        model.changeAutoResetWeeklyQuota(true)
+        model.changeAutoResetWeeklyQuota(true, for: first)
         let deadline = Date().addingTimeInterval(3)
         while model.busy, Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertFalse(model.busy)
         XCTAssertNotNil(model.error, "An unsuccessful immediate sync must remain visible")
         XCTAssertTrue(model.pendingSync)
-        XCTAssertTrue(try metadata.load().autoResetWeeklyQuotaEnabled, "Sync failure must not discard the persisted user choice")
+        let persisted = try metadata.load()
+        XCTAssertTrue(persisted.weeklyResetEnabled(for: first), "Sync failure must not discard the persisted user choice")
+        XCTAssertFalse(persisted.weeklyResetEnabled(for: second))
+        let stored = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: metadata.file))
+        XCTAssertEqual(stored["autoResetWeeklyAccounts"]["account-z"]["proxy"]["url"].string, first.proxy.url)
+        XCTAssertEqual(stored["autoResetWeeklyQuota"], .null)
         let unchanged = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
-        XCTAssertEqual(unchanged["auto_reset_weekly_quota"].bool, false)
+        XCTAssertEqual(unchanged["auto_reset_weekly_accounts"], .array([]))
 
         try FileManager.default.removeItem(at: failure)
         try await model.sync()
         XCTAssertFalse(model.pendingSync)
         let retried = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
-        XCTAssertEqual(retried["auto_reset_weekly_quota"].bool, true)
+        XCTAssertEqual(retried["auto_reset_weekly_accounts"], .array([.string("account-z")]))
+
+        model.changeAutoResetWeeklyQuota(true, for: second)
+        let secondDeadline = Date().addingTimeInterval(3)
+        while model.busy, Date() < secondDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(model.busy)
+        XCTAssertNil(model.error)
+        let both = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
+        XCTAssertEqual(both["auto_reset_weekly_accounts"], .array([.string("account-a"), .string("account-z")]))
+
+        try await model.finishLogin(first.id)
+        XCTAssertTrue(try metadata.load().weeklyResetEnabled(for: first), "Same-account relogin retains consent")
+        var moved = first; moved.proxy.url = "http://127.0.0.1:7891"
+        try await model.saveSource(moved, apiKey: "")
+        try await model.saveSource(first, apiKey: "")
+        let movedSync = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
+        XCTAssertEqual(movedSync["auto_reset_weekly_accounts"], .array([.string("account-a")]), "Changing the endpoint revokes consent even after switching back")
+
+        let accountOverride = directory.appendingPathComponent("account-\(second.id)")
+        try "account-b".write(to: accountOverride, atomically: true, encoding: .utf8)
+        try await model.finishLogin(second.id)
+        XCTAssertEqual(model.settings.sources.first(where: { $0.id == second.id })?.account_id, "account-b")
+        let switched = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
+        XCTAssertEqual(switched["auto_reset_weekly_accounts"], .array([]), "A different account must not receive consent")
 
         try await model.updateStatus()
         let helperPID = model.status["process_id"]
@@ -123,7 +159,6 @@ final class AppModelSyncTests: XCTestCase {
         let modelRetry = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
         XCTAssertEqual(modelRetry["model_policies"], try JSONValue.from([policy]))
         XCTAssertEqual(modelRetry["model_compaction"], try JSONValue.from([rule]))
-        XCTAssertEqual(model.configuredModelIDs, [policy.model])
         XCTAssertNil(try metadata.load().localCodexAppliedModelSettingsRevision)
         XCTAssertTrue(model.localModelSettingsNeedsSync)
         XCTAssertNil(model.localModelSettingsSyncError, "Saving gateway settings must not attempt a local Codex update")
@@ -348,7 +383,10 @@ final class AppModelSyncTests: XCTestCase {
             try:
                 if operation == 'status':
                     mode = directory / 'connection-mode'
-                    data = dict(process_id=os.getpid(), port=17863, sources=[], connection_mode=mode.read_text() if mode.exists() else 'unmanaged')
+                    applied = directory / 'applied-settings.json'
+                    sources = json.loads(applied.read_text())['sources'] if applied.exists() else []
+                    for source in sources: source.pop('secret', None)
+                    data = dict(process_id=os.getpid(), port=17863, sources=sources, connection_mode=mode.read_text() if mode.exists() else 'unmanaged')
                 elif operation == 'gateway.update.info':
                     data = dict(protocol=1, version='0.8.26')
                 elif operation == 'credentials.storage.status':
@@ -374,6 +412,19 @@ final class AppModelSyncTests: XCTestCase {
                     data = json.loads((pathlib.Path(request['payload']['codex_home']) / 'backups.json').read_text())
                 elif operation == 'credentials':
                     data = dict(updated_secrets=[])
+                elif operation == 'credentials.read':
+                    sources = json.loads((directory / 'sources.json').read_text())['sources']
+                    by_id = {source['id']: source for source in sources}
+                    items = []
+                    for source_id in request['payload']['source_ids']:
+                        account = by_id.get(source_id, {}).get('account_id')
+                        override = directory / ('account-' + source_id)
+                        if override.exists(): account = override.read_text()
+                        secret = dict(account_id=account, access_token='fixture-token') if account else None
+                        items.append(dict(source_id=source_id, secret=secret))
+                    data = dict(items=items)
+                elif operation == 'official.refresh':
+                    data = dict(quota=dict(stale=False, complete=True, fetched_at=int(time.time()), error=None))
                 elif operation == 'sync':
                     if (directory / 'fail-sync').exists():
                         raise ValueError('Fixture sync failed')

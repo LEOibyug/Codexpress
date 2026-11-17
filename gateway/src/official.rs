@@ -21,6 +21,9 @@ use tokio::{
 
 #[path = "official/auto_reset.rs"]
 mod auto_reset;
+#[path = "official/recovery.rs"]
+mod recovery;
+pub(crate) use recovery::QuotaRecovery;
 #[path = "official/resets.rs"]
 mod resets;
 #[path = "official/snapshots.rs"]
@@ -783,59 +786,11 @@ pub(crate) async fn refresh_for_source(
     if !same_account_binding(&current, src) {
         bail!("来源在查询期间发生变化，请刷新");
     }
-    let result = refresh_selected_snapshots(state, &current, ENDPOINTS, include_credits).await?;
-    if !state.settings.read().await.auto_reset_weekly_quota { return Ok(result); }
-    if let Ok(refreshed) = source(state, &current.id).await {
-        if refreshed.enabled && same_account_binding(&refreshed, &current) {
-            let Some(work) = state.maintenance.enter() else { return Ok(result); };
-            let state = state.clone();
-            tokio::spawn(async move {
-                let _work = work;
-                if let Err(error) = auto_reset::consider(&state, &refreshed, ENDPOINTS).await {
-                    eprintln!("自动使用重置卡失败：{error}");
-                }
-            });
-        }
-    }
-    Ok(result)
+    refresh_selected_snapshots(state, &current, ENDPOINTS, include_credits).await
 }
 
-pub(crate) async fn schedule_auto_reset(state: &Arc<AppState>) {
-    let sources: Vec<_> = state.sources.read().await.iter()
-        .filter(|r| r.source.enabled && r.source.kind == "official")
-        .map(|r| r.source.clone()).collect();
-    for source in sources {
-        confirm_auto_reset(state, &source).await;
-    }
-}
-
-pub(crate) async fn confirm_auto_reset(state: &Arc<AppState>, src: &Source) {
-    if src.kind != "official" || !src.enabled
-        || !state.settings.read().await.auto_reset_weekly_quota { return; }
-    let Some(work) = state.maintenance.enter() else { return; };
-    let state = state.clone();
-    let src = src.clone();
-    tokio::spawn(async move {
-        let _work = work;
-        if let Err(error) = confirm_with_endpoints(&state, &src, ENDPOINTS).await {
-            eprintln!("确认自动重置额度失败：{error}");
-        }
-    });
-}
-
-async fn confirm_with_endpoints(state: &Arc<AppState>, expected: &Source, endpoints: Endpoints<'_>) -> Result<()> {
-    if !expected.enabled || expected.kind != "official"
-        || !state.settings.read().await.auto_reset_weekly_quota { return Ok(()); }
-    let mutex = lock(state, format!("auto-refresh:{}", expected.identity())).await;
-    let Ok(_guard) = mutex.try_lock() else { return Ok(()) };
-    let current = source(state, &expected.id).await?;
-    if !same_binding(&current, expected) { return Ok(()); }
-    refresh_selected_snapshots(state, &current, endpoints, false).await?;
-    let refreshed = source(state, &current.id).await?;
-    if same_account_binding(&refreshed, &current) {
-        auto_reset::consider(state, &refreshed, endpoints).await?;
-    }
-    Ok(())
+pub(crate) async fn quota_rejected(state: &Arc<AppState>, src: &Source, ticket: u64) {
+    recovery::rejected(state, src, ticket, ENDPOINTS).await;
 }
 
 #[cfg(test)]
@@ -921,12 +876,7 @@ pub(crate) mod fixture {
             token: &token, usage: &usage, credits: &credits, consume: &consume,
         };
         let expected = source(state, id).await?;
-        let result = refresh_selected_snapshots(state, &expected, endpoints, include_credits).await?;
-        let current = source(state, id).await?;
-        if same_account_binding(&current, &expected) {
-            let _ = auto_reset::consider(state, &current, endpoints).await;
-        }
-        Ok(result)
+        refresh_selected_snapshots(state, &expected, endpoints, include_credits).await
     }
     pub(crate) async fn refresh_at(state: &Arc<AppState>, id: &str, base: &str) -> Result<Source> {
         let (token, usage, credits, consume) = endpoints(base);
@@ -943,10 +893,12 @@ pub(crate) mod fixture {
         )
         .await
     }
-    pub(crate) async fn confirm_at(state: &Arc<AppState>, expected: &Source, base: &str) -> Result<()> {
-        let (token, usage, credits, consume) = endpoints(base);
-        confirm_with_endpoints(state, expected, Endpoints {
-            token: &token, usage: &usage, credits: &credits, consume: &consume,
-        }).await
+    pub(crate) async fn quota_rejected(state: &Arc<AppState>, expected: &Source, ticket: u64) {
+        recovery::rejected(state, expected, ticket, Endpoints {
+            token: "http://fixture.invalid/token",
+            usage: "http://fixture.invalid/usage",
+            credits: "http://fixture.invalid/credits",
+            consume: "http://fixture.invalid/consume",
+        }).await;
     }
 }

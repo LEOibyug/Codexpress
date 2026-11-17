@@ -30,6 +30,19 @@ pub(super) fn transient_error(value: &Value) -> bool {
             .any(|code| TRANSIENT_CODES.contains(&code))
 }
 
+pub(super) fn quota_code(value: &Value) -> Option<&str> {
+    fn explicit(value: &Value) -> Option<&str> {
+        let error = value.get("error").unwrap_or(value);
+        [error["code"].as_str(), error["type"].as_str()]
+            .into_iter()
+            .flatten()
+            .find(|code| matches!(*code,
+                "insufficient_quota" | "billing_hard_limit_reached"
+                | "usage_limit_reached" | "quota_exceeded"))
+    }
+    value.get("response").and_then(explicit).or_else(|| explicit(value))
+}
+
 pub(crate) fn permanent_code(value: &Value) -> Option<&str> {
     let error = value.get("error").unwrap_or(value);
     let codes = [error["code"].as_str(), error["type"].as_str()];
@@ -90,6 +103,7 @@ type SourceKey = (String, String);
 struct Failures {
     attempts: u8,
     upstream_errors: u8,
+    quota_rejected: bool,
 }
 
 /// Lives only for one authenticated client request, including internal replans.
@@ -118,6 +132,17 @@ impl RequestRetries {
             .entry(Self::key(source))
             .or_default()
             .attempts = u8::MAX;
+    }
+
+    pub(super) fn reject_quota(&self, source: &Source) -> bool {
+        let mut failures = self.0.lock().expect("retry state");
+        let failure = failures.entry(Self::key(source)).or_default();
+        failure.attempts = u8::MAX;
+        !std::mem::replace(&mut failure.quota_rejected, true)
+    }
+
+    pub(super) fn saw_quota(&self) -> bool {
+        self.0.lock().expect("retry state").values().any(|f| f.quota_rejected)
     }
 }
 

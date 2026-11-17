@@ -477,30 +477,14 @@ async fn execute(
     let target_override = parts.extensions.get::<TestTarget>().cloned();
     let request_id = uuid::Uuid::new_v4().to_string();
     let mut rate_limited_accounts = HashSet::new();
-    for candidate in candidates(&state).await {
+    state.quota_recovery.wait_idle().await;
+    'candidates: for candidate in candidates(&state).await {
         if rate_limited_accounts.contains(&candidate.identity()) {
             continue;
         }
         let source = match crate::official::ensure_access(&state, &candidate.id).await {
             Ok(s) if s.identity() == candidate.identity() => s,
             _ => continue,
-        };
-        let mut lease = {
-            let sources = state.sources.read().await;
-            let Some(runtime) = sources.iter().find(|r| {
-                r.source.id == source.id
-                    && r.source.identity() == source.identity()
-                    && r.source.proxy == source.proxy
-            }) else {
-                continue;
-            };
-            if !source_available(runtime) {
-                continue;
-            }
-            let Some(lease) = state.affinity.reserve(None, &source, false, false, None) else {
-                continue;
-            };
-            lease
         };
         // Recheck the independent selection and enabled switch after OAuth waits.
         {
@@ -588,21 +572,28 @@ async fn execute(
             &[],
         );
         let _ = state.usage.diagnostic(&attempt.diagnostic, false);
-        let submission = state.routing_sync.lock().await;
-        if let Some(problem) = crate::model_catalog::check_client(&state, MODEL, client_kind).await { return problem; }
-        let settings = match state.images.settings() {
-            Ok(settings) if settings.enabled => settings,
-            _ => return error(StatusCode::SERVICE_UNAVAILABLE, "图片生成功能已关闭"),
+        let (submission, mut lease) = loop {
+            state.quota_recovery.wait_idle().await;
+            let submission = state.routing_sync.lock().await;
+            if let Some(problem) = crate::model_catalog::check_client(&state, MODEL, client_kind).await { return problem; }
+            let settings = match state.images.settings() {
+                Ok(settings) if settings.enabled => settings,
+                _ => return error(StatusCode::SERVICE_UNAVAILABLE, "图片生成功能已关闭"),
+            };
+            let policies = state.model_policies.read().await;
+            let sources = state.sources.read().await;
+            let still_selected = crate::model_policy::source_allowed(&policies, MODEL, &source.id)
+                && settings.source_id.as_ref().is_none_or(|id| id == &source.id)
+                && sources.iter().any(|runtime| {
+                    source_available(runtime) && runtime.source.id == source.id
+                        && runtime.source.identity() == source.identity() && runtime.source.proxy == source.proxy
+                });
+            if !still_selected { continue 'candidates; }
+            let Some(lease) = state.affinity.reserve(None, &source, false, false, None) else {
+                continue 'candidates;
+            };
+            if state.quota_recovery.try_admit().is_some() { break (submission, lease); }
         };
-        let policies = state.model_policies.read().await;
-        let still_selected = crate::model_policy::source_allowed(&policies, MODEL, &source.id)
-            && settings.source_id.as_ref().is_none_or(|id| id == &source.id)
-            && state.sources.read().await.iter().any(|runtime| {
-                source_available(runtime) && runtime.source.id == source.id
-                    && runtime.source.identity() == source.identity() && runtime.source.proxy == source.proxy
-            });
-        drop(policies);
-        if !still_selected { continue; }
         let response = crate::model_catalog::start_submission(submission, client
             .post(endpoint)
             .headers(headers)

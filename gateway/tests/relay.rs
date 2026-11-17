@@ -615,7 +615,7 @@ async fn terminal_sse_before_body_drop_retains_outcome_but_unfinished_output_is_
     use futures_util::StreamExt;
     for (wire, outcome, terminal) in [
         ("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"complete-without-usage\",\"output\":[]}}\n\n", "success", true),
-        ("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"insufficient_quota\"}}}\n\n", "failed", true),
+        ("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_request_error\"}}}\n\n", "failed", true),
         ("data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n", "success", true),
         ("data: {\"type\":\"response.output_text.delta\",\"delta\":\"not finished\"}\n\n", "interrupted", false),
         // An unterminated SSE event is not evidence of completion.
@@ -645,7 +645,6 @@ async fn terminal_sse_before_body_drop_retains_outcome_but_unfinished_output_is_
         assert_eq!(summary["recent"][0]["status"], outcome);
         assert_eq!(summary["recent"][0]["token_details"]["stream_complete"], terminal);
         assert_eq!(summary["recent"][0]["complete"], false, "missing usage must remain independent of completion");
-        if outcome == "failed" { assert_eq!(state.sources.read().await[0].health, "exhausted"); }
         task.abort();
     }
 }
@@ -2343,13 +2342,13 @@ async fn recognized_quota_and_unknown_payment_errors_have_distinct_health() {
         .oneshot(request(br#"{"model":"m"}"#))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(
             &to_bytes(response.into_body(), 10000).await.unwrap()
         )
         .unwrap()["error"]["code"],
-        "insufficient_quota"
+        "all_sources_quota_exhausted"
     );
     assert_eq!(state.sources.read().await[0].health, "exhausted");
     routing::mark_failure(&state, "a", 402, None).await;
@@ -2358,16 +2357,25 @@ async fn recognized_quota_and_unknown_payment_errors_have_distinct_health() {
 }
 
 #[tokio::test]
-async fn response_stream_failure_never_replays_and_marks_quota() {
+async fn quota_after_stream_output_never_replays_and_neutralizes_terminal_error() {
     let hits = Arc::new(AtomicUsize::new(0));
     let copy = hits.clone();
-    let wire="event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"failed-response\",\"error\":{\"code\":\"insufficient_quota\"}}}\n\n";
+    let output = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial output\"}\r\n\r\n";
+    let failure_start = "event: response.failed\r\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"failed-response\",\"error\":{\"code\":\"insufficient_";
+    let failure_end = "quota\",\"message\":\"native quota error\"}}}\r\n\r\n";
     let (first, a) = serve(Router::new().route(
         "/responses",
         post(move || async move {
+            let stream = async_stream::stream! {
+                let first = format!("{output}{failure_start}");
+                yield Ok::<_, std::io::Error>(bytes::Bytes::from(first));
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                yield Ok(bytes::Bytes::from_static(failure_end.as_bytes()));
+            };
             Response::builder()
                 .header("content-type", "text/event-stream")
-                .body(Body::from(wire))
+                .header("content-length", (output.len() + failure_start.len() + failure_end.len()).to_string())
+                .body(Body::from_stream(stream))
                 .unwrap()
         }),
     ))
@@ -2388,15 +2396,62 @@ async fn response_stream_failure_never_replays_and_marks_quota() {
         .oneshot(request(br#"{"model":"m"}"#))
         .await
         .unwrap();
-    assert_eq!(
-        &to_bytes(response.into_body(), 10000).await.unwrap()[..],
-        wire.as_bytes()
-    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key("content-length"));
+    let body = to_bytes(response.into_body(), 10000).await.unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(text.starts_with(output));
+    assert!(text.contains("event: response.failed\r\n"));
+    assert!(text.contains("\"code\":\"upstream_unavailable\""));
+    assert!(!text.contains("insufficient_quota") && !text.contains("native quota error"));
     assert_eq!(hits.load(Ordering::Relaxed), 0);
     assert_eq!(state.sources.read().await[0].health, "exhausted");
     let summary = state.usage.summary(1).unwrap();
     assert_eq!(summary["recent"][0]["status"], "failed");
     assert_eq!(summary["recent"][0]["complete"], false);
+    a.abort();
+    b.abort();
+}
+
+#[tokio::test]
+async fn metadata_only_quota_refusal_fails_over_and_requires_every_matching_source_to_be_exhausted() {
+    let rejected = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"unaccepted\",\"output\":[]}}\n\n",
+        "event: error\ndata: {\"code\":\"usage_limit_reached\"}\n\n"
+    );
+    let (first, a) = serve(Router::new().route("/responses", post(move || async move {
+        Response::builder().header("content-type", "text/event-stream").body(Body::from(rejected)).unwrap()
+    }))).await;
+    let (second, b) = serve(Router::new().route("/responses", post(|req: Request| async move {
+        let body = to_bytes(req.into_body(), 10000).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        match value["input"].as_str().unwrap() {
+            "recoverable" => (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"error":{"code":"overloaded_error"}}))),
+            "exhausted" => (StatusCode::PAYMENT_REQUIRED, axum::Json(json!({"error":{"code":"quota_exceeded"}}))),
+            _ => (StatusCode::OK, axum::Json(json!({"id":"fallback-answer"}))),
+        }
+    }))).await;
+    for (input, expected, code) in [
+        ("healthy", StatusCode::OK, None),
+        ("recoverable", StatusCode::SERVICE_UNAVAILABLE, Some("upstream_unavailable")),
+        ("exhausted", StatusCode::TOO_MANY_REQUESTS, Some("all_sources_quota_exhausted")),
+    ] {
+        let (_dir, state) = state(vec![source("a", &first, 0), source("b", &second, 1)]).await;
+        let response = relay::router(state.clone()).oneshot(request(
+            &serde_json::to_vec(&json!({"model":"m","stream":true,"input":input})).unwrap(),
+        )).await.unwrap();
+        assert_eq!(response.status(), expected);
+        if expected == StatusCode::SERVICE_UNAVAILABLE {
+            assert!(response.headers().contains_key("retry-after"));
+        }
+        let value: Value = serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap()).unwrap();
+        if let Some(code) = code {
+            assert_eq!(value["error"]["code"], code);
+        } else {
+            assert_eq!(value["id"], "fallback-answer");
+        }
+        assert!(!state.bindings.lock().await.contains_key("unaccepted"));
+    }
     a.abort();
     b.abort();
 }

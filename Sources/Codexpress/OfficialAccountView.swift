@@ -24,6 +24,11 @@ struct OfficialAccountView: View {
                     Label(model.refreshingQuotas.contains(source.id) ? "刷新中…" : "刷新额度", systemImage: "arrow.clockwise")
                 }.disabled(!model.running || source.account_id == nil || model.refreshingQuotas.contains(source.id))
             }.controlSize(.small)
+            SettingRow(title: "自动使用重置卡", subtitle: source.account_id == nil ? "登录此账号后可启用。" : "此账号的周额度耗尽时，自动消耗最早到期的可用卡片。更换账号或网络设置后需重新启用。") {
+                Toggle("自动使用重置卡", isOn: Binding(get: { source.matchesOfficialStatus(live) && model.settings.weeklyResetEnabled(for: source) }, set: { model.changeAutoResetWeeklyQuota($0, for: source) }))
+                    .labelsHidden().toggleStyle(.switch).controlSize(.small)
+                    .disabled(!model.canChangeAutoResetWeeklyQuota(for: source))
+            }
             if live["account_id"].string == nil && quota["windows"].array.isEmpty {
                 Text("登录后查看额度").font(.system(size: 11)).foregroundStyle(.secondary)
             } else if !extraWindows.isEmpty {

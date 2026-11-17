@@ -42,12 +42,6 @@ struct RoutingView: View {
                         }
                     }
                 }
-                SettingsCard("官方额度", symbol: "gauge.with.dots.needle.50percent") {
-                    SettingRow(title: "自动使用重置卡", subtitle: "周额度耗尽时，自动消耗最早到期的可用卡片。") {
-                        Toggle("自动使用重置卡", isOn: Binding(get: { model.settings.autoResetWeeklyQuotaEnabled }, set: { model.changeAutoResetWeeklyQuota($0) }))
-                            .labelsHidden().toggleStyle(.switch).controlSize(.small).disabled(model.busy)
-                    }
-                }
                 SettingsCard("上游重试", symbol: "arrow.clockwise") {
                     SettingRow(title: "最多尝试次数（含首次）") {
                         Stepper(value: Binding(get: { model.settings.upstreamAttemptLimit }, set: { model.changeUpstreamRetry(attempts: $0, delaySeconds: model.settings.upstreamRetryDelay) }), in: 1...10) {

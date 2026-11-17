@@ -80,7 +80,7 @@ fn status_snapshot(
     }
     let sources = source_statuses;
     Ok(
-        json!({"running":true,"process_id":std::process::id(),"port":state.port,"base_url":format!("http://127.0.0.1:{}/v1",state.port),"mode":settings.mode,"fixed_source_id":settings.fixed_source_id,"load_balance":settings.load_balance,"manual_route":state.manual_routing.status(),"official_low_quota_percent":settings.official_low_quota_percent,"auto_reset_weekly_quota":settings.auto_reset_weekly_quota,"degraded_context_fallback":settings.degraded_context_fallback,"idle_return_minutes":settings.idle_return_minutes,"upstream_attempts":settings.upstream_attempts,"upstream_retry_delay_seconds":settings.upstream_retry_delay_seconds,"model_policies":&*model_policies,"sources":sources,"inflight":state.inflight.load(Ordering::Relaxed),"connection_mode":config::connection_mode(&state.state_dir).unwrap_or("unknown")}),
+        json!({"running":true,"process_id":std::process::id(),"port":state.port,"base_url":format!("http://127.0.0.1:{}/v1",state.port),"mode":settings.mode,"fixed_source_id":settings.fixed_source_id,"load_balance":settings.load_balance,"manual_route":state.manual_routing.status(),"official_low_quota_percent":settings.official_low_quota_percent,"auto_reset_weekly_accounts":settings.auto_reset_weekly_accounts,"degraded_context_fallback":settings.degraded_context_fallback,"idle_return_minutes":settings.idle_return_minutes,"upstream_attempts":settings.upstream_attempts,"upstream_retry_delay_seconds":settings.upstream_retry_delay_seconds,"model_policies":&*model_policies,"sources":sources,"inflight":state.inflight.load(Ordering::Relaxed),"connection_mode":config::connection_mode(&state.state_dir).unwrap_or("unknown")}),
     )
 }
 

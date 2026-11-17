@@ -108,6 +108,17 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
         return source
     }
 }
+
+struct WeeklyResetEndpoint: Codable, Equatable, Sendable {
+    let baseURL: String
+    let proxy: ProxyPolicy
+
+    init(_ source: Source) {
+        baseURL = source.base_url
+        proxy = source.proxy
+    }
+}
+
 struct AppSettings: Codable, Sendable {
     var sources: [Source] = []
     var mode = "auto"
@@ -120,7 +131,7 @@ struct AppSettings: Codable, Sendable {
     var localCodexAppliedModelSettingsRevision: String? = nil
     var officialLowQuotaPercent: Int? = nil
     var officialQuotaRefreshMinutes: Int? = nil
-    var autoResetWeeklyQuota: Bool? = nil
+    var autoResetWeeklyAccounts: [String: WeeklyResetEndpoint]? = nil
     var legacyProviderOrigins: [LegacyProviderOrigin]? = nil
     var degradedContextFallback: Bool? = nil
     var loadBalance: Bool? = nil
@@ -132,7 +143,20 @@ struct AppSettings: Codable, Sendable {
     var sshRemoteProfiles: [SSHRemoteProfile]? = nil
     var lowQuotaPercent: Int { officialLowQuotaPercent ?? 10 }
     var officialQuotaRefreshInterval: Int { max(officialQuotaRefreshMinutes ?? 30, 1) }
-    var autoResetWeeklyQuotaEnabled: Bool { autoResetWeeklyQuota ?? false }
+    func weeklyResetEnabled(for source: Source) -> Bool {
+        guard source.official, let account = source.account_id, !account.isEmpty else { return false }
+        return autoResetWeeklyAccounts?[account] == WeeklyResetEndpoint(source)
+    }
+    var weeklyResetAccountIDs: [String] {
+        guard autoResetWeeklyAccounts?.isEmpty == false else { return [] }
+        var ids = Set<String>()
+        for source in sources {
+            guard let account = source.account_id, weeklyResetEnabled(for: source) else { continue }
+            ids.insert(account)
+        }
+        return ids.sorted()
+    }
+
     var loadBalanceEnabled: Bool { loadBalance ?? false }
     var idleReturnDelay: Int { conversationStickyMinutes ?? 5 }
     var upstreamAttemptLimit: Int { min(max(upstreamAttempts ?? 3, 1), 10) }
@@ -221,6 +245,16 @@ func healthLabel(_ value: String?) -> String {
 }
 
 extension Source {
+    func hasSameOfficialBinding(as other: Source) -> Bool {
+        official && other.official && account_id == other.account_id && base_url == other.base_url && proxy == other.proxy
+    }
+    func matchesOfficialStatus(_ live: JSONValue) -> Bool {
+        guard official, let account = account_id, !account.isEmpty else { return false }
+        return live["id"].string == id && live["kind"].string == "official" && live["account_id"].string == account
+            && live["base_url"].string == base_url && live["proxy"]["mode"].string == proxy.mode
+            && live["proxy"]["url"].string == proxy.url
+    }
+
     // Editors may hold a snapshot across an OAuth callback; editable fields never own identity.
     func preservingOfficialIdentity(current: Source?, live: JSONValue) -> Source {
         guard official else { return self }

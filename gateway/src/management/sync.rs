@@ -45,11 +45,16 @@ impl SyncRequest {
             .map(|v| v.as_bool().context("负载均衡须为布尔值"))
             .transpose()?
             .unwrap_or(false);
-        let auto_reset_weekly_quota = payload
-            .get("auto_reset_weekly_quota")
-            .map(|v| v.as_bool().context("自动使用重置卡须为布尔值"))
+        let mut auto_reset_weekly_accounts: Vec<String> = payload
+            .get("auto_reset_weekly_accounts")
+            .map(|v| serde_json::from_value(v.clone()).context("自动使用重置卡须为官方账号列表"))
             .transpose()?
-            .unwrap_or(false);
+            .unwrap_or_default();
+        if auto_reset_weekly_accounts.iter().any(|id| id.is_empty() || id.len() > 256 || id.trim() != id) {
+            bail!("自动使用重置卡的官方账号标识无效");
+        }
+        auto_reset_weekly_accounts.sort_unstable();
+        auto_reset_weekly_accounts.dedup();
         let idle_return_minutes = match payload.get("idle_return_minutes") {
             None => 5,
             Some(value) => value
@@ -110,7 +115,7 @@ impl SyncRequest {
                 fixed_source_id: fixed,
                 load_balance,
                 official_low_quota_percent: threshold,
-                auto_reset_weekly_quota,
+                auto_reset_weekly_accounts,
                 degraded_context_fallback,
                 idle_return_minutes,
                 upstream_attempts,
@@ -264,15 +269,25 @@ pub(super) async fn handle(state: &Arc<AppState>, payload: Value) -> Result<Valu
         .await
         .retain(|_, source| ids.contains(source) && !invalidated.contains(source));
     drop(current);
-    let enable_auto_reset = settings.auto_reset_weekly_quota
-        && !state.settings.read().await.auto_reset_weekly_quota;
     *state.settings.write().await = settings;
     *state.model_compaction.write().await = model_compaction.into();
     *state.model_compaction_revision.write().await = model_compaction_revision;
     *state.model_policies.write().await = model_policies.into();
     state.routing_revision.fetch_add(1, Ordering::Release);
-    if enable_auto_reset {
-        crate::official::schedule_auto_reset(state).await;
-    }
     Ok(super::credentials(state).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn weekly_reset_sync_never_enrolls_accounts_from_the_legacy_switch() {
+        let legacy = SyncRequest::parse(&json!({"sources":[],"auto_reset_weekly_quota":true})).unwrap();
+        assert!(legacy.settings.auto_reset_weekly_accounts.is_empty());
+        let enrolled = SyncRequest::parse(&json!({"sources":[],"auto_reset_weekly_accounts":["account-a","account-a"]})).unwrap();
+        assert_eq!(enrolled.settings.auto_reset_weekly_accounts, vec!["account-a"]);
+        assert!(SyncRequest::parse(&json!({"sources":[],"auto_reset_weekly_accounts":true})).is_err());
+    }
 }

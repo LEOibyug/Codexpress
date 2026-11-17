@@ -236,7 +236,7 @@ pub struct RoutingSettings {
     #[serde(default = "default_low_quota")]
     pub official_low_quota_percent: u8,
     #[serde(default)]
-    pub auto_reset_weekly_quota: bool,
+    pub auto_reset_weekly_accounts: Vec<String>,
     #[serde(default = "default_fallback")]
     pub degraded_context_fallback: bool,
     #[serde(default = "default_idle_return")]
@@ -245,6 +245,14 @@ pub struct RoutingSettings {
     pub upstream_attempts: u8,
     #[serde(default = "default_retry_delay")]
     pub upstream_retry_delay_seconds: u64,
+}
+
+impl RoutingSettings {
+    pub(crate) fn auto_reset_weekly(&self, source: &Source) -> bool {
+        source.official_account_id().is_some_and(|id| {
+            self.auto_reset_weekly_accounts.iter().any(|account| account == id)
+        })
+    }
 }
 fn default_upstream_attempts() -> u8 {
     3
@@ -270,6 +278,7 @@ pub struct AppState {
     pub routing_sync: Mutex<()>,
     pub sources: RwLock<Vec<SourceRuntime>>,
     pub settings: RwLock<RoutingSettings>,
+    pub(crate) quota_recovery: crate::official::QuotaRecovery,
     pub(crate) model_compaction: RwLock<Arc<[crate::compaction::ModelCompactionRule]>>,
     pub(crate) model_compaction_revision: RwLock<String>,
     pub(crate) model_metadata: RwLock<crate::model_catalog::MetadataCache>,
@@ -324,12 +333,13 @@ impl AppState {
                 fixed_source_id: None,
                 load_balance: false,
                 official_low_quota_percent: 10,
-                auto_reset_weekly_quota: false,
+                auto_reset_weekly_accounts: Vec::new(),
                 degraded_context_fallback: true,
                 idle_return_minutes: default_idle_return(),
                 upstream_attempts: default_upstream_attempts(),
                 upstream_retry_delay_seconds: default_retry_delay(),
             }),
+            quota_recovery: Default::default(),
             model_compaction: RwLock::new(Arc::from([])),
             model_compaction_revision: RwLock::new(crate::model_catalog::configuration_revision(&[], &[], &[], "auto", None)),
             model_metadata: RwLock::new(crate::model_catalog::MetadataCache::open(&state_dir)),

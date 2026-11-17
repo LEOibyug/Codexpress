@@ -119,12 +119,8 @@ pub async fn mark_rejection(
         Some("invalid_api_key" | "token_expired" | "account_deactivated" | "authentication_error")
     );
     if exhausted || authentication {
-        if let Some(runtime) = state
-            .sources
-            .write()
-            .await
-            .iter_mut()
-            .find(|r| same_target(&r.source, source))
+        let mut sources = state.sources.write().await;
+        if let Some(runtime) = sources.iter_mut().find(|r| same_target(&r.source, source))
         {
             runtime.health = if exhausted {
                 "exhausted"
@@ -150,14 +146,16 @@ pub async fn mark_rejection(
                 None
             };
             if exhausted && runtime.source.kind == "official" {
-                state
-                    .notifications
-                    .quota(&runtime.source.identity(), &runtime.source.name, true);
+                let identity = runtime.source.identity();
+                state.notifications.quota(&identity, &runtime.source.name, true);
+                // The hard block belongs to the account even if its original
+                // source is removed while another alias remains configured.
+                for alias in sources.iter_mut().filter(|r| r.source.id != source.id && r.source.identity() == identity) {
+                    alias.quota_exhausted = true;
+                    alias.health_revision = alias.health_revision.wrapping_add(1);
+                }
             }
         }
-    }
-    if exhausted {
-        crate::official::confirm_auto_reset(state, source).await;
     }
 }
 

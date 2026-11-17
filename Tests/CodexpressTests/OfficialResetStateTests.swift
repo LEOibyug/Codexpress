@@ -290,19 +290,42 @@ final class OfficialResetStateTests: XCTestCase {
         XCTAssertTrue(try ResetOperationStore(directory: fixture.directory).load().isEmpty)
     }
 
-    @MainActor func testOfficialFailureSnapshotsDoNotExtendNormalRefreshIntervals() async throws {
+    @MainActor func testFailedQuotaRetriesIndependentlyUntilAuthoritativeSuccess() async throws {
         let source = Self.source("account-A")
-        let fixture = try OfficialResetFixture(sources: [source])
+        let healthy = Self.source("account-B")
+        var disabled = Self.source("account-C"); disabled.enabled = false
+        let sources = [source, healthy, disabled]
+        let fixture = try OfficialResetFixture(sources: sources)
         defer { fixture.stop() }
-        try await fixture.start()
-        try await fixture.model.queryOfficial(source.id, includeCredits: true)
+        try await fixture.start(withTimers: true)
+        XCTAssertFalse(fixture.model.officialRefreshSchedule.isRetrying(source.id), "No quota yet is not a failed query")
+
+        let failed: JSONValue = .object(["stale": .bool(true), "error": .string("quota query failed"), "failure_count": .number(1)])
+        try fixture.setSources(sources, quotas: [source.id: failed, disabled.id: failed])
+        let observedAfter = Date()
+        await fixture.model.poll()
         let now = Date()
-        let schedule = fixture.model.officialRefreshSchedule
-        XCTAssertTrue(schedule.isDue(source.id, now: now.addingTimeInterval(15), foreground: true))
-        XCTAssertTrue(schedule.isDue(source.id, now: now.addingTimeInterval(60), interval: 60))
-        XCTAssertLessThanOrEqual(schedule.backgroundDelay(for: [source.id], since: now, interval: 60, now: now), 60)
-        XCTAssertFalse(schedule.needsCredits(source.id, now: now.addingTimeInterval(299)))
-        XCTAssertTrue(schedule.needsCredits(source.id, now: now.addingTimeInterval(300)))
+        var schedule = fixture.model.officialRefreshSchedule
+        XCTAssertFalse(schedule.isDue(source.id, now: observedAfter.addingTimeInterval(4.9), interval: 60))
+        XCTAssertFalse(schedule.observeQuota(source.id, snapshot: failed, now: now.addingTimeInterval(4)), "Observing the same failure again must not postpone the retry")
+        XCTAssertTrue(schedule.isDue(source.id, now: now.addingTimeInterval(5), interval: 60))
+        XCTAssertFalse(schedule.isRetrying(healthy.id))
+        XCTAssertFalse(schedule.isRetrying(disabled.id))
+
+        try await fixture.waitUntil(timeout: 8) { try fixture.refreshRequests().count == 1 && !fixture.model.refreshingQuotas.contains(source.id) }
+        XCTAssertEqual(try fixture.refreshRequests(), [.object(["source_id": .string(source.id), "include_credits": .bool(false)])])
+        XCTAssertTrue(fixture.model.officialRefreshSchedule.isRetrying(source.id), "An RPC success carrying a stale quota is still a quota failure")
+
+        let fresh: JSONValue = .object(["stale": .bool(false), "complete": .bool(true), "fetched_at": .number(Date().timeIntervalSince1970)])
+        try fixture.setSources(sources, quotas: [source.id: fresh])
+        let recoveredAfter = Date()
+        await fixture.model.poll()
+        let recovered = fixture.model.officialRefreshSchedule
+        XCTAssertFalse(recovered.isRetrying(source.id))
+        XCTAssertFalse(recovered.isDue(source.id, now: recoveredAfter.addingTimeInterval(59), interval: 60))
+        XCTAssertTrue(recovered.isDue(source.id, now: Date().addingTimeInterval(60), interval: 60))
+        XCTAssertTrue(recovered.needsCredits(source.id), "Quota-only retries must not advance the separate credit cadence")
+        XCTAssertEqual(try fixture.refreshRequests().count, 1)
     }
 
     @MainActor func testManualBalanceRefreshBypassesFailureCooldownButOrdinaryRefreshDoesNot() async throws {
@@ -382,14 +405,15 @@ final class OfficialResetStateTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.appendingPathComponent("gateway-fixture").path)
     }
 
-    func start() async throws {
+    func start(withTimers: Bool = false) async throws {
         let previous = ProcessInfo.processInfo.environment["CODEXPRESS_GATEWAY_PATH"]
         setenv("CODEXPRESS_GATEWAY_PATH", directory.appendingPathComponent("gateway-fixture").path, 1)
         defer {
             if let previous { setenv("CODEXPRESS_GATEWAY_PATH", previous, 1) }
             else { unsetenv("CODEXPRESS_GATEWAY_PATH") }
         }
-        await model.startHelper()
+        if withTimers { await model.start() }
+        else { await model.startHelper() }
         XCTAssertTrue(model.running, model.error ?? "Fixture did not start")
         guard model.running else { throw AppError.message("Fixture did not start") }
         if let polling = model.controlResetPollTask { await polling.value }
@@ -400,7 +424,7 @@ final class OfficialResetStateTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    func setSources(_ sources: [Source], balances: [String: JSONValue] = [:]) throws {
+    func setSources(_ sources: [Source], balances: [String: JSONValue] = [:], quotas: [String: JSONValue] = [:]) throws {
         let cards: [JSONValue] = ["card", "other-card"].map { id in
             .object(["id": .string(id), "status": .string("available"), "expiry_known": .bool(true), "expires_at": .number(4_000_000_000)])
         }
@@ -408,6 +432,7 @@ final class OfficialResetStateTests: XCTestCase {
             guard case .object(var value) = try JSONValue.from(source) else { throw AppError.message("Invalid fixture source") }
             value["credits"] = .object(["stale": .bool(false), "error": .null, "credits": .array(cards)])
             value["balance"] = balances[source.id] ?? .null
+            value["quota"] = quotas[source.id] ?? .null
             return .object(value)
         }
         try JSONEncoder().encode(JSONValue.object(["sources": .array(live), "disconnect_consume": .bool(disconnectConsume), "reject_duplicate_sync": .bool(rejectDuplicateSync)])).write(to: directory.appendingPathComponent("fixture-state.json"), options: .atomic)
@@ -446,8 +471,8 @@ final class OfficialResetStateTests: XCTestCase {
 
     func release() throws { try Data().write(to: directory.appendingPathComponent("release-consume")) }
 
-    func waitUntil(_ condition: () throws -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(5)
+    func waitUntil(timeout: TimeInterval = 5, _ condition: () throws -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
         while try !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(try condition(), "Fixture condition timed out")
     }

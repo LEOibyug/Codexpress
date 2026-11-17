@@ -65,6 +65,7 @@ import ServiceManagement
     private var timerTask: Task<Void, Never>?
     private var accountTimerTask: Task<Void, Never>?
     private var officialAccountTimerTask: Task<Void, Never>?
+    private var officialBackgroundWakeAt: Date?
     private var officialBackgroundStartedAt = Date()
     private var restarting = false
     private var restartCount = 0
@@ -72,6 +73,7 @@ import ServiceManagement
     @Published var operations: [String: ResetOperation] = [:]
     var officialRefreshSchedule = OfficialRefreshSchedule()
     var officialQueries: [String: (includeCredits: Bool, task: Task<Void, Error>)] = [:]
+    private var weeklyResetRevocationPending = false
     var controlResetPollTask: Task<Void, Never>?
     var controlResetPollingError: String?
     var presentedControlResetRequest: CreditResetRequest?
@@ -379,6 +381,10 @@ import ServiceManagement
         try requireWritableMetadata()
         var next = next
         if next.codexHome != settings.codexHome { next.localCodexAppliedModelSettingsRevision = nil }
+        if let enrolled = next.autoResetWeeklyAccounts {
+            let retained = Set(next.weeklyResetAccountIDs)
+            next.autoResetWeeklyAccounts = enrolled.filter { retained.contains($0.key) }
+        }
         let revision: String
         if next.modelCompaction == settings.modelCompaction, next.modelPolicies == settings.modelPolicies {
             revision = modelSettingsRevision
@@ -386,13 +392,24 @@ import ServiceManagement
             revision = try ModelSettingsRevision.value(for: next)
         }
         try metadata.save(next)
+        if let prior = settings.autoResetWeeklyAccounts,
+           prior.keys.contains(where: { next.autoResetWeeklyAccounts?[$0] == nil }) {
+            weeklyResetRevocationPending = true
+        }
         for source in settings.sources where !next.sources.contains(where: {
             $0.id == source.id && $0.kind == source.kind && $0.base_url == source.base_url
                 && $0.proxy == source.proxy && $0.account_id == source.account_id
         }) { apiBalances[source.id] = nil }
         if next.codexHome != settings.codexHome { configurationBackups = [] }
         if next.codexHome != settings.codexHome || revision != modelSettingsRevision { localModelSettingsSyncError = nil }
-        let officialIntervalChanged = next.officialQuotaRefreshInterval != settings.officialQuotaRefreshInterval
+        let previousOfficial = settings.sources.filter(\.official)
+        let nextOfficial = next.sources.filter(\.official)
+        let invalidated = previousOfficial.filter { previous in
+            !nextOfficial.contains { $0.id == previous.id && $0.hasSameOfficialBinding(as: previous) }
+        }
+        for source in invalidated { officialRefreshSchedule.reset(source.id) }
+        let officialScheduleChanged = !invalidated.isEmpty || next.officialQuotaRefreshInterval != settings.officialQuotaRefreshInterval
+            || Set(previousOfficial.filter(\.enabled).map(\.id)) != Set(nextOfficial.filter(\.enabled).map(\.id))
         if next.sources.map(\.models) != settings.sources.map(\.models)
             || next.sources.map(\.official) != settings.sources.map(\.official)
             || next.modelPolicies?.map(\.model) != settings.modelPolicies?.map(\.model)
@@ -401,7 +418,7 @@ import ServiceManagement
         }
         settings = next
         modelSettingsRevision = revision
-        if officialIntervalChanged, timerTask != nil { scheduleOfficialAccountRefresh() }
+        if officialScheduleChanged { scheduleOfficialAccountRefresh() }
         do { try balanceWarnings?.retain(sources: next.sources) }
         catch { notice = "无法更新余额预警记录，请检查应用数据目录的写入权限。" }
     }
@@ -470,6 +487,14 @@ import ServiceManagement
             else if let live = fresh["sources"].array.first(where: { $0["id"].string == next.sources[i].id }), let account = live["account_id"].string, !account.isEmpty { next.sources[i].account_id = account }
         }
         if next.sources != settings.sources { try persistSettings(next) }
+        var officialScheduleChanged = false
+        for live in status["sources"].array {
+            guard let id = live["id"].string,
+                  let source = settings.sources.first(where: { $0.id == id && $0.enabled }),
+                  source.matchesOfficialStatus(live) else { continue }
+            if officialRefreshSchedule.observeQuota(id, snapshot: live["quota"]) { officialScheduleChanged = true }
+        }
+        if officialScheduleChanged { scheduleOfficialAccountRefresh() }
         for before in balanceSources where !before.official {
             guard let current = settings.sources.first(where: { $0.id == before.id }), current.sameConfiguration(as: before),
                   (try? balanceCredentials.load(before.id)) == (try? credentialSnapshot.load(before.id)) else { continue }
@@ -506,11 +531,13 @@ import ServiceManagement
             values.append(.object(value))
         }
         if next.sources != settings.sources { try persistSettings(next) }
+        let enrolled = settings.weeklyResetAccountIDs
         do {
-            try await mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "auto_reset_weekly_quota":.bool(settings.autoResetWeeklyQuotaEnabled), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true), "load_balance":.bool(settings.loadBalanceEnabled), "idle_return_minutes":.number(Double(settings.idleReturnDelay)), "upstream_attempts":.number(Double(settings.upstreamAttemptLimit)), "upstream_retry_delay_seconds":.number(Double(settings.upstreamRetryDelay)), "model_compaction":try JSONValue.from(settings.modelCompaction ?? []), "model_policies":try JSONValue.from(settings.modelPolicies ?? [])])))
+            try await mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "auto_reset_weekly_accounts":.array(enrolled.map(JSONValue.string)), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true), "load_balance":.bool(settings.loadBalanceEnabled), "idle_return_minutes":.number(Double(settings.idleReturnDelay)), "upstream_attempts":.number(Double(settings.upstreamAttemptLimit)), "upstream_retry_delay_seconds":.number(Double(settings.upstreamRetryDelay)), "model_compaction":try JSONValue.from(settings.modelCompaction ?? []), "model_policies":try JSONValue.from(settings.modelPolicies ?? [])])))
             historyStatus = try await client.call("history.configure", historyPayload(settings.historyCacheSettings))
             try await updateStatus()
-            pendingSync = false
+            if enrolled == settings.weeklyResetAccountIDs { weeklyResetRevocationPending = false }
+            pendingSync = weeklyResetRevocationPending
             await refreshModelInformation()
         } catch { pendingSync = true; throw error }
     }
@@ -529,6 +556,7 @@ import ServiceManagement
                 }
                 scheduleModelRefresh()
             }
+            if weeklyResetRevocationPending, !busy { try await sync() }
             reportPollingError(nil)
             scheduleControlResetPoll()
         } catch { reportPollingError(error.localizedDescription) }
@@ -542,19 +570,42 @@ import ServiceManagement
         if error == message { error = nil }
     }
     func accountPageOpened() { accountRefreshGeneration += 1 }
-    private func scheduleOfficialAccountRefresh() {
+    func scheduleOfficialAccountRefresh() {
+        guard timerTask != nil, !shuttingDown else { return }
+        let delay = officialBackgroundDelay()
+        let wakeAt = Date().addingTimeInterval(delay)
+        // New failures can bring the wakeup forward; unrelated refreshes cannot postpone it.
+        if let scheduled = officialBackgroundWakeAt, scheduled <= wakeAt { return }
+        officialBackgroundWakeAt = wakeAt
         officialAccountTimerTask?.cancel()
         officialAccountTimerTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let delay = self?.officialBackgroundDelay() else { break }
-                do { try await Task.sleep(for: .seconds(delay)) } catch { break }
-                guard !Task.isCancelled, let self else { break }
-                await self.refreshAccountInfo(sourceIDs: self.sources.filter(\.official).map(\.id), foreground: false)
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard !Task.isCancelled, let self else { return }
+            self.officialBackgroundWakeAt = nil
+            self.dispatchOfficialBackgroundRefresh()
+            self.scheduleOfficialAccountRefresh()
+        }
+    }
+    private func dispatchOfficialBackgroundRefresh() {
+        guard running, !busy, !shuttingDown else { return }
+        var slots = 4 - officialQueries.count
+        guard slots > 0 else { return }
+        let interval = Double(settings.officialQuotaRefreshInterval) * 60
+        // Give failed accounts priority without letting a slow account hold up other retries.
+        for pass in 0..<2 {
+            for source in settings.sources where source.enabled && source.official {
+                let id = source.id
+                guard officialRefreshSchedule.isRetrying(id) == (pass == 0), !refreshingQuotas.contains(id),
+                      officialRefreshSchedule.isDue(id, interval: interval, since: officialBackgroundStartedAt),
+                      (try? credentialSnapshot.load(id))?["access_token"].string?.isEmpty == false else { continue }
+                Task { await refreshAccount(id, foreground: false) }
+                slots -= 1
+                if slots == 0 { return }
             }
         }
     }
     private func officialBackgroundDelay() -> TimeInterval {
-        officialRefreshSchedule.backgroundDelay(for: sources.filter { $0.enabled && $0.official }.map(\.id),
+        officialRefreshSchedule.backgroundDelay(for: settings.sources.lazy.filter { $0.enabled && $0.official }.map(\.id),
             since: officialBackgroundStartedAt, interval: Double(settings.officialQuotaRefreshInterval) * 60)
     }
     func refreshAccountInfo(sourceIDs: [String]? = nil, foreground: Bool = true) async {
@@ -571,10 +622,11 @@ import ServiceManagement
         }
     }
     func refreshAccount(_ id: String, foreground: Bool, force: Bool = false) async {
-        guard running, !busy, !Task.isCancelled, let before = settings.sources.first(where: { $0.id == id }), before.enabled || foreground else { return }
+        guard running, !busy, !shuttingDown, !Task.isCancelled, let before = settings.sources.first(where: { $0.id == id }), before.enabled || foreground else { return }
         if before.official {
-            guard !refreshingQuotas.contains(id), officialRefreshSchedule.isDue(id, foreground: foreground, interval: Double(settings.officialQuotaRefreshInterval) * 60, since: officialBackgroundStartedAt), let secret = try? credentialSnapshot.load(id), secret["access_token"].string?.isEmpty == false else { return }
-            try? await queryOfficial(id, includeCredits: officialRefreshSchedule.needsCredits(id))
+            guard before.enabled, !refreshingQuotas.contains(id), officialRefreshSchedule.isDue(id, foreground: foreground, interval: Double(settings.officialQuotaRefreshInterval) * 60, since: officialBackgroundStartedAt), let secret = try? credentialSnapshot.load(id), secret["access_token"].string?.isEmpty == false else { return }
+            let includeCredits = !officialRefreshSchedule.isRetrying(id) && officialRefreshSchedule.needsCredits(id)
+            try? await queryOfficial(id, includeCredits: includeCredits)
         } else {
             guard !refreshingBalances.contains(id) else { return }
             if !force, let cached = apiBalances[id], (cached["failure_count"].number ?? 0) > 0,
@@ -637,7 +689,6 @@ import ServiceManagement
             if next.fixed_source_id == source.id && !source.enabled { next.mode = "auto"; next.fixed_source_id = nil }
         }
         if connectionChanged {
-            if source.official { officialRefreshSchedule.reset(source.id) }
             modelErrors[source.id] = nil
             apiBalances[source.id] = nil
             lastModelRefresh[source.id] = nil
@@ -754,9 +805,25 @@ import ServiceManagement
             try await self.updateSettingsAndSync { $0.officialLowQuotaPercent = value }
         }
     }
-    func changeAutoResetWeeklyQuota(_ enabled: Bool) {
+    private func confirmedWeeklyResetAccount(for source: Source) -> String? {
+        guard source.official, let account = source.account_id, !account.isEmpty,
+              let current = settings.sources.first(where: { $0.id == source.id }),
+              current.hasSameOfficialBinding(as: source), source.matchesOfficialStatus(state(source.id)) else { return nil }
+        return account
+    }
+    func canChangeAutoResetWeeklyQuota(for source: Source) -> Bool {
+        running && !busy && !metadataLoadFailed && loginSource != source.id && confirmedWeeklyResetAccount(for: source) != nil
+    }
+    func changeAutoResetWeeklyQuota(_ enabled: Bool, for source: Source) {
         perform {
-            try await self.updateSettingsAndSync { $0.autoResetWeeklyQuota = enabled }
+            guard self.running, self.loginSource != source.id, let account = self.confirmedWeeklyResetAccount(for: source) else {
+                throw AppError.message("账号或网络设置已变化，请刷新来源后重试。")
+            }
+            try await self.updateSettingsAndSync { next in
+                var enrolled = next.autoResetWeeklyAccounts ?? [:]
+                enrolled[account] = enabled ? WeeklyResetEndpoint(source) : nil
+                next.autoResetWeeklyAccounts = enrolled
+            }
         }
     }
     func changeContextFallback(_ enabled: Bool) {

@@ -40,12 +40,13 @@ extension AppModel {
         // The helper durably installs official credentials before returning; never replay an IPC token snapshot.
         try await loadCredentialSnapshot([id])
         let durable = try OfficialCredentialMirror.requireDurable(credentialSnapshot.load(id))
+        let enrolled = settings.weeklyResetAccountIDs
         var next = settings
         if let i = next.sources.firstIndex(where: { $0.id == id }) { next.sources[i].account_id = durable["account_id"].string }
         try persistSettings(next); callbackURL = ""; loginSource = nil; loginFlow = nil; loginMessage = "官方账号已连接。"
-        officialRefreshSchedule.reset(id)
         lastModelRefresh[id] = nil
         scheduleModelRefresh()
+        if enrolled != settings.weeklyResetAccountIDs { try await sync() }
         Task { await refreshAccount(id, foreground: true) }
     }
     func queryOfficial(_ id: String, includeCredits: Bool) async throws {
@@ -56,11 +57,25 @@ extension AppModel {
             }
             return
         }
+        let before = settings.sources.first { $0.id == id && $0.official }
         refreshingQuotas.insert(id)
         let task = Task<Void, Error> {
             defer { officialQueries[id] = nil; refreshingQuotas.remove(id) }
             officialRefreshSchedule.record(id, includeCredits: includeCredits)
-            _ = try await client.call("official.refresh", .object(["source_id": .string(id), "include_credits": .bool(includeCredits)]))
+            let result: JSONValue
+            do {
+                result = try await client.call("official.refresh", .object(["source_id": .string(id), "include_credits": .bool(includeCredits)]))
+            } catch {
+                if let before, settings.sources.contains(where: { $0.id == id && $0.hasSameOfficialBinding(as: before) }) {
+                    officialRefreshSchedule.quotaQueryFailed(id)
+                    scheduleOfficialAccountRefresh()
+                }
+                throw error
+            }
+            if let before, settings.sources.contains(where: { $0.id == id && $0.hasSameOfficialBinding(as: before) }) {
+                officialRefreshSchedule.observeQuota(id, snapshot: result["quota"], queried: true)
+                scheduleOfficialAccountRefresh()
+            }
             try await refreshCredentials()
             try await updateStatus()
         }

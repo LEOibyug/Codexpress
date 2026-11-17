@@ -119,6 +119,9 @@ pub(super) fn quota_snapshot(raw: &Value) -> Result<Value> {
         && raw
             .get("additional_rate_limits")
             .is_none_or(|v| v.is_null() || v.is_array());
+    complete &= ["allowed", "limit_reached"].iter().all(|key| {
+        raw["rate_limit"].get(*key).is_none_or(Value::is_boolean)
+    });
     if let Some(additional) = raw["additional_rate_limits"].as_array() {
         for (index, item) in additional.iter().enumerate() {
             complete &= item.get("rate_limit").is_some_and(|v| {
@@ -140,7 +143,7 @@ pub(super) fn quota_snapshot(raw: &Value) -> Result<Value> {
         }
     }
     Ok(
-        json!({"plan_type":raw.get("plan_type").and_then(Value::as_str),"windows":windows,"complete":complete,"fetched_at":fetched_at,"stale":false,"error":null}),
+        json!({"plan_type":raw.get("plan_type").and_then(Value::as_str),"windows":windows,"complete":complete,"fetched_at":fetched_at,"stale":false,"error":null,"allowed":raw["rate_limit"]["allowed"].as_bool(),"limit_reached":raw["rate_limit"]["limit_reached"].as_bool()}),
     )
 }
 pub(super) fn credits_snapshot(raw: &Value) -> Result<Value> {
@@ -186,8 +189,11 @@ fn stale(mut previous: Value, kind: &str, error: &str) -> Value {
     previous["error"] = json!(error);
     previous
 }
-fn confirmed_main_windows(quota: &Value) -> Option<Vec<&Value>> {
-    if quota["stale"] != false || quota["complete"] != true {
+pub(super) fn confirmed_main_windows(quota: &Value) -> Option<Vec<&Value>> {
+    let at = now();
+    if quota["stale"] != false || quota["complete"] != true || !quota["error"].is_null()
+        || !quota["fetched_at"].as_u64().is_some_and(|fetched| fetched <= at && at - fetched <= 120)
+    {
         return None;
     }
     let windows: Vec<_> = quota["windows"]
@@ -196,6 +202,12 @@ fn confirmed_main_windows(quota: &Value) -> Option<Vec<&Value>> {
         .filter(|w| matches!(w["name"].as_str(), Some("primary" | "secondary")))
         .collect();
     if windows.is_empty() || windows.iter().any(|w| w["used_percent"].as_f64().is_none()) {
+        return None;
+    }
+    let exhausted = windows.iter().any(|w| w["used_percent"].as_f64().is_some_and(|used| used >= 100.0));
+    if quota["allowed"].as_bool().is_some_and(|allowed| allowed == exhausted)
+        || quota["limit_reached"].as_bool().is_some_and(|limited| limited != exhausted)
+    {
         return None;
     }
     Some(windows)
@@ -242,7 +254,7 @@ pub(super) async fn refresh_selected_snapshots(
     endpoints: Endpoints<'_>,
     include_credits: bool,
 ) -> Result<Value> {
-    let (quota, credits) = tokio::join!(refresh_quota(state, src, endpoints), async {
+    let (quota, credits) = tokio::join!(refresh_quota(state, src, endpoints, false), async {
         if include_credits {
             refresh_credits(state, src, endpoints).await
         } else {
@@ -261,23 +273,28 @@ pub(super) async fn refresh_selected_snapshots(
     Ok(result)
 }
 
-async fn refresh_quota(
+pub(super) async fn refresh_quota(
     state: &Arc<AppState>,
     src: &Source,
     endpoints: Endpoints<'_>,
+    fresh: bool,
 ) -> Result<()> {
     let mutex = lock(state, query_key("quota-lock", src)).await;
-    let _guard = match mutex.try_lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            // Reuse the completed in-flight query, including its stale/error
-            // state. Another source entry for this account needs no second GET.
-            let _guard = mutex.lock().await;
-            let sources = state.sources.read().await;
-            if !sources.iter().any(|r| same_account_binding(&r.source, src)) {
-                bail!("来源在查询期间发生变化，请刷新");
+    let _guard = if fresh {
+        mutex.lock().await
+    } else {
+        match mutex.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // Recovery waits its turn and queries again instead of trusting
+                // an earlier observation that predates the rejection or POST.
+                let _guard = mutex.lock().await;
+                let sources = state.sources.read().await;
+                if !sources.iter().any(|r| same_account_binding(&r.source, src)) {
+                    bail!("来源在查询期间发生变化，请刷新");
+                }
+                return Ok(());
             }
-            return Ok(());
         }
     };
     let access = refresh_bound_inner(state, src, false, endpoints).await;
@@ -286,14 +303,15 @@ async fn refresh_quota(
     }
     let refreshed = access.as_ref().unwrap_or(src);
     let src = refreshed;
+    let identity = src.identity();
     let (threshold, auto_enabled) = {
         let settings = state.settings.read().await;
-        (settings.official_low_quota_percent, settings.auto_reset_weekly_quota)
+        (settings.official_low_quota_percent, settings.auto_reset_weekly(src))
     };
     let sources = state.sources.read().await;
     let account_revisions: std::collections::HashMap<_, _> = sources
         .iter()
-        .filter(|r| r.source.identity() == src.identity())
+        .filter(|r| r.source.identity() == identity)
         .map(|r| (r.source.id.clone(), r.health_revision))
         .collect();
     let recovering_revision = sources
@@ -313,7 +331,7 @@ async fn refresh_quota(
     let mut sources = state.sources.write().await;
     let may_confirm_recovery = sources
         .iter()
-        .filter(|r| r.source.identity() == src.identity())
+        .filter(|r| r.source.identity() == identity)
         .all(|r| account_revisions.get(&r.source.id) == Some(&r.health_revision));
     let previous_quota = sources
         .iter()
@@ -325,13 +343,16 @@ async fn refresh_quota(
     } else {
         0
     };
-    let runtime = sources
-        .iter_mut()
-        .find(|r| same_binding(&r.source, src))
+    let runtime_index = sources.iter().position(|r| same_binding(&r.source, src))
         .ok_or_else(|| anyhow!("来源在查询期间发生变化，请刷新"))?;
+    let hard_block = sources.iter().any(|r| r.quota_exhausted && r.source.identity() == identity);
+    let runtime = &mut sources[runtime_index];
     runtime.quota = match quota {
         Ok(mut v) if may_confirm_recovery => {
-            preserve_low_windows(&mut v, &previous_quota, threshold);
+            preserve_low_windows(&mut v, &previous_quota, threshold, hard_block);
+            if v["stale"] != true && confirmed_main_windows(&v).is_none() {
+                v = stale(v, "quota", "官方未返回可确认的主额度");
+            }
             // A fresh authenticated query proves this proxy path works. Never
             // clear a newer failure, HTTP throttling, or an auth/quota block.
             if runtime.health == "proxy_error"
@@ -364,7 +385,9 @@ async fn refresh_quota(
         recover_exhaustion(runtime);
     }
     let confirmed_quota = runtime.quota.clone();
-    let confirmed_recovery = confirmed_main_windows(&runtime.quota).is_some_and(|windows| {
+    let windows = confirmed_main_windows(&runtime.quota);
+    let confirmed = windows.is_some();
+    let confirmed_recovery = windows.is_some_and(|windows| {
         windows.iter().all(|window| {
             window["used_percent"]
                 .as_f64()
@@ -374,7 +397,6 @@ async fn refresh_quota(
     // Multiple source entries may share a subscription. A fresh recovery must
     // release the account block for all of them without clearing auth/network faults.
     if confirmed_recovery && may_confirm_recovery {
-        let identity = src.identity();
         for runtime in sources
             .iter_mut()
             .filter(|r| r.source.identity() == identity)
@@ -390,9 +412,12 @@ async fn refresh_quota(
             }
         }
     }
+    if may_confirm_recovery && confirmed {
+        state.quota_recovery.confirm(src, false);
+    }
     if let Some(error) = query_error {
         for runtime in sources.iter_mut().filter(|r| {
-            r.source.identity() == src.identity() && r.source.proxy == src.proxy
+            r.source.identity() == identity && r.source.proxy == src.proxy
         }) {
             runtime.quota = stale(runtime.quota.clone(), "quota", &error);
             runtime.quota["failure_count"] = json!(failure_count);
@@ -461,7 +486,7 @@ async fn refresh_credits(
     Ok(())
 }
 
-fn preserve_low_windows(fresh: &mut Value, previous: &Value, threshold: u8) {
+fn preserve_low_windows(fresh: &mut Value, previous: &Value, threshold: u8, hard_block: bool) {
     let Some(old) = previous["windows"].as_array() else {
         return;
     };
@@ -471,9 +496,9 @@ fn preserve_low_windows(fresh: &mut Value, previous: &Value, threshold: u8) {
     let mut retained = false;
     for old_window in old.iter().filter(|window| {
         matches!(window["name"].as_str(), Some("primary" | "secondary"))
-            && window["used_percent"]
-                .as_f64()
-                .is_some_and(|used| used.is_finite() && used >= 100.0 - f64::from(threshold))
+            && ((hard_block && window["window_seconds"].as_f64() == Some(604800.0))
+                || window["used_percent"].as_f64()
+                    .is_some_and(|used| used.is_finite() && used >= 100.0 - f64::from(threshold)))
     }) {
         // Retained observations must not become newer than a confirmed recovery
         // seen through another source for the same account.
@@ -489,6 +514,8 @@ fn preserve_low_windows(fresh: &mut Value, previous: &Value, threshold: u8) {
             if current["used_percent"]
                 .as_f64()
                 .is_some_and(|used| used.is_finite() && used >= 0.0)
+                && !(hard_block && old_window["window_seconds"].as_f64() == Some(604800.0)
+                    && current["window_seconds"].as_f64() != Some(604800.0))
             {
                 continue;
             }

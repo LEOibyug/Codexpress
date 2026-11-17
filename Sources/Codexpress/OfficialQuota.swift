@@ -65,19 +65,26 @@ struct QuotaOverview {
 struct OfficialRefreshSchedule {
     private var quotaAttempts: [String: Date] = [:]
     private var creditAttempts: [String: Date] = [:]
+    private var quotaRetries: [String: Date] = [:]
+    private var lastConfirmedQuota: [String: Double] = [:]
+
+    func isRetrying(_ id: String) -> Bool { quotaRetries[id] != nil }
+
+    private func deadline(_ id: String, foreground: Bool, interval: TimeInterval, since start: Date) -> Date {
+        quotaRetries[id] ?? (quotaAttempts[id] ?? (foreground ? .distantPast : start)).addingTimeInterval(foreground ? 15 : interval)
+    }
 
     func isDue(_ id: String, now: Date = Date(), foreground: Bool = false, interval: TimeInterval = 1800, since start: Date = .distantPast) -> Bool {
-        now.timeIntervalSince(quotaAttempts[id] ?? (foreground ? .distantPast : start)) >= (foreground ? 15 : interval)
+        now >= deadline(id, foreground: foreground, interval: interval, since: start)
     }
-    func backgroundDelay(for ids: [String], since start: Date, interval: TimeInterval, now: Date = Date()) -> TimeInterval {
-        var deadline: Date?
+    func backgroundDelay(for ids: some Sequence<String>, since start: Date, interval: TimeInterval, now: Date = Date()) -> TimeInterval {
+        var delay: TimeInterval?
         for id in ids {
-            let next = (quotaAttempts[id] ?? start).addingTimeInterval(interval)
-            deadline = min(deadline ?? next, next)
+            let remaining = deadline(id, foreground: false, interval: interval, since: start).timeIntervalSince(now)
+            // Busy or ineligible accounts do not spin when past their deadline.
+            delay = min(delay ?? 1800, remaining > 0 ? remaining : (isRetrying(id) ? 5 : 15))
         }
-        // Recheck overdue accounts without spinning when the gateway is busy or credentials are unavailable.
-        let remaining = deadline?.timeIntervalSince(now) ?? interval
-        return remaining > 0 ? min(remaining, 1800) : 15
+        return delay ?? min(interval, 1800)
     }
     func needsCredits(_ id: String, now: Date = Date()) -> Bool {
         now.timeIntervalSince(creditAttempts[id] ?? .distantPast) >= 300
@@ -86,7 +93,27 @@ struct OfficialRefreshSchedule {
         quotaAttempts[id] = now
         if includeCredits { creditAttempts[id] = now }
     }
+    @discardableResult mutating func observeQuota(_ id: String, snapshot: JSONValue, queried: Bool = false, now: Date = Date()) -> Bool {
+        if snapshot["stale"].bool == false, snapshot["complete"].bool == true,
+           snapshot["error"] == .null, let fetchedAt = snapshot["fetched_at"].number {
+            guard queried || lastConfirmedQuota[id] != fetchedAt else { return false }
+            lastConfirmedQuota[id] = fetchedAt
+            quotaAttempts[id] = now
+            quotaRetries[id] = nil
+            return true
+        }
+        let failed = (snapshot["stale"].bool == true && (snapshot["error"].string != nil || (snapshot["failure_count"].number ?? 0) > 0))
+            || (snapshot["stale"].bool == false && snapshot["complete"].bool == false)
+        if failed { lastConfirmedQuota[id] = nil }
+        guard queried || (failed && quotaRetries[id] == nil) else { return false }
+        quotaQueryFailed(id, now: now)
+        return true
+    }
+    mutating func quotaQueryFailed(_ id: String, now: Date = Date()) {
+        quotaRetries[id] = now.addingTimeInterval(5)
+    }
     mutating func reset(_ id: String) {
         quotaAttempts[id] = nil; creditAttempts[id] = nil
+        quotaRetries[id] = nil; lastConfirmedQuota[id] = nil
     }
 }

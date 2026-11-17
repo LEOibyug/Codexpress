@@ -6,7 +6,7 @@ pub(crate) use roles::RoleCapabilities;
 
 use self::{
     request::{clear_body_headers, retry_request, Payload},
-    response::{probe_context_rejection, read_error_prefix, stream_response, Attempt},
+    response::{probe_context_rejection, read_error_prefix, response_has_output, response_is_sse, stream_response, Attempt},
 };
 use crate::{
     model::{AppState, Source},
@@ -49,15 +49,47 @@ fn error(status: StatusCode, message: &str) -> Response<Body> {
 }
 
 fn recovery_timeout(retry_after: u64) -> Response<Body> {
-    let mut response = error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "来源仍在冷却或等待空闲名额，已等待恢复；请稍后重试。",
-    );
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"error": {
+        "code": "upstream_unavailable", "type": "server_error",
+        "message": "来源正在等待恢复或可用名额，请稍后重试。"
+    }}))).into_response();
     response.headers_mut().insert(
         "retry-after",
         HeaderValue::from_str(&retry_after.max(1).to_string()).expect("seconds"),
     );
     response
+}
+
+async fn quota_unavailable(state: &Arc<AppState>, model: &str, saw_quota: bool) -> Option<Response<Body>> {
+    let settings = state.settings.read().await.clone();
+    let policies = state.model_policies.read().await;
+    let sources = state.sources.read().await;
+    let matching = sources.iter().filter(|runtime| {
+        let source = &runtime.source;
+        source.enabled
+            && crate::model_policy::source_allowed(&policies, model, &source.id)
+            && (model.is_empty() || source.models.is_empty() || source.models.iter().any(|m| m == model))
+            && (settings.mode != "fixed" || settings.fixed_source_id.as_ref() == Some(&source.id))
+    });
+    let mut had_quota = saw_quota;
+    let mut all_exhausted = true;
+    let mut matched = false;
+    for runtime in matching {
+        let unconfirmed = state.quota_recovery.unconfirmed(&runtime.source);
+        let exhausted = routing::official_exhausted(runtime, &sources)
+            || (runtime.source.kind != "official" && runtime.health == "exhausted"
+                && runtime.cooldown_until.is_none_or(|until| until > crate::model::now()));
+        matched = true;
+        had_quota |= exhausted || unconfirmed;
+        all_exhausted &= exhausted && !unconfirmed;
+    }
+    if state.quota_recovery.try_admit().is_some() && matched && all_exhausted {
+        return Some((StatusCode::TOO_MANY_REQUESTS, axum::Json(json!({"error": {
+            "code": "all_sources_quota_exhausted", "type": "gateway_error",
+            "message": "所有支持此模型的已配置来源额度均已耗尽。"
+        }}))).into_response());
+    }
+    had_quota.then(|| recovery_timeout(1))
 }
 
 fn sensitive(name: &str) -> bool {
@@ -197,6 +229,22 @@ struct PreservedScopedSession(String);
 struct RecoveryWindow {
     deadline: tokio::time::Instant,
     attempted: bool,
+    quota_deadline: Option<tokio::time::Instant>,
+    quota_retry: Option<Source>,
+}
+
+impl RecoveryWindow {
+    fn quota_deadline(&mut self) -> tokio::time::Instant {
+        *self.quota_deadline.get_or_insert_with(|| {
+            tokio::time::Instant::now() + std::time::Duration::from_secs(RECOVERY_WAIT_SECONDS)
+        })
+    }
+
+    fn retries_quota(&self, source: &Source) -> bool {
+        self.quota_retry.as_ref().is_some_and(|target| {
+            target.id == source.id && target.identity() == source.identity()
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -262,6 +310,8 @@ pub(crate) async fn forward(
         deadline: tokio::time::Instant::now()
             + std::time::Duration::from_secs(RECOVERY_WAIT_SECONDS),
         attempted: false,
+        quota_deadline: None,
+        quota_retry: None,
     });
     forward_once(state, request, None, 0).await
 }
@@ -667,6 +717,14 @@ async fn forward_once(
     if let Some(problem) = crate::model_catalog::check_client(&state, parsed["model"].as_str().unwrap_or(""), client_kind).await {
         return problem;
     }
+    let route_epoch = loop {
+        if let Some(epoch) = state.quota_recovery.try_admit() { break epoch; }
+        drop(prepared_route.take());
+        let deadline = parts.extensions.get_mut::<RecoveryWindow>().expect("request recovery window").quota_deadline();
+        if tokio::time::timeout_at(deadline, state.quota_recovery.wait_idle()).await.is_err() {
+            return recovery_timeout(1);
+        }
+    };
     // Each client request can join the same takeover. Internal replans retain
     // their marker and cannot pick up a newer operation or retry a failed probe.
     let mut manual = match parts.extensions.get::<ManualRequest>().cloned() {
@@ -825,6 +883,7 @@ async fn forward_once(
         && !tool_result
         && manual_target.is_none()
         && !priority_probe
+        && !request_retries.saw_quota()
     {
         if let Some(key) = affinity_key.as_deref() {
             let has_state = binding.is_some() || opaque_state;
@@ -913,6 +972,9 @@ async fn forward_once(
             let bindings = state.bindings.lock().await;
             hard_keys.iter().all(|key| !bindings.contains_key(*key))
         };
+    let saw_quota = request_retries.saw_quota();
+    let window = parts.extensions.get::<RecoveryWindow>().expect("request recovery window");
+    let retry_quota = |source: &Source| window.retries_quota(source);
     let mut sources = if let Some((source, _)) = &prepared_route {
         let mut candidates = vec![source.clone()];
         candidates.extend(
@@ -986,7 +1048,19 @@ async fn forward_once(
         });
     }
     if priority_probe {
-        sources = routing::priority::candidates(&state, model, affinity_key.as_deref()).await;
+        let priority = routing::priority::candidates(&state, model, affinity_key.as_deref()).await;
+        if !saw_quota || (binding.is_none() && origin.is_none()) {
+            sources = priority;
+        } else if let Some(recovered) = priority.into_iter().find(&retry_quota) {
+            // The prior priority probe already used these exact wire bytes.
+            if !sources.iter().any(|source| retry_quota(source)) {
+                sources.insert(0, recovered);
+            }
+        }
+    }
+    if saw_quota && probe_unknown_id {
+        // Quota does not prove that an unknown remote ID belongs elsewhere.
+        sources.retain(retry_quota);
     }
     if manual.attempted {
         if let Some(trial) = &manual.trial {
@@ -1000,8 +1074,9 @@ async fn forward_once(
     }
     let retry_limit = state.settings.read().await.upstream_attempts;
     let had_candidates = !sources.is_empty();
-    sources.retain(|source| !request_retries.exhausted(source, retry_limit));
-    if had_candidates && sources.is_empty() {
+    sources.retain(|source| retry_quota(source) || !request_retries.exhausted(source, retry_limit));
+    sources.sort_by_key(|source| !retry_quota(source));
+    if had_candidates && sources.is_empty() && !saw_quota {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "本次请求已用完来源尝试次数，请稍后重试",
@@ -1022,11 +1097,10 @@ async fn forward_once(
             diagnostics
         );
         let mut restore_error = None;
-        if !degraded && !discovery && (binding.is_some() || opaque_state) {
+        if !degraded && !discovery && (binding.is_some() || opaque_state || saw_quota && origin.is_some()) {
             let eligible =
-                !routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
-                    .await
-                    .is_empty();
+                routing::candidates_with_session(&state, model, None, affinity_key.as_deref())
+                    .await.iter().any(|source| !request_retries.exhausted(source, retry_limit));
             if eligible && settings.degraded_context_fallback {
                 match portable_request(&state, &parts, &parsed, affinity_key.as_deref()).await {
                     Ok((retry, context)) => {
@@ -1097,8 +1171,11 @@ async fn forward_once(
                 }
             }
         }
-        if let Some(response) = restore_error {
+        if let Some(response) = restore_error.filter(|_| !saw_quota) {
             return *response;
+        }
+        if let Some(response) = quota_unavailable(&state, model, saw_quota).await {
+            return response;
         }
         return error(
             if binding.is_some() {
@@ -1182,7 +1259,10 @@ async fn forward_once(
                     continue;
                 }
             }
-        } else if let Some((_, lease)) = prepared_route.take() {
+        } else if prepared_route.as_ref().is_some_and(|(source, _)| {
+            source.id == candidate.id && source.identity() == candidate.identity()
+        }) {
+            let (_, lease) = prepared_route.take().expect("matched route lease");
             // Reconstruction may await disk work. Honor source removal, model
             // changes, quota updates and fixed-mode changes before submission.
             if !routing::source_is_eligible(&state, &candidate, model).await {
@@ -1194,6 +1274,7 @@ async fn forward_once(
             None
         } else {
             let reserved = if last_error.is_some()
+                || (saw_quota && !parts.extensions.get::<RecoveryWindow>().expect("request recovery window").retries_quota(&candidate))
                 || rebuild
                     .as_ref()
                     .is_some_and(|context| context.rejected_source.is_some())
@@ -1447,16 +1528,6 @@ async fn forward_once(
                 binding.is_some(),
                 opaque_state
             );
-            // Preparation can be abandoned during OAuth or route revalidation.
-            // Notify only when the reconstructed request is actually submitted.
-            if let Some(context) = rebuild
-                .as_ref()
-                .filter(|context| context.excluded.iter().any(|key| key != "rebuilt"))
-            {
-                state
-                    .notifications
-                    .fallback(context.key.as_deref().unwrap_or(&request_id));
-            }
             let submission = state.routing_sync.lock().await;
             if let Some(problem) = crate::model_catalog::check_client(&state, model, client_kind).await {
                 return problem;
@@ -1471,9 +1542,35 @@ async fn forward_once(
                 let retry = Request::from_parts(parts, Body::from(bytes));
                 return Box::pin(forward_once(state, retry, rebuild, replans + 1)).await;
             }
+            let Some(ticket) = state.quota_recovery.try_admit().filter(|epoch| *epoch == route_epoch) else {
+                drop(submission);
+                drop(route_lease.take());
+                drop(attempt);
+                if replans >= 3 {
+                    return recovery_timeout(1);
+                }
+                let retry = Request::from_parts(parts, Body::from(bytes));
+                return Box::pin(forward_once(state, retry, rebuild, replans + 1)).await;
+            };
+            attempt.dispatch_ticket = Some(ticket);
+            let window = parts.extensions.get_mut::<RecoveryWindow>().expect("request recovery window");
+            let quota_replay = window.retries_quota(&source);
+            if quota_replay {
+                window.quota_retry = None;
+            }
             if manual_candidate {
                 manual.attempted = true;
                 parts.extensions.insert(manual.clone());
+            }
+            // Preparation can be abandoned during OAuth or route revalidation.
+            // Notify only when the reconstructed request is actually submitted.
+            if let Some(context) = rebuild
+                .as_ref()
+                .filter(|context| context.excluded.iter().any(|key| key != "rebuilt"))
+            {
+                state
+                    .notifications
+                    .fallback(context.key.as_deref().unwrap_or(&request_id));
             }
             let upstream = crate::model_catalog::start_submission(submission, tokio::time::timeout(
                 std::time::Duration::from_secs(120),
@@ -1523,7 +1620,7 @@ async fn forward_once(
                         transport::failure_reason(&err),
                     );
                     attempt.finish("failed", None);
-                    if definitely_unsubmitted {
+                    if definitely_unsubmitted && !quota_replay {
                         if let Some(delay) = retries.failed(false) {
                             drop(attempt);
                             tokio::time::sleep(delay).await;
@@ -1597,8 +1694,8 @@ async fn forward_once(
                 .diagnostic
                 .response(upstream.status().as_u16(), upstream.headers());
             attempt.save_diagnostic(false);
-            let status = upstream.status();
-            if !status.is_success() {
+            let upstream_status = upstream.status();
+            if !upstream_status.is_success() {
                 eprintln!(
                     "upstream_http_failure unix={} kind={} status={}",
                     crate::model::now(),
@@ -1607,7 +1704,7 @@ async fn forward_once(
                     } else {
                         "api"
                     },
-                    status.as_u16()
+                    upstream_status.as_u16()
                 );
             }
             let retry_after = upstream
@@ -1616,17 +1713,78 @@ async fn forward_once(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
             let mut prefix = Vec::new();
-            let mut transient_error = if retries::transient_status(status.as_u16()) {
-                read_error_prefix(&mut upstream, &mut prefix).await
+            let request_is_stream = parsed["stream"].as_bool() == Some(true)
+                || (source.kind == "official" && omp_ingress && !native_compaction);
+            let upstream_sse = response_is_sse(upstream.headers(), request_is_stream, upstream_status);
+            let code = upstream_status.as_u16();
+            let omp_v2_error = omp_ingress && parts.uri.path() == "/v1/responses"
+                && matches!(code, 400 | 404 | 422 | 501) && crate::chatbot::is_compaction_v2(&parsed);
+            let context_error = matches!(code, 400 | 404 | 409 | 422)
+                && (binding.is_some() || opaque_state || payload.may_repair());
+            let http_error = if !upstream_sse && (omp_v2_error || context_error
+                || matches!(code, 402 | 403) || retries::transient_status(code))
+            {
+                read_error_prefix(&mut upstream, &mut prefix, &mut attempt).await
             } else {
                 None
             };
-            let permanent_rejection = transient_error
-                .as_ref()
-                .is_some_and(|value| retries::permanent_code(value).is_some());
+            let http_output = http_error.as_ref().is_some_and(response_has_output);
+            let ambiguous_status = matches!(upstream_status.as_u16(), 408 | 504);
+            // SSE and output-bearing JSON must not inherit replay permission
+            // from the HTTP status alone. The actual upstream status is forwarded.
+            let status = if upstream_sse || http_output { StatusCode::OK } else { upstream_status };
+            let probe = if upstream_sse || (upstream_status.is_success()
+                && (manual_candidate || (!degraded && (binding.is_some() || opaque_state)
+                    && (priority_probe || probe_unknown_id
+                        || state.settings.read().await.degraded_context_fallback))))
+            {
+                // Hold a bounded prefix until output or a refusal is observed.
+                match probe_context_rejection(&mut upstream, &mut prefix, request_is_stream, &mut attempt).await {
+                    Ok(probe) => Some(probe),
+                    Err(()) => {
+                        if manual_candidate { manual.abandon(&state); }
+                        return error(StatusCode::BAD_GATEWAY, "来源响应中断，提交结果不明确；未自动重试");
+                    }
+                }
+            } else {
+                None
+            };
+            let http_quota = http_error.as_ref().and_then(retries::quota_code);
+            let stream_quota = probe.as_ref().and_then(|probe| probe.quota_code.as_deref());
+            let saw_quota_in_response = http_quota.is_some() || stream_quota.is_some();
+            if let Some(code) = http_quota.or(stream_quota) {
+                // Even after output, report the refusal with its original dispatch epoch.
+                attempt.report_quota(&source, code, retry_after).await;
+                let safe_refusal = !ambiguous_status && (http_quota.is_some() && !http_output
+                    || probe.as_ref().and_then(|probe| probe.failure.as_ref()).and_then(retries::quota_code).is_some());
+                if safe_refusal {
+                    let first = request_retries.reject_quota(&source);
+                    let retry_official = source.kind == "official" && first;
+                    let window = parts.extensions.get_mut::<RecoveryWindow>().expect("request recovery window");
+                    if retry_official {
+                        window.quota_retry = Some(source.clone());
+                        window.quota_deadline();
+                    }
+                    attempt.finish("failed", None);
+                    drop(route_lease.take());
+                    drop(upstream);
+                    drop(attempt);
+                    if manual_candidate {
+                        if !retry_official {
+                            return after_manual_failure(state, parts, bytes, rebuild, replans, true).await;
+                        }
+                        manual.attempted = false;
+                        parts.extensions.insert(manual.clone());
+                    }
+                    let retry = Request::from_parts(parts, Body::from(bytes));
+                    return Box::pin(forward_once(state, retry, rebuild, replans)).await;
+                }
+            }
+            let permanent_rejection = retries::transient_status(status.as_u16()) && http_error
+                .as_ref().is_some_and(|value| retries::permanent_code(value).is_some());
             if permanent_rejection {
                 request_retries.block(&source);
-            } else if retries::transient_status(status.as_u16()) {
+            } else if !quota_replay && retries::transient_status(status.as_u16()) {
                 if let Some(delay) = retries.failed(true) {
                     attempt.finish("failed", None);
                     // Keep the capacity lease, but release the failed transport.
@@ -1637,7 +1795,7 @@ async fn forward_once(
                     continue;
                 }
             }
-            if source.kind == "official" && status == StatusCode::UNAUTHORIZED && !auth_refreshed {
+            if !quota_replay && source.kind == "official" && status == StatusCode::UNAUTHORIZED && !auth_refreshed {
                 auth_refreshed = true;
                 attempt.finish("failed", None);
                 attempt.collect_error(&mut upstream, &mut prefix).await;
@@ -1702,71 +1860,33 @@ async fn forward_once(
                     }
                 }
             }
-            let compaction_error = if parts.uri.path() == "/v1/responses" && crate::chatbot::is_compaction_v2(&parsed)
-                && parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some()
-                && matches!(status.as_u16(), 400 | 404 | 422 | 501) {
-                let value = read_error_prefix(&mut upstream, &mut prefix).await;
-                if let Some(value) = &value {
+            if omp_v2_error {
+                if let Some(value) = &http_error {
                     crate::omp_ingress::observe_compaction_rejection(&source, status, value);
                 }
-                value
-            } else { None };
+            }
             let mut context_rejected = false;
-            if matches!(status.as_u16(), 400 | 404 | 409 | 422)
-                && (binding.is_some() || opaque_state || payload.may_repair())
-            {
-                let rejection = match compaction_error {
-                    Some(value) => Some(value),
-                    None => read_error_prefix(&mut upstream, &mut prefix).await,
-                };
-                if let Some(value) = rejection {
-                    if payload.repair_rejection(status, &value, &source, &state.role_capabilities) {
+            if context_error {
+                if let Some(value) = &http_error {
+                    if !quota_replay && payload.repair_rejection(status, value, &source, &state.role_capabilities) {
                         attempt.finish("failed", None);
                         attempt.collect_error(&mut upstream, &mut prefix).await;
                         drop(upstream);
                         continue;
                     }
-                    context_rejected = explicit_context_rejection(&value);
+                    context_rejected = explicit_context_rejection(value);
                 }
             }
-            if status.is_success()
-                && (manual_candidate
-                    || (!degraded
-                        && (binding.is_some() || opaque_state)
-                        && (priority_probe
-                            || probe_unknown_id
-                            || state.settings.read().await.degraded_context_fallback)))
-            {
-                // Hold only an initial bounded prefix. A failed Responses SSE
-                // can use HTTP 200, so headers alone do not prove acceptance.
-                // Once any output is seen (or the probe is inconclusive), its
-                // original bytes are streamed without replay.
-                let probe = match probe_context_rejection(
-                    &mut upstream,
-                    &mut prefix,
-                    parsed["stream"].as_bool() == Some(true),
-                    &mut attempt,
-                )
-                .await
-                {
-                    Ok(probe) => probe,
-                    Err(()) => {
-                        if manual_candidate {
-                            manual.abandon(&state);
-                        }
-                        return error(
-                            StatusCode::BAD_GATEWAY,
-                            "来源响应中断，提交结果不明确；未自动重试",
-                        );
-                    }
-                };
+            let mut stream_transient = false;
+            if let Some(probe) = probe.filter(|probe| probe.quota_code.is_none() && !ambiguous_status) {
                 context_rejected = probe.context_rejected;
+                stream_transient = saw_quota && probe.failure.as_ref().is_some_and(retries::transient_error);
                 if manual_candidate {
                     if let Some(failure) = probe.failure {
                         let transient = retries::transient_error(&failure);
                         let response = failure.get("response").unwrap_or(&failure);
                         let permanent = retries::permanent_code(response);
-                        if transient {
+                        if transient && !quota_replay {
                             if let Some(delay) = retries.failed(true) {
                                 attempt.finish("failed", None);
                                 drop(upstream);
@@ -1812,15 +1932,8 @@ async fn forward_once(
                 )
                 .await;
                 if matches!(status.as_u16(), 402 | 403 | 429) || permanent_rejection {
-                    // Read only a bounded error prefix, retaining the original
-                    // chunks for exact forwarding if this is the final source.
-                    let value = if transient_error.is_some() {
-                        transient_error.take()
-                    } else {
-                        read_error_prefix(&mut upstream, &mut prefix).await
-                    };
-                    if let Some(value) = value {
-                        let code = retries::permanent_code(&value).or_else(|| {
+                    if let Some(value) = &http_error {
+                        let code = retries::permanent_code(value).or_else(|| {
                             value
                                 .pointer("/error/code")
                                 .and_then(Value::as_str)
@@ -1901,7 +2014,7 @@ async fn forward_once(
                 && (binding.is_some() || opaque_state || origin.is_some())
                 && (context_rejected
                     || matches!(status.as_u16(), 401 | 402 | 403 | 429)
-                    || retries::transient_status(status.as_u16()))
+                    || retries::transient_status(status.as_u16()) || stream_transient)
                 && state.settings.read().await.degraded_context_fallback
                 && if priority_probe {
                     !routing::priority::candidates(&state, model, affinity_key.as_deref())
@@ -1941,10 +2054,22 @@ async fn forward_once(
                 && (origin.is_none() || planned_return)
                 && (matches!(status.as_u16(), 401 | 402 | 403 | 429)
                     || retries::transient_status(status.as_u16())
-                    || (degraded && context_rejected));
+                    || stream_transient || (degraded && context_rejected));
+            if saw_quota && (stream_transient || matches!(status.as_u16(), 401 | 402 | 403 | 429)
+                || retries::transient_status(status.as_u16())) && !safe_to_fallback
+            {
+                attempt.finish("failed", None);
+                return recovery_timeout(1);
+            }
             if safe_to_fallback {
+                let quota_failover = saw_quota && !context_rejected;
+                if quota_failover { request_retries.block(&source); }
                 attempt.finish("failed", None);
                 drop(route_lease.take());
+                if quota_failover {
+                    if !stream_transient { attempt.collect_error(&mut upstream, &mut prefix).await; }
+                    break;
+                }
                 // Preserve the final source's native error body when there is no
                 // later candidate; streaming this response must not trigger replay.
                 if candidate_index + 1 < source_count {
@@ -1960,7 +2085,7 @@ async fn forward_once(
                         ResponseContext {
                             discovery,
                             session_key: session_key.clone(),
-                            request_is_stream: parsed["stream"].as_bool() == Some(true),
+                            request_is_stream,
                             rebuild: None,
                             history: None,
                             accepted_state: None,
@@ -1971,7 +2096,7 @@ async fn forward_once(
                 );
                 break;
             }
-            if status.is_success() {
+            if upstream_status.is_success() && !saw_quota_in_response {
                 routing::mark_ready(&state, &source).await;
             }
             if manual_candidate {
@@ -2024,7 +2149,7 @@ async fn forward_once(
                 ResponseContext {
                     discovery,
                     session_key: session_key.clone(),
-                    request_is_stream: parsed["stream"].as_bool() == Some(true),
+                    request_is_stream,
                     rebuild,
                     history: history_capture,
                     accepted_state,
@@ -2051,6 +2176,9 @@ async fn forward_once(
             drop(route_lease.take());
             return after_manual_failure(state, parts, bytes, rebuild, replans, true).await;
         }
+    }
+    if saw_quota {
+        return quota_unavailable(&state, model, true).await.expect("quota failure response");
     }
     last_error.unwrap_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "所有来源暂时不可用"))
 }
@@ -2088,6 +2216,8 @@ mod recovery_tests {
         request.extensions_mut().insert(RecoveryWindow {
             deadline: started + std::time::Duration::from_millis(60),
             attempted: false,
+            quota_deadline: None,
+            quota_retry: None,
         });
         let response = forward_once(state.clone(), request, None, 0).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2105,6 +2235,64 @@ mod recovery_tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_ready_text_source_waits_for_official_quota_recovery() {
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+
+        let usage_started = Arc::new(Notify::new());
+        let release_usage = Arc::new(Notify::new());
+        let inference = Arc::new(Notify::new());
+        let fixture = Router::new()
+            .route("/usage", get({
+                let (started, release) = (usage_started.clone(), release_usage.clone());
+                move || async move {
+                    started.notify_one();
+                    release.notified().await;
+                    axum::Json(json!({"rate_limit": {
+                        "primary_window": {"used_percent":100,"reset_at":2000000000,"limit_window_seconds":18000},
+                        "secondary_window": {"used_percent":100,"reset_at":2000500000,"limit_window_seconds":604800}
+                    }}))
+                }
+            }))
+            .route("/responses", post({
+                let inference = inference.clone();
+                move || async move {
+                    inference.notify_one();
+                    axum::Json(json!({"status":"completed","output":[]}))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, fixture).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().into(), 0, "fixture".into()).unwrap();
+        let official: Source = serde_json::from_value(json!({
+            "id":"official","name":"Official fixture","kind":"official","enabled":true,"priority":0,
+            "base_url":"https://chatgpt.com/backend-api/codex","proxy":{"mode":"explicit","url":url},
+            "models":["separate-model"],"account_id":"fixture-account",
+            "secret":{"access_token":"access","refresh_token":"refresh","expires_at":crate::model::now()+3600,"account_id":"fixture-account"}
+        })).unwrap();
+        let api: Source = serde_json::from_value(json!({
+            "id":"api","name":"API fixture","kind":"api","enabled":true,"priority":1,
+            "base_url":url,"proxy":{"mode":"direct"},"secret":{"api_key":"fixture"}
+        })).unwrap();
+        *state.sources.write().await = vec![official.clone(), api].into_iter().map(crate::model::SourceRuntime::new).collect();
+        let ticket = state.quota_recovery.try_admit().unwrap();
+        crate::official::fixture::quota_rejected(&state, &official, ticket).await;
+        tokio::time::timeout(std::time::Duration::from_millis(500), usage_started.notified()).await.unwrap();
+        let request = Request::builder().method("POST").uri("/v1/responses")
+            .header("host", "127.0.0.1:0").header("authorization", "Bearer fixture")
+            .body(Body::from(r#"{"model":"m"}"#)).unwrap();
+        let task = tokio::spawn(router(state.clone()).oneshot(request));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), inference.notified()).await.is_err());
+        release_usage.notify_one();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-codexpress-source-id"], "api");
+        server.abort();
     }
 }
 

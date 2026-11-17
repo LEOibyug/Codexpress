@@ -32,6 +32,7 @@ const EVENT_LIMIT: usize = crate::usage::diagnostics::BODY_LIMIT;
 pub(super) async fn read_error_prefix(
     upstream: &mut reqwest::Response,
     prefix: &mut Vec<(Bytes, Instant)>,
+    attempt: &mut Attempt,
 ) -> Option<Value> {
     let mut observed = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -45,6 +46,11 @@ pub(super) async fn read_error_prefix(
                     break;
                 }
             }
+            Ok(Err(_)) => {
+                attempt.captured_transport_error = true;
+                attempt.diagnostic.transport("body_transport", "上游错误响应传输中断");
+                return None;
+            }
             _ => break,
         }
     }
@@ -55,6 +61,7 @@ pub(super) async fn read_error_prefix(
 pub(super) struct ResponseProbe {
     pub context_rejected: bool,
     pub failure: Option<Value>,
+    pub quota_code: Option<String>,
 }
 
 pub(super) async fn probe_context_rejection(
@@ -74,6 +81,7 @@ pub(super) async fn probe_context_rejection(
             Ok(Ok(Some(chunk))) => {
                 let received_at = Instant::now();
                 observed = observed.saturating_add(chunk.len());
+                probe.replay_blocked |= observed > 65536;
                 probe.push(&chunk, received_at);
                 if !probe.sse {
                     if let Ok(value) = serde_json::from_slice::<Value>(&probe.buffer) {
@@ -105,16 +113,143 @@ pub(super) async fn probe_context_rejection(
         } else {
             probe.failure_event
         },
+        quota_code: probe.quota_code,
     })
 }
 
-fn response_is_sse(headers: &HeaderMap, request_is_stream: bool, status: StatusCode) -> bool {
+pub(super) fn response_is_sse(headers: &HeaderMap, request_is_stream: bool, status: StatusCode) -> bool {
     let content_type = headers.get("content-type");
     content_type.and_then(|v| v.to_str().ok()).is_some_and(|v| {
         v.split(';')
             .next()
             .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
     }) || (request_is_stream && status.is_success() && content_type.is_none())
+}
+
+pub(super) fn response_has_output(value: &Value) -> bool {
+    let response = value.get("response").unwrap_or(value);
+    response["output"].as_array().is_some_and(|items| !items.is_empty())
+        || response["usage"]["output_tokens"].as_u64().is_some_and(|tokens| tokens > 0)
+}
+
+// Preserve ordinary event bytes. Hold only a bounded incomplete frame so a
+// split quota event cannot leak its native hard error before we recognize it.
+#[derive(Default)]
+struct SseQuotaFilter {
+    pending: Vec<u8>,
+    line_len: usize,
+    line_cr: bool,
+    disabled: bool,
+}
+
+impl SseQuotaFilter {
+    fn flush(&mut self) -> Bytes {
+        Bytes::from(std::mem::take(&mut self.pending))
+    }
+
+    fn push(&mut self, chunk: Bytes, observed_quota: bool) -> Bytes {
+        if self.disabled { return chunk; }
+        let mut boundary = 0;
+        for (index, &byte) in chunk.iter().enumerate() {
+            if byte == b'\n' {
+                if self.line_len == 0 || (self.line_len == 1 && self.line_cr) {
+                    boundary = index + 1;
+                }
+                self.line_len = 0;
+            } else {
+                if self.line_len == 0 { self.line_cr = byte == b'\r'; }
+                self.line_len = (self.line_len + 1).min(2);
+            }
+        }
+        let tail = &chunk[boundary..];
+        if tail.len() + if boundary == 0 { self.pending.len() } else { 0 } > EVENT_LIMIT {
+            self.disabled = true;
+            boundary = chunk.len();
+        }
+        if boundary == 0 {
+            self.pending.extend_from_slice(tail);
+            return Bytes::new();
+        }
+        let ready = if self.pending.is_empty() {
+            chunk.slice(..boundary)
+        } else {
+            let mut ready = std::mem::take(&mut self.pending);
+            ready.extend_from_slice(&chunk[..boundary]);
+            Bytes::from(ready)
+        };
+        self.pending.extend_from_slice(&chunk[boundary..]);
+        if observed_quota { rewrite_quota_frames(ready) } else { ready }
+    }
+}
+
+fn rewrite_quota_frames(bytes: Bytes) -> Bytes {
+    let mut start = 0;
+    let mut end = 0;
+    let mut written = 0;
+    let mut rewritten = Vec::new();
+    for line in bytes.split_inclusive(|&byte| byte == b'\n') {
+        end += line.len();
+        if line != b"\n" && line != b"\r\n" { continue; }
+        let frame = &bytes[start..end];
+        if frame.len() <= EVENT_LIMIT {
+            if let Some(value) = neutral_quota_event(frame) {
+                rewritten.extend_from_slice(&bytes[written..start]);
+                let mut data_written = false;
+                for line in frame.split_inclusive(|&byte| byte == b'\n') {
+                    if line.starts_with(b"data:") {
+                        if !data_written {
+                            rewritten.extend_from_slice(b"data: ");
+                            serde_json::to_writer(&mut rewritten, &value).expect("JSON event");
+                            rewritten.extend_from_slice(if line.ends_with(b"\r\n") { b"\r\n" } else { b"\n" });
+                            data_written = true;
+                        }
+                    } else {
+                        rewritten.extend_from_slice(line);
+                    }
+                }
+                written = end;
+            }
+        }
+        start = end;
+    }
+    if written == 0 { return bytes; }
+    rewritten.extend_from_slice(&bytes[written..]);
+    Bytes::from(rewritten)
+}
+
+fn neutral_quota_event(frame: &[u8]) -> Option<Value> {
+    let mut name = None;
+    let mut data = Vec::new();
+    for line in frame.split(|&byte| byte == b'\n') {
+        if let Some(line) = line.strip_prefix(b"data:") {
+            if !data.is_empty() { data.push(b'\n'); }
+            data.extend_from_slice(line.strip_prefix(b" ").unwrap_or(line));
+        }
+        if let Some(line) = line.strip_prefix(b"event:") {
+            name = std::str::from_utf8(line).ok().map(str::trim);
+        }
+    }
+    let mut value: Value = serde_json::from_slice(&data).ok()?;
+    let event_type = value["type"].as_str().or(name).unwrap_or("");
+    let root_error = event_type == "error";
+    if !matches!(event_type, "error" | "response.failed")
+        && value.get("response").unwrap_or(&value)["status"] != "failed"
+    {
+        return None;
+    }
+    super::retries::quota_code(&value)?;
+    const MESSAGE: &str = "来源暂不可用，请稍后重试。";
+    let neutral = serde_json::json!({"code":"upstream_unavailable", "type":"server_error", "message":MESSAGE});
+    if let Some(error) = value.pointer_mut("/response/error") {
+        *error = neutral.clone();
+    }
+    if let Some(error) = value.get_mut("error") {
+        *error = neutral;
+    } else if root_error {
+        value["code"] = "upstream_unavailable".into();
+        value["message"] = MESSAGE.into();
+    }
+    Some(value)
 }
 
 pub(super) struct Attempt {
@@ -127,8 +262,24 @@ pub(super) struct Attempt {
     captured_transport_error: bool,
     saved_failure: Option<Value>,
     pub(super) manual_trial: Option<routing::manual::Trial>,
+    pub(super) dispatch_ticket: Option<u64>,
+    quota_reported: bool,
 }
 impl Attempt {
+    pub(super) async fn report_quota(&mut self, source: &Source, code: &str, retry_after: Option<u64>) {
+        if self.quota_reported {
+            return;
+        }
+        if source.kind == "official" {
+            if let Some(ticket) = self.dispatch_ticket {
+                crate::official::quota_rejected(&self.state, source, ticket).await;
+            }
+        } else {
+            routing::mark_rejection(&self.state, source, Some(code), retry_after).await;
+        }
+        self.quota_reported = true;
+    }
+
     pub(super) fn new(
         state: Arc<AppState>,
         source: &Source,
@@ -181,6 +332,8 @@ impl Attempt {
             captured_transport_error: false,
             saved_failure: None,
             manual_trial: None,
+            dispatch_ticket: None,
+            quota_reported: false,
         }
     }
     pub(super) fn save_diagnostic(&self, body: bool) {
@@ -345,6 +498,7 @@ pub(super) struct Observer {
     buffer: Vec<u8>,
     line: Vec<u8>,
     data: Vec<u8>,
+    event_name: Option<String>,
     discarding_line: bool,
     discarding_event: bool,
     oversized: bool,
@@ -352,6 +506,7 @@ pub(super) struct Observer {
     terminal: bool,
     failed: bool,
     failure_code: Option<String>,
+    quota_code: Option<String>,
     failure_event: Option<Value>,
     input: Option<u64>,
     output: Option<u64>,
@@ -461,17 +616,12 @@ impl Observer {
                     && response["output"].is_array());
         // Any generated item, including a tool call or private reasoning, makes
         // replay unsafe even when no text delta has been seen yet.
-        self.replay_blocked |= event_type.starts_with("response.output_")
-            || event_type.starts_with("response.refusal.")
-            || event_type.starts_with("response.audio.")
-            || event_type.starts_with("response.audio_transcript.")
-            || event_type.starts_with("response.image_generation_call.")
-            || event_type.starts_with("response.function_call_")
-            || event_type.starts_with("response.reasoning_")
-            || event_type.starts_with("response.custom_tool_")
-            || response["output"]
-                .as_array()
-                .is_some_and(|items| !items.is_empty());
+        self.replay_blocked |= self.accepted_completion
+            || (self.sse && !matches!(event_type,
+                "response.created" | "response.queued" | "response.in_progress"
+                | "response.metadata" | "rate_limits.updated" | "codex.rate_limits"
+                | "response.failed" | "error"))
+            || response_has_output(value);
         if self.history_request.is_some() && event_type == "response.output_item.done" {
             if let (Some(index), Some(item)) = (value["output_index"].as_u64(), value.get("item")) {
                 self.history_bytes = self.history_bytes.saturating_add(item.to_string().len());
@@ -584,6 +734,13 @@ impl Observer {
             self.failed = true;
             self.failure_event = Some(value.clone());
             self.context_rejected |= explicit_context_rejection(value);
+            if self.quota_code.is_none() {
+                self.quota_code = super::retries::quota_code(value).map(String::from);
+                if self.sse && self.quota_code.is_some() {
+                    self.terminal = true;
+                    self.terminal_at.get_or_insert(received_at);
+                }
+            }
             self.failure_code = super::retries::permanent_code(response)
                 .or_else(|| super::retries::permanent_code(value))
                 .or_else(|| response.pointer("/error/code").and_then(Value::as_str))
@@ -623,13 +780,20 @@ impl Observer {
     fn event(&mut self, received_at: Instant) {
         if self.discarding_event {
             self.history_invalid = true;
+            self.replay_blocked = true;
         }
         if !self.discarding_event {
-            if let Ok(value) = serde_json::from_slice::<Value>(&self.data) {
+            if let Ok(mut value) = serde_json::from_slice::<Value>(&self.data) {
+                if let Some((name, object)) = self.event_name.take().zip(value.as_object_mut()) {
+                    object.entry("type").or_insert(Value::String(name));
+                }
                 self.value(&value, received_at);
+            } else if !self.data.is_empty() {
+                self.replay_blocked = true;
             }
         }
         self.data.clear();
+        self.event_name = None;
         self.discarding_event = false;
     }
     fn push(&mut self, bytes: &[u8], received_at: Instant) {
@@ -663,6 +827,9 @@ impl Observer {
                             self.discarding_event = true;
                             self.data.clear();
                         }
+                    } else if let Some(raw) = self.line.strip_prefix(b"event:") {
+                        self.event_name = std::str::from_utf8(raw).ok()
+                            .map(str::trim).filter(|name| name.len() <= 128).map(String::from);
                     }
                 }
                 self.line.clear();
@@ -747,7 +914,9 @@ async fn finalize_response(
     if observer.history_request.take().is_some() {
         state.history.record_skip();
     }
-    if observer.failed {
+    if let Some(code) = &observer.quota_code {
+        attempt.report_quota(source, code, None).await;
+    } else if observer.failed {
         routing::mark_rejection(state, source, observer.failure_code.as_deref(), None).await;
     }
     bind_ids(state, source, observer).await;
@@ -850,7 +1019,7 @@ pub(super) async fn stream_response(
         .as_ref()
         .is_some_and(|record| record.status == "failed");
     let status = upstream.status();
-    let headers = clean_headers(upstream.headers(), false);
+    let mut headers = clean_headers(upstream.headers(), false);
     let content_length = headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
@@ -875,6 +1044,11 @@ pub(super) async fn stream_response(
     }
     // Official Codex can omit Content-Type while still returning SSE.
     let sse = response_is_sse(&headers, request_is_stream, status);
+    let rewrite_quota = sse && content_length != Some(0)
+        && headers.get("content-encoding").is_none_or(|encoding| {
+            encoding.to_str().is_ok_and(|value| value.eq_ignore_ascii_case("identity"))
+        });
+    if rewrite_quota { super::clear_body_headers(&mut headers); }
     let mut observer = Observer {
         sse,
         defer_bindings: accepted_state.is_some() || rejected_attempt,
@@ -930,12 +1104,29 @@ pub(super) async fn stream_response(
         let mut received = 0u64;
         let mut finalized = content_length == Some(0);
         let mut chunk_index = 0usize;
-        while let Some(chunk) = upstream.next().await {
+        let mut filter = SseQuotaFilter { disabled: !rewrite_quota, ..Default::default() };
+        loop {
+            let chunk = if filter.pending.is_empty() {
+                upstream.next().await
+            } else {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), upstream.next()).await {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        filter.disabled = true;
+                        yield Ok::<Bytes, std::io::Error>(filter.flush());
+                        continue;
+                    }
+                }
+            };
+            let Some(chunk) = chunk else { break; };
             match chunk {
                 Ok((chunk, received_at)) => {
                     if chunk_index >= captured_prefix { attempt.diagnostic.chunk(&chunk); }
                     chunk_index += 1;
                     observer.push(&chunk, received_at);
+                    if let Some(code) = &observer.quota_code {
+                        attempt.report_quota(&source, code, None).await;
+                    }
                     persist_history(&state, &mut observer).await;
                     bind_ids(&state, &source, &mut observer).await;
                     received = received.saturating_add(chunk.len() as u64);
@@ -952,12 +1143,17 @@ pub(super) async fn stream_response(
                         attempt.finish(if status.is_success() { "streaming" } else { "failed" }, Some(&observer));
                     }
                     confirm_manual_acceptance(&state, &source, &mut observer, &mut accepted_state, &mut route_lease, &mut session_key, status.is_success() && !rejected_attempt).await;
-                    yield Ok::<Bytes, std::io::Error>(chunk);
-                    if complete_body { return; }
+                    let chunk = filter.push(chunk, observer.quota_code.is_some());
+                    if !chunk.is_empty() { yield Ok::<Bytes, std::io::Error>(chunk); }
+                    if complete_body {
+                        if !filter.pending.is_empty() { yield Ok(filter.flush()); }
+                        return;
+                    }
                 },
                 Err(_) => {
                     attempt.diagnostic.transport("body_transport", "上游响应传输中断");
                     if !finalized { attempt.finish("interrupted", Some(&observer)); }
+                    if !filter.pending.is_empty() { yield Ok(filter.flush()); }
                     yield Err(std::io::Error::other("来源流已中断"));
                     return;
                 }
@@ -965,12 +1161,14 @@ pub(super) async fn stream_response(
         }
         if attempt.captured_transport_error {
             if !finalized { attempt.finish("failed", Some(&observer)); }
+            if !filter.pending.is_empty() { yield Ok(filter.flush()); }
             yield Err(std::io::Error::other("来源流已中断"));
             return;
         }
         attempt.diagnostic.complete();
         if !finalized { finalize_response(&state, &source, status, discovery, &mut observer, &mut attempt).await; }
         confirm_manual_acceptance(&state, &source, &mut observer, &mut accepted_state, &mut route_lease, &mut session_key, status.is_success() && !rejected_attempt).await;
+        if !filter.pending.is_empty() { yield Ok(filter.flush()); }
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;

@@ -418,9 +418,16 @@ async fn explicit_permanent_rejections_inside_transient_http_statuses_are_not_re
             .oneshot(request(BODY))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let status = response.status();
         let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
-        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        if health == "exhausted" {
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response["error"]["code"], "all_sources_quota_exhausted");
+        } else {
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(response, expected);
+        }
         assert_eq!(*calls.lock().unwrap(), 1);
         assert_eq!(state.sources.read().await[0].health, health);
         task.abort();
