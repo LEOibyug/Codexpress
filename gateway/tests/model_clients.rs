@@ -89,11 +89,11 @@ async fn client_catalogs_and_dispatch_share_model_policies_without_losing_native
     let original = native_models.iter().find(|model| model["id"] == "omp-only").unwrap();
     assert_eq!(original["default_context_window"], 700000);
     assert_eq!(original["default_auto_compact_token_limit"], Value::Null);
-    assert_eq!(original["context_window"], 700000);
+    assert_eq!(original["context_window"], 800000);
     for (id, window) in [("gpt-6.2-sol", 500000), ("gpt-6.2-astra", 272000)] {
         let model = native_models.iter().find(|model| model["id"] == id).unwrap();
         assert_eq!(model["default_context_window"], window);
-        assert_eq!(model["context_window"], window);
+        assert_eq!(model["context_window"], 872000);
         assert!(model.get("max_output_tokens").is_none());
     }
     let native = relay::router(state.clone());
@@ -105,8 +105,8 @@ async fn client_catalogs_and_dispatch_share_model_policies_without_losing_native
         assert_eq!(result["data"][0]["id"], expected);
         if expected == "omp-only" {
             assert_eq!(result["data"], binding["models"]);
-            assert_eq!(result["data"][0]["context_window"], 700000);
-            assert_eq!(result["data"][0]["max_context_window"], 700000);
+            assert_eq!(result["data"][0]["context_window"], 800000);
+            assert_eq!(result["data"][0]["max_context_window"], 800000);
             assert_eq!(result["data"][0]["default_context_window"], 700000);
             assert_eq!(result["data"][0]["default_max_context_window"], 900000);
             assert_eq!(result["data"][0]["auto_compact_token_limit"], 250000);

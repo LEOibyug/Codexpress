@@ -56,7 +56,7 @@ struct ModelSettingsView: View {
         let rule = model.settings.modelCompaction?.first { $0.model == id }
         let clients = (policy?.clients ?? ModelClient.allCases).lazy.filter { $0.isApplicable(to: id) }
         let information = model.modelInformation[id] ?? .null
-        let defaultWindow = information["default_context_window"].number.map(Int.init)
+        let defaultWindow = (information["default_max_context_window"].number ?? information["default_context_window"].number).map(Int.init)
         let windowValue = rule?.context_window.map { min($0, defaultWindow ?? $0) } ?? defaultWindow
         let thresholdValue = (rule?.auto_compact_token_limit ?? information["default_auto_compact_token_limit"].number.map(Int.init)).map { min($0, windowValue.map { $0 * 9 / 10 } ?? $0) }
         let window = windowValue.map { $0.formatted() + " Token" } ?? "模型默认"
@@ -106,7 +106,7 @@ private struct ModelEditor: View {
     @State private var error: String?
     @State private var savedModelID: String?
     private var information: JSONValue { model.modelInformation[modelID.trimmingCharacters(in: .whitespacesAndNewlines)] ?? .null }
-    private var defaultWindow: Int? { information["default_context_window"].number.map(Int.init) }
+    private var defaultWindow: Int? { (information["default_max_context_window"].number ?? information["default_context_window"].number).map(Int.init) }
 
     init(settings: AppSettings, modelID: String, isNew: Bool, onBack: @escaping () -> Void) {
         self.isNew = isNew; self.onBack = onBack
@@ -272,7 +272,7 @@ private struct ModelEditor: View {
                         TextField(defaultWindow.map { "默认 " + $0.formatted() } ?? "模型默认", text: $window).settingsField().accessibilityLabel("最大输入 Token，可选")
                     }.frame(maxWidth: .infinity)
                 }
-                Text("留空分别使用默认值；最大输入不可超过模型默认窗口，压缩阈值不可超过实际最大输入的 90%。")
+                Text("留空分别使用默认值；最大输入不可超过官方最大输入，压缩阈值不可超过实际最大输入的 90%。")
                     .font(AppTypography.caption).foregroundStyle(.secondary)
             }
         }

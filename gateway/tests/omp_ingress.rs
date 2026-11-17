@@ -124,7 +124,7 @@ async fn budget_revision_tracks_committed_rules_without_discovery_and_shares_the
     let info = management::dispatch(&state, "models.info", json!({})).await.unwrap();
     let sol = info["models"].as_array().unwrap().iter().find(|model| model["id"] == "gpt-6.2-sol").unwrap();
     assert_eq!(sol["default_context_window"], 500000);
-    assert_eq!(sol["max_context_window"], 500000);
+    assert_eq!(sol["max_context_window"], 1050000);
     assert_eq!(sol["thinking"], json!({"mode":"effort","efforts":["high","xhigh"]}));
     assert!(sol.get("max_output_tokens").is_none());
     std::fs::remove_file(&path).unwrap();
@@ -248,10 +248,10 @@ async fn native_omp_authentication_bytes_events_and_source_identity() {
             "kind":"chat","input_modalities":["text","image"],"supported_reasoning_levels":[{"effort":"high"}],
             "thinking":{"high":1000},"cost":{"input":2,"output":10}}]})).unwrap()).unwrap();
     let expanded = management::dispatch(&state, "omp.binding", json!({})).await.unwrap();
-    assert_eq!(expanded["models"].as_array().unwrap().iter().find(|model| model["id"] == "cached-model").unwrap()["context_window"], 700000);
+    assert_eq!(expanded["models"].as_array().unwrap().iter().find(|model| model["id"] == "cached-model").unwrap()["context_window"], 900000);
     let cached = expanded["models"].as_array().unwrap().iter().find(|model| model["id"] == "cached-model").unwrap();
     assert_eq!(cached["kind"], "chat");
-    assert_eq!(cached["max_context_window"], 700000);
+    assert_eq!(cached["max_context_window"], 900000);
     assert_eq!(cached["input"], json!(["text", "image"]));
     assert_eq!(cached["reasoning"], true);
     assert_eq!(cached["thinking"], json!({"mode":"effort","efforts":["high"]}));
@@ -268,13 +268,13 @@ async fn native_omp_authentication_bytes_events_and_source_identity() {
     }).collect();
     for (rules, window, maximum, limit) in [
         (json!([{"model":"cached-model","context_window":1000000,"auto_compact_token_limit":600000},
-            {"model":"gpt-image-2","context_window":1000000,"auto_compact_token_limit":600000}]), 700000, 700000, json!(600000)),
-        (json!([{"model":"cached-model","context_window":800000,"auto_compact_token_limit":250000}]), 700000, 700000, json!(250000)),
-        (json!([{"model":"cached-model","auto_compact_token_limit":250000}]), 700000, 700000, json!(250000)),
+            {"model":"gpt-image-2","context_window":1000000,"auto_compact_token_limit":600000}]), 900000, 900000, json!(600000)),
+        (json!([{"model":"cached-model","context_window":800000,"auto_compact_token_limit":250000}]), 800000, 800000, json!(250000)),
+        (json!([{"model":"cached-model","auto_compact_token_limit":250000}]), 900000, 900000, json!(250000)),
         (json!([{"model":"cached-model","context_window":300000}]), 300000, 300000, json!(270000)),
-        (json!([{"model":"cached-model","context_window":2000000,"auto_compact_token_limit":1000000}]), 700000, 700000, json!(630000)),
-        (json!([{"model":"cached-model"}]), 700000, 700000, json!(350000)),
-        (json!([]), 700000, 700000, json!(350000)),
+        (json!([{"model":"cached-model","context_window":2000000,"auto_compact_token_limit":1000000}]), 900000, 900000, json!(810000)),
+        (json!([{"model":"cached-model"}]), 900000, 900000, json!(350000)),
+        (json!([]), 900000, 900000, json!(350000)),
     ] {
         management::dispatch(&state, "sync", json!({"sources":sources,"model_compaction":rules})).await.unwrap();
         if limit == json!(600000) {
@@ -290,7 +290,7 @@ async fn native_omp_authentication_bytes_events_and_source_identity() {
             }
             let binding = management::dispatch(&state, "omp.binding", json!({})).await.unwrap();
             let model = binding["models"].as_array().unwrap().iter().find(|model| model["id"] == "cached-model").unwrap();
-            assert_eq!(model["context_window"], 700000);
+            assert_eq!(model["context_window"], 900000);
             assert_eq!(model["auto_compact_token_limit"], 600000);
         }
         let response = router.clone().oneshot(Request::builder().uri("/omp/v1/models")

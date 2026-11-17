@@ -155,7 +155,7 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertEqual(model.connectionMode, "official")
         let invalidRules = [
             ModelCompactionRule(model: policy.model, auto_compact_token_limit: 0, context_window: nil),
-            ModelCompactionRule(model: policy.model, auto_compact_token_limit: nil, context_window: 100001)
+            ModelCompactionRule(model: policy.model, auto_compact_token_limit: nil, context_window: 200001)
         ]
         for invalid in invalidRules {
             do {
@@ -166,6 +166,9 @@ final class AppModelSyncTests: XCTestCase {
         let unchangedModel = try metadata.load()
         XCTAssertEqual(unchangedModel.modelPolicies, [policy])
         XCTAssertEqual(unchangedModel.modelCompaction, [revisedRule])
+        let extended = ModelCompactionRule(model: policy.model, auto_compact_token_limit: nil, context_window: 150000)
+        try await model.saveModelSettings(model: policy.model, policy: policy, compaction: extended)
+        XCTAssertEqual(try metadata.load().modelCompaction, [extended], "Maximum input may exceed the standard window, but not the official maximum")
     }
 
     @MainActor func testUsageAnalyticsSharesRequestsAndKeepsSnapshotsAcrossPageCancellationAndRefreshFailure() async throws {
@@ -347,7 +350,7 @@ final class AppModelSyncTests: XCTestCase {
                     while (directory / 'hold-models').exists(): time.sleep(0.01)
                     data = dict(models=['old-account-model'])
                 elif operation == 'models.info':
-                    data = dict(models=[dict(id='custom-model',default_context_window=100000,default_auto_compact_token_limit=None)])
+                    data = dict(models=[dict(id='custom-model',default_context_window=100000,default_max_context_window=200000,default_auto_compact_token_limit=None)])
                 elif operation == 'usage.analytics':
                     counter = directory / 'analytics-count'
                     count = int(counter.read_text()) + 1 if counter.exists() else 1

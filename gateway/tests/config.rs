@@ -51,10 +51,10 @@ fn discovered_models_keep_upstream_capabilities_with_explicit_context_limits() {
         .iter()
         .find(|m| m["slug"] == "gpt-6.1-terra")
         .unwrap();
-    assert_eq!(terra["context_window"], 400000);
-    assert_eq!(terra["max_context_window"], 400000);
+    assert_eq!(terra["context_window"], 1000000);
+    assert_eq!(terra["max_context_window"], 1000000);
     assert_eq!(terra["default_context_window"], 400000);
-    assert_eq!(terra["auto_compact_token_limit"], 360000);
+    assert_eq!(terra["auto_compact_token_limit"], 600000);
     assert_eq!(
         terra["supported_reasoning_levels"],
         additions["models"][0]["supported_reasoning_levels"]
@@ -127,7 +127,7 @@ fn per_model_limits_apply_update_disable_and_restore_without_losing_other_settin
     let models = catalog["models"].as_array().unwrap();
     let configured = models.iter().find(|m| m["slug"] == "gpt-6.1-sol").unwrap();
     assert_eq!(configured["auto_compact_token_limit"], 180000);
-    assert_eq!(configured["context_window"], 272000);
+    assert_eq!(configured["context_window"], 300000);
     assert!(models
         .iter()
         .all(|model| model["base_instructions"].is_string()));
@@ -647,9 +647,10 @@ fn legacy_managed_catalogs_recover_original_defaults_across_previews_and_repeate
     fs::write(home.join("config.toml"), format!("model='gpt-6.2-sol'\nmodel_catalog_json={:?}\n", legacy_path.to_str().unwrap())).unwrap();
     config::attach(&home, &state, 17863, "fixture-key").unwrap();
     for (window, limit, effective_window, effective_limit) in [
-        (900000, 800000, 500000, 450000),
+        (900000, 800000, 872000, 784800),
         (200000, 150000, 200000, 150000),
-        (900000, 800000, 500000, 450000),
+        (800000, 600000, 800000, 600000),
+        (900000, 800000, 872000, 784800),
     ] {
         let rules = [rule("gpt-6.2-sol", limit, Some(window))];
         let preview = config::preview_with_rules(&home, &state, 17863, "fixture-key", &rules).unwrap();

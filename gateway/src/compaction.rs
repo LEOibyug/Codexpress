@@ -260,15 +260,15 @@ pub(crate) fn preserve_defaults(model: &mut Value) {
 
 pub(crate) fn apply_budget(model: &mut Value, rule: Option<&ModelCompactionRule>) {
     preserve_defaults(model);
-    let default_window = model["default_context_window"].as_i64();
+    let default_window = model["default_max_context_window"].as_i64()
+        .or_else(|| model["default_context_window"].as_i64());
     let window = match (rule.and_then(|rule| rule.context_window), default_window) {
         (Some(window), Some(default)) => Some(window.min(default)),
         (window, default) => window.or(default),
     };
     if let Some(window) = window {
         model["context_window"] = json!(window);
-        // OMP's context-fit expansion must obey the original default, not the
-        // optional extended context capacity or a legacy oversized override.
+        // Explicit reductions cannot exceed the source's original maximum.
         model["max_context_window"] = json!(window);
     }
     let limit = rule.and_then(|rule| rule.auto_compact_token_limit)

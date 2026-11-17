@@ -802,7 +802,7 @@ import ServiceManagement
             _ = try ModelCompactionRule.parse(model: id,
                 threshold: compaction.auto_compact_token_limit.map(String.init) ?? "",
                 window: compaction.context_window.map(String.init) ?? "",
-                defaultWindow: modelInformation[id]?["default_context_window"].number.map(Int.init))
+                defaultWindow: (modelInformation[id]?["default_max_context_window"].number ?? modelInformation[id]?["default_context_window"].number).map(Int.init))
         }
         var next = settings
         var policies = next.modelPolicies ?? []
