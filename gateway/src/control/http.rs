@@ -307,6 +307,7 @@ async fn checked(state: Arc<AppState>, request: Request, next: Next) -> Response
 pub(super) fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .fallback(handle)
+        .layer(middleware::from_fn_with_state(state.clone(), crate::maintenance::http))
         .layer(middleware::from_fn_with_state(state.clone(), gate))
         .with_state(state)
 }

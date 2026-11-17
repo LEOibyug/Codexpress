@@ -290,6 +290,7 @@ pub struct AppState {
     pub gateway_key: String,
     pub port: u16,
     pub state_dir: PathBuf,
+    pub(crate) maintenance: crate::maintenance::Maintenance,
     pub inflight: AtomicUsize,
     pub official_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub official_queries: Mutex<HashMap<String, crate::official::QuerySchedule>>,
@@ -353,12 +354,21 @@ impl AppState {
             gateway_key,
             port,
             state_dir,
+            maintenance: Default::default(),
             inflight: AtomicUsize::new(0),
             official_locks: Mutex::new(HashMap::new()),
             official_queries: Mutex::new(HashMap::new()),
             config_lock: Mutex::new(()),
             credential_store,
         }))
+    }
+
+    pub fn hold_gateway_ingress(&self, hold: bool) {
+        self.maintenance.hold_ingress(hold);
+    }
+
+    pub async fn wait_for_gateway_shutdown(&self) {
+        self.maintenance.shutdown.notified().await;
     }
 
     pub fn persist_credential(&self, source_id: &str, secret: &Value) -> Result<()> {

@@ -691,7 +691,10 @@ async fn callback_server(listener: TcpListener) {
                                 .map(|owner| (id.clone(), f.source.id.clone(), owner))
                         })
                 };
-                if let Some((flow_id, id, owner)) = selected {
+                if let Some((flow_id, id, owner, _work)) = selected.and_then(|(flow_id, id, owner)| {
+                    let work = owner.maintenance.enter()?;
+                    Some((flow_id, id, owner, work))
+                }) {
                     success = complete(&owner, &id, &flow_id, &callback, ENDPOINTS)
                         .await
                         .is_ok();
@@ -784,8 +787,10 @@ pub(crate) async fn refresh_for_source(
     if !state.settings.read().await.auto_reset_weekly_quota { return Ok(result); }
     if let Ok(refreshed) = source(state, &current.id).await {
         if refreshed.enabled && same_account_binding(&refreshed, &current) {
+            let Some(work) = state.maintenance.enter() else { return Ok(result); };
             let state = state.clone();
             tokio::spawn(async move {
+                let _work = work;
                 if let Err(error) = auto_reset::consider(&state, &refreshed, ENDPOINTS).await {
                     eprintln!("自动使用重置卡失败：{error}");
                 }
@@ -807,9 +812,11 @@ pub(crate) async fn schedule_auto_reset(state: &Arc<AppState>) {
 pub(crate) async fn confirm_auto_reset(state: &Arc<AppState>, src: &Source) {
     if src.kind != "official" || !src.enabled
         || !state.settings.read().await.auto_reset_weekly_quota { return; }
+    let Some(work) = state.maintenance.enter() else { return; };
     let state = state.clone();
     let src = src.clone();
     tokio::spawn(async move {
+        let _work = work;
         if let Err(error) = confirm_with_endpoints(&state, &src, ENDPOINTS).await {
             eprintln!("确认自动重置额度失败：{error}");
         }

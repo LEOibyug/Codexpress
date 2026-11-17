@@ -26,6 +26,8 @@ import ServiceManagement
     @Published var notice: String?
     @Published private(set) var busy = false
     @Published private(set) var running = false
+    @Published private(set) var gatewayVersion: String?
+    @Published private(set) var gatewayUpdateWaiting = false
     @Published private(set) var settingsWindowActive = false
     @Published var loginSource: String?
     @Published var loginFlow: String?
@@ -51,6 +53,8 @@ import ServiceManagement
     var credentialSnapshot = CredentialSnapshot()
     let client: GatewayClient
     private var helper: Process?
+    private var stagedGateway: URL?
+    private var gatewayUpdateCancelled = false
     private var logPipe: Pipe?
     private var timerTask: Task<Void, Never>?
     private var accountTimerTask: Task<Void, Never>?
@@ -146,8 +150,8 @@ import ServiceManagement
         officialBackgroundStartedAt = Date()
         scheduleOfficialAccountRefresh()
     }
-    func startHelper() async {
-        guard !metadataLoadFailed else { return }
+    func startHelper(port: Int? = nil, expectedVersion: String? = nil, requiredEntries: [String] = []) async {
+        guard !metadataLoadFailed, !shuttingDown else { return }
         guard !startInProgress else { return }
         startInProgress = true
         defer { startInProgress = false }
@@ -158,9 +162,15 @@ import ServiceManagement
             // Do not adopt a possibly unrelated live helper without the metadata we own.
             if helper?.isRunning != true {
                 if (try? await client.call("status")) != nil { throw AppError.message("此状态目录已有网关运行，已拒绝接管其他实例。请先退出另一个 Codexpress 实例。") }
-                let path = ProcessInfo.processInfo.environment["CODEXPRESS_GATEWAY_PATH"] ?? Bundle.main.executableURL!.deletingLastPathComponent().appendingPathComponent("codexpress-gateway").path
-                guard FileManager.default.isExecutableFile(atPath: path) else { throw AppError.message("未找到随应用打包的网关。请从 Codexpress.app 启动，或配置 CODEXPRESS_GATEWAY_PATH。") }
-                let process = Process(); process.executableURL = URL(fileURLWithPath: path); process.arguments = ["--state-dir", directory.path, "--port", String(settings.port)]
+                guard !shuttingDown else { return }
+                if stagedGateway == nil {
+                    let source = try ProcessInfo.processInfo.environment["CODEXPRESS_GATEWAY_PATH"].map { URL(fileURLWithPath: $0) } ?? GatewayExecutable.bundled()
+                    stagedGateway = try gatewayExecutables.stage(source, replacing: "gateway-a")
+                }
+                guard let executable = stagedGateway else { throw AppError.message("未找到网关可执行文件。") }
+                let process = Process(); process.executableURL = executable
+                process.arguments = ["--state-dir", directory.path, "--port", String(port ?? settings.port)]
+                if expectedVersion != nil { process.arguments?.append("--hold-ingress") }
                 let pipe = Pipe(); process.standardError = pipe; process.standardOutput = FileHandle.nullDevice
                 // Helper errors are bounded and protected; never append IPC payloads.
                 let logURL = directory.appendingPathComponent("gateway.log")
@@ -175,7 +185,10 @@ import ServiceManagement
                     if FileManager.default.createFile(atPath: temp.path, contents: previous, attributes: [.posixPermissions: 0o600]) { _ = rename(temp.path, logURL.path) }
                 }
                 try process.run(); helper = process; logPipe = pipe
-                process.terminationHandler = { [weak self] _ in Task { @MainActor in await self?.helperStopped() } }
+                process.terminationHandler = { [weak self] stopped in
+                    let pid = stopped.processIdentifier
+                    Task { @MainActor in await self?.helperStopped(pid: pid) }
+                }
             }
             for _ in 0..<30 {
                 if let result = try? await client.call("status") {
@@ -186,11 +199,24 @@ import ServiceManagement
                 try? await Task.sleep(for: .milliseconds(100))
             }
             guard verifiedProcessID != nil else { throw AppError.message("网关未能启动。请检查端口冲突和受保护的 gateway.log。") }
+            let info = try await client.call("gateway.update.info")
+            if let expectedVersion {
+                guard info["protocol"].number == 1, info["version"].string == expectedVersion else {
+                    throw AppError.message("新版网关与当前应用不兼容。")
+                }
+            }
             running = true
             credentialStorage = try await client.call("credentials.storage.status")
             credentialSnapshot = CredentialSnapshot()
             try await loadCredentialSnapshot(settings.sources.map(\.id))
             try await sync()
+            for entry in requiredEntries {
+                guard try await client.call(entry)["running"].bool == true else {
+                    throw AppError.message("网关未能恢复原先运行的接入端口。")
+                }
+            }
+            if expectedVersion != nil { _ = try await client.call("gateway.update.release") }
+            gatewayVersion = info["version"].string
             await poll()
         } catch {
             // A rejected sync still leaves our verified helper available for
@@ -200,13 +226,89 @@ import ServiceManagement
             self.error = error.localizedDescription
         }
     }
-    private func helperStopped() async {
+    private func helperStopped(pid: Int32) async {
+        guard helper?.processIdentifier == pid else { return }
         running = false
         guard !shuttingDown, !restarting else { return }
         guard restartCount < 3 else { error = "网关反复退出，已停止自动重启。请检查本地端口后手动重试。"; return }
         restarting = true; restartCount += 1
         try? await Task.sleep(for: .seconds(restartCount))
         await startHelper(); restarting = false
+    }
+    private var gatewayExecutables: GatewayExecutable {
+        GatewayExecutable(directory: directory.appendingPathComponent("gateway-runtime", isDirectory: true))
+    }
+    func updateGateway() {
+        perform {
+            guard self.running, !self.restarting, let old = self.helper, old.isRunning,
+                  let previous = self.stagedGateway, let currentVersion = self.gatewayVersion,
+                  let currentPort = self.status["port"].number else {
+                throw AppError.message("请先启动网关。")
+            }
+            let version = try GatewayExecutable.installedVersion()
+            guard version.compare(currentVersion, options: .numeric) == .orderedDescending else {
+                self.notice = "当前没有可应用的新版网关。请先替换磁盘上的 Codexpress.app。"
+                return
+            }
+            guard version.split(separator: ".").prefix(2).elementsEqual(currentVersion.split(separator: ".").prefix(2)) else {
+                throw AppError.message("此版本需重启 Codexpress 后生效。")
+            }
+            let candidate = try self.gatewayExecutables.stage(GatewayExecutable.bundled(), replacing: previous.lastPathComponent == "gateway-a" ? "gateway-b" : "gateway-a")
+            try GatewayExecutable.validate(candidate)
+            var requiredEntries: [String] = []
+            for entry in ["chatbot.status", "images.status", "control.status"] {
+                if try await self.client.call(entry)["running"].bool == true { requiredEntries.append(entry) }
+            }
+            self.gatewayUpdateCancelled = false
+            self.gatewayUpdateWaiting = true
+            defer { self.gatewayUpdateWaiting = false; self.restarting = false }
+            while !self.gatewayUpdateCancelled {
+                guard !self.shuttingDown, self.helper === old, old.isRunning else {
+                    throw AppError.message("网关已停止或重新启动，请重新应用更新。")
+                }
+                if self.loginFlow == nil, self.creditResetRequest == nil, self.consuming.subtracting(["all"]).isEmpty {
+                    self.restarting = true
+                    do {
+                        if try await self.client.call("gateway.update.stop_when_idle")["stopping"].bool == true { break }
+                    } catch {
+                        self.restarting = false
+                        if !old.isRunning { await self.startHelper(port: Int(currentPort)) }
+                        throw error
+                    }
+                    self.restarting = false
+                }
+                try await Task.sleep(for: .seconds(1))
+            }
+            guard self.restarting, !self.shuttingDown else { return }
+            self.gatewayUpdateWaiting = false
+            try await self.waitForGatewayExit(old)
+            guard !self.shuttingDown else { return }
+            self.stagedGateway = candidate
+            await self.startHelper(port: Int(currentPort), expectedVersion: version, requiredEntries: requiredEntries)
+            if self.running, !self.pendingSync, self.gatewayVersion == version, self.helper?.isRunning == true {
+                self.restartCount = 0
+                self.notice = "网关已更新至 \(version)。"
+                return
+            }
+            guard !self.shuttingDown else { return }
+            let failure = self.error ?? "新版网关未就绪。"
+            if let failed = self.helper { try await self.waitForGatewayExit(failed, terminate: true) }
+            guard !self.shuttingDown else { return }
+            self.stagedGateway = previous
+            await self.startHelper(port: Int(currentPort), expectedVersion: currentVersion, requiredEntries: requiredEntries)
+            if self.running, !self.pendingSync, self.gatewayVersion == currentVersion, self.helper?.isRunning == true {
+                throw AppError.message("更新失败，已恢复网关 \(currentVersion)：\(failure)")
+            }
+            if let failed = self.helper { try await self.waitForGatewayExit(failed, terminate: true) }
+            throw AppError.message("更新失败，旧网关未能恢复：\(self.error ?? failure)")
+        }
+    }
+    func cancelGatewayUpdate() { gatewayUpdateCancelled = true }
+    private func waitForGatewayExit(_ process: Process, terminate: Bool = false) async throws {
+        if terminate && process.isRunning { process.terminate() }
+        for _ in 0..<30 where process.isRunning { try await Task.sleep(for: .milliseconds(100)) }
+        guard !process.isRunning else { throw AppError.message("网关未退出，未继续切换版本。") }
+        running = false
     }
     func shutdown() async {
         if running { _ = try? await refreshCredentials() }
@@ -367,7 +469,7 @@ import ServiceManagement
         } catch { pendingSync = true; throw error }
     }
     func poll(refreshCredentials: Bool = true) async {
-        guard running, !busy else { return }
+        guard running, !busy, !restarting else { return }
         do {
             try await updateStatus()
             if refreshCredentials {

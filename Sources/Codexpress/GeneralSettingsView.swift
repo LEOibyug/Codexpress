@@ -60,6 +60,22 @@ struct GeneralSettingsView: View {
                 LabeledContent("网关地址") {
                     Text(model.baseURL).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
                 }.foregroundStyle(.secondary)
+                if let version = model.gatewayVersion {
+                    SettingRow(title: "网关版本") {
+                        HStack(spacing: 10) {
+                            Text(version).monospacedDigit().foregroundStyle(.secondary)
+                            if model.gatewayUpdateWaiting {
+                                Button("取消等待") { model.cancelGatewayUpdate() }
+                            } else {
+                                Button("空闲后更新网关") { model.updateGateway() }
+                                    .disabled(model.busy || !model.running)
+                            }
+                        }
+                    }
+                    if model.gatewayUpdateWaiting {
+                        InfoNote(text: "正在等待请求和后台操作结束。", symbol: "clock")
+                    }
+                }
                 if model.portNeedsRestart { InfoNote(text: "端口已保存，重启 Codexpress 后生效。", symbol: "arrow.clockwise", color: .orange) }
             }
         }

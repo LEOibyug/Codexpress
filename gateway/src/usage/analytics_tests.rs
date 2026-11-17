@@ -259,6 +259,44 @@ fn appended_and_late_completions_extend_aligned_history_without_double_counting(
 }
 
 #[test]
+fn rolling_window_adds_new_rows_and_moves_previous_rows_between_buckets() {
+    let (_dir, data) = fixture();
+    let store = crate::usage::UsageStore {
+        data: std::sync::Mutex::new(data),
+    };
+    let from = 100_000;
+    let rolling = |start| json!({"from":start,"to":start+3600,"day_starts":(start..=start+3600).step_by(300).collect::<Vec<_>>()});
+    for (id, offset, latency) in [
+        ("first", 299, 100),
+        ("boundary", 300, 200),
+        ("second", 303, 300),
+        ("future", 3600, 400),
+    ] {
+        let mut row = record(id, from + offset);
+        row.latency_ms = latency;
+        store.record(row).unwrap();
+    }
+    assert_eq!(store.analytics(&rolling(from)).unwrap()["daily"][1]["requests"], 2);
+    let mut appended = record("late", from + 10);
+    appended.latency_ms = 500;
+    store.record(appended).unwrap();
+    let shifted = store.analytics(&rolling(from + 3)).unwrap();
+    assert_eq!(shifted["groups"][0]["requests"], 5);
+    assert_eq!(shifted["daily"][0]["requests"], 3);
+    assert_eq!(shifted["daily"][1]["requests"], 1);
+    assert_eq!(shifted["daily"][11]["requests"], 1);
+    assert_eq!(shifted["performance"]["p50_latency_ms"], 300.0);
+
+    let rebucketed = store.analytics(&rolling(from + 6)).unwrap();
+    assert_eq!(rebucketed["groups"][0]["requests"], 5);
+    assert_eq!(rebucketed["daily"][0]["requests"], 4);
+    assert_eq!(rebucketed["daily"][1]["requests"], 0);
+    assert_eq!(rebucketed["daily"][1]["total_usd"], 0);
+    assert_eq!(rebucketed["daily"][0]["start_at"], from + 6);
+    assert_eq!(rebucketed["performance"]["p50_latency_ms"], 300.0);
+}
+
+#[test]
 fn corrections_diagnostics_and_shifted_windows_do_not_reuse_stale_totals() {
     let (dir, data) = fixture();
     persist(&data, &record("legacy", 100_000), Some("native"));

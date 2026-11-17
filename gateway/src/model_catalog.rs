@@ -3,10 +3,18 @@ use crate::{
     compaction::ModelCompactionRule,
     model_policy::{self, ClientKind},
 };
+use anyhow::{bail, Context, Result};
 use axum::{http::{request::Parts, StatusCode}, response::{IntoResponse, Response}, Json};
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::{BTreeMap, BTreeSet}, future::Future, path::Path, sync::Arc, time::SystemTime};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs, future::Future,
+    io::{Read, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::Path, sync::Arc, time::SystemTime,
+};
 use sha2::{Digest, Sha256};
 
 pub(crate) fn client(parts: &Parts) -> ClientKind {
@@ -73,37 +81,120 @@ fn merge_metadata(entries: &mut BTreeMap<String, Value>, mut catalog: Value) {
     }
 }
 
-// Filesystem identity checks are cheap enough for budget polling; parsing and
-// canonical hashing happen only after the local catalog file actually changes.
+const LOCAL_CAPABILITIES: &str = "model-catalogs/local-capabilities.json";
+const MAX_IMPORT_BYTES: usize = 256 * 1024;
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalCapabilities {
+    models: Vec<LocalCapability>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalCapability {
+    slug: String,
+    max_context_window: i64,
+    auto_compact_token_limit: Option<i64>,
+}
+
+impl LocalCapabilities {
+    fn parse(json: &[u8]) -> Result<Self> {
+        if json.len() > MAX_IMPORT_BYTES { bail!("模型能力 JSON 不能超过 256 KiB"); }
+        let mut capabilities: Self = serde_json::from_slice(json)
+            .map_err(|_| anyhow::anyhow!("模型能力 JSON 格式错误；请只使用 models、slug、max_context_window、auto_compact_token_limit 字段"))?;
+        if capabilities.models.len() > 200 { bail!("最多支持导入 200 条模型能力"); }
+        capabilities.models.sort_unstable_by(|left, right| left.slug.cmp(&right.slug));
+        if capabilities.models.windows(2).any(|entries| entries[0].slug == entries[1].slug) {
+            bail!("模型能力包含重复的模型 ID");
+        }
+        for model in &capabilities.models {
+            if model.slug.is_empty() || model.slug.len() > 256
+                || model.slug.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
+                bail!("模型 ID 必须为 1 至 256 字节且不含空白或控制字符");
+            }
+            if model.slug == crate::images::MODEL { bail!("不支持导入图像模型的文本预算"); }
+            crate::compaction::validate_budget(&model.slug, Some(model.max_context_window), model.auto_compact_token_limit)?;
+        }
+        Ok(capabilities)
+    }
+
+    fn load(path: &Path) -> Result<Self> {
+        let mut bytes = Vec::new();
+        fs::File::open(path)?.take(MAX_IMPORT_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+        Self::parse(&bytes)
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        let parent = path.parent().context("无法确定模型能力目录")?;
+        fs::create_dir_all(parent)?;
+        let bytes = serde_json::to_vec(self)?;
+        let temporary = parent.join(format!(".codexpress-{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+        // Rename is the commit point; nothing fallible follows it.
+        let result = file.write_all(&bytes).and_then(|()| file.sync_all())
+            .and_then(|()| fs::rename(&temporary, path));
+        if result.is_err() { let _ = fs::remove_file(&temporary); }
+        result?;
+        Ok(())
+    }
+
+    fn merge(&self, entries: &mut BTreeMap<String, Value>) {
+        for model in &self.models {
+            let metadata = entries.entry(model.slug.clone())
+                .or_insert_with(|| crate::compaction::metadata_for_model(&[], &model.slug));
+            let context = metadata["context_window"].as_i64().filter(|n| *n >= 2)
+                .unwrap_or(model.max_context_window).min(model.max_context_window);
+            metadata["context_window"] = json!(context);
+            metadata["max_context_window"] = json!(model.max_context_window);
+            metadata["auto_compact_token_limit"] = json!(model.auto_compact_token_limit);
+            if let Some(fields) = metadata.as_object_mut() {
+                for field in ["default_context_window", "default_max_context_window", "default_auto_compact_token_limit"] {
+                    fields.remove(field);
+                }
+            }
+        }
+    }
+}
+
+// Polls only check official-cache identity. Local overrides publish explicitly.
 pub(crate) struct MetadataCache {
     signature: Option<(u64, SystemTime)>,
+    local: LocalCapabilities,
     metadata: Arc<[Value]>,
     pub(crate) revision: String,
 }
 
 impl MetadataCache {
     pub(crate) fn open(state_dir: &Path) -> Self {
-        let mut cache = Self { signature: None, metadata: Arc::from([]), revision: String::new() };
+        let local = LocalCapabilities::load(&state_dir.join(LOCAL_CAPABILITIES)).unwrap_or_default();
+        let mut cache = Self { signature: None, local, metadata: Arc::from([]), revision: String::new() };
         cache.refresh(state_dir);
         cache
     }
 
     pub(crate) fn refresh(&mut self, state_dir: &Path) {
+        self.refresh_from_disk(state_dir, false);
+    }
+
+    fn refresh_from_disk(&mut self, state_dir: &Path, force: bool) {
         let path = state_dir.join("model-catalogs/official-latest.json");
         let signature = std::fs::metadata(&path).ok().and_then(|metadata| {
             Some((metadata.len(), metadata.modified().ok()?))
         });
-        if !self.revision.is_empty() && signature == self.signature { return; }
+        if !force && !self.revision.is_empty() && signature == self.signature { return; }
         self.signature = signature;
         let mut entries = BTreeMap::new();
         if let Ok(catalog) = crate::compaction::bundled_catalog() {
             merge_metadata(&mut entries, catalog);
         }
         if signature.is_some_and(|(size, _)| size <= 4 * 1024 * 1024) {
-            if let Some(catalog) = std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) {
+            if let Some(catalog) = fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) {
                 merge_metadata(&mut entries, catalog);
             }
         }
+        self.local.merge(&mut entries);
         let metadata: Vec<_> = entries.into_values().collect();
         let normalized: Vec<_> = metadata.iter().map(|model| {
             normalized_model(model["slug"].as_str().unwrap_or_default(), Some(model), None)
@@ -111,6 +202,31 @@ impl MetadataCache {
         self.revision = format!("{:x}", Sha256::digest(serde_json::to_vec(&normalized).expect("JSON model metadata")));
         self.metadata = metadata.into();
     }
+}
+
+pub(crate) async fn replace_metadata(state: &Arc<AppState>, payload: Value) -> Result<Value> {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        if payload.as_object().is_none_or(|fields| fields.len() != 1) {
+            bail!("请提供模型能力 JSON 或指定恢复默认");
+        }
+        let local = match (payload.get("json"), payload.get("reset")) {
+            (Some(Value::String(text)), None) => {
+                let local = LocalCapabilities::parse(text.as_bytes())?;
+                if local.models.is_empty() { bail!("模型能力必须包含非空 models 列表；清空请使用恢复默认"); }
+                local
+            }
+            (None, Some(Value::Bool(true))) => LocalCapabilities::default(),
+            _ => bail!("请提供模型能力 JSON 或指定恢复默认"),
+        };
+        let count = local.models.len();
+        // Serialize writes with catalog readers, including if an IPC caller disconnects.
+        let mut cache = state.model_metadata.blocking_write();
+        local.save(&state.state_dir.join(LOCAL_CAPABILITIES)).context("无法保存本地模型能力，未更改快照")?;
+        cache.local = local;
+        cache.refresh_from_disk(&state.state_dir, true);
+        Ok(json!({"count":count,"revision":cache.revision}))
+    }).await.context("模型能力更新失败")?
 }
 
 async fn metadata(state: &Arc<AppState>) -> Arc<[Value]> {
@@ -121,14 +237,21 @@ async fn metadata(state: &Arc<AppState>) -> Arc<[Value]> {
 
 pub(crate) async fn info(state: &Arc<AppState>) -> Value {
     let _sync = state.routing_sync.lock().await;
-    let metadata = metadata(state).await;
+    let mut names = BTreeSet::new();
     let rules = state.model_compaction.read().await;
-    let mut names: BTreeSet<String> = metadata.iter().filter_map(|model| model["slug"].as_str().map(str::to_owned)).collect();
     names.extend(state.sources.read().await.iter().flat_map(|runtime| runtime.source.models.iter().cloned()));
     names.extend(state.model_policies.read().await.iter().map(|policy| policy.model.clone()));
     names.extend(rules.iter().filter(|rule| rule.context_window.is_some() || rule.auto_compact_token_limit.is_some()).map(|rule| rule.model.clone()));
+    let mut cache = state.model_metadata.write().await;
+    cache.refresh(&state.state_dir);
+    let metadata = &cache.metadata;
+    names.extend(metadata.iter().filter_map(|model| model["slug"].as_str().map(str::to_owned)));
     json!({"models": names.into_iter().map(|id| {
-        normalized_model(&id, metadata.iter().find(|model| model["slug"] == id), rules.iter().find(|rule| rule.model == id))
+        let mut model = normalized_model(&id, metadata.iter().find(|model| model["slug"] == id), rules.iter().find(|rule| rule.model == id));
+        if cache.local.models.binary_search_by(|entry| entry.slug.cmp(&id)).is_ok() {
+            model["local_metadata"] = Value::Bool(true);
+        }
+        model
     }).collect::<Vec<_>>()})
 }
 
@@ -241,5 +364,53 @@ impl Catalog {
         self.names.into_iter().map(|id| {
             normalized_model(&id, self.metadata.iter().find(|model| model["slug"] == id), self.rules.iter().find(|rule| rule.model == id))
         }).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{model::SourceRuntime, omp_ingress::budgets_revision};
+
+    #[tokio::test]
+    async fn local_capabilities_publish_live_and_failed_replacement_keeps_the_snapshot() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let catalogs = dir.path().join("model-catalogs");
+        fs::create_dir(&catalogs).unwrap();
+        fs::write(catalogs.join("official-latest.json"), br#"{"models":[{"slug":"gpt-6.2-sol","display_name":"Official fixture","context_window":280000,"max_context_window":300000}]}"#).unwrap();
+        let state = AppState::new(dir.path().to_owned(), 0, "fixture".into()).unwrap();
+        let source = serde_json::from_value(json!({
+            "id":"fixture","name":"Fixture","kind":"api","base_url":"http://127.0.0.1:1","enabled":true,
+            "priority":1,"proxy":{"mode":"direct"},"models":["gpt-6.2-sol"],"secret":{"api_key":"fixture"}
+        })).unwrap();
+        state.sources.write().await.push(SourceRuntime::new(source));
+        *state.model_compaction.write().await = Arc::from([ModelCompactionRule {
+            model: "gpt-6.2-sol".into(), context_window: Some(700000), auto_compact_token_limit: Some(580000),
+        }]);
+        let baseline = budgets_revision(&state).await;
+        let imported = replace_metadata(&state, json!({"json":r#"{"models":[{"slug":"gpt-6.2-sol","max_context_window":600000,"auto_compact_token_limit":400000}]}"#})).await.unwrap();
+        let updated = budgets_revision(&state).await;
+        assert_ne!(updated, baseline);
+        assert_eq!(imported["count"], 1);
+
+        let info_snapshot = info(&state).await;
+        let info_model = info_snapshot["models"].as_array().unwrap().iter().find(|model| model["id"] == "gpt-6.2-sol").unwrap();
+        assert_eq!(info_model["name"], "Official fixture");
+        assert_eq!(info_model["local_metadata"], true);
+        assert_eq!(info_model["default_max_context_window"], 600000);
+        assert_eq!(info_model["default_auto_compact_token_limit"], 400000);
+        let omp_models = load(&state, ClientKind::Omp).await.unwrap().models();
+        assert_eq!(omp_models[0]["context_window"], 600000);
+        assert_eq!(omp_models[0]["auto_compact_token_limit"], 540000);
+
+        let invalid = json!({"json":r#"{"models":[{"slug":"gpt-6.2-sol","max_context_window":500000},{"slug":"invalid","max_context_window":20,"auto_compact_token_limit":19}]}"#});
+        assert!(replace_metadata(&state, invalid).await.is_err());
+        assert_eq!(budgets_revision(&state).await, updated);
+        assert_eq!(info(&state).await, info_snapshot);
+        assert_eq!(MetadataCache::open(dir.path()).revision, imported["revision"].as_str().unwrap());
+
+        replace_metadata(&state, json!({"reset":true})).await.unwrap();
+        assert_eq!(budgets_revision(&state).await, baseline);
+        assert_eq!(load(&state, ClientKind::Omp).await.unwrap().models()[0]["context_window"], 300000);
     }
 }

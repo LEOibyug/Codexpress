@@ -322,6 +322,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/responses/compact", post(compact))
         .merge(crate::omp_ingress::router(state.clone()))
         .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(state.clone(), crate::maintenance::http))
         .layer(middleware::from_fn_with_state(state, gate))
 }
 async fn remote_check() -> Json<Value> {

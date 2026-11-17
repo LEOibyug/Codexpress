@@ -27,6 +27,7 @@ pub(super) struct Operations {
 }
 
 pub(super) async fn start(state: &Arc<AppState>, kind: &str, payload: Value) -> Result<Value> {
+    let work = state.maintenance.enter().context("网关正在切换版本，请稍后重试")?;
     safety::fields(
         &payload,
         if kind == "quotas" {
@@ -113,6 +114,7 @@ pub(super) async fn start(state: &Arc<AppState>, kind: &str, payload: Value) -> 
     let state = state.clone();
     let kind = kind.to_owned();
     tokio::spawn(async move {
+        let _work = work;
         let mut results = Vec::new();
         let mut failed = false;
         for (binding, source) in bindings.into_iter().zip(selected) {

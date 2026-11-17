@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 private struct EditingModel {
     let id: String
@@ -9,8 +10,17 @@ struct ModelSettingsView: View {
     @EnvironmentObject var model: AppModel
     @State private var search = ""
     @State private var editing: EditingModel?
+    @State private var choosingMetadata = false
+    @State private var confirmingMetadataReset = false
+    @State private var updatingMetadata = false
+    @State private var metadataNotice: String?
+    @State private var metadataError: String?
     private var visibleModels: [String] {
-        search.isEmpty ? model.configuredModelIDs : model.configuredModelIDs.filter { $0.localizedCaseInsensitiveContains(search) }
+        let imported = model.modelInformation.compactMap { id, information in
+            information["local_metadata"].bool == true ? id : nil
+        }
+        let ids = imported.isEmpty ? model.configuredModelIDs : Set(model.configuredModelIDs).union(imported).sorted()
+        return search.isEmpty ? ids : ids.filter { $0.localizedCaseInsensitiveContains(search) }
     }
 
     var body: some View {
@@ -21,21 +31,47 @@ struct ModelSettingsView: View {
             } else {
                 modelList
             }
-        }.task { await model.refreshModelInformation() }
+        }
+        .task { await model.refreshModelInformation() }
+        .fileImporter(isPresented: $choosingMetadata, allowedContentTypes: [.json]) { result in
+            switch result {
+            case .success(let url): updateMetadata(from: url)
+            case .failure(let error): metadataNotice = nil; metadataError = error.localizedDescription
+            }
+        }
+        .confirmationDialog("恢复默认模型能力？", isPresented: $confirmingMetadataReset, titleVisibility: .visible) {
+            Button("恢复默认", role: .destructive) { updateMetadata(from: nil) }
+        } message: {
+            Text("清除全部本地导入的默认值，恢复使用已缓存的官方或内置能力。不会删除各模型单独设置的规则。")
+        }
     }
 
     private var modelList: some View {
         VStack(alignment: .leading, spacing: 18) {
             PageHeading("模型") {
                 Button(model.modelInformationRefreshing ? "读取中…" : "刷新信息") { Task { await model.refreshModelInformation() } }
-                    .disabled(!model.running || model.modelInformationRefreshing)
+                    .disabled(!model.running || model.modelInformationRefreshing || updatingMetadata)
+                Menu(updatingMetadata ? "更新中…" : "模型能力") {
+                    Button("导入 JSON…") { choosingMetadata = true }
+                    Button("恢复默认…") { confirmingMetadataReset = true }
+                }.disabled(!model.running || model.modelInformationRefreshing || updatingMetadata)
                 Button { editing = EditingModel(id: "", isNew: true) } label: { Label("添加模型", systemImage: "plus") }
                     .buttonStyle(.borderedProminent).disabled(model.busy || model.metadataLoadFailed)
             }
             Text("管理各模型的来源顺序、可用接入端和上下文设置。")
                 .foregroundStyle(.secondary)
+            DisclosureGroup("模型能力 JSON 格式与优先级") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("导入会整份替换上次导入的数据。未列出的模型沿用已缓存的官方能力，未缓存则沿用内置能力。省略压缩阈值或写 null 表示使用客户端默认；各模型单独设置的规则仍优先，并受窗口上限和 90% 压缩边界约束。")
+                    Text(#"{"models":[{"slug":"gpt-6.2-sol","max_context_window":600000,"auto_compact_token_limit":400000}]}"#)
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    Text("最多 200 个模型、256 KiB。导入后网关模型目录和 OMP 预算立即更新，无需重启；不修改价格、来源或本地/远端 Codex 配置。")
+                }.font(AppTypography.caption).foregroundStyle(.secondary)
+            }
             TextField("搜索模型", text: $search).settingsField().accessibilityLabel("搜索模型")
             if let error = model.modelInformationError { InfoNote(text: "模型信息未更新：\(error)", color: .orange) }
+            if let metadataError { InfoNote(text: "模型能力未更新：\(metadataError)", color: .orange) }
+            if let metadataNotice { InfoNote(text: metadataNotice) }
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(visibleModels, id: \.self) { id in
@@ -45,7 +81,7 @@ struct ModelSettingsView: View {
                     if visibleModels.isEmpty { Text("暂无匹配模型，可手动添加模型 ID。").foregroundStyle(.secondary).padding(24) }
                 }.cardSurface()
             }
-            Text("OMP 自动同步预算；本地 Codex 请在「接入」中手动同步，远端 Codex 在「远端 SSH」中预览并应用。聊天客户端请刷新模型列表。")
+            Text("各模型单独保存的规则：OMP 自动同步；本地 Codex 请在「接入」中手动同步，远端 Codex 在「远端 SSH」中预览并应用。聊天客户端请刷新模型列表。")
                 .font(AppTypography.caption).foregroundStyle(.secondary)
             Button("前往接入") { NotificationCenter.default.post(name: .codexpressNavigate, object: SettingsPage.connections) }
         }.settingsPage()
@@ -66,6 +102,9 @@ struct ModelSettingsView: View {
                 HStack {
                     Text(id).font(.system(size: 14, weight: .medium, design: .monospaced)).foregroundStyle(.primary).lineLimit(1)
                     Spacer()
+                    if information["local_metadata"].bool == true {
+                        Text("已导入能力").font(AppTypography.caption).foregroundStyle(.secondary)
+                    }
                     if clients.isEmpty || policy?.sourceIDs?.isEmpty == true {
                         Text("未启用").font(AppTypography.caption).foregroundStyle(.secondary)
                     }
@@ -86,6 +125,39 @@ struct ModelSettingsView: View {
         guard let ids = policy?.sourceIDs else { return "跟随来源池" }
         guard !ids.isEmpty else { return "未启用来源" }
         return ids.map { id in model.settings.sources.first { $0.id == id }?.name ?? "已移除来源" }.joined(separator: " → ")
+    }
+
+    private func updateMetadata(from file: URL?) {
+        guard model.running, !updatingMetadata else { return }
+        updatingMetadata = true; metadataNotice = nil; metadataError = nil
+        Task {
+            defer { updatingMetadata = false }
+            do {
+                let payload: JSONValue
+                if let file {
+                    let text = try await Task.detached(priority: .utility) {
+                        let accessing = file.startAccessingSecurityScopedResource()
+                        defer { if accessing { file.stopAccessingSecurityScopedResource() } }
+                        guard try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else {
+                            throw AppError.message("请选择普通 JSON 文件。")
+                        }
+                        let handle = try FileHandle(forReadingFrom: file)
+                        defer { try? handle.close() }
+                        let maxBytes = 256 * 1024
+                        let data = try handle.read(upToCount: maxBytes + 1) ?? Data()
+                        guard data.count <= maxBytes else { throw AppError.message("模型能力 JSON 不能超过 256 KiB。") }
+                        guard let json = String(data: data, encoding: .utf8) else { throw AppError.message("模型能力 JSON 必须使用 UTF-8。") }
+                        return json
+                    }.value
+                    payload = .object(["json": .string(text)])
+                } else {
+                    payload = .object(["reset": .bool(true)])
+                }
+                let result = try await model.remoteCall("models.metadata.replace", payload)
+                await model.refreshModelInformation()
+                metadataNotice = file == nil ? "已恢复默认模型能力。" : "已更新 \(Int(result["count"].number ?? 0)) 个模型的能力，无需重启。"
+            } catch { metadataError = error.localizedDescription }
+        }
     }
 }
 
@@ -272,7 +344,7 @@ private struct ModelEditor: View {
                         TextField(defaultWindow.map { "默认 " + $0.formatted() } ?? "模型默认", text: $window).settingsField().accessibilityLabel("最大输入 Token，可选")
                     }.frame(maxWidth: .infinity)
                 }
-                Text("留空分别使用默认值；最大输入不可超过官方最大输入，压缩阈值不可超过实际最大输入的 90%。")
+                Text("留空分别使用默认值；最大输入不可超过模型能力的默认最大输入，压缩阈值不可超过实际最大输入的 90%。")
                     .font(AppTypography.caption).foregroundStyle(.secondary)
             }
         }

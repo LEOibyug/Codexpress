@@ -12,11 +12,14 @@
   const statusNames = { success: '成功', failed: '失败', interrupted: '已中断', active: '进行中', connecting: '连接中', streaming: '接收中' };
   const ingressNames = { native: 'Codex', ssh: 'Codex（SSH）', omp: 'OMP', chatbot: '聊天客户端', image: '图片生成', unknown: '未知入口' };
   const ingressName = (value) => ingressNames[value] || '未知入口';
+  const refreshInterval = 3000;
+  const statusInterval = 15000;
+  const rendered = new Map();
   const state = {
     tab: 'overview', filter: null, hours: 0, epoch: 0, busy: false,
     controllers: new Map(), records: [], cacheRecords: [], next: null, pages: 0,
     total: 0, active: 0, legacy: 0, unfiltered: false, attempt: '', detail: null,
-    lastFocus: null,
+    lastFocus: null, statusAt: -Infinity, gatewaySources: null, overviewAt: null,
   };
   let searchTimer;
   const numberFormat = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
@@ -43,6 +46,12 @@
     $('feedback').textContent = text;
     $('feedback').className = error ? 'error' : '';
   }
+  function changed(section, value) {
+    const signature = JSON.stringify(value);
+    if (rendered.get(section) === signature) return false;
+    rendered.set(section, signature);
+    return true;
+  }
   function dateValue(date) {
     return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')].join('-');
   }
@@ -67,11 +76,13 @@
   function hourRange() {
     const to = Math.floor(Date.now() / 1000) + 1;
     const from = to - state.hours * 3600;
+    return { from, to, day_starts: Array.from({ length: state.hours * 12 + 1 }, (_, i) => from + i * 300) };
+  }
+  function showHourRange({ from, to }) {
     for (const [id, value] of [['filter-from', from], ['filter-to', to]]) {
       const date = new Date(value * 1000);
       $(id).value = dateValue(date) + 'T' + timeValue(date);
     }
-    return { from, to, day_starts: Array.from({ length: state.hours * 12 + 1 }, (_, i) => from + i * 300) };
   }
   function quickHours(hours) {
     setRangeMode(hours);
@@ -95,8 +106,10 @@
   }
   function readFilters() {
     let result;
-    if (state.hours) result = hourRange();
-    else {
+    if (state.hours) {
+      result = hourRange();
+      showHourRange(result);
+    } else {
       const start = localDate($('filter-from').value);
       const end = localDate($('filter-to').value);
       if (end < start) throw new Error('结束日期不能早于开始日期。');
@@ -116,10 +129,10 @@
     }
     return result;
   }
-  function query(kind) {
+  function query(kind, filter) {
     if (kind === 'cache' && state.unfiltered) return {};
     if (kind === 'cache' && state.attempt) return { attempt_id: state.attempt };
-    const result = { ...state.filter };
+    const result = { ...filter };
     if (kind !== 'analytics') delete result.day_starts;
     if (kind === 'cache') {
       delete result.status;
@@ -137,11 +150,12 @@
     state.controllers.set(scope, result);
     return result;
   }
-  function cancelPending() {
+  function cancelPending(keepStatus = false) {
     clearTimeout(searchTimer);
     state.epoch++;
-    for (const value of state.controllers.values()) value.abort();
-    state.controllers.clear();
+    for (const scope of state.controllers.keys()) {
+      if (!keepStatus || scope !== 'status') abort(scope);
+    }
     state.busy = false;
     $('refresh').disabled = false;
     $('requests-more').disabled = false;
@@ -177,10 +191,11 @@
     select.value = selected;
   }
   function renderOptions(options) {
-    if (!options) return;
+    if (!options || !changed('options', options)) return false;
     fillOptions('filter-source', options.sources, '全部来源', (x) => x.id, (x) => (x.name || x.id) + (x.name && x.name !== x.id ? ' · ' + x.id : ''));
     fillOptions('filter-model', options.models, '全部模型', (x) => x, (x) => x || '未记录模型');
     fillOptions('filter-ingress', options.ingresses, '全部入口', (x) => x, ingressName);
+    return true;
   }
   function table(headers, rows, empty = '当前筛选范围内没有记录。', rowActions = []) {
     if (!rows.length) return node('p', 'empty', empty);
@@ -231,11 +246,8 @@
     card.append(node('p', 'kpi-label', label), node('p', 'kpi-value', value), node('p', 'kpi-note', note));
     return card;
   }
-  function renderOverview(data, status) {
-    renderOptions(data.options);
-    const groups = data.groups || [];
+  function renderOverviewMetrics(groups, p) {
     const t = totals(groups);
-    const p = data.performance || {};
     const ended = (t.requests || 0) - (t.active_requests || 0);
     const tps = t.throughput_latency_ms > 0 ? t.throughput_output_tokens / (t.throughput_latency_ms / 1000) : null;
     $('kpis').replaceChildren(
@@ -255,18 +267,40 @@
       kpi('已知缓存节省 · USD', usd(t.cache_savings_usd), '按已知价格计算；未知不补零'),
       kpi('费用数据覆盖', n(t.priced_requests) + ' / ' + n(t.requests), '已定价 / 总请求；未知价格 ' + n(t.unpriced_requests) + ' · 未观测 ' + n(t.unobserved_requests) + ' · 部分 ' + n(t.partial_cost_requests)),
     );
-    $('groups').replaceChildren(table(
-      ['来源', '模型', '请求', '成功率', '进行中', '输入', '输出', '缓存', '推理', 'USD（已知）', '实际 / 参考', '输出 TPS'],
-      groups.map((g) => [g.source_name || g.source_id || '未记录', g.model || '未记录', n(g.requests), pct(g.successes, g.requests - g.active_requests), n(g.active_requests), n(g.input_tokens), n(g.output_tokens), n(g.cached_input_tokens), n(g.reasoning_output_tokens), usd(g.total_usd), n(g.upstream_priced_requests) + ' / ' + n(Math.max(0, (g.priced_requests || 0) - (g.upstream_priced_requests || 0))), n(g.throughput_latency_ms > 0 ? g.throughput_output_tokens / (g.throughput_latency_ms / 1000) : null)]),
-    ));
-    renderDaily(data.daily || []);
-    const sources = Array.isArray(status.sources) ? status.sources : [];
-    $('gateway-status').replaceChildren(
-      node('span', '', '本地网关已连接'),
-      node('span', '', '配置来源 ' + sources.length + ' 个'),
-      node('span', '', '数据更新 ' + stamp(data.fetched_at)),
-    );
-    $('status-details').replaceChildren(rawDetails('本地状态、历史与对账信息（原始字段）', status, true));
+  }
+  function renderOverview(data) {
+    const optionsChanged = renderOptions(data.options);
+    const groups = data.groups || [];
+    const p = data.performance || {};
+    const daily = data.daily || [];
+    const groupsChanged = changed('groups', groups);
+    const performanceChanged = changed('performance', p);
+    const dailyChanged = changed('daily', [state.hours, daily]);
+    if (groupsChanged || performanceChanged) renderOverviewMetrics(groups, p);
+    if (groupsChanged) {
+      $('groups').replaceChildren(table(
+        ['来源', '模型', '请求', '成功率', '进行中', '输入', '输出', '缓存', '推理', 'USD（已知）', '实际 / 参考', '输出 TPS'],
+        groups.map((g) => [g.source_name || g.source_id || '未记录', g.model || '未记录', n(g.requests), pct(g.successes, g.requests - g.active_requests), n(g.active_requests), n(g.input_tokens), n(g.output_tokens), n(g.cached_input_tokens), n(g.reasoning_output_tokens), usd(g.total_usd), n(g.upstream_priced_requests) + ' / ' + n(Math.max(0, (g.priced_requests || 0) - (g.upstream_priced_requests || 0))), n(g.throughput_latency_ms > 0 ? g.throughput_output_tokens / (g.throughput_latency_ms / 1000) : null)]),
+      ));
+    }
+    if (dailyChanged) renderDaily(daily);
+    return optionsChanged || groupsChanged || performanceChanged || dailyChanged;
+  }
+  function renderOverviewStatus(status, fetchedAt) {
+    if (status) {
+      state.gatewaySources = Array.isArray(status.sources) ? status.sources.length : 0;
+      if (changed('status', status)) {
+        const host = $('status-details');
+        host.replaceChildren(rawDetails('本地状态、历史与对账信息（原始字段）', status, host.firstElementChild?.open ?? true));
+      }
+    }
+    if (state.gatewaySources !== null && changed('gateway', [state.gatewaySources, fetchedAt])) {
+      $('gateway-status').replaceChildren(
+        node('span', '', '本地网关已连接'),
+        node('span', '', '配置来源 ' + state.gatewaySources + ' 个'),
+        node('span', '', '数据更新 ' + stamp(fetchedAt)),
+      );
+    }
   }
   function renderDaily(daily) {
     const hourly = state.hours > 0;
@@ -356,53 +390,84 @@
     for (const item of incoming) merged.set(String(item[key]), item);
     return [...merged.values()].sort((a, b) => (b.started_at ?? b.sequence ?? 0) - (a.started_at ?? a.sequence ?? 0));
   }
-  async function load({ more = false, refresh = false, options = false } = {}) {
-    if (state.hours && !more) {
-      state.filter = { ...state.filter, ...hourRange() };
-      if (state.tab !== 'cache' || (!state.unfiltered && !state.attempt)) {
-        resetPages();
-        refresh = false;
-      }
+  // Status includes slower whole-gateway diagnostics and does not delay analytics.
+  async function loadOverviewStatus(auto, force) {
+    if (state.controllers.has('status') || (!force && performance.now() - state.statusAt < statusInterval)) return;
+    const scope = controller('status');
+    state.statusAt = performance.now();
+    const current = () => !scope.signal.aborted && (!auto || canAutoRefresh());
+    try {
+      const status = await api('status', {}, scope.signal);
+      if (current()) renderOverviewStatus(status, state.overviewAt);
+    } catch (error) {
+      if (current()) report(error);
+    } finally {
+      if (state.controllers.get('status') === scope) state.controllers.delete('status');
     }
+  }
+  async function load({ more = false, refresh = false, options = false, auto = false, forceStatus = false } = {}) {
+    const rolling = state.hours && !more;
+    const filter = rolling ? { ...state.filter, ...hourRange() } : state.filter;
+    if (rolling && (state.tab !== 'cache' || (!state.unfiltered && !state.attempt))) refresh = false;
     const scope = controller('list');
     const epoch = state.epoch;
     const tab = state.tab;
     state.busy = true;
-    $('refresh').disabled = true;
-    $(tab === 'cache' ? 'cache-more' : 'requests-more').disabled = true;
-    message(more ? '正在加载下一页…' : '正在读取本地数据…');
+    if (!auto) {
+      $('refresh').disabled = true;
+      $(tab === 'cache' ? 'cache-more' : 'requests-more').disabled = true;
+      message(more ? '正在加载下一页…' : '正在读取本地数据…');
+    }
+    const obsolete = () => epoch !== state.epoch || scope.signal.aborted || (auto && !canAutoRefresh());
+    const acceptRange = () => {
+      if (obsolete()) return false;
+      // The visible cursor and its query must advance together. A page click can supersede a poll.
+      if (rolling) {
+        state.filter = filter;
+        showHourRange(filter);
+      }
+      return true;
+    };
     try {
       if (tab === 'overview') {
-        const [data, status] = await Promise.all([api('analytics', query('analytics'), scope.signal), api('status', {}, scope.signal)]);
-        if (epoch !== state.epoch || scope.signal.aborted) return;
-        renderOverview(data, status);
-        message('已更新 · ' + stamp(data.fetched_at));
+        const pending = api('analytics', query('analytics', filter), scope.signal);
+        loadOverviewStatus(auto, forceStatus);
+        const data = await pending;
+        if (!acceptRange()) return;
+        state.overviewAt = data.fetched_at;
+        const updated = renderOverview(data);
+        if (updated || !auto) renderOverviewStatus(null, data.fetched_at);
+        if (updated || !auto || $('feedback').className === 'error') message('已更新 · ' + stamp(data.fetched_at));
       } else {
-        const params = { ...query(tab), limit: 100 };
+        const params = { ...query(tab, filter), limit: 100 };
         if (more && state.next !== null) params.before = state.next;
         const [data, optionData] = await Promise.all([
           api(tab, params, scope.signal),
-          options ? api('analytics', query('analytics'), scope.signal) : Promise.resolve(null),
+          options ? api('analytics', query('analytics', filter), scope.signal) : Promise.resolve(null),
         ]);
-        if (epoch !== state.epoch || scope.signal.aborted) return;
+        if (!acceptRange()) return;
         if (optionData) renderOptions(optionData.options);
         const key = tab === 'requests' ? 'records' : 'cacheRecords';
         const incoming = data.records || [];
         const oldPages = state.pages;
-        state[key] = more || refresh ? mergeRecords(state[key], incoming, tab === 'requests' ? 'attempt_id' : 'id') : incoming;
-        if (refresh && tab === 'requests') {
+        const keepHistory = refresh && oldPages > 1;
+        state[key] = more || keepHistory ? mergeRecords(state[key], incoming, tab === 'requests' ? 'attempt_id' : 'id') : incoming;
+        if (keepHistory && tab === 'requests') {
           const incomingIds = new Set(incoming.map((r) => r.attempt_id));
           state.records = state.records.filter((r) => r.active !== true || incomingIds.has(r.attempt_id));
         }
-        if (!refresh || oldPages <= 1) state.next = data.next_cursor ?? null;
-        state.pages = more ? oldPages + 1 : refresh ? Math.max(1, oldPages) : 1;
+        if (!keepHistory) state.next = data.next_cursor ?? null;
+        state.pages = more ? oldPages + 1 : keepHistory ? oldPages : 1;
         state.total = data.total;
         state.active = data.active_count;
         state.legacy = data.legacy_total;
-        if (tab === 'requests') renderRequests(); else renderCache();
-        message('已更新 · ' + stamp(data.fetched_at) + (refresh && oldPages > 1 ? ' · 已保留已加载的历史分页' : ''));
+        const updated = changed(tab, [state[key], state.total, state.active, state.legacy, state.next, state.unfiltered, state.attempt]);
+        if (updated) {
+          if (tab === 'requests') renderRequests(); else renderCache();
+        }
+        if (updated || !auto || $('feedback').className === 'error') message('已更新 · ' + stamp(data.fetched_at) + (keepHistory ? ' · 已保留已加载的历史分页' : ''));
       }
-    } catch (error) { report(error); }
+    } catch (error) { if (!obsolete()) report(error); }
     finally {
       if (epoch === state.epoch && state.controllers.get('list') === scope) {
         state.busy = false;
@@ -773,6 +838,8 @@
     state.total = 0;
     state.active = 0;
     state.legacy = 0;
+    rendered.delete('requests');
+    rendered.delete('cache');
     $('requests-table').replaceChildren();
     $('cache-table').replaceChildren();
     $('requests-count').textContent = '';
@@ -807,20 +874,25 @@
     let filter;
     try { filter = readFilters(); } catch (error) { message(error.message, true); return; }
     closeDetail();
-    cancelPending();
+    cancelPending(state.tab === 'overview');
     state.filter = filter;
     state.unfiltered = false;
     state.attempt = '';
     resetPages();
     for (const id of ['kpis', 'groups', 'daily-chart', 'daily-table']) $(id).replaceChildren();
+    for (const section of ['options', 'groups', 'performance', 'daily']) rendered.delete(section);
     load({ options: true });
+  }
+  function canAutoRefresh() {
+    return $('auto-refresh').checked && !document.hidden && !state.detail && state.pages <= 1;
   }
   function updateRefreshState() {
     let label = '';
     if ($('auto-refresh').checked) {
-      label = document.hidden ? '自动刷新已暂停：页面不可见' : state.detail ? '自动刷新已暂停：正在阅读详情' : state.pages > 1 ? '自动刷新已暂停：保留历史分页' : state.busy ? '正在读取' : '自动刷新已开启 · 15 秒';
+      label = document.hidden ? '自动刷新已暂停：页面不可见' : state.detail ? '自动刷新已暂停：正在阅读详情' : state.pages > 1 ? '自动刷新已暂停：保留历史分页' : state.busy ? '正在读取' : '自动刷新已开启 · 3 秒';
     } else label = '自动刷新已关闭';
-    $('refresh-state').textContent = label;
+    const status = $('refresh-state');
+    if (status.textContent !== label) status.textContent = label;
   }
   $('filters').addEventListener('submit', (event) => { event.preventDefault(); applyFilters(); });
   $('reset').addEventListener('click', () => {
@@ -858,12 +930,12 @@
     resetPages();
     load();
   });
-  $('refresh').addEventListener('click', () => load({ refresh: state.tab !== 'overview' }));
+  $('refresh').addEventListener('click', () => load({ refresh: state.tab !== 'overview', forceStatus: true }));
   $('auto-refresh').addEventListener('change', updateRefreshState);
   document.addEventListener('visibilitychange', updateRefreshState);
   setInterval(() => {
-    if ($('auto-refresh').checked && !document.hidden && !state.busy && !state.detail && state.pages <= 1) load({ refresh: state.tab !== 'overview' });
-  }, 15000);
+    if (!state.busy && canAutoRefresh()) load({ refresh: state.tab !== 'overview', auto: true });
+  }, refreshInterval);
   $('detail-close').addEventListener('click', closeDetail);
   $('detail-dialog').addEventListener('cancel', (event) => { event.preventDefault(); closeDetail(); });
   $('detail-dialog').addEventListener('close', () => {

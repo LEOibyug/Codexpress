@@ -54,6 +54,8 @@ bash scripts/package.sh
 
 每次替换或安装本地应用版本，都必须提交并推送该版本对应的完整源码、测试、文档、资源及版本号，确保可从远端提交重建。提交或推送失败时须明确报告，不能将该版本视为交付完成。`dist/` 等安装包与构建产物仍不提交；本地替换不要求自动创建 Release 标签。
 
+网关可在同一主／次版本内独立切换。此类更新须兼容现有 Swift IPC 和旧网关的数据格式，让应用能重新同步来源且能回退；不兼容的变更不得沿用同一热更新协议号。更新路径使用 `gateway.update.info` 核对版本和协议、`gateway.update.stop_when_idle` 请求空闲退出，候选网关以 `--hold-ingress` 启动，待配置和接入口就绪后才通过 `gateway.update.release` 开放流量。
+
 ## 发布
 
 1. 更新 `Resources/Info.plist` 的应用版本与构建号，并同步 `gateway/Cargo.toml` 和 `gateway/Cargo.lock` 中网关包的版本。

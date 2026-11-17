@@ -10,6 +10,7 @@ pub mod credentials;
 pub mod discovery;
 pub mod history;
 pub mod images;
+mod maintenance;
 pub mod management;
 pub mod model;
 pub(crate) mod model_catalog;

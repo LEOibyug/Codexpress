@@ -1,6 +1,6 @@
 [package]
 name = "codexpress-gateway"
-version = "0.8.24"
+version = "0.8.25"
 edition = "2021"
 rust-version = "1.85"
 
@@ -13,6 +13,7 @@ bytes = "1"
 futures-util = "0.3"
 flate2 = "1"
 http = "1"
+http-body = "1"
 http-body-util = "0.1"
 libc = "0.2"
 rand = "0.8"

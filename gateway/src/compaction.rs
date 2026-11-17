@@ -55,17 +55,20 @@ pub fn validate(rules: &[ModelCompactionRule]) -> Result<()> {
         {
             bail!("请填写不含空白且不重复的模型 ID");
         }
-        if rule.auto_compact_token_limit.is_some_and(|n| !(1..=1_000_000_000).contains(&n))
-            || rule
-                .context_window
-                .is_some_and(|n| !(2..=1_000_000_000).contains(&n))
-        {
-            bail!("压缩阈值须为正整数，上下文窗口至少为 2 Token，最大支持十亿 Token");
-        }
-        if let (Some(limit), Some(window)) = (rule.auto_compact_token_limit, rule.context_window) {
-            if limit > window.saturating_mul(9) / 10 {
-                bail!("模型 {} 的压缩阈值不能超过最大输入的 90%", rule.model);
-            }
+        validate_budget(&rule.model, rule.context_window, rule.auto_compact_token_limit)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_budget(model: &str, window: Option<i64>, limit: Option<i64>) -> Result<()> {
+    if limit.is_some_and(|n| !(1..=1_000_000_000).contains(&n))
+        || window.is_some_and(|n| !(2..=1_000_000_000).contains(&n))
+    {
+        bail!("压缩阈值须为正整数，上下文窗口至少为 2 Token，最大支持十亿 Token");
+    }
+    if let (Some(limit), Some(window)) = (limit, window) {
+        if limit > window.saturating_mul(9) / 10 {
+            bail!("模型 {} 的压缩阈值不能超过最大输入的 90%", model);
         }
     }
     Ok(())

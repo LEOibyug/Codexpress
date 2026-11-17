@@ -168,19 +168,77 @@ pub(in crate::usage) struct Cached {
     timings: Timings,
 }
 impl Cached {
+    fn same_filters(&self, query: &Query) -> bool {
+        let old = &self.query;
+        old.source == query.source
+            && old.model == query.model
+            && old.ingress == query.ingress
+            && old.status == query.status
+            && old.search == query.search
+    }
+
     fn offset(&self, query: &Query) -> Option<usize> {
         let old = &self.query;
-        if old.source != query.source
-            || old.model != query.model
-            || old.ingress != query.ingress
-            || old.status != query.status
-            || old.search != query.search
-        {
+        if !self.same_filters(query) {
             return None;
         }
         let offset = query.days.binary_search(&old.from).ok()?;
         (query.days.get(offset..offset + old.days.len())? == old.days).then_some(offset)
     }
+}
+
+// If no previously counted attempt aged out, the window-wide aggregates can
+// advance by row ID as usual. Only buckets crossed by old rows need rebuilding.
+fn rolling_delta(
+    connection: &Connection,
+    base: &Cached,
+    query: &Query,
+) -> Result<Option<(u64, bool)>> {
+    let old = &base.query;
+    if !matches!(query.to - query.from, 3600 | 18_000)
+        || old.to - old.from != query.to - query.from
+        || query.from <= old.from
+        || query.from - old.from >= 300
+        || !base.same_filters(query)
+    {
+        return Ok(None);
+    }
+    let mut has_rows = connection.prepare_cached("SELECT 1 FROM usage WHERE started_at>=?1 AND started_at<?2 AND attempt<=?3 LIMIT 1")?;
+    let mut crosses = |from: u64, to: u64| -> rusqlite::Result<bool> {
+        has_rows.exists(rusqlite::params![from as i64, to as i64, base.cursor])
+    };
+    if crosses(old.from, query.from)? {
+        return Ok(None);
+    }
+    // A five-hour window has at most 60 buckets. Each crossing dirties both neighbors.
+    let mut dirty = 0;
+    for i in 1..query.days.len() - 1 {
+        if crosses(old.days[i], query.days[i])? {
+            dirty |= 3 << (i - 1);
+        }
+    }
+    Ok(Some((dirty, crosses(old.to, query.to)?)))
+}
+
+fn rebuild_buckets(
+    connection: &Connection,
+    query: &Query,
+    dirty: u64,
+    daily: &mut [Value],
+) -> Result<()> {
+    if dirty != 0 {
+        let aggregate = aggregate_json();
+        let mut statement = connection.prepare_cached(&format!("WITH attempts AS ({ATTEMPT_ROWS}) SELECT {aggregate} FROM attempts WHERE {FILTERS}"))?;
+        let mut bindings = query.bindings();
+        for (i, day) in daily.iter_mut().enumerate().filter(|(i, _)| dirty & (1 << *i) != 0) {
+            bindings[0] = SqlValue::Integer(query.days[i] as i64);
+            bindings[1] = SqlValue::Integer(query.days[i + 1] as i64);
+            let totals: String = statement.query_row(rusqlite::params_from_iter(&bindings), |row| row.get(0))?;
+            let totals: Value = serde_json::from_str(&totals)?;
+            *day = if totals["requests"] == 0 { zero_day() } else { totals };
+        }
+    }
+    Ok(())
 }
 
 // Callers exclude mutations to already-cached rows before acknowledging writes.
@@ -355,17 +413,38 @@ pub(super) fn snapshot(data: &mut StoreData, query: &Query) -> Result<Snapshot> 
             })
         })
         .max();
-    let mut cached = latest.map(|(exact, _, index, offset)| {
-        let base = if exact {
-            data.analytics_cache.remove(index).expect("cached query")
-        } else {
-            data.analytics_cache[index].clone()
-        };
-        (base, offset)
-    });
+    let rolling = if latest.is_none() {
+        let mut found = None;
+        for (index, cached) in data.analytics_cache.iter().enumerate().rev() {
+            if cached.cursor <= cursor {
+                if let Some((dirty, entering)) = rolling_delta(&transaction, cached, query)? {
+                    found = Some((index, dirty, entering));
+                    break;
+                }
+            }
+        }
+        found
+    } else {
+        None
+    };
+    let mut cached = if let Some((index, _, _)) = &rolling {
+        Some((data.analytics_cache.remove(*index).expect("cached rolling query"), 0))
+    } else {
+        latest.map(|(exact, _, index, offset)| {
+            let base = if exact {
+                data.analytics_cache.remove(index).expect("cached query")
+            } else {
+                data.analytics_cache[index].clone()
+            };
+            (base, offset)
+        })
+    };
     if cached
         .as_ref()
-        .is_none_or(|(cached, _)| cached.cursor != cursor || cached.query.days != query.days)
+        .is_none_or(|(cached, _)| {
+            cached.cursor != cursor
+                || rolling.as_ref().map_or(cached.query.days != query.days, |(_, _, entering)| *entering)
+        })
     {
         let timings = cached
             .as_mut()
@@ -425,7 +504,6 @@ pub(super) fn snapshot(data: &mut StoreData, query: &Query) -> Result<Snapshot> 
             ));
         }
         let base = &mut cached.as_mut().expect("loaded snapshot").0;
-        base.query = query.clone();
         base.cursor = cursor;
         base.snapshot.performance = if base.timings.exhausted {
             sql_performance(&transaction, query)?
@@ -433,6 +511,11 @@ pub(super) fn snapshot(data: &mut StoreData, query: &Query) -> Result<Snapshot> 
             base.timings.performance()
         };
     }
+    let base = &mut cached.as_mut().expect("loaded snapshot").0;
+    if let Some((_, dirty, _)) = rolling {
+        rebuild_buckets(&transaction, query, dirty, &mut base.snapshot.daily)?;
+    }
+    base.query = query.clone();
     transaction.commit()?;
     let cached = cached.expect("loaded snapshot").0;
     ensure!(

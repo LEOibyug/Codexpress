@@ -56,6 +56,7 @@ pub fn start(state: &Arc<AppState>) {
     });
 }
 pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str>) -> Value {
+    let Some(work) = state.maintenance.enter() else { return status(state); };
     let sync = &state.balances.billing;
     if sync
         .running
@@ -67,6 +68,7 @@ pub(crate) fn schedule(state: &Arc<AppState>, full: bool, source_id: Option<&str
     let worker = state.clone();
     let requested = source_id.map(str::to_owned);
     tokio::spawn(async move {
+        let _work = work;
         let state = worker;
         let sources: Vec<_> = state
             .sources

@@ -299,6 +299,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/images/edits", post(edit))
         .layer(DefaultBodyLimit::max(REQUEST_LIMIT))
         .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(state.clone(), crate::maintenance::http))
         .layer(middleware::from_fn_with_state(state, gate))
 }
 async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {

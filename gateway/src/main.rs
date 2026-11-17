@@ -26,6 +26,7 @@ async fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut state_dir = None;
     let mut port = 17863;
+    let mut hold_ingress = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--state-dir" => {
@@ -38,6 +39,7 @@ async fn run() -> Result<()> {
                     .parse::<u16>()
                     .context("端口格式错误")?
             }
+            "--hold-ingress" => hold_ingress = true,
             "--version" => {
                 println!("codexpress-gateway {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -88,6 +90,7 @@ async fn run() -> Result<()> {
         key.trim().into(),
         Some(credential_store),
     )?;
+    state.hold_gateway_ingress(hold_ingress);
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
         .await
         .context("本地端口被占用，未更改 Codex 连接")?;
@@ -104,13 +107,14 @@ async fn run() -> Result<()> {
     codexpress_gateway::balance::billing::start(&state);
     let server = axum::serve(
         listener,
-        codexpress_gateway::remote::router(state)
+        codexpress_gateway::remote::router(state.clone())
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     );
     tokio::select! {
         result=management=>result?,
         result=server=>result?,
         _=tokio::signal::ctrl_c()=>{},
+        _=state.wait_for_gateway_shutdown()=>{},
     }
     // The OS releases listeners on exit. Keep the socket path: the next owner
     // checks liveness before removing it, so a shutdown cannot unlink another

@@ -85,6 +85,16 @@ fn status_snapshot(
 }
 
 pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result<Value> {
+    use crate::maintenance;
+    match op {
+        "gateway.update.info" => return Ok(maintenance::info()),
+        "gateway.update.release" => {
+            state.hold_gateway_ingress(false);
+            return Ok(maintenance::info());
+        }
+        _ => {}
+    }
+    let _work = state.maintenance.enter().context("网关正在切换版本，请稍后重试")?;
     match op {
         "status" => status(state).await,
         "credentials" => Ok(credentials(state).await),
@@ -155,6 +165,7 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
         }
         "models.list" => crate::discovery::list(state, payload).await,
         "models.info" => Ok(crate::model_catalog::info(state).await),
+        "models.metadata.replace" => crate::model_catalog::replace_metadata(state, payload).await,
         "balance.query" => crate::balance::query(state, payload).await,
         "usage.reconcile" => Ok(crate::balance::billing::schedule(
             state,
@@ -212,7 +223,14 @@ async fn serve_connection(state: Arc<AppState>, stream: UnixStream) -> Result<()
         bail!("管理请求超出限制");
     }
     let request: Request = serde_json::from_str(&line).context("管理请求格式错误")?;
-    let response = match dispatch(&state, &request.op, request.payload).await {
+    let mut lease = None;
+    let result = if request.op == "gateway.update.stop_when_idle" {
+        lease = state.maintenance.begin_shutdown();
+        Ok(json!({"stopping": lease.is_some()}))
+    } else {
+        dispatch(&state, &request.op, request.payload).await
+    };
+    let response = match result {
         Ok(data) => json!({"id":request.id,"ok":true,"data":data,"error":null}),
         Err(error) => json!({"id":request.id,"ok":false,"data":null,"error":error.to_string()}),
     };
@@ -220,6 +238,10 @@ async fn serve_connection(state: Arc<AppState>, stream: UnixStream) -> Result<()
     data.push(b'\n');
     writer.write_all(&data).await?;
     writer.shutdown().await?;
+    if let Some(_lease) = lease {
+        state.maintenance.shutdown.notify_one();
+        std::future::pending::<()>().await;
+    }
     Ok(())
 }
 

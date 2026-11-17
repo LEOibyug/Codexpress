@@ -345,6 +345,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
                 Json(json!({"service":"codexpress","mode":"pool","version":1})).into_response()
             }),
         )
+        .layer(middleware::from_fn_with_state(state.clone(), crate::maintenance::http))
         .layer(middleware::from_fn_with_state(state, gate))
 }
 
