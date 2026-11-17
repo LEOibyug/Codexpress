@@ -14,23 +14,28 @@ struct ModelSettingsView: View {
     }
 
     var body: some View {
-        if let item = editing {
-            ModelEditor(settings: model.settings, modelID: item.id, isNew: item.isNew, onBack: { editing = nil })
-                .id(item.id)
-        } else {
-            modelList
-        }
+        Group {
+            if let item = editing {
+                ModelEditor(settings: model.settings, modelID: item.id, isNew: item.isNew, onBack: { editing = nil })
+                    .id(item.id)
+            } else {
+                modelList
+            }
+        }.task { await model.refreshModelInformation() }
     }
 
     private var modelList: some View {
         VStack(alignment: .leading, spacing: 18) {
             PageHeading("模型") {
+                Button(model.modelInformationRefreshing ? "读取中…" : "刷新信息") { Task { await model.refreshModelInformation() } }
+                    .disabled(!model.running || model.modelInformationRefreshing)
                 Button { editing = EditingModel(id: "", isNew: true) } label: { Label("添加模型", systemImage: "plus") }
                     .buttonStyle(.borderedProminent).disabled(model.busy || model.metadataLoadFailed)
             }
             Text("管理各模型的来源顺序、可用接入端和上下文设置。")
                 .foregroundStyle(.secondary)
             TextField("搜索模型", text: $search).settingsField().accessibilityLabel("搜索模型")
+            if let error = model.modelInformationError { InfoNote(text: "模型信息未更新：\(error)", color: .orange) }
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(visibleModels, id: \.self) { id in
@@ -50,8 +55,12 @@ struct ModelSettingsView: View {
         let policy = model.settings.modelPolicies?.first { $0.model == id }
         let rule = model.settings.modelCompaction?.first { $0.model == id }
         let clients = (policy?.clients ?? ModelClient.allCases).lazy.filter { $0.isApplicable(to: id) }
-        let window = rule?.context_window.map { $0.formatted() + " Token" } ?? "模型默认"
-        let threshold = rule.map { $0.auto_compact_token_limit.formatted() + " Token" } ?? "客户端默认"
+        let information = model.modelInformation[id] ?? .null
+        let defaultWindow = information["default_context_window"].number.map(Int.init)
+        let windowValue = rule?.context_window.map { min($0, defaultWindow ?? $0) } ?? defaultWindow
+        let thresholdValue = (rule?.auto_compact_token_limit ?? information["default_auto_compact_token_limit"].number.map(Int.init)).map { min($0, windowValue.map { $0 * 9 / 10 } ?? $0) }
+        let window = windowValue.map { $0.formatted() + " Token" } ?? "模型默认"
+        let threshold = thresholdValue.map { $0.formatted() + " Token" } ?? "客户端默认"
         return Button { editing = EditingModel(id: id, isNew: false) } label: {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
@@ -65,7 +74,7 @@ struct ModelSettingsView: View {
                 Text("来源：\(sourceSummary(policy))").lineLimit(1)
                 Text("接入端：\(clients.isEmpty ? "未启用" : clients.map(\.label).joined(separator: "、"))")
                 HStack(spacing: 24) {
-                    Text("窗口：\(window)")
+                    Text("最大输入：\(window)")
                     Text("压缩点：\(threshold)")
                 }.monospacedDigit()
             }.font(AppTypography.caption).foregroundStyle(.secondary)
@@ -96,6 +105,8 @@ private struct ModelEditor: View {
     @State private var saving = false
     @State private var error: String?
     @State private var savedModelID: String?
+    private var information: JSONValue { model.modelInformation[modelID.trimmingCharacters(in: .whitespacesAndNewlines)] ?? .null }
+    private var defaultWindow: Int? { information["default_context_window"].number.map(Int.init) }
 
     init(settings: AppSettings, modelID: String, isNew: Bool, onBack: @escaping () -> Void) {
         self.isNew = isNew; self.onBack = onBack
@@ -108,7 +119,7 @@ private struct ModelEditor: View {
         _sourceSelectionInitialized = State(initialValue: policy?.sourceIDs != nil)
         _clients = State(initialValue: policy?.clients ?? ModelClient.allCases)
         _customCompaction = State(initialValue: rule != nil)
-        _threshold = State(initialValue: rule.map { String($0.auto_compact_token_limit) } ?? "")
+        _threshold = State(initialValue: rule?.auto_compact_token_limit.map(String.init) ?? "")
         _window = State(initialValue: rule?.context_window.map(String.init) ?? "")
     }
 
@@ -123,6 +134,7 @@ private struct ModelEditor: View {
                         Text("模型 ID").font(AppTypography.caption).foregroundStyle(.secondary)
                         TextField("模型 ID", text: $modelID).settingsField().accessibilityLabel("模型 ID").disabled(!isNew || savedModelID != nil)
                     }
+                    informationSection
                     sourceSection
                     clientSection
                     compactionSection
@@ -141,6 +153,35 @@ private struct ModelEditor: View {
                     .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
             }
         }.settingsPage().disabled(saving || model.metadataLoadFailed)
+    }
+
+    private var informationSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("基本信息").font(.headline)
+            LabeledContent("名称", value: information["name"].string ?? modelID)
+            LabeledContent("默认最大输入", value: defaultWindow.map { $0.formatted() + " Token" } ?? "未提供")
+            LabeledContent("默认压缩阈值", value: information["default_auto_compact_token_limit"].number.map { Int($0).formatted() + " Token" } ?? "客户端默认")
+            if let output = information["max_output_tokens"].number {
+                LabeledContent("最大输出", value: Int(output).formatted() + " Token")
+            }
+            let inputs = information["input"].array.compactMap(\.string)
+            if !inputs.isEmpty {
+                LabeledContent("输入类型", value: inputs.map { ["text": "文本", "image": "图像", "audio": "音频"][$0] ?? $0 }.joined(separator: "、"))
+            }
+            let efforts = information["supported_reasoning_levels"].array.compactMap { $0["effort"].string ?? $0.string }
+            if !efforts.isEmpty { LabeledContent("推理档位", value: efforts.joined(separator: " / ")) }
+            let cost = information["cost"]
+            if cost["input"].number != nil {
+                Text("API 标准基础参考价 · USD/百万 Token：输入 \(price(cost["input"]))；缓存读 \(price(cost["cacheRead"]))；缓存写 \(price(cost["cacheWrite"]))；输出 \(price(cost["output"]))。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
+                Text("参考费用随上下文长度和速度档位变化，不代表订阅实际扣费。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
+            }
+        }.monospacedDigit()
+    }
+
+    private func price(_ value: JSONValue) -> String {
+        value.number.map { "$" + $0.formatted(.number.precision(.fractionLength(0...4))) } ?? "未提供"
     }
 
     private var sourceSection: some View {
@@ -219,19 +260,19 @@ private struct ModelEditor: View {
 
     private var compactionSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Toggle("自定义上下文压缩", isOn: $customCompaction).font(.headline)
+            Toggle("自定义输入与压缩", isOn: $customCompaction).font(.headline)
             if customCompaction {
                 HStack(alignment: .top, spacing: 16) {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("压缩阈值 · Token").font(AppTypography.caption).foregroundStyle(.secondary)
-                        TextField("必填", text: $threshold).settingsField().accessibilityLabel("压缩阈值 Token")
+                        TextField(information["default_auto_compact_token_limit"].number.map { "默认 " + Int($0).formatted() } ?? "客户端默认", text: $threshold).settingsField().accessibilityLabel("压缩阈值 Token，可选")
                     }.frame(maxWidth: .infinity)
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("上下文窗口 · Token").font(AppTypography.caption).foregroundStyle(.secondary)
-                        TextField("模型默认", text: $window).settingsField().accessibilityLabel("上下文窗口 Token，可选")
+                        Text("最大输入 · Token").font(AppTypography.caption).foregroundStyle(.secondary)
+                        TextField(defaultWindow.map { "默认 " + $0.formatted() } ?? "模型默认", text: $window).settingsField().accessibilityLabel("最大输入 Token，可选")
                     }.frame(maxWidth: .infinity)
                 }
-                Text("阈值须为正整数；填写窗口时，阈值不能超过窗口的 90%。")
+                Text("留空分别使用默认值；最大输入不可超过模型默认窗口，压缩阈值不可超过实际最大输入的 90%。")
                     .font(AppTypography.caption).foregroundStyle(.secondary)
             }
         }
@@ -249,7 +290,8 @@ private struct ModelEditor: View {
             try ModelPolicy.validateModelID(id)
             if isNew, savedModelID != id, model.configuredModelIDs.contains(id) { throw AppError.message("此模型已存在，请从列表中编辑。") }
             let policy = customPolicy ? ModelPolicy(model: id, sourceIDs: customSources ? sourceIDs : nil, clients: clients.filter { $0.isApplicable(to: id) }) : nil
-            let rule = customCompaction ? try ModelCompactionRule.parse(model: id, threshold: threshold, window: window) : nil
+            let parsedRule = customCompaction ? try ModelCompactionRule.parse(model: id, threshold: threshold, window: window, defaultWindow: defaultWindow) : nil
+            let rule = parsedRule.flatMap { $0.auto_compact_token_limit != nil || $0.context_window != nil ? $0 : nil }
             saving = true; error = nil
             Task {
                 do {

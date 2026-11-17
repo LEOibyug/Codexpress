@@ -45,7 +45,7 @@ pub(super) fn prepare_compaction(
             .parse::<DocumentMut>()?,
         None => doc.clone(),
     };
-    if rules.is_empty() && excluded_models.is_empty() {
+    if rules.iter().all(|rule| rule.context_window.is_none() && rule.auto_compact_token_limit.is_none()) && excluded_models.is_empty() {
         if snapshot.is_some_and(|s| s.applied_compaction.is_some()) {
             restore_compaction(doc, &original);
         }

@@ -7,6 +7,9 @@ import ServiceManagement
     static let shared = AppModel()
     @Published private(set) var settings = AppSettings()
     @Published private(set) var configuredModelIDs: [String] = []
+    @Published private(set) var modelInformation: [String: JSONValue] = [:]
+    @Published private(set) var modelInformationRefreshing = false
+    @Published private(set) var modelInformationError: String?
     @Published private(set) var modelSettingsRevision = ModelSettingsRevision.empty
     @Published private(set) var localModelSettingsSyncError: String?
     @Published private(set) var status: JSONValue = .null
@@ -360,6 +363,7 @@ import ServiceManagement
             historyStatus = try await client.call("history.configure", historyPayload(settings.historyCacheSettings))
             try await updateStatus()
             pendingSync = false
+            await refreshModelInformation()
         } catch { pendingSync = true; throw error }
     }
     func poll(refreshCredentials: Bool = true) async {
@@ -518,6 +522,7 @@ import ServiceManagement
         let result = try await client.call("models.list", payload)
         let models = result["models"].array.compactMap(\.string)
         guard !models.isEmpty else { throw AppError.message("供应商未返回可用模型。") }
+        await refreshModelInformation()
         return models
     }
     func scheduleModelRefresh(maximumAge: TimeInterval = 3600) {
@@ -762,6 +767,20 @@ import ServiceManagement
         try persistSettings(next)
     }
     func requireCurrentPort() throws { try ConfigConnectionPolicy.requireCurrentPort(saved: settings.port, live: status["port"].number) }
+    func refreshModelInformation() async {
+        guard running, !modelInformationRefreshing else { return }
+        modelInformationRefreshing = true
+        defer { modelInformationRefreshing = false }
+        do {
+            let result = try await client.call("models.info")
+            var information: [String: JSONValue] = [:]
+            for item in result["models"].array {
+                if let id = item["id"].string { information[id] = item }
+            }
+            if information != modelInformation { modelInformation = information }
+            modelInformationError = nil
+        } catch { modelInformationError = error.localizedDescription }
+    }
     private static func modelIDs(in settings: AppSettings) -> [String] {
         var ids = Set(settings.sources.flatMap(\.models))
         ids.formUnion((settings.modelPolicies ?? []).map(\.model))
@@ -777,6 +796,13 @@ import ServiceManagement
         try ModelPolicy.validateModelID(id)
         guard policy == nil || policy?.model == id, compaction == nil || compaction?.model == id else {
             throw AppError.message("模型 ID 已变化，请重新编辑。")
+        }
+        let compaction = compaction.flatMap { $0.auto_compact_token_limit != nil || $0.context_window != nil ? $0 : nil }
+        if let compaction {
+            _ = try ModelCompactionRule.parse(model: id,
+                threshold: compaction.auto_compact_token_limit.map(String.init) ?? "",
+                window: compaction.context_window.map(String.init) ?? "",
+                defaultWindow: modelInformation[id]?["default_context_window"].number.map(Int.init))
         }
         var next = settings
         var policies = next.modelPolicies ?? []

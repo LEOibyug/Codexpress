@@ -97,11 +97,48 @@ async fn budget_revision_tracks_committed_rules_without_discovery_and_shares_the
     payload["model_compaction"] = json!([]);
     management::dispatch(&state, "sync", payload.clone()).await.unwrap();
     assert_eq!(revision(&router, &socket, &key).await, empty);
+    payload["model_compaction"] = json!([{"model":"empty-default-rule"}]);
+    management::dispatch(&state, "sync", payload.clone()).await.unwrap();
+    assert_eq!(revision(&router, &socket, &key).await, empty);
+    let defaults = management::dispatch(&state, "models.info", json!({})).await.unwrap();
+    assert!(!defaults["models"].as_array().unwrap().iter().any(|model| model["id"] == "empty-default-rule"));
+    payload["model_compaction"] = json!([]);
     let restarted = AppState::new(dir.path().into(), 17863, "native-secret".into()).unwrap();
+    management::dispatch(&restarted, "sync", payload.clone()).await.unwrap();
     assert_eq!(management::dispatch(&restarted, "omp.budgets.revision", json!({})).await.unwrap(), empty);
     payload["model_compaction"] = original_rules;
-    management::dispatch(&restarted, "sync", payload).await.unwrap();
+    management::dispatch(&restarted, "sync", payload.clone()).await.unwrap();
     assert_eq!(management::dispatch(&restarted, "omp.budgets.revision", json!({})).await.unwrap(), original);
+    let catalog_dir = dir.path().join("model-catalogs");
+    std::fs::create_dir_all(&catalog_dir).unwrap();
+    let discovered = json!({"models":[{"slug":"gpt-6.2-sol","display_name":"Discovered Codex 6.2",
+        "context_window":500000,"max_context_window":1050000,
+        "input_modalities":["text","image","audio"],"supported_reasoning_levels":[{"effort":"high"},{"effort":"xhigh"}]}]});
+    let path = catalog_dir.join("official-latest.json");
+    std::fs::write(&path, discovered.to_string()).unwrap();
+    let discovered_revision = revision(&router, &socket, &key).await;
+    assert_ne!(discovered_revision, empty);
+    assert_eq!(revision(&router, &socket, &key).await, discovered_revision);
+    std::fs::write(&path, serde_json::to_vec_pretty(&discovered).unwrap()).unwrap();
+    assert_eq!(revision(&router, &socket, &key).await, discovered_revision, "equivalent cached catalogs must not reload OMP");
+    let info = management::dispatch(&state, "models.info", json!({})).await.unwrap();
+    let sol = info["models"].as_array().unwrap().iter().find(|model| model["id"] == "gpt-6.2-sol").unwrap();
+    assert_eq!(sol["default_context_window"], 500000);
+    assert_eq!(sol["max_context_window"], 500000);
+    assert_eq!(sol["thinking"], json!({"mode":"effort","efforts":["high","xhigh"]}));
+    assert!(sol.get("max_output_tokens").is_none());
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(revision(&router, &socket, &key).await, empty);
+    payload["model_compaction"] = json!([]);
+    payload["sources"][0]["models"] = json!(["new-inventory-model"]);
+    management::dispatch(&state, "sync", payload.clone()).await.unwrap();
+    let inventory_revision = revision(&router, &socket, &key).await;
+    assert_ne!(inventory_revision, empty);
+    management::dispatch(&state, "sync", payload.clone()).await.unwrap();
+    assert_eq!(revision(&router, &socket, &key).await, inventory_revision);
+    payload["sources"][0]["models"] = json!([]);
+    management::dispatch(&state, "sync", payload).await.unwrap();
+    assert_eq!(revision(&router, &socket, &key).await, empty);
 
     for (method, host, token, expected) in [
         ("GET", "127.0.0.1:17865", None, StatusCode::UNAUTHORIZED),
@@ -207,17 +244,17 @@ async fn native_omp_authentication_bytes_events_and_source_identity() {
     state.sources.write().await.push(SourceRuntime::new(official));
     std::fs::create_dir(dir.path().join("model-catalogs")).unwrap();
     std::fs::write(dir.path().join("model-catalogs/official-latest.json"),
-        serde_json::to_vec(&json!({"models":[{"slug":"cached-model","context_window":700000,"max_context_window":900000,
+        serde_json::to_vec(&json!({"models":[{"slug":"cached-model","context_window":700000,"max_context_window":900000,"auto_compact_token_limit":350000,
             "kind":"chat","input_modalities":["text","image"],"supported_reasoning_levels":[{"effort":"high"}],
             "thinking":{"high":1000},"cost":{"input":2,"output":10}}]})).unwrap()).unwrap();
     let expanded = management::dispatch(&state, "omp.binding", json!({})).await.unwrap();
     assert_eq!(expanded["models"].as_array().unwrap().iter().find(|model| model["id"] == "cached-model").unwrap()["context_window"], 700000);
     let cached = expanded["models"].as_array().unwrap().iter().find(|model| model["id"] == "cached-model").unwrap();
     assert_eq!(cached["kind"], "chat");
-    assert_eq!(cached["max_context_window"], 900000);
+    assert_eq!(cached["max_context_window"], 700000);
     assert_eq!(cached["input"], json!(["text", "image"]));
     assert_eq!(cached["reasoning"], true);
-    assert_eq!(cached["thinking"], json!({"high":1000}));
+    assert_eq!(cached["thinking"], json!({"mode":"effort","efforts":["high"]}));
     assert_eq!(cached["cost"], json!({"input":2,"output":10}));
     assert!(cached.get("max_output_tokens").is_none());
     assert!(expanded["models"].as_array().unwrap().iter().any(|model| model["id"] == "m"));
@@ -231,13 +268,16 @@ async fn native_omp_authentication_bytes_events_and_source_identity() {
     }).collect();
     for (rules, window, maximum, limit) in [
         (json!([{"model":"cached-model","context_window":1000000,"auto_compact_token_limit":600000},
-            {"model":"gpt-image-2","context_window":1000000,"auto_compact_token_limit":600000}]), 1000000, 1000000, json!(600000)),
-        (json!([{"model":"cached-model","context_window":800000,"auto_compact_token_limit":250000}]), 800000, 900000, json!(250000)),
-        (json!([{"model":"cached-model","auto_compact_token_limit":250000}]), 700000, 900000, json!(250000)),
-        (json!([]), 700000, 900000, Value::Null),
+            {"model":"gpt-image-2","context_window":1000000,"auto_compact_token_limit":600000}]), 700000, 700000, json!(600000)),
+        (json!([{"model":"cached-model","context_window":800000,"auto_compact_token_limit":250000}]), 700000, 700000, json!(250000)),
+        (json!([{"model":"cached-model","auto_compact_token_limit":250000}]), 700000, 700000, json!(250000)),
+        (json!([{"model":"cached-model","context_window":300000}]), 300000, 300000, json!(270000)),
+        (json!([{"model":"cached-model","context_window":2000000,"auto_compact_token_limit":1000000}]), 700000, 700000, json!(630000)),
+        (json!([{"model":"cached-model"}]), 700000, 700000, json!(350000)),
+        (json!([]), 700000, 700000, json!(350000)),
     ] {
         management::dispatch(&state, "sync", json!({"sources":sources,"model_compaction":rules})).await.unwrap();
-        if window == 1000000 {
+        if limit == json!(600000) {
             for invalid in [json!({}), json!([
                 {"model":"cached-model","context_window":2000000,"auto_compact_token_limit":1000000},
                 {"model":"invalid","auto_compact_token_limit":0},
@@ -250,7 +290,7 @@ async fn native_omp_authentication_bytes_events_and_source_identity() {
             }
             let binding = management::dispatch(&state, "omp.binding", json!({})).await.unwrap();
             let model = binding["models"].as_array().unwrap().iter().find(|model| model["id"] == "cached-model").unwrap();
-            assert_eq!(model["context_window"], 1000000);
+            assert_eq!(model["context_window"], 700000);
             assert_eq!(model["auto_compact_token_limit"], 600000);
         }
         let response = router.clone().oneshot(Request::builder().uri("/omp/v1/models")
@@ -263,6 +303,13 @@ async fn native_omp_authentication_bytes_events_and_source_identity() {
         assert_eq!(cached["context_window"], window);
         assert_eq!(cached["max_context_window"], maximum);
         assert_eq!(cached["auto_compact_token_limit"], limit);
+        assert_eq!(cached["default_context_window"], 700000);
+        assert_eq!(cached["default_max_context_window"], 900000);
+        assert_eq!(cached["default_auto_compact_token_limit"], 350000);
+        let binding = management::dispatch(&state, "omp.binding", json!({})).await.unwrap();
+        assert_eq!(value["data"], binding["models"]);
+        let info = management::dispatch(&state, "models.info", json!({})).await.unwrap();
+        assert_eq!(info["models"].as_array().unwrap().iter().find(|model| model["id"] == "cached-model").unwrap(), cached);
         let unconfigured = models.iter().find(|model| model["id"] == "m").unwrap();
         assert!(unconfigured.get("context_window").is_none());
         assert_eq!(unconfigured["auto_compact_token_limit"], Value::Null);
@@ -275,6 +322,8 @@ async fn native_omp_authentication_bytes_events_and_source_identity() {
     state.sources.write().await.iter_mut().find(|runtime| runtime.source.id == "official").unwrap().source.enabled = false;
     let disabled = management::dispatch(&state, "omp.binding", json!({})).await.unwrap();
     assert!(!disabled["models"].as_array().unwrap().iter().any(|model| model["id"] == "gpt-image-2"));
+    let offline_info = management::dispatch(&state, "models.info", json!({})).await.unwrap();
+    assert!(offline_info["models"].as_array().unwrap().iter().any(|model| model["id"] == "cached-model"));
     state.sources.write().await.iter_mut().find(|runtime| runtime.source.id == "official").unwrap().source.enabled = true;
     state.sources.write().await.iter_mut().find(|runtime| runtime.source.id == "api").unwrap().source.models.clear();
     let discovered = management::dispatch(&state, "omp.binding", json!({})).await.unwrap();

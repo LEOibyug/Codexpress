@@ -85,10 +85,12 @@ async fn remote_compaction_uses_remote_paths_preserves_metadata_and_can_restore_
     );
     assert_eq!(reset_doc["model_provider"].as_str(), Some("codexpress"));
     payload["model_compaction"] =
-        json!([{"model":"custom","auto_compact_token_limit":95000,"context_window":100000}]);
-    assert!(management::dispatch(&state, "remote.preview", payload)
-        .await
-        .is_err());
+        json!([{"model":"custom","auto_compact_token_limit":120000,"context_window":150000}]);
+    let clamped = management::dispatch(&state, "remote.preview", payload).await.unwrap();
+    let catalog: serde_json::Value = serde_json::from_str(clamped["catalog"].as_str().unwrap()).unwrap();
+    assert_eq!(catalog["models"][0]["auto_compact_token_limit"], 108000);
+    assert_eq!(catalog["models"][0]["context_window"], 120000);
+    assert_eq!(catalog["models"][0]["default_context_window"], 120000);
     assert_eq!(
         remote::compaction_source(original).unwrap()["catalog_path"],
         "own-models.json"

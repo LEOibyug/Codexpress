@@ -154,6 +154,7 @@ pub async fn dispatch(state: &Arc<AppState>, op: &str, payload: Value) -> Result
             Ok(json!({"acknowledged":true}))
         }
         "models.list" => crate::discovery::list(state, payload).await,
+        "models.info" => Ok(crate::model_catalog::info(state).await),
         "balance.query" => crate::balance::query(state, payload).await,
         "usage.reconcile" => Ok(crate::balance::billing::schedule(
             state,

@@ -6,7 +6,7 @@ use std::fs;
 fn rule(model: &str, limit: i64, window: Option<i64>) -> ModelCompactionRule {
     ModelCompactionRule {
         model: model.into(),
-        auto_compact_token_limit: limit,
+        auto_compact_token_limit: Some(limit),
         context_window: window,
     }
 }
@@ -51,8 +51,10 @@ fn discovered_models_keep_upstream_capabilities_with_explicit_context_limits() {
         .iter()
         .find(|m| m["slug"] == "gpt-6.1-terra")
         .unwrap();
-    assert_eq!(terra["context_window"], 1000000);
-    assert_eq!(terra["auto_compact_token_limit"], 600000);
+    assert_eq!(terra["context_window"], 400000);
+    assert_eq!(terra["max_context_window"], 400000);
+    assert_eq!(terra["default_context_window"], 400000);
+    assert_eq!(terra["auto_compact_token_limit"], 360000);
     assert_eq!(
         terra["supported_reasoning_levels"],
         additions["models"][0]["supported_reasoning_levels"]
@@ -125,7 +127,7 @@ fn per_model_limits_apply_update_disable_and_restore_without_losing_other_settin
     let models = catalog["models"].as_array().unwrap();
     let configured = models.iter().find(|m| m["slug"] == "gpt-6.1-sol").unwrap();
     assert_eq!(configured["auto_compact_token_limit"], 180000);
-    assert_eq!(configured["context_window"], 300000);
+    assert_eq!(configured["context_window"], 272000);
     assert!(models
         .iter()
         .all(|model| model["base_instructions"].is_string()));
@@ -157,7 +159,8 @@ fn per_model_limits_apply_update_disable_and_restore_without_losing_other_settin
             .unwrap()["auto_compact_token_limit"],
         160000
     );
-    config::attach_with_rules(&home, &state, 17863, "private-local-key", &[]).unwrap();
+    let blank: ModelCompactionRule = serde_json::from_value(serde_json::json!({"model":"gpt-6.1-sol"})).unwrap();
+    config::attach_with_rules(&home, &state, 17863, "private-local-key", &[blank]).unwrap();
     let disabled = fs::read_to_string(home.join("config.toml")).unwrap();
     assert!(disabled.contains("model_auto_compact_token_limit = 160000"));
     assert!(!disabled.contains("model_catalog_json"));
@@ -626,4 +629,43 @@ fn original_gateway_snapshot_format_remains_compatible() {
     config::use_official(&home, &state).unwrap();
     config::restore(&home, &state).unwrap();
     assert!(!home.join("config.toml").exists());
+}
+
+#[test]
+fn legacy_managed_catalogs_recover_original_defaults_across_previews_and_repeated_apply() {
+    fs::create_dir_all(".runtime").unwrap();
+    let root = tempfile::tempdir_in(".runtime").unwrap();
+    let home = root.path().join("codex");
+    let state = root.path().join("app");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(state.join("model-catalogs")).unwrap();
+    let legacy_path = fs::canonicalize(state.join("model-catalogs")).unwrap().join("legacy.json");
+    let legacy = serde_json::json!({"models":[{"slug":"gpt-6.2-sol","context_window":900000,
+        "max_context_window":900000,"auto_compact_token_limit":800000,"base_instructions":"keep custom instructions",
+        "custom_capability":{"keep":true}}]});
+    fs::write(&legacy_path, legacy.to_string()).unwrap();
+    fs::write(home.join("config.toml"), format!("model='gpt-6.2-sol'\nmodel_catalog_json={:?}\n", legacy_path.to_str().unwrap())).unwrap();
+    config::attach(&home, &state, 17863, "fixture-key").unwrap();
+    for (window, limit, effective_window, effective_limit) in [
+        (900000, 800000, 500000, 450000),
+        (200000, 150000, 200000, 150000),
+        (900000, 800000, 500000, 450000),
+    ] {
+        let rules = [rule("gpt-6.2-sol", limit, Some(window))];
+        let preview = config::preview_with_rules(&home, &state, 17863, "fixture-key", &rules).unwrap();
+        assert_eq!(preview["model_limits"][0]["default_context_window"], 500000);
+        assert_eq!(preview["model_limits"][0]["context_window"], effective_window);
+        config::apply_model_settings(&home, &state, &rules, &Default::default()).unwrap();
+        let catalog = active_catalog(&home);
+        let model = &catalog["models"][0];
+        assert_eq!(model["default_context_window"], 500000);
+        assert_eq!(model["default_auto_compact_token_limit"], Value::Null);
+        assert_eq!(model["context_window"], effective_window);
+        assert_eq!(model["max_context_window"], effective_window);
+        assert_eq!(model["auto_compact_token_limit"], effective_limit);
+        assert_eq!(model["base_instructions"], "keep custom instructions");
+        assert_eq!(model["custom_capability"], serde_json::json!({"keep":true}));
+        assert_eq!(config::apply_model_settings(&home, &state, &rules, &Default::default()).unwrap()["changed"], false);
+    }
+    assert_eq!(serde_json::from_slice::<Value>(&fs::read(&legacy_path).unwrap()).unwrap(), legacy);
 }

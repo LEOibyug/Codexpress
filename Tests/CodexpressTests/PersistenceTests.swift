@@ -81,6 +81,17 @@ final class PersistenceTests: XCTestCase {
         XCTAssertThrowsError(try ModelCompactionRule.parse(model: "m", threshold: "90001", window: "100000"))
         XCTAssertThrowsError(try ModelCompactionRule.parse(model: "m", threshold: "1.5", window: ""))
         XCTAssertThrowsError(try ModelCompactionRule.parse(model: "m", threshold: "0", window: ""))
+        let windowOnly = try ModelCompactionRule.parse(model: "window-only", threshold: " ", window: "100000", defaultWindow: 200000)
+        XCTAssertNil(windowOnly.auto_compact_token_limit)
+        XCTAssertEqual(windowOnly.context_window, 100000)
+        let defaults = try ModelCompactionRule.parse(model: "defaults", threshold: "", window: "")
+        XCTAssertNil(defaults.auto_compact_token_limit)
+        XCTAssertNil(defaults.context_window)
+        XCTAssertThrowsError(try ModelCompactionRule.parse(model: "m", threshold: "", window: "200001", defaultWindow: 200000))
+        XCTAssertThrowsError(try ModelCompactionRule.parse(model: "m", threshold: "180001", window: "", defaultWindow: 200000))
+        let numeric = try JSONDecoder().decode(ModelCompactionRule.self, from: Data(#"{"model":"legacy","auto_compact_token_limit":45000}"#.utf8))
+        XCTAssertEqual(numeric.auto_compact_token_limit, 45000)
+        XCTAssertEqual(try JSONDecoder().decode(ModelCompactionRule.self, from: JSONEncoder().encode(windowOnly)), windowOnly)
     }
     func testModelSettingsRevisionIgnoresSetOrderingButPreservesSourcePriority() throws {
         var first = AppSettings()
@@ -96,7 +107,7 @@ final class PersistenceTests: XCTestCase {
         reordered.modelPolicies?[1].sourceIDs?.reverse()
         XCTAssertNotEqual(try ModelSettingsRevision.value(for: reordered), revision)
         reordered = first
-        reordered.modelCompaction?[0].auto_compact_token_limit += 1
+        reordered.modelCompaction?[0].auto_compact_token_limit = 101
         XCTAssertNotEqual(try ModelSettingsRevision.value(for: reordered), revision)
     }
 

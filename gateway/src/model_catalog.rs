@@ -6,7 +6,8 @@ use crate::{
 use axum::{http::{request::Parts, StatusCode}, response::{IntoResponse, Response}, Json};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, future::Future, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, future::Future, path::Path, sync::Arc, time::SystemTime};
+use sha2::{Digest, Sha256};
 
 pub(crate) fn client(parts: &Parts) -> ClientKind {
     if parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some() {
@@ -49,9 +50,119 @@ pub(crate) async fn start_submission<F: Future>(
     }
 }
 
+pub(crate) fn configuration_revision(
+    rules: &[ModelCompactionRule], sources: &[crate::model::SourceRuntime],
+    policies: &[crate::model_policy::ModelPolicy], mode: &str, fixed: Option<&str>,
+) -> String {
+    let mut sources: Vec<_> = sources.iter().map(|runtime| {
+        let source = &runtime.source;
+        let models: BTreeSet<_> = source.models.iter().collect();
+        (source.id.as_str(), json!({"id":source.id,"enabled":source.enabled,"kind":source.kind,"models":models}))
+    }).collect();
+    sources.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let mut policies: Vec<_> = policies.iter().collect();
+    policies.sort_unstable_by(|left, right| left.model.cmp(&right.model));
+    let snapshot = json!({"rules":crate::compaction::revision(rules),"sources":sources,"policies":policies,"mode":mode,"fixed":fixed});
+    format!("{:x}", Sha256::digest(serde_json::to_vec(&snapshot).expect("JSON catalog configuration")))
+}
+
+fn merge_metadata(entries: &mut BTreeMap<String, Value>, mut catalog: Value) {
+    let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) else { return; };
+    for model in models.drain(..) {
+        if let Some(id) = model["slug"].as_str() { entries.insert(id.to_owned(), model); }
+    }
+}
+
+// Filesystem identity checks are cheap enough for budget polling; parsing and
+// canonical hashing happen only after the local catalog file actually changes.
+pub(crate) struct MetadataCache {
+    signature: Option<(u64, SystemTime)>,
+    metadata: Arc<[Value]>,
+    pub(crate) revision: String,
+}
+
+impl MetadataCache {
+    pub(crate) fn open(state_dir: &Path) -> Self {
+        let mut cache = Self { signature: None, metadata: Arc::from([]), revision: String::new() };
+        cache.refresh(state_dir);
+        cache
+    }
+
+    pub(crate) fn refresh(&mut self, state_dir: &Path) {
+        let path = state_dir.join("model-catalogs/official-latest.json");
+        let signature = std::fs::metadata(&path).ok().and_then(|metadata| {
+            Some((metadata.len(), metadata.modified().ok()?))
+        });
+        if !self.revision.is_empty() && signature == self.signature { return; }
+        self.signature = signature;
+        let mut entries = BTreeMap::new();
+        if let Ok(catalog) = crate::compaction::bundled_catalog() {
+            merge_metadata(&mut entries, catalog);
+        }
+        if signature.is_some_and(|(size, _)| size <= 4 * 1024 * 1024) {
+            if let Some(catalog) = std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) {
+                merge_metadata(&mut entries, catalog);
+            }
+        }
+        let metadata: Vec<_> = entries.into_values().collect();
+        let normalized: Vec<_> = metadata.iter().map(|model| {
+            normalized_model(model["slug"].as_str().unwrap_or_default(), Some(model), None)
+        }).collect();
+        self.revision = format!("{:x}", Sha256::digest(serde_json::to_vec(&normalized).expect("JSON model metadata")));
+        self.metadata = metadata.into();
+    }
+}
+
+async fn metadata(state: &Arc<AppState>) -> Arc<[Value]> {
+    let mut cache = state.model_metadata.write().await;
+    cache.refresh(&state.state_dir);
+    cache.metadata.clone()
+}
+
+pub(crate) async fn info(state: &Arc<AppState>) -> Value {
+    let _sync = state.routing_sync.lock().await;
+    let metadata = metadata(state).await;
+    let rules = state.model_compaction.read().await;
+    let mut names: BTreeSet<String> = metadata.iter().filter_map(|model| model["slug"].as_str().map(str::to_owned)).collect();
+    names.extend(state.sources.read().await.iter().flat_map(|runtime| runtime.source.models.iter().cloned()));
+    names.extend(state.model_policies.read().await.iter().map(|policy| policy.model.clone()));
+    names.extend(rules.iter().filter(|rule| rule.context_window.is_some() || rule.auto_compact_token_limit.is_some()).map(|rule| rule.model.clone()));
+    json!({"models": names.into_iter().map(|id| {
+        normalized_model(&id, metadata.iter().find(|model| model["slug"] == id), rules.iter().find(|rule| rule.model == id))
+    }).collect::<Vec<_>>()})
+}
+
+fn normalized_model(id: &str, metadata: Option<&Value>, rule: Option<&ModelCompactionRule>) -> Value {
+    let mut model = json!({"id":id,"name":id,"object":"model","created":0,"owned_by":"codexpress","auto_compact_token_limit":null});
+    if let Some(metadata) = metadata {
+        for (target, source) in [("context_window","context_window"),("max_context_window","max_context_window"),
+            ("auto_compact_token_limit","auto_compact_token_limit"),("max_output_tokens","max_output_tokens"),
+            ("name","display_name"),("kind","kind"),("thinking","thinking"),("cost","cost"),("pricing","pricing"),
+            ("supported_reasoning_levels","supported_reasoning_levels"),("experimental_supported_tools","experimental_supported_tools")] {
+            if let Some(value) = metadata.get(source) { model[target] = value.clone(); }
+        }
+        if let Some(input) = metadata["input_modalities"].as_array() {
+            model["input"] = Value::Array(input.clone());
+        }
+        if let Some(levels) = metadata["supported_reasoning_levels"].as_array() {
+            let efforts: Vec<_> = levels.iter().filter_map(|level| level.as_str().or_else(|| level["effort"].as_str())).collect();
+            model["reasoning"] = json!(!efforts.is_empty());
+            if !efforts.is_empty() && model["thinking"]["mode"].as_str().is_none() {
+                model["thinking"] = json!({"mode":"effort","efforts":efforts});
+            }
+        }
+    }
+    if model.get("cost").is_none_or(Value::is_null) {
+        if let Some(cost) = crate::pricing::model_cost(id) { model["cost"] = cost; }
+    }
+    crate::compaction::apply_budget(&mut model, rule);
+    if model.get("auto_compact_token_limit").is_none() { model["auto_compact_token_limit"] = Value::Null; }
+    model
+}
+
 pub(crate) struct Catalog {
     names: BTreeSet<String>,
-    metadata: Vec<Value>,
+    metadata: Arc<[Value]>,
     rules: Arc<[ModelCompactionRule]>,
 }
 
@@ -72,10 +183,7 @@ pub(crate) async fn load(state: &Arc<AppState>, client: ClientKind) -> anyhow::R
         }).collect();
         (sources, state.model_policies.read().await.clone(), state.model_compaction.read().await.clone())
     };
-    let catalog = std::fs::read(state.state_dir.join("model-catalogs/official-latest.json"))
-        .ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .or_else(|| crate::compaction::bundled_catalog().ok());
-    let metadata = catalog.as_ref().and_then(|value| value["models"].as_array()).cloned().unwrap_or_default();
+    let metadata = metadata(state).await;
     let mut names = BTreeSet::new();
     for source in &sources {
         names.extend(source.models.iter().cloned());
@@ -103,7 +211,7 @@ pub(crate) async fn load(state: &Arc<AppState>, client: ClientKind) -> anyhow::R
     }
     drop(queries);
     names.extend(policies.iter().map(|policy| policy.model.clone()));
-    names.extend(rules.iter().map(|rule| rule.model.clone()));
+    names.extend(rules.iter().filter(|rule| rule.context_window.is_some() || rule.auto_compact_token_limit.is_some()).map(|rule| rule.model.clone()));
     names.retain(|model| model != crate::images::MODEL
         && model_policy::client_allowed(&policies, model, client)
         && sources.iter().any(|source| {
@@ -119,7 +227,7 @@ pub(crate) async fn load(state: &Arc<AppState>, client: ClientKind) -> anyhow::R
 impl Catalog {
     pub(crate) fn codex(self) -> anyhow::Result<Value> {
         if self.names.is_empty() { return Ok(json!({"models":[]})); }
-        let mut metadata = self.metadata;
+        let mut metadata = self.metadata.to_vec();
         for name in &self.names {
             if !metadata.iter().any(|entry| entry["slug"] == *name) {
                 metadata.push(crate::compaction::metadata_for_model(&metadata, name));
@@ -131,24 +239,7 @@ impl Catalog {
     }
     pub(crate) fn models(self) -> Vec<Value> {
         self.names.into_iter().map(|id| {
-            let mut model = json!({"id":id,"object":"model","created":0,"owned_by":"codexpress","auto_compact_token_limit":null});
-            if let Some(metadata) = self.metadata.iter().find(|entry| entry["slug"] == model["id"]) {
-                for (target, source) in [("context_window","context_window"),("max_context_window","max_context_window"),
-                    ("max_output_tokens","max_output_tokens"),("name","display_name"),("input","input_modalities"),
-                    ("kind","kind"),("thinking","thinking"),("cost","cost"),("pricing","pricing"),
-                    ("supported_reasoning_levels","supported_reasoning_levels"),("experimental_supported_tools","experimental_supported_tools")] {
-                    if let Some(value) = metadata.get(source) { model[target] = value.clone(); }
-                }
-                if let Some(levels) = metadata["supported_reasoning_levels"].as_array() { model["reasoning"] = json!(!levels.is_empty()); }
-            }
-            if let Some(rule) = self.rules.iter().find(|rule| model["id"] == rule.model) {
-                if let Some(window) = rule.context_window { model["context_window"] = json!(window); }
-                model["auto_compact_token_limit"] = json!(rule.auto_compact_token_limit);
-            }
-            if let Some(window) = model["context_window"].as_i64() {
-                model["max_context_window"] = json!(model["max_context_window"].as_i64().unwrap_or(window).max(window));
-            }
-            model
+            normalized_model(&id, self.metadata.iter().find(|model| model["slug"] == id), self.rules.iter().find(|rule| rule.model == id))
         }).collect()
     }
 }

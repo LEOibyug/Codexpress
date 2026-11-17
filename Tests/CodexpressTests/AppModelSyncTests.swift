@@ -153,11 +153,16 @@ final class AppModelSyncTests: XCTestCase {
         try await model.updateStatus()
         XCTAssertEqual(model.status["process_id"], helperPID)
         XCTAssertEqual(model.connectionMode, "official")
-        let invalid = ModelCompactionRule(model: policy.model, auto_compact_token_limit: 0, context_window: nil)
-        do {
-            try await model.saveModelSettings(model: policy.model, policy: ModelPolicy(model: policy.model), compaction: invalid)
-            XCTFail("Invalid compression must reject the entire model edit")
-        } catch {}
+        let invalidRules = [
+            ModelCompactionRule(model: policy.model, auto_compact_token_limit: 0, context_window: nil),
+            ModelCompactionRule(model: policy.model, auto_compact_token_limit: nil, context_window: 100001)
+        ]
+        for invalid in invalidRules {
+            do {
+                try await model.saveModelSettings(model: policy.model, policy: ModelPolicy(model: policy.model), compaction: invalid)
+                XCTFail("Invalid compression must reject the entire model edit")
+            } catch {}
+        }
         let unchangedModel = try metadata.load()
         XCTAssertEqual(unchangedModel.modelPolicies, [policy])
         XCTAssertEqual(unchangedModel.modelCompaction, [revisedRule])
@@ -341,6 +346,8 @@ final class AppModelSyncTests: XCTestCase {
                     (directory / 'models-started').touch()
                     while (directory / 'hold-models').exists(): time.sleep(0.01)
                     data = dict(models=['old-account-model'])
+                elif operation == 'models.info':
+                    data = dict(models=[dict(id='custom-model',default_context_window=100000,default_auto_compact_token_limit=None)])
                 elif operation == 'usage.analytics':
                     counter = directory / 'analytics-count'
                     count = int(counter.read_text()) + 1 if counter.exists() else 1

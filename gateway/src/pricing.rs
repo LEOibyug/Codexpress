@@ -54,6 +54,22 @@ fn matches_model(model: &str, id: &str) -> bool {
                 })
         })
 }
+fn price_for_model(model: &str) -> Option<&'static Price> {
+    let model = model.strip_prefix("openai/").unwrap_or(model);
+    prices().models.iter().find(|p| matches_model(model, &p.id))
+}
+
+/// Standard API-reference USD rates per million tokens, not billed balances.
+pub(crate) fn model_cost(model: &str) -> Option<Value> {
+    let price = price_for_model(model)?;
+    Some(json!({
+        "input": price.input,
+        "output": price.output,
+        "cacheRead": price.cached_input,
+        "cacheWrite": price.cache_write_30m,
+    }))
+}
+
 fn dollars(tokens: u64, per_million: f64, multiplier: f64) -> f64 {
     // Integer picodollars retain fractional-cent cache rates without rounding
     // each component to a displayed currency precision.
@@ -87,7 +103,6 @@ pub fn estimate(record: &Value, historical: bool) -> Value {
         .as_str()
         .or_else(|| record["model"].as_str())
         .unwrap_or("");
-    let model = model.strip_prefix("openai/").unwrap_or(model);
     let official = details["source_kind"] == "official";
     let subscription = details["is_subscription"] == true;
     if details["source_kind"] == "api" {
@@ -115,9 +130,10 @@ pub fn estimate(record: &Value, historical: bool) -> Value {
         cost["status"] = json!(status);
         cost
     };
-    let Some(price) = prices().models.iter().find(|p| matches_model(model, &p.id)) else {
+    let Some(price) = price_for_model(model) else {
         return unavailable("unknown_model");
     };
+    let gpt_62 = matches!(price.id.as_str(), "gpt-6.2-sol" | "gpt-6.2-astra");
     let tier = details["service_tier"].as_str().unwrap_or("default");
     let multiplier = match tier {
         "default" | "standard" | "auto" => Some(1.0),
@@ -146,13 +162,16 @@ pub fn estimate(record: &Value, historical: bool) -> Value {
         .as_u64()
         .unwrap_or(0)
         .min(input - read);
-    let uncached = input - read - write;
+    // New Codex credit references keep cache writes within ordinary input;
+    // preserve the existing older-model reference behavior.
+    let subscription_pricing = gpt_62 && (official || subscription);
+    let uncached = input - read - if subscription_pricing { 0 } else { write };
     let long = price
         .long_context_over
         .is_some_and(|threshold| input > threshold);
-    // Official Sol exemption is documented for subscription usage. Other API
-    // providers can explicitly opt into subscription reference pricing.
-    let waived = subscription || official && price.id == "gpt-6.1-sol";
+    // Only 6.1 Sol has a documented official subscription exemption. Preserve
+    // older opt-in references, but do not infer an exemption for 6.2.
+    let waived = !gpt_62 && (subscription || official && price.id == "gpt-6.1-sol");
     let long_priced = long && !waived;
     if long_priced && matches!(tier, "priority" | "fast") && price.session_scope {
         return unavailable("unknown_tier");
@@ -169,10 +188,14 @@ pub fn estimate(record: &Value, historical: bool) -> Value {
         } else {
             1.0
         };
-    let write_price = match details["cache_write_retention"].as_str() {
-        None | Some("in_memory" | "30m") => price.cache_write_30m,
-        Some("12h") => price.cache_write_12h,
-        _ => None,
+    let write_price = if subscription_pricing {
+        Some(0.0)
+    } else {
+        match details["cache_write_retention"].as_str() {
+            None | Some("in_memory" | "30m") => price.cache_write_30m,
+            Some("12h") => price.cache_write_12h,
+            _ => None,
+        }
     };
     let input_usd = dollars(uncached, price.input, input_multiplier);
     let cached_usd = dollars(read, price.cached_input, input_multiplier);
@@ -256,6 +279,72 @@ mod tests {
         value["token_details"]["service_tier"] = json!("ultrafast");
         assert_eq!(estimate(&value, false)["status"], "unknown_tier");
     }
+    #[test]
+    fn gpt_62_prices_full_requests_at_the_long_context_boundary_and_supported_tiers() {
+        for (model, short_total, long_total, retained_total, fast_total, batch_total) in [
+            ("gpt-6.2-sol", 0.175, 0.345004, 0.355004, 0.690008, 0.172502),
+            ("gpt-6.2-astra", 0.7, 1.380016, 1.420016, 2.760032, 0.690008),
+        ] {
+            let mut value = record(272000, 200000);
+            value["model"] = json!(model);
+            value["token_details"]["source_kind"] = json!("api");
+            value["token_details"]["cache_write_input_tokens"] = json!(2000);
+            let short = estimate(&value, false);
+            assert_eq!(short["long_context"], false);
+            assert!((short["total_usd"].as_f64().unwrap() - short_total).abs() < 1e-9);
+            value["input_tokens"] = json!(272001);
+            let long = estimate(&value, false);
+            assert_eq!(long["long_context"], true);
+            assert!((long["total_usd"].as_f64().unwrap() - long_total).abs() < 1e-9);
+            value["token_details"]["cache_write_retention"] = json!("12h");
+            let retained = estimate(&value, false);
+            assert!((retained["total_usd"].as_f64().unwrap() - retained_total).abs() < 1e-9);
+            value["token_details"]["cache_write_retention"] = json!("30m");
+            for (tier, total) in [("fast", fast_total), ("batch", batch_total)] {
+                value["token_details"]["service_tier"] = json!(tier);
+                let cost = estimate(&value, false);
+                assert!((cost["total_usd"].as_f64().unwrap() - total).abs() < 1e-9);
+            }
+            // The promotional Ultrafast rate depends on date and eligibility;
+            // neither a perpetual 3x nor a perpetual 6x is a known API rate.
+            value["token_details"]["service_tier"] = json!("ultrafast");
+            assert_eq!(estimate(&value, false)["status"], "unknown_tier");
+        }
+    }
+
+    #[test]
+    fn gpt_62_subscription_references_keep_the_surcharge_without_a_cache_write_premium() {
+        for (model, total) in [("gpt-6.2-sol", 0.343004), ("gpt-6.2-astra", 1.372016)] {
+            let mut value = record(272001, 200000);
+            value["model"] = json!(model);
+            value["token_details"]["cache_write_input_tokens"] = json!(2000);
+            value["token_details"]["cache_write_retention"] = json!("12h");
+            for (source, subscription) in [("official", false), ("api", true)] {
+                value["token_details"]["source_kind"] = json!(source);
+                value["token_details"]["is_subscription"] = json!(subscription);
+                let cost = estimate(&value, false);
+                assert_eq!(cost["long_context_waived"], false);
+                assert_eq!(cost["uncached_input_tokens"], 72001);
+                assert_eq!(cost["cache_write_usd"], 0.0);
+                assert!((cost["total_usd"].as_f64().unwrap() - total).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn model_metadata_costs_use_standard_api_rates_and_explicit_snapshot_aliases() {
+        assert_eq!(
+            model_cost("openai/gpt-6.2-sol-2026-11-18"),
+            Some(json!({"input":2.0,"output":10.0,"cacheRead":0.1,"cacheWrite":2.5}))
+        );
+        assert_eq!(
+            model_cost("gpt-6.2-astra"),
+            Some(json!({"input":8.0,"output":40.0,"cacheRead":0.4,"cacheWrite":10.0}))
+        );
+        assert!(model_cost("gpt-6.2-sol-unverified").is_none());
+        assert!(model_cost("provider-custom-model").is_none());
+    }
+
     #[test]
     fn upstream_charge_overrides_reference_rates_even_for_unknown_models_and_zero_cost() {
         let mut value = record(512000, 400000);

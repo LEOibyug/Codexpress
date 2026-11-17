@@ -265,8 +265,8 @@ pub fn preview_with_origins(
     let catalog = prepare_compaction(&mut after, &home, state_dir, snapshot.as_ref(), rules, excluded_models)?;
     let model_limits = catalog.as_ref().map(|(_, bytes)| {
         let catalog: Value = serde_json::from_slice(bytes).expect("generated JSON");
-        catalog["models"].as_array().unwrap().iter().filter(|m| rules.iter().any(|r| m["slug"] == r.model))
-            .map(|m| json!({"model":m["slug"],"auto_compact_token_limit":m["auto_compact_token_limit"],"context_window":m["context_window"]})).collect::<Vec<_>>()
+        catalog["models"].as_array().unwrap().iter().filter(|m| rules.iter().any(|r| m["slug"] == r.model && (r.context_window.is_some() || r.auto_compact_token_limit.is_some())))
+            .map(|m| json!({"model":m["slug"],"auto_compact_token_limit":m["auto_compact_token_limit"],"context_window":m["context_window"],"default_context_window":m["default_context_window"],"default_auto_compact_token_limit":m["default_auto_compact_token_limit"]})).collect::<Vec<_>>()
     }).unwrap_or_default();
     Ok(
         json!({"before":redact(&before),"after":redact(&after),"attached":snapshot.is_some(),"model_limits":model_limits,"legacy_providers":legacy_providers,"compatibility_provider_ids":compatibility_provider_ids,"warning":WARNING}),

@@ -168,7 +168,7 @@ import SwiftUI
             if rules.isEmpty { summary += base == nil ? "\n模型压缩 = 保留远端设置" : "\n模型压缩 = 恢复远端原设置" }
             else {
                 summary += "\n模型压缩（\(rules.count)）"
-                for rule in rules { summary += "\n\(rule.model)：压缩 \(rule.auto_compact_token_limit.formatted()) Token" + (rule.context_window.map { "，窗口 \($0.formatted())" } ?? "") }
+                for rule in rules { summary += "\n\(rule.model)：压缩 " + (rule.auto_compact_token_limit.map { $0.formatted() + " Token" } ?? "默认") + (rule.context_window.map { "，最大输入 \($0.formatted())" } ?? "") }
             }
             self.summary = summary; self.aliases = rendered["aliases"].array.compactMap(\.string)
             self.status = current

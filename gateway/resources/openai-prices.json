@@ -1,10 +1,38 @@
 {
-  "revision": "openai-2026-10-29-v1",
-  "verified_at": "2026-10-29",
+  "revision": "openai-2026-11-18-v1",
+  "verified_at": "2026-11-18",
   "currency": "USD",
   "unit": "per_million_tokens",
   "source_url": "https://developers.openai.com/api/docs/pricing",
   "models": [
+    {
+      "id": "gpt-6.2-sol",
+      "input": 2,
+      "cached_input": 0.1,
+      "output": 10,
+      "cache_write_30m": 2.5,
+      "cache_write_12h": 5,
+      "long_context_over": 272000,
+      "long_input_multiplier": 2,
+      "long_output_multiplier": 1.5,
+      "fast_multiplier": 2,
+      "discount_multiplier": 0.5,
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-6.2-sol"
+    },
+    {
+      "id": "gpt-6.2-astra",
+      "input": 8,
+      "cached_input": 0.4,
+      "output": 40,
+      "cache_write_30m": 10,
+      "cache_write_12h": 20,
+      "long_context_over": 272000,
+      "long_input_multiplier": 2,
+      "long_output_multiplier": 1.5,
+      "fast_multiplier": 2,
+      "discount_multiplier": 0.5,
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-6.2-astra"
+    },
     {
       "id": "gpt-6.1-terra",
       "input": 1,

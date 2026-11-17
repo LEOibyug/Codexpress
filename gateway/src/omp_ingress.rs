@@ -31,7 +31,9 @@ pub(crate) async fn binding(state: &Arc<AppState>, enable: bool) -> anyhow::Resu
 
 pub(crate) async fn budgets_revision(state: &Arc<AppState>) -> Value {
     let _sync = state.routing_sync.lock().await;
-    json!({"revision": &*state.model_compaction_revision.read().await})
+    let mut catalog = state.model_metadata.write().await;
+    catalog.refresh(&state.state_dir);
+    json!({"revision": format!("{}:{}", &*state.model_compaction_revision.read().await, catalog.revision)})
 }
 
 pub(crate) fn router(_state: Arc<AppState>) -> Router<Arc<AppState>> {

@@ -1,0 +1,116 @@
+{
+  "source_url": "https://chatgpt.com/backend-api/codex/models",
+  "client_version": "0.169.0",
+  "verified_at": "2026-11-17",
+  "models": [
+    {
+      "slug": "gpt-6.2-sol",
+      "display_name": "GPT-6.2-Sol",
+      "minimal_client_version": "0.166.0",
+      "context_window": 500000,
+      "max_context_window": 872000,
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balances speed and reasoning depth for everyday tasks"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra high reasoning depth for complex problems"
+        },
+        {
+          "effort": "max",
+          "description": "Maximum reasoning depth for the hardest problems"
+        },
+        {
+          "effort": "ultra",
+          "description": "Maximum reasoning with automatic task delegation"
+        }
+      ],
+      "default_reasoning_level": "low",
+      "input_modalities": [
+        "text",
+        "image",
+        "audio"
+      ],
+      "supported_in_api": true,
+      "experimental_supported_tools": [
+        "request_user_input_async",
+        "send_message_to_user_async",
+        "clock",
+        "literature_search_query",
+        "multi_agent_v2_in_code_mode"
+      ],
+      "supports_parallel_tool_calls": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_reasoning_summaries": true
+    },
+    {
+      "slug": "gpt-6.2-astra",
+      "display_name": "GPT-6.2-Astra",
+      "minimal_client_version": "0.166.0",
+      "context_window": 272000,
+      "max_context_window": 872000,
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balances speed and reasoning depth for everyday tasks"
+        },
+        {
+          "effort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extra high reasoning depth for complex problems"
+        },
+        {
+          "effort": "max",
+          "description": "Maximum reasoning depth for the hardest problems"
+        },
+        {
+          "effort": "ultra",
+          "description": "Maximum reasoning with automatic task delegation"
+        }
+      ],
+      "default_reasoning_level": "low",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supported_in_api": true,
+      "experimental_supported_tools": [
+        "request_user_input_async",
+        "send_message_to_user_async",
+        "clock",
+        "literature_search_query",
+        "multi_agent_v2_in_code_mode"
+      ],
+      "supports_parallel_tool_calls": true,
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_reasoning_summaries": true
+    }
+  ]
+}

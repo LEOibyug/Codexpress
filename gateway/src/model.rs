@@ -272,6 +272,7 @@ pub struct AppState {
     pub settings: RwLock<RoutingSettings>,
     pub(crate) model_compaction: RwLock<Arc<[crate::compaction::ModelCompactionRule]>>,
     pub(crate) model_compaction_revision: RwLock<String>,
+    pub(crate) model_metadata: RwLock<crate::model_catalog::MetadataCache>,
     pub(crate) model_policies: RwLock<Arc<[crate::model_policy::ModelPolicy]>>,
     pub(crate) role_capabilities: crate::relay::RoleCapabilities,
     pub(crate) omp_cache_groups: Mutex<crate::omp_ingress::CacheGroups>,
@@ -329,7 +330,8 @@ impl AppState {
                 upstream_retry_delay_seconds: default_retry_delay(),
             }),
             model_compaction: RwLock::new(Arc::from([])),
-            model_compaction_revision: RwLock::new(crate::compaction::revision(&[])),
+            model_compaction_revision: RwLock::new(crate::model_catalog::configuration_revision(&[], &[], &[], "auto", None)),
+            model_metadata: RwLock::new(crate::model_catalog::MetadataCache::open(&state_dir)),
             model_policies: RwLock::new(Arc::from([])),
             role_capabilities: crate::relay::RoleCapabilities::open(
                 state_dir.join("source-compatibility.json"),

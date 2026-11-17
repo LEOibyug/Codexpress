@@ -57,7 +57,8 @@ fn prepare_compaction(
     preview: &RemotePreview,
 ) -> Result<(String, Value, &'static str)> {
     crate::compaction::validate(&preview.model_compaction)?;
-    if preview.model_compaction.is_empty() && preview.compaction_base.is_none() {
+    let has_rules = preview.model_compaction.iter().any(|rule| rule.context_window.is_some() || rule.auto_compact_token_limit.is_some());
+    if !has_rules && preview.compaction_base.is_none() {
         return Ok((after.into(), Value::Null, "keep"));
     }
     let base = preview
@@ -67,7 +68,7 @@ fn prepare_compaction(
         .parse::<DocumentMut>()
         .map_err(|_| anyhow::anyhow!("远端原模型设置不是有效 TOML"))?;
     let mut doc = after.parse::<DocumentMut>()?;
-    if preview.model_compaction.is_empty() {
+    if !has_rules {
         for key in crate::compaction::MANAGED_KEYS {
             match base.get(key) {
                 Some(item) => doc[key] = item.clone(),

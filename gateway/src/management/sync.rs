@@ -248,7 +248,9 @@ pub(super) async fn handle(state: &Arc<AppState>, payload: Value) -> Result<Valu
     tokio::task::spawn_blocking(move || usage.reprice_historical(&pricing_sources))
         .await
         .context("历史费用更新失败")??;
-    let model_compaction_revision = crate::compaction::revision(&model_compaction);
+    let model_compaction_revision = crate::model_catalog::configuration_revision(
+        &model_compaction, &next, &model_policies, &settings.mode, settings.fixed_source_id.as_deref(),
+    );
     // Odd revisions describe publication in progress. Readers must not
     // submit using a mixture of old routing settings and new sources.
     state.routing_revision.fetch_add(1, Ordering::AcqRel);

@@ -14,7 +14,8 @@ pub const MANAGED_KEYS: [&str; 3] = [
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCompactionRule {
     pub model: String,
-    pub auto_compact_token_limit: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<i64>,
     #[serde(default)]
     pub context_window: Option<i64>,
 }
@@ -22,14 +23,17 @@ pub struct ModelCompactionRule {
 pub(crate) fn revision(rules: &[ModelCompactionRule]) -> String {
     // Rule order does not affect budgets. Hash a canonical, length-delimited
     // snapshot only when publishing configuration, never on a polling request.
-    let mut ordered: Vec<_> = rules.iter().collect();
+    let mut ordered: Vec<_> = rules.iter().filter(|rule| rule.auto_compact_token_limit.is_some() || rule.context_window.is_some()).collect();
     ordered.sort_unstable_by(|left, right| left.model.cmp(&right.model));
     let mut hash = Sha256::new();
-    hash.update(b"codexpress-omp-budgets-v1");
+    hash.update(b"codexpress-omp-budgets-v2");
     for rule in ordered {
         hash.update((rule.model.len() as u64).to_le_bytes());
         hash.update(rule.model.as_bytes());
-        hash.update(rule.auto_compact_token_limit.to_le_bytes());
+        hash.update([u8::from(rule.auto_compact_token_limit.is_some())]);
+        if let Some(limit) = rule.auto_compact_token_limit {
+            hash.update(limit.to_le_bytes());
+        }
         hash.update([u8::from(rule.context_window.is_some())]);
         if let Some(window) = rule.context_window {
             hash.update(window.to_le_bytes());
@@ -51,12 +55,17 @@ pub fn validate(rules: &[ModelCompactionRule]) -> Result<()> {
         {
             bail!("请填写不含空白且不重复的模型 ID");
         }
-        if !(1..=1_000_000_000).contains(&rule.auto_compact_token_limit)
+        if rule.auto_compact_token_limit.is_some_and(|n| !(1..=1_000_000_000).contains(&n))
             || rule
                 .context_window
                 .is_some_and(|n| !(2..=1_000_000_000).contains(&n))
         {
             bail!("压缩阈值须为正整数，上下文窗口至少为 2 Token，最大支持十亿 Token");
+        }
+        if let (Some(limit), Some(window)) = (rule.auto_compact_token_limit, rule.context_window) {
+            if limit > window.saturating_mul(9) / 10 {
+                bail!("模型 {} 的压缩阈值不能超过最大输入的 90%", rule.model);
+            }
         }
     }
     Ok(())
@@ -86,6 +95,7 @@ pub fn catalog_with_additions(
     additions: Option<&Value>,
 ) -> Result<Value> {
     validate(rules)?;
+    let bundled = original.get("model_catalog_json").is_none() && !home.join("models_cache.json").exists();
     let mut catalog = if let Some(path) = original.get("model_catalog_json") {
         let path = path
             .as_str()
@@ -101,6 +111,31 @@ pub fn catalog_with_additions(
     } else {
         bundled_catalog()?
     };
+    let managed_catalog = original.get("model_catalog_json").and_then(|value| value.as_str()).is_some_and(|path| {
+        let path = Path::new(path);
+        path.parent().and_then(Path::file_name).is_some_and(|name| name == "model-catalogs")
+            || path.file_name().is_some_and(|name| name == ".codexpress-model-catalog.json")
+    });
+    if managed_catalog {
+        // Older generated catalogs did not distinguish original defaults from
+        // effective overrides. Recover only budget defaults from trusted local
+        // source metadata, retaining the user's instructions and capabilities.
+        let defaults = bundled_catalog()?;
+        if let Some(models) = catalog["models"].as_array_mut() {
+            for model in models {
+                let bundled = defaults["models"].as_array().and_then(|models| models.iter().find(|entry| entry["slug"] == model["slug"]));
+                let discovered = additions.and_then(|catalog| catalog["models"].as_array()).and_then(|models| models.iter().find(|entry| entry["slug"] == model["slug"]));
+                if bundled.is_some() || discovered.is_some() {
+                    for (target, field) in [("default_context_window", "context_window"),
+                        ("default_max_context_window", "max_context_window"),
+                        ("default_auto_compact_token_limit", "auto_compact_token_limit")] {
+                        model[target] = discovered.and_then(|entry| entry.get(field))
+                            .or_else(|| bundled.and_then(|entry| entry.get(field))).cloned().unwrap_or(Value::Null);
+                    }
+                }
+            }
+        }
+    }
     if let Some(additions) = additions.and_then(|value| value["models"].as_array()) {
         if let Some(models) = catalog["models"].as_array_mut() {
             let mut names: HashSet<String> = models
@@ -111,6 +146,15 @@ pub fn catalog_with_additions(
                 if let Some(slug) = model["slug"].as_str() {
                     if names.insert(slug.to_owned()) {
                         models.push(model.clone());
+                    } else if bundled {
+                        if let Some(existing) = models.iter_mut().find(|entry| entry["slug"] == slug).and_then(Value::as_object_mut) {
+                            if let Some(fields) = model.as_object() {
+                                // Refresh capabilities without replacing the bundled
+                                // compatibility instructions during explicit sync.
+                                existing.extend(fields.iter().filter(|(key, _)| !matches!(key.as_str(), "base_instructions" | "model_messages"))
+                                    .map(|(key, value)| (key.clone(), value.clone())));
+                            }
+                        }
                     }
                 }
             }
@@ -120,9 +164,22 @@ pub fn catalog_with_additions(
 }
 
 pub fn bundled_catalog() -> Result<Value> {
-    Ok(serde_json::from_str(include_str!(
-        "../resources/codex-models-0.162.1.json"
-    ))?)
+    let mut catalog: Value = serde_json::from_str(include_str!("../resources/codex-models-0.162.1.json"))?;
+    let supplement: Value = serde_json::from_str(include_str!("../resources/codex-model-capabilities.json"))?;
+    let models = catalog["models"].as_array_mut().context("内置模型目录缺少 models")?;
+    for capability in supplement["models"].as_array().into_iter().flatten() {
+        let id = capability["slug"].as_str().context("内置模型能力缺少模型 ID")?;
+        let index = if let Some(index) = models.iter().position(|model| model["slug"] == id) {
+            index
+        } else {
+            models.push(metadata_for_model(models, id));
+            models.len() - 1
+        };
+        if let (Some(model), Some(capability)) = (models[index].as_object_mut(), capability.as_object()) {
+            model.extend(capability.clone());
+        }
+    }
+    Ok(catalog)
 }
 
 /// Apply rules to supplied metadata without opening any local Codex files.
@@ -142,29 +199,22 @@ pub fn catalog_from_value(
         let slug = model
             .get("slug")
             .and_then(Value::as_str)
-            .context("模型目录缺少模型 ID")?;
+            .context("模型目录缺少模型 ID")?.to_owned();
         if !names.insert(slug.to_owned()) {
             bail!("模型目录存在重复模型 ID");
         }
-        // Move existing root defaults into metadata before removing root overrides.
-        if let Some(window) = original
-            .get("model_context_window")
-            .and_then(|v| v.as_integer())
-        {
-            let max = model
-                .get("max_context_window")
-                .and_then(Value::as_i64)
-                .unwrap_or(window);
-            model["context_window"] = json!(window.min(max));
-        }
-        if let Some(limit) = original
-            .get("model_auto_compact_token_limit")
-            .and_then(|v| v.as_integer())
-        {
-            model["auto_compact_token_limit"] = json!(limit);
-        }
+        preserve_defaults(model);
+        // Explicit Codex sync migrates root overrides, but never increases the
+        // catalog's original default capacity.
+        let root_rule = ModelCompactionRule {
+            model: slug,
+            context_window: original.get("model_context_window").and_then(|v| v.as_integer()),
+            auto_compact_token_limit: original.get("model_auto_compact_token_limit").and_then(|v| v.as_integer()),
+        };
+        apply_budget(model, Some(&root_rule));
     }
     for rule in rules {
+        if rule.context_window.is_none() && rule.auto_compact_token_limit.is_none() { continue; }
         let index = if let Some(index) = models.iter().position(|m| m["slug"] == rule.model) {
             index
         } else {
@@ -174,24 +224,7 @@ pub fn catalog_from_value(
             models.len() - 1
         };
         let model = &mut models[index];
-        if let Some(window) = rule.context_window {
-            model["context_window"] = json!(window);
-            // An explicit window is a user assertion about their upstream's capacity.
-            model["max_context_window"] = json!(window);
-        }
-        let window = model
-            .get("context_window")
-            .and_then(Value::as_i64)
-            .or_else(|| model.get("max_context_window").and_then(Value::as_i64));
-        if window
-            .is_some_and(|window| rule.auto_compact_token_limit > window.saturating_mul(9) / 10)
-        {
-            bail!(
-                "模型 {} 的压缩阈值超过上下文窗口的 90%；请降低阈值或填写正确的上下文窗口",
-                rule.model
-            );
-        }
-        model["auto_compact_token_limit"] = json!(rule.auto_compact_token_limit);
+        apply_budget(model, Some(rule));
     }
     // Older Codex clients deserialize every catalog entry and require the
     // pre-model_messages instruction field. Retain modern metadata verbatim;
@@ -211,6 +244,40 @@ pub fn catalog_from_value(
     }
     // Cache envelopes may contain authentication/cache identity; export model metadata only.
     Ok(json!({"models":models}))
+}
+
+pub(crate) fn preserve_defaults(model: &mut Value) {
+    for (default, field) in [
+        ("default_context_window", "context_window"),
+        ("default_max_context_window", "max_context_window"),
+        ("default_auto_compact_token_limit", "auto_compact_token_limit"),
+    ] {
+        if model.get(default).is_none() {
+            model[default] = model.get(field).cloned().unwrap_or(Value::Null);
+        }
+    }
+}
+
+pub(crate) fn apply_budget(model: &mut Value, rule: Option<&ModelCompactionRule>) {
+    preserve_defaults(model);
+    let default_window = model["default_context_window"].as_i64();
+    let window = match (rule.and_then(|rule| rule.context_window), default_window) {
+        (Some(window), Some(default)) => Some(window.min(default)),
+        (window, default) => window.or(default),
+    };
+    if let Some(window) = window {
+        model["context_window"] = json!(window);
+        // OMP's context-fit expansion must obey the original default, not the
+        // optional extended context capacity or a legacy oversized override.
+        model["max_context_window"] = json!(window);
+    }
+    let limit = rule.and_then(|rule| rule.auto_compact_token_limit)
+        .or_else(|| model["default_auto_compact_token_limit"].as_i64());
+    if let Some(limit) = limit {
+        model["auto_compact_token_limit"] = json!(window.map_or(limit, |window| limit.min(window.saturating_mul(9) / 10)));
+    } else {
+        model.as_object_mut().map(|model| model.remove("auto_compact_token_limit"));
+    }
 }
 
 pub(crate) fn metadata_for_model(models: &[Value], id: &str) -> Value {
