@@ -13,7 +13,7 @@ bash scripts/build.sh
 
 `check.sh` 运行测试与静态检查，`build.sh` 生成 `dist/Codexpress.app`。
 
-OMP 扩展的源码位于配套 `codexpress-omp-extension` 项目。更新扩展时在那里执行 `bun run pack`，将生成的 `dist/codexpress-omp-extension-*.tgz` 复制为本项目 `Resources/omp-extension.tgz` 后再构建应用。发行版携带该完整包，安装时不依赖配套源码或开发工具。
+OMP 扩展的开发目录为配套 `codexpress-omp-extension` 项目。更新扩展时在那里执行 `bun run pack`，将生成的 `dist/codexpress-omp-extension-*.tgz` 复制为本项目 `Resources/omp-extension.tgz` 后再构建应用。该发行包同时保留扩展源码、测试、构建脚本和锁文件，可从本仓库的归档解包重建；安装和运行不依赖配套源码或开发工具。
 
 ## 目录与本地产物
 

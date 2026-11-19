@@ -380,7 +380,7 @@ Responses 本身允许 `system` 消息。第三方代理若在 HTTP 400／422 �
 
 ## OMP 一键接入
 
-在 Codexpress「接入 → OMP」点击「安装扩展」，将应用内置的 `@codexpress/omp-extension` 安装到本机官方 OMP；基于 18.16 公开 SDK，已验证官方 18.18，不需要修改 OMP 核心或依赖开发源码。安装后重新启动 OMP，在 `/login` 中选择 **Codexpress**，或执行 `omp login codexpress`，即可自动启用本机入口、取得模型 Key 并读取模型列表。模型请求使用独立 `/omp/v1/codex/responses` Agent 路径与 `openai-codex-responses` 传输，不经过通用聊天格式转换；既有 `/omp/v1/responses` 仍可使用。账号登录、令牌刷新和来源调度由 Codexpress 负责。
+在 Codexpress「接入 → OMP」点击「安装扩展」，将应用内置的 `@codexpress/omp-extension` 安装到本机官方 OMP。扩展 0.1.10 起基于 19.0.0 公开 SDK，兼容 OMP 18.16 至 19.x，已验证官方 18.18 与 19.0.0；不需要修改 OMP 核心或依赖开发源码。安装后重新启动 OMP，在 `/login` 中选择 **Codexpress**，或执行 `omp login codexpress`，即可自动启用本机入口、取得模型 Key 并读取模型列表。模型请求使用独立 `/omp/v1/codex/responses` Agent 路径与 `openai-codex-responses` 传输，不经过通用聊天格式转换；既有 `/omp/v1/responses` 仍可使用。账号登录、令牌刷新和来源调度由 Codexpress 负责。
 
 本机绑定使用 Codexpress 自己的 `control.sock`；`CODEXPRESS_STATE_DIR` 可指定其他应用状态目录。新安装不创建 `models.yml` 或复制固定模型清单，绑定 Key 由 OMP 自己的凭据存储保存。重新绑定会读取最新端口、Key 与模型。原版命令行通过 `omp --model codexpress/模型ID` 选择扩展模型，不使用在扩展加载前验证的 `--provider codexpress`。远端扩展可显式设置客户端基址与 Key；非密钥的 `codexpress.json` 随当前 OMP profile 保存。
 
