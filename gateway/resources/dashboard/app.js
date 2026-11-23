@@ -23,6 +23,7 @@
   };
   let searchTimer;
   const numberFormat = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
+  const ratioFormat = new Intl.NumberFormat('en-US', { maximumSignificantDigits: 3, useGrouping: false });
   const isNumber = (value) => typeof value === 'number' && Number.isFinite(value);
   const n = (value) => isNumber(value) ? numberFormat.format(value) : '未知';
   const usd = (value) => isNumber(value) ? '$' + value.toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 6 }) : '未知';
@@ -245,6 +246,12 @@
     return row.throughput_latency_ms > 0 && isNumber(row.throughput_output_tokens)
       ? row.throughput_output_tokens * 1000 / row.throughput_latency_ms : null;
   }
+  function inputOutputRatio(row) {
+    const input = row.input_tokens, output = row.output_tokens, details = row.token_details || {};
+    if (!isNumber(input) || !isNumber(output) || input < 0 || output <= 0 || details.input_available === false || details.output_available === false) return '—';
+    const estimated = row.estimated_requests > 0 || details.input_estimated || details.output_estimated;
+    return (estimated ? '≈' : '') + ratioFormat.format(input / output) + ' : 1';
+  }
   function kpi(label, value, note) {
     const card = node('div', 'kpi');
     card.append(node('p', 'kpi-label', label), node('p', 'kpi-value', value), node('p', 'kpi-note', note));
@@ -261,6 +268,7 @@
       kpi('总 token', n(t.total_tokens), '输入 + 输出；估算样本 ' + n(t.estimated_requests) + ' 条'),
       kpi('输入 token', n(t.input_tokens), '含已报告缓存输入；部分记录可能缺失'),
       kpi('输出 token', n(t.output_tokens), '已知输出；不重复累加推理 token'),
+      kpi('输入输出比', inputOutputRatio(t), '输入总量 ÷ 输出总量；输入含缓存，输出为零时不计算'),
       kpi('缓存输入 token', n(t.cached_input_tokens), '记录的缓存量；未报告不等于未命中'),
       kpi('推理 token', n(t.reasoning_output_tokens), '仅统计上游明确报告的推理量'),
       kpi('加权生成 TPS', n(weightedTps(t)), '从首个输出计时；缺少计时的旧记录沿用完整耗时'),
@@ -282,8 +290,8 @@
     if (groupsChanged || performanceChanged) renderOverviewMetrics(groups, p);
     if (groupsChanged) {
       $('groups').replaceChildren(table(
-        ['来源', '模型', '请求', '成功率', '进行中', '输入', '输出', '缓存', '推理', 'USD（已知）', '实际 / 参考', '生成 TPS'],
-        groups.map((g) => [g.source_name || g.source_id || '未记录', g.model || '未记录', n(g.requests), pct(g.successes, g.requests - g.active_requests), n(g.active_requests), n(g.input_tokens), n(g.output_tokens), n(g.cached_input_tokens), n(g.reasoning_output_tokens), usd(g.total_usd), n(g.upstream_priced_requests) + ' / ' + n(Math.max(0, (g.priced_requests || 0) - (g.upstream_priced_requests || 0))), n(weightedTps(g))]),
+        ['来源', '模型', '请求', '成功率', '进行中', '输入', '输出', '输入输出比', '缓存', '推理', 'USD（已知）', '实际 / 参考', '生成 TPS'],
+        groups.map((g) => [g.source_name || g.source_id || '未记录', g.model || '未记录', n(g.requests), pct(g.successes, g.requests - g.active_requests), n(g.active_requests), n(g.input_tokens), n(g.output_tokens), inputOutputRatio(g), n(g.cached_input_tokens), n(g.reasoning_output_tokens), usd(g.total_usd), n(g.upstream_priced_requests) + ' / ' + n(Math.max(0, (g.priced_requests || 0) - (g.upstream_priced_requests || 0))), n(weightedTps(g))]),
       ));
     }
     if (dailyChanged) renderDaily(daily);
@@ -311,7 +319,7 @@
     $('daily-note').textContent = hourly ? '滚动小时窗口 · 每 5 分钟请求次数（含进行中）' : '本地日历日 · 请求次数（含进行中）';
     $('daily-table-title').textContent = hourly ? '每 5 分钟完整数据表' : '每日完整数据表';
     $('daily-summary').textContent = daily.length + (hourly ? ' 个 5 分钟区间' : ' 个本地日历日');
-    $('daily-table').replaceChildren(table([hourly ? '区间开始时间' : '日期', '请求', '成功', '失败', '输入', '输出', '缓存', '总 token', 'USD（已知）'], daily.map((d) => [hourly ? stamp(d.start_at) : dateValue(new Date(d.start_at * 1000)), n(d.requests), n(d.successes), n(d.failures), n(d.input_tokens), n(d.output_tokens), n(d.cached_input_tokens), n(d.total_tokens), usd(d.total_usd)])));
+    $('daily-table').replaceChildren(table([hourly ? '区间开始时间' : '日期', '请求', '成功', '失败', '输入', '输出', '输入输出比', '缓存', '总 token', 'USD（已知）'], daily.map((d) => [hourly ? stamp(d.start_at) : dateValue(new Date(d.start_at * 1000)), n(d.requests), n(d.successes), n(d.failures), n(d.input_tokens), n(d.output_tokens), inputOutputRatio(d), n(d.cached_input_tokens), n(d.total_tokens), usd(d.total_usd)])));
     const host = $('daily-chart');
     host.replaceChildren();
     if (!daily.length) {
@@ -345,7 +353,7 @@
       const x = 47 + i * step;
       const bar = shape('rect', { x, y: 175 - height, width: Math.max(1, step * .72), height, rx: Math.min(3, step / 4), class: 'bar' });
       const title = document.createElementNS(svg.namespaceURI, 'title');
-      title.textContent = (hourly ? stamp(d.start_at) + ' 至 ' + stamp(d.start_at + 300) + '（5 分钟）' : dateValue(new Date(d.start_at * 1000))) + '：' + n(count) + ' 次请求';
+      title.textContent = (hourly ? stamp(d.start_at) + ' 至 ' + stamp(d.start_at + 300) + '（5 分钟）' : dateValue(new Date(d.start_at * 1000))) + '：' + n(count) + ' 次请求；输入输出比 ' + inputOutputRatio(d);
       bar.append(title);
       if (i % labelStep === 0 || i === daily.length - 1) shape('text', { x: x + step / 2, y: 199, 'text-anchor': 'middle' }, hourly ? timeValue(new Date(d.start_at * 1000)).slice(0, 5) : dateValue(new Date(d.start_at * 1000)).slice(5));
     });
@@ -553,7 +561,7 @@
       ['尝试 ID', r.attempt_id || detail.id], ['请求 ID', r.request_id || '未记录'], ['开始时间', stamp(r.started_at)],
       ['来源', r.source_name || r.source_id || '未记录'], ['模型', r.model || '未记录'], ['入口', ingressName(r.ingress ?? d?.ingress)],
       ['状态', statusNames[r.status] || r.status || '未知'], ['HTTP', String(r.http_status ?? d?.http_status ?? '未记录')],
-      ['输入 / 输出', tokenLabel(r)], ['缓存输入', r.token_details?.cached_input_reported ? n(r.cached_input_tokens) : '未报告'],
+      ['输入 / 输出', tokenLabel(r)], ['输入输出比', inputOutputRatio(r)], ['缓存输入', r.token_details?.cached_input_reported ? n(r.cached_input_tokens) : '未报告'],
       ['推理 token', n(r.token_details?.reasoning_output_tokens)], ['完整耗时', ms(r.latency_ms)], ['首 token 延迟', ms(r.first_token_latency_ms)],
       ['生成耗时', ms(r.generation_ms)], ['生成 TPS', n(r.output_tps)], ['费用 USD', costLabel(r.cost)],
     ]));

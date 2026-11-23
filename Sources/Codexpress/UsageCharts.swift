@@ -11,12 +11,14 @@ struct UsageTrendChart: View {
     }
     private var total: Double { days.reduce(0) { $0 + $1.total } }
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        let input = days.reduce(0) { $0 + $1.input }
+        let output = days.reduce(0) { $0 + $1.output }
+        return VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .firstTextBaseline) {
                 Text("Token 趋势").font(.system(size: 14, weight: .semibold))
                 Spacer()
                 if let selected {
-                    Text(selected.date.formatted(intraday ? .dateTime.month().day().hour().minute() : .dateTime.month().day()) + " · " + usageCount(selected.total, estimated: selected.estimated) + " Token")
+                    Text(selected.date.formatted(intraday ? .dateTime.month().day().hour().minute() : .dateTime.month().day()) + " · " + usageCount(selected.total, estimated: selected.estimated) + " Token · 入/出 " + usageInputOutputRatio(selected.input, selected.output, estimated: selected.estimated))
                         .font(.system(size: 12, weight: .medium)).monospacedDigit()
                 }
             }
@@ -52,18 +54,19 @@ struct UsageTrendChart: View {
             }
             .frame(height: 210)
             HStack(alignment: .top, spacing: 28) {
-                tokenLabel("输入", value: days.reduce(0) { $0 + $1.input })
-                tokenLabel("缓存读取", value: days.reduce(0) { $0 + $1.cached })
-                tokenLabel("输出", value: days.reduce(0) { $0 + $1.output })
+                tokenLabel("输入", value: usageCount(input))
+                tokenLabel("缓存读取", value: usageCount(days.reduce(0) { $0 + $1.cached }))
+                tokenLabel("输出", value: usageCount(output))
+                tokenLabel("输入输出比", value: usageInputOutputRatio(input, output, estimated: days.contains(where: \.estimated)))
                 Spacer()
-                tokenLabel("总计", value: total, prominent: true)
+                tokenLabel("总计", value: usageCount(total), prominent: true)
             }.monospacedDigit()
         }.padding(20).cardSurface()
     }
-    private func tokenLabel(_ label: String, value: Double, prominent: Bool = false) -> some View {
+    private func tokenLabel(_ label: String, value: String, prominent: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(label).font(.system(size: 11)).foregroundStyle(.secondary)
-            Text(usageCount(value)).font(.system(size: 13, weight: prominent ? .semibold : .regular))
+            Text(value).font(.system(size: 13, weight: prominent ? .semibold : .regular))
         }
     }
 }
@@ -127,7 +130,11 @@ struct UsageDistributionChart: View {
         Text(usageMoney(slice.cost, estimated: slice.costEstimated)).font(.system(size: 16, weight: .semibold)).monospacedDigit()
     }
     private func sourceTokens(_ slice: UsageSourceSlice) -> some View {
-        Text(usageCount(slice.tokenTotal, estimated: slice.estimated) + " Token").font(.system(size: 12)).monospacedDigit().foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 3) {
+            Text(usageCount(slice.tokenTotal, estimated: slice.estimated) + " Token").font(.system(size: 12))
+            Label(usageInputOutputRatio(slice.input, slice.output, estimated: slice.estimated), systemImage: "arrow.left.arrow.right")
+                .font(.system(size: 11)).help("输入输出比；输入包含缓存读取。")
+        }.monospacedDigit().foregroundStyle(.secondary)
     }
 }
 

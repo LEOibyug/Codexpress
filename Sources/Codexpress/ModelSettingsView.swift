@@ -150,6 +150,7 @@ struct ModelSettingsView: View {
         let showPerformance = (usage?["attempts"].number ?? 0) >= 10
         let rate = showPerformance ? usageRate(usage?["tps"].number) : ""
         let cache = showPerformance ? (usage?["cache_rate"].number.map { $0.formatted(.number.precision(.fractionLength(0...1))) + "%" } ?? "—") : ""
+        let ratio = usageInputOutputRatio(usage?["input_tokens"].number, usage?["output_tokens"].number)
         let disabled = clients.isEmpty || policy?.sourceIDs?.isEmpty == true
         let imported = information["local_metadata"].bool == true
         return Button { editing = EditingModel(id: id, isNew: false) } label: {
@@ -167,6 +168,7 @@ struct ModelSettingsView: View {
                     .help("\(id)\n最大输入：\(window) · 压缩点：\(threshold)")
                 HStack(spacing: 18) {
                     modelMetric(total, symbol: "number", help: "近期 Token")
+                    modelMetric(ratio, symbol: "arrow.left.arrow.right", help: "输入输出比；按全局最近 1,000 条已结束请求中该模型的输入、输出总量计算，输入包含缓存读取。")
                     if showPerformance {
                         modelMetric(rate, symbol: "speedometer", help: "生成 TPS")
                         modelMetric(cache, symbol: "bolt.circle", help: "缓存命中率")
@@ -176,7 +178,7 @@ struct ModelSettingsView: View {
             }.font(AppTypography.caption).foregroundStyle(.secondary)
                 .padding(.horizontal, 14).padding(.vertical, 12).contentShape(Rectangle())
         }.buttonStyle(.plain).accessibilityLabel("编辑模型 \(id)")
-            .accessibilityValue("\(disabled ? "未启用" : clients.map(\.label).joined(separator: "、"))，\(sourceSummary(policy))，近期 Token \(total)" + (showPerformance ? "，生成 TPS \(rate)，缓存命中 \(cache)" : ""))
+            .accessibilityValue("\(disabled ? "未启用" : clients.map(\.label).joined(separator: "、"))，\(sourceSummary(policy))，近期 Token \(total)，输入输出比 \(ratio)" + (showPerformance ? "，生成 TPS \(rate)，缓存命中 \(cache)" : ""))
     }
 
     private func sourceSummary(_ policy: ModelPolicy?) -> String {

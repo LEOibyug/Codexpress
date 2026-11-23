@@ -6,20 +6,22 @@ use serde_json::{json, Value};
 pub(super) fn build(connection: &Connection) -> Result<Value> {
     let (_, duration) = rate_durations();
     let mut query = connection.prepare_cached(&format!(
-        "SELECT model,TOTAL(input_tokens+output_tokens) AS tokens,COUNT(*),
+        "SELECT model,TOTAL(input_tokens) AS input_total,TOTAL(output_tokens) AS output_total,COUNT(*),
              TOTAL(output_tokens) FILTER (WHERE ({duration}) IS NOT NULL) * 1000
                  / NULLIF(TOTAL({duration}),0),
              MIN(100, TOTAL(cached_input_tokens) FILTER (WHERE {CACHE_SAMPLE}) * 100
                  / NULLIF(TOTAL(input_tokens) FILTER (WHERE {CACHE_SAMPLE}),0))
          FROM (SELECT model,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata
                FROM usage ORDER BY started_at DESC,attempt DESC LIMIT 1000)
-         GROUP BY model ORDER BY tokens DESC,model"
+         GROUP BY model ORDER BY input_total+output_total DESC,model"
     ))?;
     let models = query
         .query_map([], |row| {
-            Ok(json!({"model":row.get::<_, String>(0)?,"total_tokens":row.get::<_, f64>(1)?,
-                "attempts":row.get::<_, u64>(2)?,"tps":row.get::<_, Option<f64>>(3)?,
-                "cache_rate":row.get::<_, Option<f64>>(4)?}))
+            let input = row.get::<_, f64>(1)?;
+            let output = row.get::<_, f64>(2)?;
+            Ok(json!({"model":row.get::<_, String>(0)?,"total_tokens":input+output,
+                "input_tokens":input,"output_tokens":output,"attempts":row.get::<_, u64>(3)?,
+                "tps":row.get::<_, Option<f64>>(4)?,"cache_rate":row.get::<_, Option<f64>>(5)?}))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(json!({"models":models}))
@@ -51,9 +53,9 @@ mod tests {
         "#).unwrap();
         let result = store.models().unwrap();
         assert_eq!(result["models"], json!([
-            {"model":"z-heavy", "total_tokens":597920.0, "attempts":998, "tps":80.0, "cache_rate":10.0},
-            {"model":"a-zero", "total_tokens":100.0, "attempts":1, "tps":0.0, "cache_rate":0.0},
-            {"model":"b-unknown", "total_tokens":100.0, "attempts":1, "tps":null, "cache_rate":null}
+            {"model":"z-heavy", "total_tokens":597920.0, "input_tokens":100000.0, "output_tokens":497920.0, "attempts":998, "tps":80.0, "cache_rate":10.0},
+            {"model":"a-zero", "total_tokens":100.0, "input_tokens":100.0, "output_tokens":0.0, "attempts":1, "tps":0.0, "cache_rate":0.0},
+            {"model":"b-unknown", "total_tokens":100.0, "input_tokens":100.0, "output_tokens":0.0, "attempts":1, "tps":null, "cache_rate":null}
         ]));
     }
 }

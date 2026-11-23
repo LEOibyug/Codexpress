@@ -109,7 +109,8 @@ struct UsageView: View {
         HStack(alignment: .top, spacing: 0) {
             summaryMetric("费用 · USD", value: usageMoney(totals.cost, estimated: totals.costEstimated), detail: totals.cost == nil ? "暂无已计价请求" : totals.costEstimated ? "参考价估算" : "实际扣费", prominent: true)
             Rectangle().fill(Color(nsColor: .separatorColor)).frame(width: 1, height: 64).padding(.horizontal, 20)
-            summaryMetric("总 Token", value: usageCount(totals.total, estimated: totals.estimated))
+            summaryMetric("总 Token", value: usageCount(totals.total, estimated: totals.estimated), detail: "输入输出比 \(totals.inputOutputRatio)")
+                .help("输入 Token 总量 ÷ 输出 Token 总量；输入含缓存读取，输出为零时不计算。")
             summaryMetric("请求", value: usageCount(totals.sum("requests")), detail: "失败 \(usageCount(totals.sum("failures")))")
             summaryMetric("成功率", value: totals.successRate.map { String(format: "%.1f%%", $0) } ?? "—", detail: "进行中 \(usageCount(totals.sum("active_requests")))")
         }.padding(20).cardSurface()

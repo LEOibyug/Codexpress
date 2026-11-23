@@ -19,6 +19,7 @@ struct UsageTotals {
     var successRate: Double? { finished > 0 ? sum("successes") * 100 / finished : nil }
     var tps: Double? { sum("throughput_latency_ms") > 0 ? sum("throughput_output_tokens") * 1000 / sum("throughput_latency_ms") : nil }
     var cacheRate: Double? { sum("cached_reported_input_tokens") > 0 ? min(100, sum("cached_reported_tokens") * 100 / sum("cached_reported_input_tokens")) : nil }
+    var inputOutputRatio: String { usageInputOutputRatio(input, output, estimated: estimated) }
     var cost: Double? { sum("priced_requests") > 0 ? sum("total_usd") : nil }
     var costEstimated: Bool { sum("priced_requests") > sum("upstream_priced_requests") }
     var averageCost: Double? { sum("priced_requests") > 0 ? sum("total_usd") / sum("priced_requests") : nil }
@@ -80,6 +81,11 @@ func usageCount(_ number: Double, estimated: Bool = false) -> String {
 }
 func usageRate(_ number: Double?, estimated: Bool = false) -> String {
     number.map { (estimated ? "≈" : "") + compactUsageNumber($0, minimumFractionDigits: 1) } ?? "—"
+}
+func usageInputOutputRatio(_ input: Double?, _ output: Double?, estimated: Bool = false) -> String {
+    guard let input, let output, input.isFinite, output.isFinite, input >= 0, output > 0 else { return "—" }
+    let ratio = (input / output).formatted(.number.locale(Locale(identifier: "en_US_POSIX")).grouping(.never).precision(.significantDigits(1...3)))
+    return (estimated ? "≈" : "") + ratio + " : 1"
 }
 private func compactUsageNumber(_ number: Double, minimumFractionDigits: Int = 0) -> String {
     guard number.isFinite else { return "—" }
@@ -267,7 +273,9 @@ struct UsageSourceSlice: Identifiable {
     let id: String
     let name: String
     let value: Double
-    let tokenTotal: Double
+    let input: Double
+    let output: Double
+    var tokenTotal: Double { input + output }
     let cost: Double?
     let estimated: Bool
     var costEstimated = true
@@ -280,7 +288,7 @@ func usageDistributionSlices(_ groups: [JSONValue], groupBy: String) -> [UsageSo
     for row in rows {
         let value = models ? row.totals.total : row.totals.cost
         guard let value, value.isFinite, value > 0 else { continue }
-        let slice = UsageSourceSlice(id: row.id, name: row.name, value: value, tokenTotal: row.totals.total, cost: row.totals.cost, estimated: row.totals.estimated, costEstimated: row.totals.costEstimated)
+        let slice = UsageSourceSlice(id: row.id, name: row.name, value: value, input: row.totals.input, output: row.totals.output, cost: row.totals.cost, estimated: row.totals.estimated, costEstimated: row.totals.costEstimated)
         let unknownName = ["", "unknown", "unknown_model", "未知模型"].contains(row.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
         // Aggregates currently merge unknown model and tier prices into unpriced_requests.
         let unlisted = row.totals.sum("unpriced_requests") > 0 && row.totals.sum("priced_requests") == 0
@@ -291,7 +299,7 @@ func usageDistributionSlices(_ groups: [JSONValue], groupBy: String) -> [UsageSo
     let other = Array(ranked.dropFirst(3)) + forcedOther
     if !other.isEmpty {
         let knownCosts = other.compactMap(\.cost)
-        slices.append(UsageSourceSlice(id: "usage-other-sources", name: "其他", value: other.reduce(0) { $0 + $1.value }, tokenTotal: other.reduce(0) { $0 + $1.tokenTotal }, cost: knownCosts.isEmpty ? nil : knownCosts.reduce(0, +), estimated: other.contains(where: \.estimated), costEstimated: other.contains(where: \.costEstimated)))
+        slices.append(UsageSourceSlice(id: "usage-other-sources", name: "其他", value: other.reduce(0) { $0 + $1.value }, input: other.reduce(0) { $0 + $1.input }, output: other.reduce(0) { $0 + $1.output }, cost: knownCosts.isEmpty ? nil : knownCosts.reduce(0, +), estimated: other.contains(where: \.estimated), costEstimated: other.contains(where: \.costEstimated)))
     }
     return slices
 }

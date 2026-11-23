@@ -21,7 +21,7 @@ struct OverviewView: View {
                 connection
                 HStack(spacing: 14) {
                     metric("今日费用", symbol: "dollarsign.circle", value: usageMoney(totals.cost, estimated: totals.costEstimated), detail: totals.cost == nil ? "暂无已计价请求" : totals.costEstimated ? "含参考价估算" : "上游实际扣费")
-                    metric("今日 Token", symbol: "number", value: usageSnapshot == .null ? "—" : usageCount(totals.total, estimated: totals.estimated), detail: usageSnapshot == .null ? "等待用量数据" : "\(usageCount(totals.sum("requests"))) 次请求")
+                    metric("今日 Token", symbol: "number", value: usageSnapshot == .null ? "—" : usageCount(totals.total, estimated: totals.estimated), detail: usageSnapshot == .null ? "等待用量数据" : "\(usageCount(totals.sum("requests"))) 次请求 · 入/出 \(totals.inputOutputRatio)")
                     metric("进行中的请求", symbol: "waveform.path", value: model.running ? usageCount(model.status["inflight"].number ?? 0) : "—", detail: model.running ? "\(available) / \(model.sources.count) 个来源可用" : "网关未连接")
                 }
                 if let usageError { InfoNote(text: usageError, symbol: "clock", color: .orange) }

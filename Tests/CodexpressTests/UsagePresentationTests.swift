@@ -63,6 +63,12 @@ final class UsagePresentationTests: XCTestCase {
         XCTAssertEqual(totals.successRate ?? 0,200.0/3,accuracy:0.001)
         XCTAssertEqual(totals.tps ?? 0,110000.0/6000,accuracy:0.001)
         XCTAssertTrue(totals.estimated)
+        XCTAssertEqual(totals.inputOutputRatio, "≈4.55 : 1")
+        XCTAssertEqual(usageInputOutputRatio(10, 20), "0.5 : 1")
+        XCTAssertEqual(usageInputOutputRatio(1, 10000), "0.0001 : 1")
+        XCTAssertEqual(usageInputOutputRatio(0, 10), "0 : 1")
+        XCTAssertEqual(usageInputOutputRatio(10, 0), "—")
+        XCTAssertEqual(usageInputOutputRatio(nil, 10), "—")
         XCTAssertNil(UsageTotals(rows: []).tps)
         XCTAssertNil(UsageTotals(rows: []).successRate)
     }
@@ -98,6 +104,7 @@ final class UsagePresentationTests: XCTestCase {
         let sources = usageDistributionSlices(groups, groupBy: "source_id")
         XCTAssertEqual(sources.map(\.name), ["供应商"])
         XCTAssertEqual(sources.first?.tokenTotal, 667)
+        XCTAssertEqual(sources.first.map { usageInputOutputRatio($0.input, $0.output, estimated: $0.estimated) }, "≈5.06 : 1")
         XCTAssertEqual(sources.first?.cost, 1.5)
         XCTAssertTrue(sources.first?.estimated == true)
         let models = usageDistributionSlices(groups, groupBy: "model")
@@ -190,6 +197,7 @@ final class UsagePresentationTests: XCTestCase {
         XCTAssertEqual(cost.last?.value, 3)
         XCTAssertEqual(cost.last?.cost, 3)
         XCTAssertEqual(cost.last?.tokenTotal, 320)
+        XCTAssertEqual(cost.last.map { usageInputOutputRatio($0.input, $0.output) }, "15 : 1")
         XCTAssertEqual(cost.reduce(0) { $0 + $1.value }, 15)
         XCTAssertEqual(cost.reduce(0) { $0 + ($1.cost ?? 0) }, 15)
         XCTAssertEqual(cost.reduce(0) { $0 + $1.tokenTotal }, 1550)
@@ -206,10 +214,10 @@ final class UsagePresentationTests: XCTestCase {
 
     func testRingHitTestingStartsAtTwelveClockwiseAndRejectsHoleAndOutside() {
         let slices = [
-            UsageSourceSlice(id: "first", name: "第一", value: 1, tokenTotal: 100, cost: 1, estimated: false),
-            UsageSourceSlice(id: "second", name: "第二", value: 1, tokenTotal: 200, cost: 1, estimated: false),
-            UsageSourceSlice(id: "third", name: "第三", value: 1, tokenTotal: 300, cost: 1, estimated: false),
-            UsageSourceSlice(id: "usage-other-sources", name: "其他", value: 1, tokenTotal: 400, cost: 1, estimated: true)
+            UsageSourceSlice(id: "first", name: "第一", value: 1, input: 90, output: 10, cost: 1, estimated: false),
+            UsageSourceSlice(id: "second", name: "第二", value: 1, input: 190, output: 10, cost: 1, estimated: false),
+            UsageSourceSlice(id: "third", name: "第三", value: 1, input: 290, output: 10, cost: 1, estimated: false),
+            UsageSourceSlice(id: "usage-other-sources", name: "其他", value: 1, input: 390, output: 10, cost: 1, estimated: true)
         ]
         XCTAssertEqual(usageRingHit(x: 0, y: -9, outerRadius: 10, innerRatio: 0.78, slices: slices), "first")
         XCTAssertEqual(usageRingHit(x: 7, y: -7, outerRadius: 10, innerRatio: 0.78, slices: slices), "first")

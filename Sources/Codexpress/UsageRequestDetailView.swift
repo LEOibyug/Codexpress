@@ -103,6 +103,7 @@ struct UsageRequestDetailView: View {
             VStack(alignment: .leading, spacing: 11) {
                 detailRow("输入 Token", usageCount(record["input_tokens"].number ?? 0, estimated: tokens["input_estimated"].bool == true) + (tokens["input_estimated"].bool == true ? " · 估算" : ""))
                 detailRow("输出 Token", tokens["output_available"].bool == true ? usageCount(record["output_tokens"].number ?? 0, estimated: tokens["output_estimated"].bool == true) + (tokens["output_estimated"].bool == true ? " · 估算" : "") : "未报告")
+                detailRow("输入输出比", usageInputOutputRatio(tokens["input_available"].bool == false ? nil : record["input_tokens"].number, tokens["output_available"].bool == false ? nil : record["output_tokens"].number, estimated: tokens["input_estimated"].bool == true || tokens["output_estimated"].bool == true))
                 detailRow("缓存读取", tokens["cached_input_reported"].bool == true ? usageCount(record["cached_input_tokens"].number ?? 0) : "未报告")
                 detailRow("缓存写入", tokens["cache_write_input_tokens"].number.map { usageCount($0) } ?? "未报告")
                 detailRow("推理 Token", tokens["reasoning_output_tokens"].number.map { usageCount($0) } ?? "未报告")
