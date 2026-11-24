@@ -985,11 +985,96 @@ async fn confirm_manual_acceptance(
     bind_ids(state, source, observer).await;
 }
 
+type TimedByteStream = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<(Bytes, Instant), std::io::Error>> + Send>,
+>;
+type TranslatedByteStream = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
+>;
+
 pub(super) async fn stream_response(
     state: Arc<AppState>,
     source: Source,
     upstream: reqwest::Response,
     prefix: Vec<(Bytes, Instant)>,
+    attempt: Attempt,
+    context: ResponseContext,
+    route_lease: Option<crate::affinity::RouteLease>,
+) -> Response<Body> {
+    let status = upstream.status();
+    let headers = clean_headers(upstream.headers(), false);
+    let body_stream: TimedByteStream = Box::pin(
+        upstream
+            .bytes_stream()
+            .map(|result| result.map(|chunk| (chunk, Instant::now())).map_err(|_| std::io::Error::other("来源流已中断"))),
+    );
+    stream_body_response(
+        state,
+        source,
+        status,
+        headers,
+        prefix,
+        body_stream,
+        attempt,
+        context,
+        route_lease,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn stream_translated_response(
+    state: Arc<AppState>,
+    source: Source,
+    sse: bool,
+    content_length: Option<u64>,
+    body_stream: TranslatedByteStream,
+    attempt: Attempt,
+    context: ResponseContext,
+    route_lease: Option<crate::affinity::RouteLease>,
+) -> Response<Body> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(if sse {
+            "text/event-stream; charset=utf-8"
+        } else {
+            "application/json"
+        }),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_ENCODING,
+        axum::http::HeaderValue::from_static("identity"),
+    );
+    if let Some(len) = content_length {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&len.to_string()) {
+            headers.insert(axum::http::header::CONTENT_LENGTH, value);
+        }
+    }
+    let body_stream: TimedByteStream =
+        Box::pin(body_stream.map(|result| result.map(|chunk| (chunk, Instant::now()))));
+    stream_body_response(
+        state,
+        source,
+        StatusCode::OK,
+        headers,
+        Vec::new(),
+        body_stream,
+        attempt,
+        context,
+        route_lease,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_body_response(
+    state: Arc<AppState>,
+    source: Source,
+    status: StatusCode,
+    mut headers: HeaderMap,
+    prefix: Vec<(Bytes, Instant)>,
+    upstream: TimedByteStream,
     mut attempt: Attempt,
     context: ResponseContext,
     mut route_lease: Option<crate::affinity::RouteLease>,
@@ -1018,8 +1103,6 @@ pub(super) async fn stream_response(
         .record
         .as_ref()
         .is_some_and(|record| record.status == "failed");
-    let status = upstream.status();
-    let mut headers = clean_headers(upstream.headers(), false);
     let content_length = headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
@@ -1098,9 +1181,7 @@ pub(super) async fn stream_response(
         let mut route_lease=route_lease;
         let captured_prefix = attempt.captured_prefix;
         let prefix = futures_util::stream::iter(prefix.into_iter().map(Ok));
-        let mut upstream = prefix.chain(upstream.bytes_stream().map(|result| {
-            result.map(|chunk| (chunk, Instant::now()))
-        }));
+        let mut upstream = prefix.chain(upstream);
         let mut received = 0u64;
         let mut finalized = content_length == Some(0);
         let mut chunk_index = 0usize;

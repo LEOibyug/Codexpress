@@ -59,14 +59,84 @@ struct ChatbotSettingsView: View {
                         Button("重新读取") { Task { await load() } }.disabled(loading || working)
                     }
                 }
+                environmentCard
             }.settingsPage()
-        }.task(id: model.running) { await load() }
+        }.task(id: model.running) {
+            await load()
+            model.refreshEnvironmentSyncInspection()
+        }
             .onChange(of: port) { _, _ in error = nil }
             .onChange(of: newKey) { _, _ in error = nil }
             .alert("重新生成聊天客户端 API Key？", isPresented: $confirmReset) {
                 Button("取消", role: .cancel) {}
                 Button("重新生成") { update(.object(["regenerate_key": .bool(true)])) }
-            } message: { Text("旧 Key 将无法发起新请求，使用此入口的客户端需要更新密钥。") }
+            } message: {
+                Text(model.settings.autoExportChatbotEnvironmentEnabled
+                     ? "旧 Key 将无法发起新请求，环境变量会自动同步更新；使用其它方式接入的客户端需要更新密钥。"
+                     : "旧 Key 将无法发起新请求，使用此入口的客户端需要更新密钥。")
+            }
+    }
+
+    private var environmentCard: some View {
+        let enabled = model.settings.autoExportChatbotEnvironmentEnabled
+        return SettingsCard("环境变量", symbol: "terminal", accessory: {
+            if model.environmentSyncWorking {
+                ProgressView().controlSize(.small).accessibilityLabel("正在同步环境变量")
+            } else if !enabled {
+                StatusPill(text: "已关闭")
+            } else if model.environmentSynced {
+                StatusPill(text: "已同步", color: .green)
+            } else {
+                StatusPill(text: "待同步", color: .orange)
+            }
+        }) {
+            SettingRow(title: "自动写入环境变量", subtitle: "在启动、修改端口或更换 Key 时同步更新，关闭后自动清理。") {
+                Toggle("自动写入环境变量", isOn: Binding(
+                    get: { model.settings.autoExportChatbotEnvironmentEnabled },
+                    set: { model.setAutoExportChatbotEnvironment($0) }
+                ))
+                .toggleStyle(.switch).labelsHidden()
+                .disabled(model.metadataLoadFailed || model.environmentSyncWorking)
+            }
+            LabeledContent("接口地址变量") {
+                HStack(spacing: 8) {
+                    Text(ChatbotEnvironmentAccess.baseURLVariable)
+                        .font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
+                    Text(address ?? "等待读取")
+                        .font(AppTypography.small).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+            }
+            LabeledContent("密钥变量") {
+                HStack(spacing: 8) {
+                    Text(ChatbotEnvironmentAccess.apiKeyVariable)
+                        .font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
+                    Text("使用当前聊天客户端 Key")
+                        .font(AppTypography.small).foregroundStyle(.secondary)
+                }
+            }
+            LabeledContent("写入位置") {
+                Text("~/.codexpress/env.sh、~/.zshrc 与 macOS 图形环境")
+                    .font(AppTypography.small).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            if enabled && status["enabled"].bool == false {
+                InfoNote(text: "聊天客户端入口当前已关闭，启用后接口才可访问。", symbol: "exclamationmark.triangle", color: .orange)
+            }
+            if let syncError = model.environmentSyncError {
+                InfoNote(text: syncError, symbol: "exclamationmark.triangle", color: .orange)
+            }
+            HStack(spacing: 12) {
+                Text("新打开的终端和图形应用会自动读取；已打开的终端可执行 `source ~/.zshrc`。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                if enabled {
+                    Button("立即同步") { model.syncChatbotEnvironmentNow() }
+                        .disabled(!model.running || working || model.environmentSyncWorking)
+                } else if model.environmentSyncError != nil || model.environmentSynced {
+                    Button("重试清理") { model.retryChatbotEnvironmentCleanup() }
+                        .disabled(model.environmentSyncWorking)
+                }
+            }
+        }
     }
 
     private var advancedSettings: some View {
@@ -121,7 +191,20 @@ struct ChatbotSettingsView: View {
                 savedPort = status["port"].number.map { String(Int($0)) } ?? ""
                 if payload["port"] != .null { port = status["port"].number.map { String(Int($0)) } ?? "" }
                 if payload["key"] != .null { newKey = "" }
-                model.notice = payload["regenerate_key"].bool == true || payload["key"] != .null ? "API Key 已更换，请更新客户端密钥。" : "聊天客户端设置已应用。"
+                let rotated = payload["regenerate_key"].bool == true || payload["key"] != .null
+                let changedEndpoint = rotated || payload["port"] != .null
+                if changedEndpoint && model.settings.autoExportChatbotEnvironmentEnabled {
+                    let synced = await model.syncChatbotEnvironmentIfEnabled(showSuccessNotice: false)
+                    if synced {
+                        model.notice = rotated
+                            ? "API Key 已更换，环境变量已同步更新；使用其它方式接入的客户端需手动更新密钥。"
+                            : "聊天客户端设置已应用，环境变量已同步更新。"
+                    } else {
+                        model.notice = "聊天客户端设置已应用，但环境变量同步失败。"
+                    }
+                } else {
+                    model.notice = rotated ? "API Key 已更换，请更新客户端密钥。" : "聊天客户端设置已应用。"
+                }
             } catch {
                 let message = error.localizedDescription
                 if let actual = try? await model.remoteCall("chatbot.status") {

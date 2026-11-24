@@ -8,6 +8,7 @@ pub mod continuity;
 pub mod control;
 pub mod credentials;
 pub mod discovery;
+pub mod google;
 pub mod history;
 pub mod images;
 mod maintenance;

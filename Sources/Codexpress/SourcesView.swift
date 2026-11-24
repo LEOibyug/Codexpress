@@ -20,6 +20,8 @@ struct SourcesView: View {
                 if !model.sources.isEmpty {
                     Menu {
                         Button("官方账号") { addOfficial() }
+                        Button("OpenAI API Platform") { addOpenAI() }
+                        Button("Google AI Studio") { addGoogle() }
                         Button("Responses API") { addAPI() }
                     } label: { Label("添加来源", systemImage: "plus") }
                         .menuStyle(.borderedButton).buttonStyle(.borderedProminent).disabled(!canEdit)
@@ -36,10 +38,12 @@ struct SourcesView: View {
                 }.help(routingSummary)
             }
             if model.sources.isEmpty {
-                EmptyState("暂无来源", subtitle: model.running ? "添加 ChatGPT 账号或 Responses API 服务，开始分配请求。" : "网关启动后可添加 ChatGPT 账号或 Responses API 服务。", symbol: "server.rack") {
+                EmptyState("暂无来源", subtitle: model.running ? "添加 ChatGPT 账号、OpenAI API Platform、Google AI Studio 或 Responses API 服务，开始分配请求。" : "网关启动后可添加 ChatGPT 账号、OpenAI API Platform、Google AI Studio 或 Responses API 服务。", symbol: "server.rack") {
                     HStack(spacing: 10) {
-                        Button("添加官方账号") { addOfficial() }.buttonStyle(.borderedProminent)
-                        Button("添加 API") { addAPI() }.buttonStyle(.bordered)
+                        Button("官方账号") { addOfficial() }.buttonStyle(.borderedProminent)
+                        Button("OpenAI API Platform") { addOpenAI() }.buttonStyle(.bordered)
+                        Button("Google AI Studio") { addGoogle() }.buttonStyle(.bordered)
+                        Button("Responses API") { addAPI() }.buttonStyle(.bordered)
                     }.disabled(!canEdit)
                 }
             } else {
@@ -91,17 +95,29 @@ struct SourcesView: View {
         if model.routingMode == "fixed" { return "固定来源 · \(model.fixedName)" }
         return model.settings.loadBalanceEnabled ? "自动切换 · 负载均衡" : "自动切换 · 按优先级分配"
     }
+    private func uniqueSourceName(_ base: String) -> String {
+        let names = Set(model.sources.map(\.name))
+        if !names.contains(base) { return base }
+        var suffix = 2
+        while names.contains("\(base) \(suffix)") { suffix += 1 }
+        return "\(base) \(suffix)"
+    }
     private func addOfficial() {
         var source = Source.newOfficial()
-        let names = Set(model.sources.map(\.name))
-        var suffix = 2
-        while names.contains(source.name) {
-            source.name = "官方账号 \(suffix)"
-            suffix += 1
-        }
+        source.name = uniqueSourceName(source.name)
         editing = EditingSource(source: source, isNew: true)
     }
     private func addAPI() { editing = EditingSource(source: Source(), isNew: true) }
+    private func addOpenAI() {
+        var source = Source.newOpenAI()
+        source.name = uniqueSourceName(source.name)
+        editing = EditingSource(source: source, isNew: true)
+    }
+    private func addGoogle() {
+        var source = Source.newGoogle()
+        source.name = uniqueSourceName(source.name)
+        editing = EditingSource(source: source, isNew: true)
+    }
 
     private var sourceList: some View {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -137,8 +153,11 @@ struct SourcesView: View {
                     if source.official {
                         quotaSummary(source)
                         OfficialResetControl(source: source)
-                    } else {
+                    } else if source.supportsBalanceQuery {
                         APIBalanceView(sourceID: source.id)
+                    } else {
+                        Text(source.models.isEmpty ? (source.discoversModels ? "尚未获取模型" : "未限定模型") : "\(source.models.count) 个模型")
+                            .font(AppTypography.caption).foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 4)
                     Button {
@@ -170,7 +189,7 @@ struct SourcesView: View {
         return HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(source.name).font(AppTypography.sectionTitle).lineLimit(1).help(source.name)
-                Text(source.official ? "官方账号" : "Responses API").font(AppTypography.small).foregroundStyle(.secondary)
+                Text(source.kindLabel).font(AppTypography.small).foregroundStyle(.secondary)
             }
             Spacer(minLength: 4)
             if takingOver {

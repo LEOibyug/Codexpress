@@ -158,9 +158,10 @@ impl LocalCapabilities {
     }
 }
 
-// Polls only check official-cache identity. Local overrides publish explicitly.
+// Polls only check cached catalog identities. Local overrides publish explicitly.
 pub(crate) struct MetadataCache {
-    signature: Option<(u64, SystemTime)>,
+    official_signature: Option<(u64, SystemTime)>,
+    google_signature: Option<(u64, SystemTime)>,
     local: LocalCapabilities,
     metadata: Arc<[Value]>,
     pub(crate) revision: String,
@@ -169,7 +170,13 @@ pub(crate) struct MetadataCache {
 impl MetadataCache {
     pub(crate) fn open(state_dir: &Path) -> Self {
         let local = LocalCapabilities::load(&state_dir.join(LOCAL_CAPABILITIES)).unwrap_or_default();
-        let mut cache = Self { signature: None, local, metadata: Arc::from([]), revision: String::new() };
+        let mut cache = Self {
+            official_signature: None,
+            google_signature: None,
+            local,
+            metadata: Arc::from([]),
+            revision: String::new(),
+        };
         cache.refresh(state_dir);
         cache
     }
@@ -179,18 +186,34 @@ impl MetadataCache {
     }
 
     fn refresh_from_disk(&mut self, state_dir: &Path, force: bool) {
-        let path = state_dir.join("model-catalogs/official-latest.json");
-        let signature = std::fs::metadata(&path).ok().and_then(|metadata| {
+        let google_path = state_dir.join("model-catalogs/google-latest.json");
+        let official_path = state_dir.join("model-catalogs/official-latest.json");
+        let google_sig = std::fs::metadata(&google_path).ok().and_then(|metadata| {
             Some((metadata.len(), metadata.modified().ok()?))
         });
-        if !force && !self.revision.is_empty() && signature == self.signature { return; }
-        self.signature = signature;
+        let official_sig = std::fs::metadata(&official_path).ok().and_then(|metadata| {
+            Some((metadata.len(), metadata.modified().ok()?))
+        });
+        if !force
+            && !self.revision.is_empty()
+            && google_sig == self.google_signature
+            && official_sig == self.official_signature
+        {
+            return;
+        }
+        self.google_signature = google_sig;
+        self.official_signature = official_sig;
         let mut entries = BTreeMap::new();
         if let Ok(catalog) = crate::compaction::bundled_catalog() {
             merge_metadata(&mut entries, catalog);
         }
-        if signature.is_some_and(|(size, _)| size <= 4 * 1024 * 1024) {
-            if let Some(catalog) = fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) {
+        if google_sig.is_some_and(|(size, _)| size <= 4 * 1024 * 1024) {
+            if let Some(catalog) = fs::read(google_path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) {
+                merge_metadata(&mut entries, catalog);
+            }
+        }
+        if official_sig.is_some_and(|(size, _)| size <= 4 * 1024 * 1024) {
+            if let Some(catalog) = fs::read(official_path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) {
                 merge_metadata(&mut entries, catalog);
             }
         }
@@ -287,11 +310,12 @@ pub(crate) struct Catalog {
     names: BTreeSet<String>,
     metadata: Arc<[Value]>,
     rules: Arc<[ModelCompactionRule]>,
+    remote_compaction: BTreeSet<String>,
 }
 
 struct CatalogSource {
     id: String,
-    official: bool,
+    kind: String,
     models: Vec<String>,
 }
 pub(crate) async fn load(state: &Arc<AppState>, client: ClientKind) -> anyhow::Result<Catalog> {
@@ -302,7 +326,7 @@ pub(crate) async fn load(state: &Arc<AppState>, client: ClientKind) -> anyhow::R
             runtime.source.enabled
                 && (settings.mode != "fixed" || settings.fixed_source_id.as_ref() == Some(&runtime.source.id))
         }).map(|runtime| CatalogSource {
-            id: runtime.source.id.clone(), official: runtime.source.kind == "official", models: runtime.source.models.clone(),
+            id: runtime.source.id.clone(), kind: runtime.source.kind.clone(), models: runtime.source.models.clone(),
         }).collect();
         (sources, state.model_policies.read().await.clone(), state.model_compaction.read().await.clone())
     };
@@ -310,14 +334,14 @@ pub(crate) async fn load(state: &Arc<AppState>, client: ClientKind) -> anyhow::R
     let mut names = BTreeSet::new();
     for source in &sources {
         names.extend(source.models.iter().cloned());
-        if source.official && source.models.is_empty() {
+        if source.kind == "official" && source.models.is_empty() {
             names.extend(metadata.iter().filter_map(|entry| entry["slug"].as_str().map(str::to_owned)));
         }
     }
     // Reuse the existing on-demand discovery for uncached API sources. Its result
     // belongs to this snapshot, not to the user's saved capability inventory.
     let requests: Vec<_> = sources.iter().filter(|source| {
-        source.models.is_empty() && (!source.official || metadata.is_empty())
+        source.models.is_empty() && (source.kind != "official" || metadata.is_empty())
     }).map(|source| json!({"source_id":source.id})).collect();
     let discovery_attempted = !requests.is_empty();
     let mut discovery_succeeded = false;
@@ -344,7 +368,14 @@ pub(crate) async fn load(state: &Arc<AppState>, client: ClientKind) -> anyhow::R
     if names.is_empty() && discovery_attempted && !discovery_succeeded {
         anyhow::bail!("无法获取来源模型列表，请先在来源页刷新或手动填写");
     }
-    Ok(Catalog { names, metadata, rules })
+    let remote_compaction = names.iter().filter(|model| {
+        sources.iter().any(|source| {
+            source.kind != "google"
+                && model_policy::source_allowed(&policies, model, &source.id)
+                && (source.models.is_empty() || source.models.iter().any(|id| id == *model))
+        })
+    }).cloned().collect();
+    Ok(Catalog { names, metadata, rules, remote_compaction })
 }
 
 impl Catalog {
@@ -361,8 +392,15 @@ impl Catalog {
         crate::compaction::catalog_from_value(json!({"models":metadata}), &toml_edit::DocumentMut::new(), &rules)
     }
     pub(crate) fn models(self) -> Vec<Value> {
+        let remote_compaction = self.remote_compaction;
+        let metadata = self.metadata;
+        let rules = self.rules;
         self.names.into_iter().map(|id| {
-            normalized_model(&id, self.metadata.iter().find(|model| model["slug"] == id), self.rules.iter().find(|rule| rule.model == id))
+            let mut model = normalized_model(&id, metadata.iter().find(|model| model["slug"] == id), rules.iter().find(|rule| rule.model == id));
+            if !remote_compaction.contains(&id) {
+                model["remote_compaction"] = Value::Bool(false);
+            }
+            model
         }).collect()
     }
 }

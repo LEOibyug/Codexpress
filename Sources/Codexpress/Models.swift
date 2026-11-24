@@ -65,11 +65,41 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
     var max_active_conversations: Int? = nil
     var active_conversation_window_seconds: Int? = nil
     var official: Bool { kind == "official" }
+    var isGoogle: Bool { kind == "google" }
+    var isOpenAI: Bool { kind == "openai" }
+    var supportsBalanceQuery: Bool { kind == "api" }
+    var defaultsDiscoveredModelsDisabled: Bool { isGoogle || isOpenAI }
+    var kindLabel: String {
+        switch kind {
+        case "official": return "官方账号"
+        case "openai": return "OpenAI API Platform"
+        case "google": return "Google AI Studio"
+        default: return "Responses API"
+        }
+    }
     var discoversModels: Bool { automaticModelDiscovery ?? models.isEmpty }
     var policyLabel: String { proxy.mode == "direct" ? "强制直连" : "指定代理" }
     var activeConversationWindowSeconds: Int { active_conversation_window_seconds ?? 15 }
     static func newOfficial() -> Source {
         var s = Source(); s.kind = "official"; s.name = "官方账号"; s.base_url = "https://chatgpt.com/backend-api/codex"; s.proxy.mode = "explicit"; return s
+    }
+    static func newOpenAI() -> Source {
+        var s = Source()
+        s.kind = "openai"
+        s.name = "OpenAI API Platform"
+        s.base_url = "https://api.openai.com/v1"
+        s.proxy.mode = "direct"
+        s.automaticModelDiscovery = true
+        return s
+    }
+    static func newGoogle() -> Source {
+        var s = Source()
+        s.kind = "google"
+        s.name = "Google AI Studio"
+        s.base_url = "https://generativelanguage.googleapis.com/v1beta"
+        s.proxy.mode = "direct"
+        s.automaticModelDiscovery = true
+        return s
     }
     func validate() throws {
         if let limit = max_active_conversations, !(1...1024).contains(limit) {
@@ -84,7 +114,7 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw AppError.message("请填写来源名称。") }
         guard let u = URLComponents(string: base_url), ["http", "https"].contains(u.scheme?.lowercased() ?? ""), u.host != nil, u.user == nil, u.password == nil, u.query == nil, u.fragment == nil else { throw AppError.message("来源地址须为不含账号、密码、查询参数的 HTTP 或 HTTPS 地址。") }
         guard !official || base_url.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == "https://chatgpt.com/backend-api/codex" else { throw AppError.message("官方来源必须使用官方 Codex 地址。") }
-        guard ["api", "official"].contains(kind), ["direct", "explicit"].contains(proxy.mode) else { throw AppError.message("来源类型或网络策略无效。") }
+        guard ["api", "official", "google", "openai"].contains(kind), ["direct", "explicit"].contains(proxy.mode) else { throw AppError.message("来源类型或网络策略无效。") }
         guard !official || proxy.mode == "explicit" else { throw AppError.message("官方账号必须使用指定代理。") }
         if proxy.mode == "explicit" {
             guard let raw = proxy.url, let p = URLComponents(string: raw), ["http", "https", "socks5", "socks5h"].contains(p.scheme?.lowercased() ?? ""), p.host != nil, let port = p.port, (1...65535).contains(port), p.user == nil, p.password == nil, p.query == nil, p.fragment == nil, p.path.isEmpty || p.path == "/" else { throw AppError.message("请填写有效的代理端口（1–65535）。") }
@@ -141,6 +171,7 @@ struct AppSettings: Codable, Sendable {
     var upstreamRetryDelaySeconds: Int? = nil
     var historyCache: HistoryCacheSettings? = nil
     var sshRemoteProfiles: [SSHRemoteProfile]? = nil
+    var autoExportChatbotEnvironment: Bool? = nil
     var lowQuotaPercent: Int { officialLowQuotaPercent ?? 10 }
     var officialQuotaRefreshInterval: Int { max(officialQuotaRefreshMinutes ?? 30, 1) }
     func weeklyResetEnabled(for source: Source) -> Bool {
@@ -162,6 +193,7 @@ struct AppSettings: Codable, Sendable {
     var upstreamAttemptLimit: Int { min(max(upstreamAttempts ?? 3, 1), 10) }
     var upstreamRetryDelay: Int { min(max(upstreamRetryDelaySeconds ?? 3, 0), 300) }
     var historyCacheSettings: HistoryCacheSettings { historyCache ?? HistoryCacheSettings() }
+    var autoExportChatbotEnvironmentEnabled: Bool { autoExportChatbotEnvironment ?? false }
 }
 
 struct HistoryCacheSettings: Codable, Equatable, Sendable {

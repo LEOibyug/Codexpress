@@ -139,4 +139,86 @@ final class PersistenceTests: XCTestCase {
         source.base_url = "https://example.com/v1?api_key=private"; XCTAssertThrowsError(try source.validate())
         source.base_url = "https://private@example.com/v1"; XCTAssertThrowsError(try source.validate())
     }
+
+    func testChatbotEnvironmentExportDefaultsOffAndPersistsOptIn() throws {
+        let legacy = Data(#"{"sources":[],"mode":"auto","port":17863,"codexHome":"/temporary/codex"}"#.utf8)
+        var settings = try JSONDecoder().decode(AppSettings.self, from: legacy)
+        XCTAssertFalse(settings.autoExportChatbotEnvironmentEnabled)
+        settings.autoExportChatbotEnvironment = true
+        let restored = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertTrue(restored.autoExportChatbotEnvironmentEnabled)
+    }
+
+    @MainActor func testGoogleAndOpenAISourcesDefaultPoliciesAndProviderToggles() throws {
+        let google = Source.newGoogle()
+        XCTAssertTrue(google.isGoogle)
+        XCTAssertFalse(google.supportsBalanceQuery)
+        XCTAssertTrue(google.defaultsDiscoveredModelsDisabled)
+        XCTAssertEqual(google.kindLabel, "Google AI Studio")
+        XCTAssertEqual(google.base_url, "https://generativelanguage.googleapis.com/v1beta")
+        XCTAssertNoThrow(try google.validate())
+
+        let openai = Source.newOpenAI()
+        XCTAssertTrue(openai.isOpenAI)
+        XCTAssertFalse(openai.supportsBalanceQuery)
+        XCTAssertTrue(openai.defaultsDiscoveredModelsDisabled)
+        XCTAssertEqual(openai.kindLabel, "OpenAI API Platform")
+        XCTAssertEqual(openai.base_url, "https://api.openai.com/v1")
+        XCTAssertNoThrow(try openai.validate())
+
+        var customAPI = Source()
+        customAPI.id = "custom-api"
+        customAPI.name = "Custom Relay"
+        customAPI.priority = 0
+        customAPI.models = ["gpt-5.4", "claude-sonnet"]
+        XCTAssertTrue(customAPI.supportsBalanceQuery)
+        XCTAssertFalse(customAPI.defaultsDiscoveredModelsDisabled)
+
+        var googleSource = google
+        googleSource.id = "google-src"
+        googleSource.priority = 1
+        googleSource.models = ["gemini-2.5-pro", "gemini-2.5-flash"]
+
+        var openaiSource = openai
+        openaiSource.id = "openai-src"
+        openaiSource.priority = 2
+        openaiSource.models = ["gpt-5.4", "o3"]
+
+        var settings = AppSettings()
+        settings.sources = [customAPI, googleSource, openaiSource]
+        // Existing model policy with sourceIDs == nil (e.g., customized clients) must keep existing non-default-disabled sources only.
+        settings.modelPolicies = [ModelPolicy(model: "gpt-5.4", sourceIDs: nil, clients: [.codex, .omp])]
+
+        XCTAssertEqual(AppModel.applyDefaultDisabledPolicies(for: googleSource, in: &settings), 2)
+        XCTAssertEqual(AppModel.applyDefaultDisabledPolicies(for: openaiSource, in: &settings), 2)
+
+        let geminiProPolicy = settings.modelPolicies?.first { $0.model == "gemini-2.5-pro" }
+        XCTAssertEqual(geminiProPolicy?.sourceIDs, [])
+        XCTAssertFalse(ModelPolicy.isEnabled("gemini-2.5-pro", in: settings))
+
+        let gptPolicy = settings.modelPolicies?.first { $0.model == "gpt-5.4" }
+        XCTAssertEqual(gptPolicy?.sourceIDs, ["custom-api"])
+        XCTAssertEqual(gptPolicy?.clients, [.codex, .omp])
+        XCTAssertTrue(ModelPolicy.isEnabled("gpt-5.4", on: customAPI, in: settings))
+        XCTAssertFalse(ModelPolicy.isEnabled("gpt-5.4", on: openaiSource, in: settings))
+
+        let o3Policy = settings.modelPolicies?.first { $0.model == "o3" }
+        XCTAssertEqual(o3Policy?.sourceIDs, [])
+        XCTAssertFalse(ModelPolicy.isEnabled("o3", in: settings))
+
+        // Enabling a model on one provider does not re-disable already known models on refresh.
+        try ModelPolicy.setProviderModelsEnabled(sourceID: googleSource.id, modelIDs: ["gemini-2.5-pro"], enabled: true, in: &settings)
+        XCTAssertTrue(ModelPolicy.isEnabled("gemini-2.5-pro", on: googleSource, in: settings))
+        XCTAssertFalse(ModelPolicy.isEnabled("gemini-2.5-flash", on: googleSource, in: settings))
+
+        googleSource.models.append("gemini-3-flash-preview")
+        XCTAssertEqual(AppModel.applyDefaultDisabledPolicies(for: googleSource, previousModels: ["gemini-2.5-pro", "gemini-2.5-flash"], in: &settings), 1)
+        XCTAssertTrue(ModelPolicy.isEnabled("gemini-2.5-pro", on: googleSource, in: settings))
+        XCTAssertFalse(ModelPolicy.isEnabled("gemini-3-flash-preview", on: googleSource, in: settings))
+
+        try ModelPolicy.setModelsEnabled(["gemini-2.5-flash"], enabled: true, in: &settings)
+        XCTAssertTrue(ModelPolicy.isEnabled("gemini-2.5-flash", in: settings))
+        try ModelPolicy.setModelsEnabled(["gemini-2.5-flash"], enabled: false, in: &settings)
+        XCTAssertFalse(ModelPolicy.isEnabled("gemini-2.5-flash", in: settings))
+    }
 }

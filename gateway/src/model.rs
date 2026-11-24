@@ -126,7 +126,7 @@ impl Source {
         {
             bail!("来源的标识和名称不能为空");
         }
-        if !["api", "official"].contains(&self.kind.as_str()) {
+        if !["api", "official", "google", "openai"].contains(&self.kind.as_str()) {
             bail!("未知来源类型");
         }
         if self
@@ -173,7 +173,7 @@ impl Source {
             }
             _ => bail!("未知代理策略"),
         }
-        if self.kind == "api"
+        if matches!(self.kind.as_str(), "api" | "google" | "openai")
             && self
                 .secret
                 .get("api_key")
@@ -204,7 +204,7 @@ pub struct SourceRuntime {
 
 impl SourceRuntime {
     pub fn new(source: Source) -> Self {
-        let ready = source.kind == "api"
+        let ready = source.kind != "official"
             || source
                 .secret
                 .get("access_token")
@@ -285,6 +285,7 @@ pub struct AppState {
     pub(crate) model_policies: RwLock<Arc<[crate::model_policy::ModelPolicy]>>,
     pub(crate) role_capabilities: crate::relay::RoleCapabilities,
     pub(crate) omp_cache_groups: Mutex<crate::omp_ingress::CacheGroups>,
+    pub(crate) google_signatures: crate::google::ThoughtSignatures,
     pub bindings: Mutex<HashMap<String, String>>,
     pub usage: Arc<crate::usage::UsageStore>,
     pub affinity: Arc<crate::affinity::AffinityStore>,
@@ -348,6 +349,7 @@ impl AppState {
                 state_dir.join("source-compatibility.json"),
             ),
             omp_cache_groups: Mutex::new(Default::default()),
+            google_signatures: Default::default(),
             bindings: Mutex::new(HashMap::new()),
             usage: Arc::new(usage),
             affinity: crate::affinity::AffinityStore::open(&state_dir.join("affinity.sqlite"))?,

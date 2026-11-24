@@ -126,6 +126,9 @@ fn unsupported_sources() -> &'static std::sync::Mutex<std::collections::HashSet<
     &SOURCES
 }
 pub(crate) fn compaction_capability(source: &crate::model::Source) -> Option<bool> {
+    if source.kind == "google" {
+        return Some(false);
+    }
     unsupported_sources().lock().ok()?.contains(&source.identity()).then_some(false)
 }
 pub(crate) fn observe_compaction_rejection(source: &crate::model::Source, status: StatusCode, value: &Value) {

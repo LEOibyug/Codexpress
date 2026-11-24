@@ -120,8 +120,12 @@ struct MenuView: View {
                             }.fixedSize()
                         }
                     }
+                } else if source.supportsBalanceQuery {
+                    APIBalanceView(sourceID: source.id, compact: true)
+                } else {
+                    Text("\(source.kindLabel) · \(source.models.isEmpty ? (source.discoversModels ? "尚未获取模型" : "未限定模型") : "\(source.models.count) 个模型")")
+                        .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
                 }
-                else { APIBalanceView(sourceID: source.id, compact: true) }
             }.frame(maxWidth: .infinity, alignment: .leading)
         }.padding(.vertical, 9)
     }

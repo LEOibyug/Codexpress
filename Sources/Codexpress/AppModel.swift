@@ -50,12 +50,18 @@ import ServiceManagement
     @Published private(set) var codexConnectionPhase: String?
     @Published private(set) var configurationBackups: [JSONValue] = []
     @Published private(set) var credentialStorage: JSONValue = .null
+    @Published private(set) var environmentSyncWorking = false
+    @Published private(set) var environmentSynced = false
+    @Published private(set) var environmentSyncError: String?
     let directory: URL
+    let environmentAccess: ChatbotEnvironmentAccess
     private let metadata: MetadataStore
     var credentialSnapshot = CredentialSnapshot()
     let client: GatewayClient
     private var helper: Process?
     private var stagedGateway: URL?
+    private var environmentSyncTask: Task<Void, Never>?
+    private var environmentSyncGeneration: UInt64 = 0
     private struct GatewayUpdate {
         let version: String
         let process: Process
@@ -113,9 +119,16 @@ import ServiceManagement
         let home = directory.standardizedFileURL == standard.standardizedFileURL ? FileManager.default.homeDirectoryForCurrentUser : directory
         return home.appendingPathComponent(".codexpress/credentials.json")
     }
-    init(stateDirectory: URL? = nil) {
+    init(stateDirectory: URL? = nil, environmentAccess: ChatbotEnvironmentAccess? = nil) {
         let override = ProcessInfo.processInfo.environment["CODEXPRESS_STATE_DIR"]
         directory = stateDirectory ?? override.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Codexpress", isDirectory: true)
+        if let environmentAccess {
+            self.environmentAccess = environmentAccess
+        } else if stateDirectory == nil && override == nil {
+            self.environmentAccess = .live
+        } else {
+            self.environmentAccess = ChatbotEnvironmentAccess(homeDirectory: directory.appendingPathComponent("env-home", isDirectory: true), launchctl: .noop)
+        }
         metadata = MetadataStore(directory: directory)
         client = GatewayClient(socketPath: directory.appendingPathComponent("control.sock").path)
         do {
@@ -123,6 +136,7 @@ import ServiceManagement
             modelSettingsRevision = try ModelSettingsRevision.value(for: loaded)
             settings = loaded
         } catch { metadataLoadFailed = true; self.error = "来源文件无法读取，已进入只读保护。原文件未改动，请从备份修复后重新启动应用。" }
+        environmentSynced = self.environmentAccess.inspect().synced
         configuredModelIDs = Self.modelIDs(in: settings)
         do {
             balanceWarnings = try BalanceWarnings(directory: directory)
@@ -156,7 +170,7 @@ import ServiceManagement
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(1800)) } catch { break }
                 guard !Task.isCancelled, let self else { break }
-                await self.refreshAccountInfo(sourceIDs: self.sources.filter { !$0.official }.map(\.id), foreground: false)
+                await self.refreshAccountInfo(sourceIDs: self.sources.filter(\.supportsBalanceQuery).map(\.id), foreground: false)
             }
         }
         officialBackgroundStartedAt = Date()
@@ -230,6 +244,7 @@ import ServiceManagement
             if expectedVersion != nil { _ = try await client.call("gateway.update.release") }
             gatewayVersion = info["version"].string
             await poll()
+            _ = await syncChatbotEnvironmentIfEnabled(showSuccessNotice: false)
         } catch {
             // A rejected sync still leaves our verified helper available for
             // repairing source settings. Never adopt an unverified instance.
@@ -495,7 +510,7 @@ import ServiceManagement
             if officialRefreshSchedule.observeQuota(id, snapshot: live["quota"]) { officialScheduleChanged = true }
         }
         if officialScheduleChanged { scheduleOfficialAccountRefresh() }
-        for before in balanceSources where !before.official {
+        for before in balanceSources where before.supportsBalanceQuery {
             guard let current = settings.sources.first(where: { $0.id == before.id }), current.sameConfiguration(as: before),
                   (try? balanceCredentials.load(before.id)) == (try? credentialSnapshot.load(before.id)) else { continue }
             let live = fresh["sources"].array.first(where: { $0["id"].string == before.id }) ?? .null
@@ -610,7 +625,7 @@ import ServiceManagement
     }
     func refreshAccountInfo(sourceIDs: [String]? = nil, foreground: Bool = true) async {
         guard running, !busy, !Task.isCancelled else { return }
-        let selected = sources.filter { $0.enabled && (sourceIDs?.contains($0.id) ?? true) }
+        let selected = sources.filter { $0.enabled && ($0.official || $0.supportsBalanceQuery) && (sourceIDs?.contains($0.id) ?? true) }
         // Bounded concurrency keeps many configured sources from monopolizing
         // the management socket; no account request lives in the status poll.
         await withTaskGroup(of: Void.self) { group in
@@ -627,7 +642,7 @@ import ServiceManagement
             guard before.enabled, !refreshingQuotas.contains(id), officialRefreshSchedule.isDue(id, foreground: foreground, interval: Double(settings.officialQuotaRefreshInterval) * 60, since: officialBackgroundStartedAt), let secret = try? credentialSnapshot.load(id), secret["access_token"].string?.isEmpty == false else { return }
             let includeCredits = !officialRefreshSchedule.isRetrying(id) && officialRefreshSchedule.needsCredits(id)
             try? await queryOfficial(id, includeCredits: includeCredits)
-        } else {
+        } else if before.supportsBalanceQuery {
             guard !refreshingBalances.contains(id) else { return }
             if !force, let cached = apiBalances[id], (cached["failure_count"].number ?? 0) > 0,
                let retry = cached["next_retry_at"].number, retry > Date().timeIntervalSince1970 { return }
@@ -687,6 +702,7 @@ import ServiceManagement
             if let i = next.sources.firstIndex(where: { $0.id == source.id }) { next.sources[i] = source }
             else { var item = source; item.priority = next.sources.count; next.sources.append(item) }
             if next.fixed_source_id == source.id && !source.enabled { next.mode = "auto"; next.fixed_source_id = nil }
+            _ = Self.applyDefaultDisabledPolicies(for: source, previousModels: previous?.models ?? [], in: &next)
         }
         if connectionChanged {
             modelErrors[source.id] = nil
@@ -750,6 +766,7 @@ import ServiceManagement
             try await updateSettingsAndSync { next in
                 next.sources[index].automaticModelDiscovery = true
                 next.sources[index].models = models
+                _ = Self.applyDefaultDisabledPolicies(for: next.sources[index], previousModels: before.models, in: &next)
             }
         } catch {
             if !Task.isCancelled, settings.sources.contains(where: { $0 == before }),
@@ -1003,6 +1020,65 @@ import ServiceManagement
         if settings.sources.contains(where: \.official) { ids.insert("gpt-image-2") }
         return ids.sorted()
     }
+    @discardableResult
+    static func applyDefaultDisabledPolicies(for source: Source, previousModels: [String] = [], in settings: inout AppSettings) -> Int {
+        guard source.defaultsDiscoveredModelsDisabled, source.discoversModels, !source.models.isEmpty else { return 0 }
+        var policies = settings.modelPolicies ?? []
+        let previousSet = Set(previousModels)
+        var added = 0
+        for modelID in source.models where !previousSet.contains(modelID) {
+            let otherSourceIDs = settings.sources
+                .filter { $0.id != source.id && !$0.defaultsDiscoveredModelsDisabled && ($0.models.isEmpty || $0.models.contains(modelID)) }
+                .sorted { $0.priority < $1.priority }
+                .map(\.id)
+            if let index = policies.firstIndex(where: { $0.model == modelID }) {
+                if policies[index].sourceIDs == nil {
+                    policies[index].sourceIDs = otherSourceIDs
+                    added += 1
+                }
+            } else {
+                policies.append(ModelPolicy(
+                    model: modelID,
+                    sourceIDs: otherSourceIDs,
+                    clients: ModelPolicy.applicableClients(for: modelID)
+                ))
+                added += 1
+            }
+        }
+        if added > 0 { settings.modelPolicies = policies }
+        return added
+    }
+    func setModelsEnabled(_ ids: [String], enabled: Bool) async throws {
+        try await updateModelPolicies(successMessage: enabled ? "已启用所选模型。" : "已停用所选模型。") { next in
+            try ModelPolicy.setModelsEnabled(ids, enabled: enabled, in: &next)
+        }
+    }
+    func setProviderModelsEnabled(sourceID: String, modelIDs: [String], enabled: Bool) async throws {
+        try await updateModelPolicies(successMessage: enabled ? "已启用所选来源模型。" : "已停用所选来源模型。") { next in
+            try ModelPolicy.setProviderModelsEnabled(sourceID: sourceID, modelIDs: modelIDs, enabled: enabled, in: &next)
+        }
+    }
+    private func updateModelPolicies(successMessage: String, mutate: (inout AppSettings) throws -> Void) async throws {
+        guard !busy else { throw AppError.message("请等待当前操作完成后重试。") }
+        busy = true
+        defer { busy = false }
+        try requireWritableMetadata()
+        var next = settings
+        try mutate(&next)
+        try persistSettings(next)
+        preview = .null
+        pendingSync = true
+        if running {
+            do {
+                try await sync()
+            } catch {
+                throw AppError.message("模型设置已保存在本机，但同步网关失败：\(error.localizedDescription)")
+            }
+            notice = successMessage
+        } else {
+            notice = "模型设置已保存在本机，启动网关后生效。"
+        }
+    }
     func saveModelSettings(model id: String, policy: ModelPolicy?, compaction: ModelCompactionRule?) async throws {
         guard !busy else { throw AppError.message("请等待当前操作完成后重试。") }
         busy = true
@@ -1079,7 +1155,7 @@ import ServiceManagement
         perform {
             var next = self.settings
             next.legacyProviderOrigins = try values.filter { !$0.value.isEmpty }.map { provider, id in
-                guard let source = self.sources.first(where: {$0.id == id && !$0.official}), let identity = self.state(id)["identity_digest"].string else { throw AppError.message("来源状态已变化，请刷新后重新选择。") }
+                guard let source = self.sources.first(where: {$0.id == id && !$0.official && !$0.isGoogle}), let identity = self.state(id)["identity_digest"].string else { throw AppError.message("来源状态已变化，请刷新后重新选择。") }
                 return LegacyProviderOrigin(provider_id: provider, source_id: source.id, source_identity: identity)
             }.sorted { $0.provider_id < $1.provider_id }
             try self.persistSettings(next)
@@ -1169,5 +1245,121 @@ import ServiceManagement
     func setLaunchAtLogin(_ value: Bool) {
         do { if value { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }; launchAtLogin = SMAppService.mainApp.status == .enabled }
         catch { self.error = "无法更新登录启动设置：\(error.localizedDescription)" }
+    }
+    func refreshEnvironmentSyncInspection() {
+        environmentSynced = environmentAccess.inspect().synced
+    }
+    func setAutoExportChatbotEnvironment(_ enabled: Bool) {
+        do {
+            try requireWritableMetadata()
+            var next = settings
+            next.autoExportChatbotEnvironment = enabled
+            try persistSettings(next)
+            environmentSyncError = nil
+            if enabled {
+                _ = enqueueEnvironmentOperation { generation in
+                    guard self.settings.autoExportChatbotEnvironmentEnabled else { return }
+                    guard self.running else {
+                        self.environmentSynced = self.environmentAccess.inspect().synced
+                        if self.environmentSyncGeneration == generation {
+                            self.notice = "已开启环境变量自动同步，网关启动后将写入配置。"
+                        }
+                        return
+                    }
+                    await self.applyChatbotEnvironment(generation: generation, showSuccessNotice: true)
+                }
+            } else {
+                _ = enqueueEnvironmentOperation { generation in
+                    await self.removeChatbotEnvironment(generation: generation, showSuccessNotice: true)
+                }
+            }
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+    @discardableResult
+    func syncChatbotEnvironmentIfEnabled(showSuccessNotice: Bool = false) async -> Bool {
+        guard settings.autoExportChatbotEnvironmentEnabled else {
+            refreshEnvironmentSyncInspection()
+            return true
+        }
+        let task = enqueueEnvironmentOperation { generation in
+            await self.applyChatbotEnvironment(generation: generation, showSuccessNotice: showSuccessNotice)
+        }
+        await task.value
+        return environmentSyncError == nil
+    }
+    func syncChatbotEnvironmentNow() {
+        Task { _ = await syncChatbotEnvironmentIfEnabled(showSuccessNotice: true) }
+    }
+    func retryChatbotEnvironmentCleanup() {
+        guard !settings.autoExportChatbotEnvironmentEnabled else { return }
+        _ = enqueueEnvironmentOperation { generation in
+            await self.removeChatbotEnvironment(generation: generation, showSuccessNotice: true)
+        }
+    }
+    private func enqueueEnvironmentOperation(_ operation: @escaping @MainActor (UInt64) async -> Void) -> Task<Void, Never> {
+        environmentSyncGeneration &+= 1
+        let generation = environmentSyncGeneration
+        environmentSyncWorking = true
+        let previous = environmentSyncTask
+        let task = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self else { return }
+            await operation(generation)
+            if self.environmentSyncGeneration == generation {
+                self.environmentSyncWorking = false
+            }
+        }
+        environmentSyncTask = task
+        return task
+    }
+    private func applyChatbotEnvironment(generation: UInt64, showSuccessNotice: Bool) async {
+        guard environmentSyncGeneration == generation, settings.autoExportChatbotEnvironmentEnabled else { return }
+        guard running else {
+            environmentSynced = environmentAccess.inspect().synced
+            environmentSyncError = "请先启动本机网关。"
+            return
+        }
+        let access = environmentAccess
+        do {
+            let statusResult = try await client.call("chatbot.status")
+            let keyResult = try await client.call("chatbot.key")
+            guard let baseURL = statusResult["base_url"].string, !baseURL.isEmpty else {
+                throw AppError.message("无法读取聊天客户端接口地址。")
+            }
+            guard let key = keyResult["key"].string, !key.isEmpty else {
+                throw AppError.message("无法读取聊天客户端 Key。")
+            }
+            guard environmentSyncGeneration == generation, settings.autoExportChatbotEnvironmentEnabled else { return }
+            try await Task.detached(priority: .utility) {
+                try access.apply(baseURL: baseURL, key: key)
+            }.value
+            guard environmentSyncGeneration == generation else { return }
+            environmentSynced = access.inspect().synced
+            environmentSyncError = nil
+            if showSuccessNotice { notice = "聊天客户端环境变量已同步。" }
+        } catch {
+            guard environmentSyncGeneration == generation else { return }
+            environmentSynced = access.inspect().synced
+            environmentSyncError = error.localizedDescription
+        }
+    }
+    private func removeChatbotEnvironment(generation: UInt64, showSuccessNotice: Bool) async {
+        guard environmentSyncGeneration == generation, !settings.autoExportChatbotEnvironmentEnabled else { return }
+        let access = environmentAccess
+        do {
+            try await Task.detached(priority: .utility) {
+                try access.remove()
+            }.value
+            guard environmentSyncGeneration == generation else { return }
+            environmentSynced = access.inspect().synced
+            environmentSyncError = nil
+            if showSuccessNotice { notice = "已关闭并清理聊天客户端环境变量。" }
+        } catch {
+            guard environmentSyncGeneration == generation else { return }
+            environmentSynced = access.inspect().synced
+            environmentSyncError = error.localizedDescription
+        }
     }
 }

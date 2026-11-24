@@ -49,6 +49,100 @@ struct ModelPolicy: Codable, Equatable, Sendable {
             throw AppError.message("请填写不含空白的模型 ID，最多 256 字节。")
         }
     }
+    static func applicableClients(for modelID: String) -> [ModelClient] {
+        ModelClient.allCases.filter { $0.isApplicable(to: modelID) }
+    }
+    static func supports(model modelID: String, source: Source) -> Bool {
+        if modelID == "gpt-image-2" { return source.official }
+        return source.models.isEmpty || source.models.contains(modelID)
+    }
+    static func supportingSourceIDs(for modelID: String, in settings: AppSettings) -> [String] {
+        settings.sources
+            .sorted { $0.priority < $1.priority }
+            .filter { supports(model: modelID, source: $0) }
+            .map(\.id)
+    }
+    static func isEnabled(_ modelID: String, in settings: AppSettings) -> Bool {
+        let policy = settings.modelPolicies?.first { $0.model == modelID }
+        let clients = (policy?.clients ?? ModelClient.allCases).filter { $0.isApplicable(to: modelID) }
+        return !clients.isEmpty && policy?.sourceIDs?.isEmpty != true
+    }
+    static func isEnabled(_ modelID: String, on source: Source, in settings: AppSettings) -> Bool {
+        guard supports(model: modelID, source: source) else { return false }
+        let policy = settings.modelPolicies?.first { $0.model == modelID }
+        let clients = (policy?.clients ?? ModelClient.allCases).filter { $0.isApplicable(to: modelID) }
+        guard !clients.isEmpty else { return false }
+        if let sourceIDs = policy?.sourceIDs {
+            return sourceIDs.contains(source.id)
+        }
+        return true
+    }
+    static func setModelsEnabled(_ ids: [String], enabled: Bool, in settings: inout AppSettings) throws {
+        var seen = Set<String>()
+        let uniqueIDs = try ids.compactMap { raw -> String? in
+            let id = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            try validateModelID(id)
+            return seen.insert(id).inserted ? id : nil
+        }
+        guard !uniqueIDs.isEmpty else { return }
+        var policies = settings.modelPolicies ?? []
+        for id in uniqueIDs {
+            let applicable = applicableClients(for: id)
+            if let index = policies.firstIndex(where: { $0.model == id }) {
+                var policy = policies[index]
+                if enabled {
+                    if policy.sourceIDs?.isEmpty == true { policy.sourceIDs = nil }
+                    policy.clients = applicable
+                } else {
+                    policy.clients = []
+                }
+                policies[index] = policy
+            } else {
+                policies.append(ModelPolicy(model: id, sourceIDs: nil, clients: enabled ? applicable : []))
+            }
+        }
+        try validate(policies)
+        settings.modelPolicies = policies
+    }
+    static func setProviderModelsEnabled(sourceID: String, modelIDs: [String], enabled: Bool, in settings: inout AppSettings) throws {
+        var seen = Set<String>()
+        let uniqueIDs = try modelIDs.compactMap { raw -> String? in
+            let id = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            try validateModelID(id)
+            return seen.insert(id).inserted ? id : nil
+        }
+        guard !uniqueIDs.isEmpty else { return }
+        var policies = settings.modelPolicies ?? []
+        for id in uniqueIDs {
+            let applicable = applicableClients(for: id)
+            let existing = policies.first { $0.model == id }
+            let effectiveClients = (existing?.clients ?? applicable).filter { $0.isApplicable(to: id) }
+            var nextIDs: [String]
+            if let explicit = existing?.sourceIDs {
+                nextIDs = explicit
+            } else if effectiveClients.isEmpty {
+                nextIDs = []
+            } else {
+                nextIDs = supportingSourceIDs(for: id, in: settings)
+            }
+            let nextClients: [ModelClient]
+            if enabled {
+                if !nextIDs.contains(sourceID) { nextIDs.append(sourceID) }
+                nextClients = effectiveClients.isEmpty ? applicable : effectiveClients
+            } else {
+                nextIDs.removeAll { $0 == sourceID }
+                nextClients = effectiveClients
+            }
+            let updated = ModelPolicy(model: id, sourceIDs: nextIDs, clients: nextClients)
+            if let index = policies.firstIndex(where: { $0.model == id }) {
+                policies[index] = updated
+            } else {
+                policies.append(updated)
+            }
+        }
+        try validate(policies)
+        settings.modelPolicies = policies
+    }
 }
 
 enum ModelSettingsRevision {

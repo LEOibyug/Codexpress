@@ -29,7 +29,7 @@ struct OverviewView: View {
                     if !model.sources.isEmpty { Button("管理来源池", action: openSources) }
                 }) {
                     if model.sources.isEmpty {
-                        SettingRow(title: "还没有来源", subtitle: "添加官方账号或 Responses API 后即可接收请求。") {
+                        SettingRow(title: "还没有来源", subtitle: "添加官方账号、OpenAI API Platform、Google AI Studio 或 Responses API 后即可接收请求。") {
                             Button("添加来源", action: openSources).buttonStyle(.borderedProminent)
                         }
                     } else {
@@ -148,7 +148,12 @@ struct OverviewView: View {
                     }
                     OfficialResetControl(source: source)
                 }
-            } else { APIBalanceView(sourceID: source.id).fixedSize(horizontal: true, vertical: false) }
+            } else if source.supportsBalanceQuery {
+                APIBalanceView(sourceID: source.id).fixedSize(horizontal: true, vertical: false)
+            } else {
+                Text(source.models.isEmpty ? (source.discoversModels ? "尚未获取模型" : "未限定模型") : "\(source.models.count) 个模型")
+                    .font(AppTypography.small).foregroundStyle(.secondary)
+            }
         }
     }
 

@@ -48,7 +48,7 @@ struct SourceEditor: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            PageHeading(isNew ? "添加来源" : "编辑来源", subtitle: source.official ? "ChatGPT 官方账号" : "Responses API")
+            PageHeading(isNew ? "添加来源" : "编辑来源", subtitle: source.official ? "ChatGPT 官方账号" : source.kindLabel)
                 .padding(.horizontal, 24).padding(.top, 20).padding(.bottom, 8)
 
             Form {
@@ -106,7 +106,7 @@ struct SourceEditor: View {
                     }
                 }
                 conversationCapacitySection
-                if !source.official {
+                if source.supportsBalanceQuery {
                     Section("余额预警") {
                         Toggle("余额不足时通知", isOn: $balanceWarningEnabled)
                             .toggleStyle(.switch)
@@ -189,7 +189,7 @@ struct SourceEditor: View {
             do {
                 var draft = try configuredSource()
                 draft = try draft.withConversationCapacity(enabled: capacityLimitEnabled, limit: maxActiveConversations, windowSeconds: activityWindowSeconds)
-                if !draft.official, balanceWarningEnabled {
+                if draft.supportsBalanceQuery, balanceWarningEnabled {
                     guard let threshold = Double(balanceWarningAmount.trimmingCharacters(in: .whitespacesAndNewlines)), threshold.isFinite, threshold >= 0 else {
                         throw AppError.message("预警余额须为大于或等于 0 的金额。")
                     }
@@ -205,6 +205,9 @@ struct SourceEditor: View {
                 }
                 try await model.saveSource(draft, apiKey: apiKey)
                 apiKey = ""; dismiss()
+                if isNew && draft.defaultsDiscoveredModelsDisabled && !draft.models.isEmpty {
+                    model.notice = "已添加 \(draft.kindLabel) 来源，新获取的模型默认停用，请在「模型」页勾选启用。"
+                }
                 if isNew && draft.official && model.loginFlow == nil { model.login(draft) }
             }
             catch { localError = error.localizedDescription }

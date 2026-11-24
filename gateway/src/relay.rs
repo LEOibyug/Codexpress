@@ -6,7 +6,7 @@ pub(crate) use roles::RoleCapabilities;
 
 use self::{
     request::{clear_body_headers, retry_request, Payload},
-    response::{probe_context_rejection, read_error_prefix, response_has_output, response_is_sse, stream_response, Attempt},
+    response::{probe_context_rejection, read_error_prefix, response_has_output, response_is_sse, stream_response, stream_translated_response, Attempt},
 };
 use crate::{
     model::{AppState, Source},
@@ -1053,7 +1053,7 @@ async fn forward_once(
             sources = priority;
         } else if let Some(recovered) = priority.into_iter().find(&retry_quota) {
             // The prior priority probe already used these exact wire bytes.
-            if !sources.iter().any(|source| retry_quota(source)) {
+            if !sources.iter().any(&retry_quota) {
                 sources.insert(0, recovered);
             }
         }
@@ -1322,6 +1322,19 @@ async fn forward_once(
             }
             return response;
         }
+        if candidate.kind == "google"
+            && (parts.uri.path() == "/v1/responses/compact" || native_compaction)
+        {
+            let mut response = (StatusCode::BAD_REQUEST, axum::Json(json!({"error":{
+                "code":"unsupported_compaction","type":"invalid_request_error",
+                "message":"Google AI Studio 来源不支持原生上下文压缩",
+                "param":"compaction_trigger"}}))).into_response();
+            for (name, value) in [("x-codexpress-source-id", candidate.id.clone()),
+                ("x-codexpress-source-identity", candidate.identity())] {
+                if let Ok(value) = HeaderValue::from_str(&value) { response.headers_mut().insert(name, value); }
+            }
+            return response;
+        }
         let mut source = if candidate.kind == "official" {
             match crate::official::ensure_access(&state, &candidate.id).await {
                 Ok(source) if source.identity() == candidate.identity() => source,
@@ -1392,6 +1405,7 @@ async fn forward_once(
             if !eligible {
                 break;
             }
+            let is_google = source.kind == "google";
             let (wire_bytes, ignored_parameters) = match payload.wire(
                 source.kind == "official",
                 history_capture.as_ref().map(|h| &h.request["input"]),
@@ -1413,6 +1427,56 @@ async fn forward_once(
                 if body.get("instructions").is_none() { body["instructions"] = json!(""); }
                 Bytes::from(serde_json::to_vec(&body).expect("JSON"))
             } else { wire_bytes };
+            let (wire_bytes, openai_sanitized) = if source.kind == "openai" && !native_compaction {
+                if let Ok(mut body) = serde_json::from_slice::<Value>(&wire_bytes) {
+                    let mut changed = false;
+                    if let Some(map) = body.as_object_mut() {
+                        changed |= map.remove("client_metadata").is_some();
+                        changed |= map.remove("access_programs").is_some();
+                        if let Some(stream_options) = map.get_mut("stream_options").and_then(Value::as_object_mut) {
+                            if stream_options.remove("reasoning_summary_delivery").is_some() {
+                                changed = true;
+                            }
+                            if stream_options.is_empty() {
+                                map.remove("stream_options");
+                            }
+                        }
+                    }
+                    if changed {
+                        (Bytes::from(serde_json::to_vec(&body).expect("JSON")), true)
+                    } else {
+                        (wire_bytes, false)
+                    }
+                } else {
+                    (wire_bytes, false)
+                }
+            } else {
+                (wire_bytes, false)
+            };
+            let (url, wire_bytes, google_stream) = if is_google {
+                let mut effective_body: Value = match serde_json::from_slice(&wire_bytes) {
+                    Ok(value) => value,
+                    Err(_) => return error(StatusCode::BAD_REQUEST, "Responses 请求需要有效 JSON"),
+                };
+                if effective_body.get("previous_response_id").is_some_and(|v| !v.is_null()) {
+                    if let Some(expanded) = history_capture.as_ref().map(|h| &h.request["input"]) {
+                        effective_body["input"] = expanded.clone();
+                        if let Some(obj) = effective_body.as_object_mut() {
+                            obj.remove("previous_response_id");
+                        }
+                    }
+                }
+                match crate::google::build_request(&source, &effective_body, &state.google_signatures) {
+                    Ok(prepared) => (prepared.url, prepared.body, Some(prepared.stream)),
+                    Err((err_status, message)) => return error(err_status, message),
+                }
+            } else {
+                let url = match target(&source, parts.uri.path(), parts.uri.query()) {
+                    Ok(url) => url,
+                    Err(_) => return error(StatusCode::BAD_GATEWAY, "来源地址无效"),
+                };
+                (url, wire_bytes, None)
+            };
             let mut attempt = Attempt::new(state.clone(), &source, &request_id, model, input_units, ingress);
             if let Some(record) = &mut attempt.record {
                 record.token_details.service_tier = parsed["service_tier"]
@@ -1441,10 +1505,6 @@ async fn forward_once(
                     break;
                 }
             };
-            let url = match target(&source, parts.uri.path(), parts.uri.query()) {
-                Ok(url) => url,
-                Err(_) => return error(StatusCode::BAD_GATEWAY, "来源地址无效"),
-            };
             attempt.diagnostic.request(
                 ingress.as_str(),
                 parts.method.as_str(),
@@ -1453,48 +1513,80 @@ async fn forward_once(
                 &ignored_parameters,
             );
             attempt.save_diagnostic(false);
-            let mut headers = clean_headers(&parts.headers, true);
-            if payload.role_repaired() || (source.kind == "official" && !native_compaction
-                && parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some()) {
-                clear_body_headers(&mut headers);
-            }
-            let credential = source
-                .secret
-                .get(if source.kind == "official" {
-                    "access_token"
-                } else {
-                    "api_key"
-                })
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let value = match HeaderValue::from_str(&format!("Bearer {credential}")) {
-                Ok(value) if !credential.is_empty() => value,
-                _ => {
-                    attempt.finish("failed", None);
-                    return error(StatusCode::BAD_GATEWAY, "来源凭据无效");
-                }
-            };
-            headers.insert("authorization", value);
-            if source.kind == "official" {
-                if parts
-                    .extensions
-                    .get::<crate::chatbot::ChatbotIngress>()
-                    .is_some() || parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some()
+            let headers = if is_google {
+                let mut h = HeaderMap::new();
+                h.insert("content-type", HeaderValue::from_static("application/json"));
+                h.insert(
+                    "accept",
+                    HeaderValue::from_static(if google_stream == Some(true) {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    }),
+                );
+                h.insert("accept-encoding", HeaderValue::from_static("identity"));
+                let api_key = source
+                    .secret
+                    .get("api_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let value = match HeaderValue::from_str(api_key) {
+                    Ok(value) if !api_key.is_empty() => value,
+                    _ => {
+                        attempt.finish("failed", None);
+                        return error(StatusCode::BAD_GATEWAY, "来源凭据无效");
+                    }
+                };
+                h.insert(HeaderName::from_static("x-goog-api-key"), value);
+                h
+            } else {
+                let mut headers = clean_headers(&parts.headers, true);
+                if openai_sanitized
+                    || payload.role_repaired()
+                    || (source.kind == "official" && !native_compaction
+                        && parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some())
                 {
-                    headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
-                    headers.insert("version", HeaderValue::from_static(crate::official::CODEX_CLIENT_VERSION));
+                    clear_body_headers(&mut headers);
                 }
-                if let Some(account) = &source.account_id {
-                    let Ok(value) = HeaderValue::from_str(account) else {
-                        return error(StatusCode::BAD_GATEWAY, "来源账号标识无效");
-                    };
-                    headers.insert(HeaderName::from_static("chatgpt-account-id"), value);
-                    if let Some(session) = parts.extensions.get::<crate::omp_ingress::OmpIngress>()
-                        .and_then(|ingress| ingress.cache_session(account, model, parsed["service_tier"].as_str())) {
-                        headers.insert("session-id", HeaderValue::from_str(&session).expect("cache UUID"));
+                let credential = source
+                    .secret
+                    .get(if source.kind == "official" {
+                        "access_token"
+                    } else {
+                        "api_key"
+                    })
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let value = match HeaderValue::from_str(&format!("Bearer {credential}")) {
+                    Ok(value) if !credential.is_empty() => value,
+                    _ => {
+                        attempt.finish("failed", None);
+                        return error(StatusCode::BAD_GATEWAY, "来源凭据无效");
+                    }
+                };
+                headers.insert("authorization", value);
+                if source.kind == "official" {
+                    if parts
+                        .extensions
+                        .get::<crate::chatbot::ChatbotIngress>()
+                        .is_some() || parts.extensions.get::<crate::omp_ingress::OmpIngress>().is_some()
+                    {
+                        headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
+                        headers.insert("version", HeaderValue::from_static(crate::official::CODEX_CLIENT_VERSION));
+                    }
+                    if let Some(account) = &source.account_id {
+                        let Ok(value) = HeaderValue::from_str(account) else {
+                            return error(StatusCode::BAD_GATEWAY, "来源账号标识无效");
+                        };
+                        headers.insert(HeaderName::from_static("chatgpt-account-id"), value);
+                        if let Some(session) = parts.extensions.get::<crate::omp_ingress::OmpIngress>()
+                            .and_then(|ingress| ingress.cache_session(account, model, parsed["service_tier"].as_str())) {
+                            headers.insert("session-id", HeaderValue::from_str(&session).expect("cache UUID"));
+                        }
                     }
                 }
-            }
+                headers
+            };
             let settings = state.settings.read().await.clone();
             let source_index = state.sources.read().await.iter().position(|runtime| {
                 runtime.source.id == source.id && runtime.source.identity() == source.identity()
@@ -1604,7 +1696,7 @@ async fn forward_once(
                     eprintln!(
                         "upstream_transport_failure unix={} kind={} connect={} timeout={} uncertain={}",
                         crate::model::now(),
-                        if source.kind == "official" { "official" } else { "api" },
+                        source.kind.as_str(),
                         definitely_unsubmitted,
                         err.is_timeout(),
                         !definitely_unsubmitted
@@ -1699,11 +1791,7 @@ async fn forward_once(
                 eprintln!(
                     "upstream_http_failure unix={} kind={} status={}",
                     crate::model::now(),
-                    if source.kind == "official" {
-                        "official"
-                    } else {
-                        "api"
-                    },
+                    source.kind.as_str(),
                     upstream_status.as_u16()
                 );
             }
@@ -1713,30 +1801,41 @@ async fn forward_once(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
             let mut prefix = Vec::new();
-            let request_is_stream = parsed["stream"].as_bool() == Some(true)
-                || (source.kind == "official" && omp_ingress && !native_compaction);
+            let request_is_stream = google_stream.unwrap_or_else(|| {
+                parsed["stream"].as_bool() == Some(true)
+                    || (source.kind == "official" && omp_ingress && !native_compaction)
+            });
             let upstream_sse = response_is_sse(upstream.headers(), request_is_stream, upstream_status);
             let code = upstream_status.as_u16();
             let omp_v2_error = omp_ingress && parts.uri.path() == "/v1/responses"
                 && matches!(code, 400 | 404 | 422 | 501) && crate::chatbot::is_compaction_v2(&parsed);
             let context_error = matches!(code, 400 | 404 | 409 | 422)
                 && (binding.is_some() || opaque_state || payload.may_repair());
-            let http_error = if !upstream_sse && (omp_v2_error || context_error
+            let http_error = if !upstream_sse && ((is_google && !upstream_status.is_success())
+                || omp_v2_error || context_error
                 || matches!(code, 402 | 403) || retries::transient_status(code))
             {
                 read_error_prefix(&mut upstream, &mut prefix, &mut attempt).await
             } else {
                 None
             };
-            let http_output = http_error.as_ref().is_some_and(response_has_output);
+            let google_error = if is_google && !upstream_status.is_success() {
+                http_error
+                    .as_ref()
+                    .map(|value| crate::google::normalize_error_value(upstream_status, value))
+            } else {
+                None
+            };
+            let effective_http_error = google_error.as_ref().or(http_error.as_ref());
+            let http_output = !is_google && http_error.as_ref().is_some_and(response_has_output);
             let ambiguous_status = matches!(upstream_status.as_u16(), 408 | 504);
             // SSE and output-bearing JSON must not inherit replay permission
             // from the HTTP status alone. The actual upstream status is forwarded.
             let status = if upstream_sse || http_output { StatusCode::OK } else { upstream_status };
-            let probe = if upstream_sse || (upstream_status.is_success()
+            let probe = if !is_google && (upstream_sse || (upstream_status.is_success()
                 && (manual_candidate || (!degraded && (binding.is_some() || opaque_state)
                     && (priority_probe || probe_unknown_id
-                        || state.settings.read().await.degraded_context_fallback))))
+                        || state.settings.read().await.degraded_context_fallback)))))
             {
                 // Hold a bounded prefix until output or a refusal is observed.
                 match probe_context_rejection(&mut upstream, &mut prefix, request_is_stream, &mut attempt).await {
@@ -1749,7 +1848,7 @@ async fn forward_once(
             } else {
                 None
             };
-            let http_quota = http_error.as_ref().and_then(retries::quota_code);
+            let http_quota = effective_http_error.and_then(retries::quota_code);
             let stream_quota = probe.as_ref().and_then(|probe| probe.quota_code.as_deref());
             let saw_quota_in_response = http_quota.is_some() || stream_quota.is_some();
             if let Some(code) = http_quota.or(stream_quota) {
@@ -1780,8 +1879,8 @@ async fn forward_once(
                     return Box::pin(forward_once(state, retry, rebuild, replans)).await;
                 }
             }
-            let permanent_rejection = retries::transient_status(status.as_u16()) && http_error
-                .as_ref().is_some_and(|value| retries::permanent_code(value).is_some());
+            let permanent_rejection = retries::transient_status(status.as_u16()) && effective_http_error
+                .is_some_and(|value| retries::permanent_code(value).is_some());
             if permanent_rejection {
                 request_retries.block(&source);
             } else if !quota_replay && retries::transient_status(status.as_u16()) {
@@ -1866,7 +1965,7 @@ async fn forward_once(
                 }
             }
             let mut context_rejected = false;
-            if context_error {
+            if !is_google && context_error {
                 if let Some(value) = &http_error {
                     if !quota_replay && payload.repair_rejection(status, value, &source, &state.role_capabilities) {
                         attempt.finish("failed", None);
@@ -1932,7 +2031,7 @@ async fn forward_once(
                 )
                 .await;
                 if matches!(status.as_u16(), 402 | 403 | 429) || permanent_rejection {
-                    if let Some(value) = &http_error {
+                    if let Some(value) = effective_http_error {
                         let code = retries::permanent_code(value).or_else(|| {
                             value
                                 .pointer("/error/code")
@@ -1989,7 +2088,9 @@ async fn forward_once(
                 attempt.finish("failed", None);
                 attempt.collect_error(&mut upstream, &mut prefix).await;
                 drop(route_lease.take());
-                last_error = Some(
+                last_error = Some(if is_google {
+                    google_error_response(upstream_status, &source, &prefix)
+                } else {
                     stream_response(
                         state.clone(),
                         source.clone(),
@@ -2006,8 +2107,8 @@ async fn forward_once(
                         },
                         None,
                     )
-                    .await,
-                );
+                    .await
+                });
                 break;
             }
             if !degraded
@@ -2072,10 +2173,12 @@ async fn forward_once(
                 }
                 // Preserve the final source's native error body when there is no
                 // later candidate; streaming this response must not trigger replay.
-                if candidate_index + 1 < source_count {
+                if candidate_index + 1 < source_count || is_google {
                     attempt.collect_error(&mut upstream, &mut prefix).await;
                 }
-                last_error = Some(
+                last_error = Some(if is_google {
+                    google_error_response(upstream_status, &source, &prefix)
+                } else {
                     stream_response(
                         state.clone(),
                         source.clone(),
@@ -2092,8 +2195,8 @@ async fn forward_once(
                         },
                         None,
                     )
-                    .await,
-                );
+                    .await
+                });
                 break;
             }
             if upstream_status.is_success() && !saw_quota_in_response {
@@ -2140,23 +2243,94 @@ async fn forward_once(
                 });
                 capture
             });
-            let mut response = stream_response(
-                state,
-                source.clone(),
-                upstream,
-                prefix,
-                attempt,
-                ResponseContext {
-                    discovery,
-                    session_key: session_key.clone(),
-                    request_is_stream,
-                    rebuild,
-                    history: history_capture,
-                    accepted_state,
-                },
-                route_lease.take(),
-            )
-            .await;
+            let context = ResponseContext {
+                discovery,
+                session_key: session_key.clone(),
+                request_is_stream,
+                rebuild,
+                history: history_capture,
+                accepted_state,
+            };
+            let mut response = if is_google {
+                if !upstream_status.is_success() {
+                    attempt.finish("failed", None);
+                    attempt.collect_error(&mut upstream, &mut prefix).await;
+                    google_error_response(upstream_status, &source, &prefix)
+                } else if google_stream == Some(true) {
+                    let translated = Box::pin(crate::google::translate_sse_stream(
+                        upstream.bytes_stream(),
+                        model.to_owned(),
+                        state.google_signatures.clone(),
+                    ));
+                    stream_translated_response(
+                        state,
+                        source.clone(),
+                        true,
+                        None,
+                        translated,
+                        attempt,
+                        context,
+                        route_lease.take(),
+                    )
+                    .await
+                } else {
+                    match transport::read_limited(&mut upstream, 32 * 1024 * 1024).await {
+                        Ok(raw) => match crate::google::translate_non_streaming(
+                            &raw,
+                            model,
+                            &state.google_signatures,
+                        ) {
+                            Ok(json_bytes) => {
+                                let len = json_bytes.len() as u64;
+                                let translated = Box::pin(futures_util::stream::once(async move {
+                                    Ok::<Bytes, std::io::Error>(json_bytes)
+                                }));
+                                stream_translated_response(
+                                    state,
+                                    source.clone(),
+                                    false,
+                                    Some(len),
+                                    translated,
+                                    attempt,
+                                    context,
+                                    route_lease.take(),
+                                )
+                                .await
+                            }
+                            Err(message) => {
+                                attempt.diagnostic.transport("upstream_protocol", message);
+                                attempt.finish("failed", None);
+                                error(StatusCode::BAD_GATEWAY, message)
+                            }
+                        },
+                        Err(transport::BodyReadError::TooLarge) => {
+                            attempt
+                                .diagnostic
+                                .transport("body_too_large", "Google AI Studio 响应过大");
+                            attempt.finish("failed", None);
+                            error(StatusCode::BAD_GATEWAY, "来源响应过大")
+                        }
+                        Err(transport::BodyReadError::ReadFailed) => {
+                            attempt
+                                .diagnostic
+                                .transport("body_transport", "上游响应传输中断");
+                            attempt.finish("interrupted", None);
+                            error(StatusCode::BAD_GATEWAY, "来源响应中断")
+                        }
+                    }
+                }
+            } else {
+                stream_response(
+                    state,
+                    source.clone(),
+                    upstream,
+                    prefix,
+                    attempt,
+                    context,
+                    route_lease.take(),
+                )
+                .await
+            };
             for (name, value) in [("x-codexpress-source-id", source.id.clone()),
                 ("x-codexpress-source-identity", source.identity())] {
                 if let Ok(value) = HeaderValue::from_str(&value) {
@@ -2181,6 +2355,29 @@ async fn forward_once(
         return quota_unavailable(&state, model, true).await.expect("quota failure response");
     }
     last_error.unwrap_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "所有来源暂时不可用"))
+}
+
+fn google_error_response(
+    status: StatusCode,
+    source: &Source,
+    prefix: &[(Bytes, std::time::Instant)],
+) -> Response<Body> {
+    let raw: Vec<u8> = prefix.iter().flat_map(|(chunk, _)| chunk.iter().copied()).collect();
+    let body = crate::google::translate_error(status, &raw);
+    let mut response = Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    for (name, value) in [
+        ("x-codexpress-source-id", source.id.clone()),
+        ("x-codexpress-source-identity", source.identity()),
+    ] {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+    response
 }
 
 #[cfg(test)]

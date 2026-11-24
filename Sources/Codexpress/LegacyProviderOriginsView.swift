@@ -57,6 +57,6 @@ struct LegacyProviderOriginsView: View {
             if result.hasSuffix("/responses") { result.removeLast("/responses".count) }
             return result
         }
-        return model.sources.filter { source in !source.official && base.map { normalize($0) == normalize(source.base_url) } == true }
+        return model.sources.filter { source in !source.official && !source.isGoogle && base.map { normalize($0) == normalize(source.base_url) } == true }
     }
 }

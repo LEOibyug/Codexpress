@@ -751,7 +751,7 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
                         .iter()
                         .find(|s| {
                             selection["source_id"].as_str() == Some(s.source.id.as_str())
-                                && s.source.kind == "api"
+                                && matches!(s.source.kind.as_str(), "api" | "openai")
                         })
                         .context("请选择已保存的原API来源")?;
                     if selection["source_identity"].as_str()

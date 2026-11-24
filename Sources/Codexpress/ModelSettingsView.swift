@@ -1,21 +1,38 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum ModelViewMode: String, CaseIterable, Identifiable {
+    case byModel = "按模型", byProvider = "按供应商"
+    var id: String { rawValue }
+}
+
+enum ModelStatusFilter: String, CaseIterable, Identifiable {
+    case all = "全部", enabled = "已启用", disabled = "未启用"
+    var id: String { rawValue }
+}
+
 private struct EditingModel {
     let id: String
     let isNew: Bool
+    let returnToSourceID: String?
 }
 
 struct ModelSettingsView: View {
     @EnvironmentObject var model: AppModel
+    @State private var viewMode: ModelViewMode = .byModel
+    @State private var selectedSourceID: String?
     @State private var search = ""
+    @State private var providerSearch = ""
+    @State private var statusFilter: ModelStatusFilter = .all
     @State private var editing: EditingModel?
     @State private var choosingMetadata = false
     @State private var confirmingMetadataReset = false
     @State private var showingMetadataHelp = false
     @State private var updatingMetadata = false
+    @State private var updatingSelection = false
     @State private var metadataNotice: String?
     @State private var metadataError: String?
+    @State private var selectionError: String?
     @State private var modelUsage: [String: JSONValue]?
     @State private var usageRefreshing = false
     @State private var usageError: String?
@@ -38,12 +55,27 @@ struct ModelSettingsView: View {
         Group {
             if let item = editing {
                 ModelEditor(settings: model.settings, modelID: item.id, isNew: item.isNew, onBack: { editing = nil })
-                    .id(item.id)
+                    .id("\(item.id)-\(item.isNew)-\(item.returnToSourceID ?? "")")
+            } else if viewMode == .byProvider,
+                      let providerID = selectedSourceID,
+                      let source = model.settings.sources.first(where: { $0.id == providerID }) {
+                ProviderModelsEditor(
+                    source: source,
+                    rankedModels: rankedModels,
+                    modelUsage: modelUsage,
+                    onBack: { selectedSourceID = nil },
+                    onEditModel: { id in editing = EditingModel(id: id, isNew: false, returnToSourceID: source.id) }
+                )
             } else {
-                modelList
+                mainPage
             }
         }
         .task(id: model.running) { await refreshInformation() }
+        .onChange(of: model.settings.sources.map(\.id)) { _, ids in
+            if let selectedSourceID, !ids.contains(selectedSourceID) {
+                self.selectedSourceID = nil
+            }
+        }
         .fileImporter(isPresented: $choosingMetadata, allowedContentTypes: [.json]) { result in
             switch result {
             case .success(let url): updateMetadata(from: url)
@@ -58,18 +90,46 @@ struct ModelSettingsView: View {
         .sheet(isPresented: $showingMetadataHelp) { metadataHelp }
     }
 
-    private var modelList: some View {
+    private var mainPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            PageHeading("模型", subtitle: "比较用量表现，按模型配置供应商或在各供应商下启用模型。") {
+                HStack(spacing: 10) {
+                    Picker("排列方式", selection: $viewMode) {
+                        ForEach(ModelViewMode.allCases) { Text($0.rawValue).tag($0) }
+                    }.pickerStyle(.segmented).labelsHidden().frame(width: 170)
+                    Button { editing = EditingModel(id: "", isNew: true, returnToSourceID: nil) } label: { Label("添加模型", systemImage: "plus") }
+                        .buttonStyle(.borderedProminent).disabled(model.busy || model.metadataLoadFailed)
+                }
+            }
+            if viewMode == .byModel {
+                byModelList
+            } else {
+                byProviderList
+            }
+        }.settingsPage()
+    }
+
+    private var byModelList: some View {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
         let ranked = rankedModels
-        let visible = query.isEmpty ? ranked : ranked.filter { $0.localizedCaseInsensitiveContains(query) }
-        return VStack(alignment: .leading, spacing: 14) {
-            PageHeading("模型", subtitle: "比较用量表现并管理各模型的接入规则。") {
-                Button { editing = EditingModel(id: "", isNew: true) } label: { Label("添加模型", systemImage: "plus") }
-                    .buttonStyle(.borderedProminent).disabled(model.busy || model.metadataLoadFailed)
+        let visible = ranked.filter { id in
+            let matchesQuery = query.isEmpty || id.localizedCaseInsensitiveContains(query)
+            guard matchesQuery else { return false }
+            switch statusFilter {
+            case .all: return true
+            case .enabled: return ModelPolicy.isEnabled(id, in: model.settings)
+            case .disabled: return !ModelPolicy.isEnabled(id, in: model.settings)
             }
+        }
+        let enabledCount = ranked.filter { ModelPolicy.isEnabled($0, in: model.settings) }.count
+        let filteredScope = !query.isEmpty || statusFilter != .all
+        return Group {
             HStack(spacing: 12) {
-                TextField("搜索模型 ID", text: $search).settingsField().frame(maxWidth: 270)
+                TextField("搜索模型 ID", text: $search).settingsField().frame(maxWidth: 240)
                     .accessibilityLabel("搜索模型")
+                Picker("状态", selection: $statusFilter) {
+                    ForEach(ModelStatusFilter.allCases) { Text($0.rawValue).tag($0) }
+                }.pickerStyle(.segmented).labelsHidden().frame(width: 190)
                 Spacer(minLength: 0)
                 Button { Task { await refreshInformation() } } label: {
                     Label(model.modelInformationRefreshing || usageRefreshing ? "读取中…" : "刷新信息", systemImage: "arrow.clockwise")
@@ -83,22 +143,34 @@ struct ModelSettingsView: View {
                     Button("JSON 格式与优先级…") { showingMetadataHelp = true }
                 }.fixedSize(horizontal: true, vertical: false)
             }
+            if !ranked.isEmpty {
+                HStack(spacing: 12) {
+                    Text("已启用 \(enabledCount) / \(ranked.count)")
+                        .font(AppTypography.caption).foregroundStyle(.secondary).monospacedDigit()
+                    Spacer(minLength: 0)
+                    Button(filteredScope ? "启用当前" : "全部启用") {
+                        applyBatchEnabled(visible, enabled: true)
+                    }.disabled(visible.isEmpty || updatingSelection || model.busy || model.metadataLoadFailed)
+                    Button(filteredScope ? "停用当前" : "全部停用") {
+                        applyBatchEnabled(visible, enabled: false)
+                    }.disabled(visible.isEmpty || updatingSelection || model.busy || model.metadataLoadFailed)
+                }
+            }
             if let error = model.modelInformationError { InfoNote(text: "模型信息未更新：\(error)", color: .orange) }
             if let usageError { InfoNote(text: "模型用量未更新：\(usageError)", color: .orange) }
             if let metadataError { InfoNote(text: "模型能力未更新：\(metadataError)", color: .orange) }
+            if let selectionError { InfoNote(text: selectionError, symbol: "exclamationmark.triangle", color: .orange) }
             if let metadataNotice { InfoNote(text: metadataNotice) }
             if ranked.isEmpty {
                 EmptyState("暂无模型", subtitle: "在来源池获取模型列表，或添加一个模型 ID。", symbol: "square.stack")
             } else if visible.isEmpty {
-                EmptyState("未找到模型", subtitle: "试试其他模型 ID。", symbol: "magnifyingglass") {
-                    Button("清除搜索") { search = "" }
+                EmptyState("未找到模型", subtitle: "试试调整搜索关键词或状态筛选。", symbol: "magnifyingglass") {
+                    Button("重置筛选") { search = ""; statusFilter = .all }
                 }
             } else {
-                Text("按全局最近 1,000 条已结束请求的 Token 用量排序；模型不足 10 条时不显示速度和缓存命中率。")
+                Text("点击行首开关快速启用或停用模型；点击模型可进入二级设置配置供应商与上下文。")
                     .font(AppTypography.caption).foregroundStyle(.secondary)
                     .help("生成 TPS 按首个输出到生成结束的耗时计算。缺少生成计时的旧记录沿用请求总耗时。")
-            }
-            if !visible.isEmpty {
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         ForEach(visible, id: \.self) { id in
@@ -108,7 +180,87 @@ struct ModelSettingsView: View {
                     }.cardSurface()
                 }
             }
-        }.settingsPage()
+        }
+    }
+
+    private var byProviderList: some View {
+        let query = providerSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sources = model.sources.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
+        return Group {
+            HStack(spacing: 12) {
+                TextField("搜索供应商", text: $providerSearch).settingsField().frame(maxWidth: 270)
+                    .accessibilityLabel("搜索供应商")
+                Spacer(minLength: 0)
+                Button { Task { await refreshInformation() } } label: {
+                    Label(model.modelInformationRefreshing || usageRefreshing ? "读取中…" : "刷新信息", systemImage: "arrow.clockwise")
+                }.disabled(!model.running || model.modelInformationRefreshing || usageRefreshing || updatingMetadata)
+            }
+            if model.sources.isEmpty {
+                EmptyState("暂无供应商", subtitle: "请先在「来源池」添加官方账号、OpenAI API Platform、Google AI Studio 或 Responses API。", symbol: "server.rack")
+            } else if sources.isEmpty {
+                EmptyState("未找到供应商", subtitle: "试试其他名称。", symbol: "magnifyingglass") {
+                    Button("清除搜索") { providerSearch = "" }
+                }
+            } else {
+                Text("按来源池优先级排列，选择供应商后进入二级页面启用或停用其模型。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(sources.enumerated()), id: \.element.id) { index, source in
+                            if index > 0 { Divider() }
+                            providerRow(source, index: index)
+                        }
+                    }.cardSurface()
+                }
+            }
+        }
+    }
+
+    private func providerRow(_ source: Source, index: Int) -> some View {
+        let kindTitle = source.kindLabel
+        let declared = providerModels(for: source, ranked: rankedModels)
+        let enabledCount = declared.filter { ModelPolicy.isEnabled($0, on: source, in: model.settings) }.count
+        let summaryText: String = {
+            if !source.models.isEmpty {
+                return "已启用 \(enabledCount) / \(declared.count) 个模型"
+            }
+            if source.discoversModels {
+                return declared.isEmpty ? "尚未获取模型" : "已启用 \(enabledCount) / \(declared.count) 个模型"
+            }
+            return "未限定模型 · 当前可用 \(enabledCount) 个"
+        }()
+        return Button { selectedSourceID = source.id } label: {
+            HStack(spacing: 12) {
+                Text("\(index + 1)").font(AppTypography.caption.weight(.semibold)).monospacedDigit()
+                    .foregroundStyle(.secondary).frame(width: 24, height: 24)
+                    .background(AppPalette.well, in: RoundedRectangle(cornerRadius: 5))
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        Text(source.name).font(.system(size: 13, weight: .semibold)).foregroundStyle(.primary).lineLimit(1)
+                        StatusPill(text: kindTitle, compact: true)
+                        if !source.enabled { StatusPill(text: "来源已停用", compact: true) }
+                    }
+                    Text(summaryText).lineLimit(1)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+                Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).frame(width: 8)
+            }.font(AppTypography.caption).foregroundStyle(.secondary)
+                .padding(.horizontal, 14).padding(.vertical, 12).contentShape(Rectangle())
+        }.buttonStyle(.plain).accessibilityLabel("管理供应商 \(source.name) 的模型")
+    }
+
+    private func providerModels(for source: Source, ranked: [String]) -> [String] {
+        var ids = Set(source.models)
+        if source.models.isEmpty {
+            ids.formUnion(ranked.filter { ModelPolicy.supports(model: $0, source: source) })
+        }
+        for policy in model.settings.modelPolicies ?? [] where policy.sourceIDs?.contains(source.id) == true {
+            ids.insert(policy.model)
+        }
+        return ids.sorted { a, b in
+            let aTokens = modelUsage?[a]?["total_tokens"].number ?? 0
+            let bTokens = modelUsage?[b]?["total_tokens"].number ?? 0
+            return aTokens == bTokens ? a < b : aTokens > bTokens
+        }
     }
 
     private var metadataHelp: some View {
@@ -151,40 +303,59 @@ struct ModelSettingsView: View {
         let rate = showPerformance ? usageRate(usage?["tps"].number) : ""
         let cache = showPerformance ? (usage?["cache_rate"].number.map { $0.formatted(.number.precision(.fractionLength(0...1))) + "%" } ?? "—") : ""
         let ratio = usageInputOutputRatio(usage?["input_tokens"].number, usage?["output_tokens"].number)
-        let disabled = clients.isEmpty || policy?.sourceIDs?.isEmpty == true
+        let enabled = ModelPolicy.isEnabled(id, in: model.settings)
         let imported = information["local_metadata"].bool == true
-        return Button { editing = EditingModel(id: id, isNew: false) } label: {
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(id).font(.system(size: 13, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(.primary).lineLimit(1)
-                    Text(sourceSummary(policy)).lineLimit(1)
-                    HStack(spacing: 6) {
-                        if disabled { StatusPill(text: "未启用", compact: true) }
-                        if imported { StatusPill(text: "已导入", compact: true) }
-                        if !disabled { Text(clients.map(\.label).joined(separator: "、")).lineLimit(1) }
+        return HStack(spacing: 12) {
+            Toggle("启用 \(id)", isOn: Binding(
+                get: { enabled },
+                set: { next in applyBatchEnabled([id], enabled: next) }
+            ))
+            .toggleStyle(.switch).controlSize(.small).labelsHidden()
+            .disabled(updatingSelection || model.busy || model.metadataLoadFailed)
+            Button { editing = EditingModel(id: id, isNew: false, returnToSourceID: nil) } label: {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(id).font(.system(size: 13, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(enabled ? .primary : .secondary).lineLimit(1)
+                        Text(sourceSummary(policy)).lineLimit(1)
+                        HStack(spacing: 6) {
+                            if !enabled { StatusPill(text: "未启用", compact: true) }
+                            if imported { StatusPill(text: "已导入", compact: true) }
+                            if enabled { Text(clients.map(\.label).joined(separator: "、")).lineLimit(1) }
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                        .help("\(id)\n最大输入：\(window) · 压缩点：\(threshold)")
+                    HStack(spacing: 18) {
+                        modelMetric(total, symbol: "number", help: "近期 Token")
+                        modelMetric(ratio, symbol: "arrow.left.arrow.right", help: "输入输出比；按全局最近 1,000 条已结束请求中该模型的输入、输出总量计算，输入包含缓存读取。")
+                        if showPerformance {
+                            modelMetric(rate, symbol: "speedometer", help: "生成 TPS")
+                            modelMetric(cache, symbol: "bolt.circle", help: "缓存命中率")
+                        }
                     }
-                }.frame(maxWidth: .infinity, alignment: .leading)
-                    .help("\(id)\n最大输入：\(window) · 压缩点：\(threshold)")
-                HStack(spacing: 18) {
-                    modelMetric(total, symbol: "number", help: "近期 Token")
-                    modelMetric(ratio, symbol: "arrow.left.arrow.right", help: "输入输出比；按全局最近 1,000 条已结束请求中该模型的输入、输出总量计算，输入包含缓存读取。")
-                    if showPerformance {
-                        modelMetric(rate, symbol: "speedometer", help: "生成 TPS")
-                        modelMetric(cache, symbol: "bolt.circle", help: "缓存命中率")
-                    }
-                }
-                Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).frame(width: 8)
-            }.font(AppTypography.caption).foregroundStyle(.secondary)
-                .padding(.horizontal, 14).padding(.vertical, 12).contentShape(Rectangle())
-        }.buttonStyle(.plain).accessibilityLabel("编辑模型 \(id)")
-            .accessibilityValue("\(disabled ? "未启用" : clients.map(\.label).joined(separator: "、"))，\(sourceSummary(policy))，近期 Token \(total)，输入输出比 \(ratio)" + (showPerformance ? "，生成 TPS \(rate)，缓存命中 \(cache)" : ""))
+                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).frame(width: 8)
+                }.contentShape(Rectangle())
+            }.buttonStyle(.plain).accessibilityLabel("编辑模型 \(id)")
+                .accessibilityValue("\(enabled ? clients.map(\.label).joined(separator: "、") : "未启用")，\(sourceSummary(policy))，近期 Token \(total)，输入输出比 \(ratio)" + (showPerformance ? "，生成 TPS \(rate)，缓存命中 \(cache)" : ""))
+        }.font(AppTypography.caption).foregroundStyle(.secondary)
+            .padding(.horizontal, 14).padding(.vertical, 12)
     }
 
     private func sourceSummary(_ policy: ModelPolicy?) -> String {
         guard let ids = policy?.sourceIDs else { return "跟随来源池" }
         guard !ids.isEmpty else { return "未启用来源" }
         return ids.map { id in model.settings.sources.first { $0.id == id }?.name ?? "已移除来源" }.joined(separator: " → ")
+    }
+
+    private func applyBatchEnabled(_ ids: [String], enabled: Bool) {
+        guard !ids.isEmpty, !updatingSelection else { return }
+        updatingSelection = true; selectionError = nil
+        Task {
+            defer { updatingSelection = false }
+            do {
+                try await model.setModelsEnabled(ids, enabled: enabled)
+            } catch { selectionError = error.localizedDescription }
+        }
     }
 
     private func refreshInformation() async {
@@ -239,6 +410,150 @@ struct ModelSettingsView: View {
     }
 }
 
+private struct ProviderModelsEditor: View {
+    @EnvironmentObject var model: AppModel
+    let source: Source
+    let rankedModels: [String]
+    let modelUsage: [String: JSONValue]?
+    let onBack: () -> Void
+    let onEditModel: (String) -> Void
+    @State private var search = ""
+    @State private var statusFilter: ModelStatusFilter = .all
+    @State private var updating = false
+    @State private var error: String?
+
+    private var currentSource: Source {
+        model.settings.sources.first { $0.id == source.id } ?? source
+    }
+
+    private var kindTitle: String {
+        currentSource.kindLabel
+    }
+
+    private var candidateModels: [String] {
+        let active = currentSource
+        var ids = Set(active.models)
+        if active.models.isEmpty {
+            ids.formUnion(rankedModels.filter { ModelPolicy.supports(model: $0, source: active) })
+        }
+        for policy in model.settings.modelPolicies ?? [] where policy.sourceIDs?.contains(active.id) == true {
+            ids.insert(policy.model)
+        }
+        return ids.sorted { a, b in
+            let aTokens = modelUsage?[a]?["total_tokens"].number ?? 0
+            let bTokens = modelUsage?[b]?["total_tokens"].number ?? 0
+            return aTokens == bTokens ? a < b : aTokens > bTokens
+        }
+    }
+
+    var body: some View {
+        let active = currentSource
+        let all = candidateModels
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        let visible = all.filter { id in
+            let matches = query.isEmpty || id.localizedCaseInsensitiveContains(query)
+            guard matches else { return false }
+            switch statusFilter {
+            case .all: return true
+            case .enabled: return ModelPolicy.isEnabled(id, on: active, in: model.settings)
+            case .disabled: return !ModelPolicy.isEnabled(id, on: active, in: model.settings)
+            }
+        }
+        let enabledCount = all.filter { ModelPolicy.isEnabled($0, on: active, in: model.settings) }.count
+        let filteredScope = !query.isEmpty || statusFilter != .all
+
+        return VStack(alignment: .leading, spacing: 14) {
+            PageHeading(active.name, subtitle: "\(kindTitle) · 已启用 \(enabledCount) / \(all.count) 个模型") {
+                HStack(spacing: 10) {
+                    if active.discoversModels {
+                        Button {
+                            Task { await model.refreshModels(active.id) }
+                        } label: {
+                            Label(model.refreshingModels.contains(active.id) ? "刷新中…" : "刷新模型", systemImage: "arrow.clockwise")
+                        }.disabled(!model.running || model.busy || model.refreshingModels.contains(active.id) || (active.official && active.account_id == nil))
+                    }
+                    Button(action: onBack) { Label("返回供应商列表", systemImage: "chevron.left") }
+                        .keyboardShortcut(.cancelAction)
+                }
+            }
+            if !active.enabled {
+                InfoNote(text: "此供应商在来源池中已停用，仅保留模型选择设置。", color: .orange)
+            }
+            if active.models.isEmpty {
+                InfoNote(text: "此供应商未限定模型列表，当前展示可分配给它的模型；取消勾选将从该模型排除此供应商。")
+            }
+            HStack(spacing: 12) {
+                TextField("搜索模型 ID", text: $search).settingsField().frame(maxWidth: 240)
+                    .accessibilityLabel("搜索供应商模型")
+                Picker("状态", selection: $statusFilter) {
+                    ForEach(ModelStatusFilter.allCases) { Text($0.rawValue).tag($0) }
+                }.pickerStyle(.segmented).labelsHidden().frame(width: 190)
+                Spacer(minLength: 0)
+                Button(filteredScope ? "启用当前" : "全部启用") {
+                    apply(visible, enabled: true)
+                }.disabled(visible.isEmpty || updating || model.busy || model.metadataLoadFailed)
+                Button(filteredScope ? "停用当前" : "全部停用") {
+                    apply(visible, enabled: false)
+                }.disabled(visible.isEmpty || updating || model.busy || model.metadataLoadFailed)
+            }
+            if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
+            if all.isEmpty {
+                EmptyState("暂无模型", subtitle: active.discoversModels ? "点击「刷新模型」获取该供应商支持的模型列表。" : "可在来源池中为该供应商填写模型列表。", symbol: "square.stack")
+            } else if visible.isEmpty {
+                EmptyState("未找到模型", subtitle: "试试调整搜索或状态筛选。", symbol: "magnifyingglass") {
+                    Button("重置筛选") { search = ""; statusFilter = .all }
+                }
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(visible, id: \.self) { id in
+                            if id != visible.first { Divider() }
+                            providerModelRow(id, source: active)
+                        }
+                    }.cardSurface()
+                }
+            }
+        }.settingsPage()
+    }
+
+    private func providerModelRow(_ id: String, source: Source) -> some View {
+        let enabled = ModelPolicy.isEnabled(id, on: source, in: model.settings)
+        let policy = model.settings.modelPolicies?.first { $0.model == id }
+        let clients = (policy?.clients ?? ModelClient.allCases).filter { $0.isApplicable(to: id) }
+        return HStack(spacing: 12) {
+            Toggle("在 \(source.name) 上启用 \(id)", isOn: Binding(
+                get: { enabled },
+                set: { next in apply([id], enabled: next) }
+            ))
+            .toggleStyle(.switch).controlSize(.small).labelsHidden()
+            .disabled(updating || model.busy || model.metadataLoadFailed)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(id).font(.system(size: 13, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(enabled ? .primary : .secondary).lineLimit(1)
+                if !enabled {
+                    StatusPill(text: clients.isEmpty ? "全局未启用" : "此供应商未启用", compact: true)
+                } else {
+                    Text(clients.map(\.label).joined(separator: "、"))
+                        .font(AppTypography.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+            Button("设置") { onEditModel(id) }
+                .buttonStyle(.borderless).font(AppTypography.caption)
+        }.padding(.horizontal, 14).padding(.vertical, 10)
+    }
+
+    private func apply(_ ids: [String], enabled: Bool) {
+        guard !ids.isEmpty, !updating else { return }
+        updating = true; error = nil
+        Task {
+            defer { updating = false }
+            do {
+                try await model.setProviderModelsEnabled(sourceID: source.id, modelIDs: ids, enabled: enabled)
+            } catch { self.error = error.localizedDescription }
+        }
+    }
+}
+
 private struct ModelEditor: View {
     @EnvironmentObject var model: AppModel
     let isNew: Bool
@@ -277,7 +592,7 @@ private struct ModelEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             PageHeading(isNew && savedModelID == nil ? "添加模型" : "模型设置", subtitle: isNew && savedModelID == nil ? nil : modelID) {
-                Button(action: onBack) { Label("返回模型列表", systemImage: "chevron.left") }
+                Button(action: onBack) { Label("返回", systemImage: "chevron.left") }
                     .keyboardShortcut(.cancelAction).disabled(saving)
             }
             ScrollView {
@@ -440,9 +755,7 @@ private struct ModelEditor: View {
     }
 
     private func supports(_ source: Source) -> Bool {
-        let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
-        if id == "gpt-image-2" { return source.official }
-        return source.models.isEmpty || source.models.contains(id)
+        ModelPolicy.supports(model: modelID.trimmingCharacters(in: .whitespacesAndNewlines), source: source)
     }
     private func save() {
         guard !saving else { return }
@@ -450,7 +763,10 @@ private struct ModelEditor: View {
             let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
             try ModelPolicy.validateModelID(id)
             if isNew, savedModelID != id, model.configuredModelIDs.contains(id) { throw AppError.message("此模型已存在，请从列表中编辑。") }
-            let policy = customPolicy ? ModelPolicy(model: id, sourceIDs: customSources ? sourceIDs : nil, clients: clients.filter { $0.isApplicable(to: id) }) : nil
+            let keepDefaultDisabledExplicit = !customPolicy && model.settings.sources.contains { $0.defaultsDiscoveredModelsDisabled && $0.models.contains(id) }
+            let policy: ModelPolicy? = (customPolicy || keepDefaultDisabledExplicit)
+                ? ModelPolicy(model: id, sourceIDs: customSources ? sourceIDs : nil, clients: ModelPolicy.applicableClients(for: id).filter { clients.contains($0) })
+                : nil
             let parsedRule = customCompaction ? try ModelCompactionRule.parse(model: id, threshold: threshold, window: window, defaultWindow: defaultWindow) : nil
             let rule = parsedRule.flatMap { $0.auto_compact_token_limit != nil || $0.context_window != nil ? $0 : nil }
             saving = true; error = nil
