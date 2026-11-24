@@ -23,6 +23,10 @@ pub struct TokenDetails {
     pub output_available: bool,
     pub cached_input_reported: bool,
     pub cache_write_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_30m_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_12h_tokens: Option<u64>,
     pub reasoning_output_tokens: Option<u64>,
     pub reported_total_tokens: Option<u64>,
     pub stream_complete: bool,
@@ -150,6 +154,38 @@ impl UsageStore {
             )?;
         }
         diagnostics::initialize(&connection)?;
+        // Google omitted cachedContentTokenCount on cache misses in earlier builds.
+        // Mark complete uncached Google samples as reported before repricing so cache rate includes misses.
+        loop {
+            let pending = {
+                let mut query = connection.prepare(
+                    "SELECT attempt,metadata FROM usage WHERE json_extract(metadata,'$.token_details.source_kind')='google' AND cached_input_tokens=0 AND COALESCE(json_extract(metadata,'$.token_details.input_estimated'),0)=0 AND COALESCE(json_extract(metadata,'$.token_details.cached_input_reported'),0)=0 LIMIT 1000",
+                )?;
+                let values = query
+                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                values
+            };
+            if pending.is_empty() {
+                break;
+            }
+            let transaction = connection.transaction()?;
+            for (id, metadata) in pending {
+                let mut metadata: Value =
+                    serde_json::from_str(&metadata).unwrap_or_else(|_| json!({}));
+                if let Some(details) = metadata
+                    .get_mut("token_details")
+                    .and_then(Value::as_object_mut)
+                {
+                    details.insert("cached_input_reported".into(), json!(true));
+                }
+                transaction.execute(
+                    "UPDATE usage SET metadata=?1 WHERE attempt=?2",
+                    params![metadata.to_string(), id],
+                )?;
+            }
+            transaction.commit()?;
+        }
         // Fill legacy records and revisit previously unavailable prices once per
         // catalog revision. Existing priced snapshots are never rewritten.
         let revision = crate::pricing::catalog()["revision"]
@@ -943,5 +979,44 @@ mod tests {
     fn character_estimates_exclude_encrypted_and_multimodal_payloads() {
         let input = json!([{"type":"message","content":[{"type":"input_text","text":"你好abcd"},{"type":"input_image","image_url":"data:image/fixture","detail":"high"}]},{"type":"reasoning","encrypted_content":"opaque-blob"},{"type":"input_file","file_data":"a-lot-of-data","filename":"file.pdf"}]);
         assert_eq!(estimated_tokens(content_units(&input)), 3);
+    }
+
+    #[test]
+    fn reopening_store_backfills_google_cache_miss_reporting_and_prices_gemini4() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.sqlite");
+        drop(UsageStore::open(&path).unwrap());
+        let db = Connection::open(&path).unwrap();
+        let metadata = json!({
+            "token_details": {
+                "source_kind": "google",
+                "is_subscription": false,
+                "input_estimated": false,
+                "output_estimated": false,
+                "output_available": true,
+                "cached_input_reported": false
+            },
+            "cost": {
+                "status": "unknown_model",
+                "revision": "openai-2026-11-18-v1",
+                "historical": false
+            }
+        });
+        db.execute(
+            "INSERT INTO usage (request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata) VALUES ('g-miss','g','Google','gemini-4-hydrogen',?1,'success',1000,200,0,1,1000,?2)",
+            params![crate::model::now(), metadata.to_string()],
+        )
+        .unwrap();
+        drop(db);
+
+        let reopened = UsageStore::open(&path).unwrap();
+        let summary = reopened.summary_for(1, Some("g")).unwrap();
+        let item = &summary["recent"][0];
+        assert_eq!(item["token_details"]["cached_input_reported"], true);
+        assert_eq!(item["cost"]["status"], "reported");
+        // 1000 * 1.5/1M + 200 * 7.5/1M = 0.0015 + 0.0015 = 0.003
+        assert!((item["cost"]["total_usd"].as_f64().unwrap() - 0.003).abs() < 1e-9);
+        assert_eq!(summary["rows"][0]["cached_reported_input_tokens"], 1000);
+        assert_eq!(summary["rows"][0]["cached_reported_tokens"], 0);
     }
 }

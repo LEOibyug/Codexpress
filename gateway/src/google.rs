@@ -1033,13 +1033,22 @@ fn translate_usage(usage: &Value) -> Option<Value> {
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
     });
-    if let Some(cached) = cached {
-        result["input_tokens_details"] = json!({"cached_tokens": cached.min(input_tokens)});
+    if prompt.is_some() || cached.is_some() {
+        result["input_tokens_details"] =
+            json!({"cached_tokens": cached.unwrap_or(0).min(input_tokens)});
     }
     if let Some(thoughts) = thoughts {
         result["output_tokens_details"] = json!({"reasoning_tokens": thoughts});
     }
     Some(result)
+}
+
+fn extract_service_tier(usage: &Value) -> Option<String> {
+    usage["serviceTier"]
+        .as_str()
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty() && tier.len() <= 32)
+        .map(str::to_ascii_lowercase)
 }
 
 fn status_from_finish_reason(reason: Option<&str>) -> (&'static str, Value) {
@@ -1189,6 +1198,9 @@ pub(crate) fn translate_non_streaming(
     if let Some(usage) = translate_usage(&value["usageMetadata"]) {
         response["usage"] = usage;
     }
+    if let Some(tier) = extract_service_tier(&value["usageMetadata"]) {
+        response["service_tier"] = json!(tier);
+    }
     Ok(Bytes::from(serde_json::to_vec(&response).unwrap()))
 }
 
@@ -1207,6 +1219,7 @@ struct StreamTranslator {
     completed_items: Vec<Value>,
     finish_reason: Option<String>,
     usage: Option<Value>,
+    service_tier: Option<String>,
     pending_signature: Option<String>,
 }
 
@@ -1227,6 +1240,7 @@ impl StreamTranslator {
             completed_items: Vec::new(),
             finish_reason: None,
             usage: None,
+            service_tier: None,
             pending_signature: None,
         }
     }
@@ -1354,6 +1368,9 @@ impl StreamTranslator {
         }
         if let Some(usage) = translate_usage(&chunk_json["usageMetadata"]) {
             self.usage = Some(usage);
+        }
+        if let Some(tier) = extract_service_tier(&chunk_json["usageMetadata"]) {
+            self.service_tier = Some(tier);
         }
         if let Some(err) = chunk_json.get("error").filter(|e| !e.is_null()) {
             self.ensure_started(out);
@@ -1622,6 +1639,9 @@ impl StreamTranslator {
         });
         if let Some(usage) = self.usage.take() {
             response["usage"] = usage;
+        }
+        if let Some(tier) = self.service_tier.take() {
+            response["service_tier"] = json!(tier);
         }
         self.emit(json!({"type": event_type, "response": response}), &mut out);
         Ok(Bytes::from(out))
@@ -2171,5 +2191,55 @@ mod tests {
         assert_eq!(parsed["error"]["code"], "rate_limit_exceeded");
         assert_eq!(parsed["error"]["type"], "rate_limit_exceeded");
         assert_eq!(parsed["error"]["message"], "Quota exceeded");
+    }
+
+    #[tokio::test]
+    async fn reports_zero_cached_tokens_when_omitted_and_preserves_service_tier() {
+        let signatures = ThoughtSignatures::default();
+        let non_stream_raw = json!({
+            "modelVersion": "gemini-4-carbon",
+            "candidates": [{
+                "content": { "role": "model", "parts": [{"text": "391"}] },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 47,
+                "candidatesTokenCount": 17,
+                "totalTokenCount": 64,
+                "serviceTier": "standard"
+            }
+        });
+        let non_stream_bytes =
+            translate_non_streaming(&serde_json::to_vec(&non_stream_raw).unwrap(), "gemini-4-carbon", &signatures)
+                .unwrap();
+        let non_stream_resp: Value = serde_json::from_slice(&non_stream_bytes).unwrap();
+        assert_eq!(non_stream_resp["usage"]["input_tokens"], 47);
+        assert_eq!(non_stream_resp["usage"]["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(non_stream_resp["service_tier"], "standard");
+
+        let chunks = vec![Ok::<_, ()>(Bytes::from(
+            "data: {\"modelVersion\":\"gemini-4-neon\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"400\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":54,\"thoughtsTokenCount\":256,\"totalTokenCount\":310,\"serviceTier\":\"STANDARD\"}}\n\n",
+        ))];
+        let mut translated = Vec::new();
+        let mut out_stream = Box::pin(translate_sse_stream(
+            stream::iter(chunks),
+            "gemini-4-neon".into(),
+            signatures,
+        ));
+        while let Some(item) = out_stream.next().await {
+            translated.extend_from_slice(&item.unwrap());
+        }
+        let text = String::from_utf8(translated).unwrap();
+        let completed: Value = text
+            .split("\n\n")
+            .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .find(|v| v["type"] == "response.completed")
+            .unwrap();
+        assert_eq!(completed["response"]["usage"]["input_tokens"], 54);
+        assert_eq!(completed["response"]["usage"]["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(completed["response"]["usage"]["output_tokens"], 256);
+        assert_eq!(completed["response"]["usage"]["output_tokens_details"]["reasoning_tokens"], 256);
+        assert_eq!(completed["response"]["service_tier"], "standard");
     }
 }

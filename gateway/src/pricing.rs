@@ -55,7 +55,11 @@ fn matches_model(model: &str, id: &str) -> bool {
         })
 }
 fn price_for_model(model: &str) -> Option<&'static Price> {
-    let model = model.strip_prefix("openai/").unwrap_or(model);
+    let model = model
+        .strip_prefix("openai/")
+        .or_else(|| model.strip_prefix("google/"))
+        .or_else(|| model.strip_prefix("models/"))
+        .unwrap_or(model);
     prices().models.iter().find(|p| matches_model(model, &p.id))
 }
 
@@ -188,20 +192,63 @@ pub fn estimate(record: &Value, historical: bool) -> Value {
         } else {
             1.0
         };
-    let write_price = if subscription_pricing {
-        Some(0.0)
+    let retention_price = match details["cache_write_retention"].as_str() {
+        None | Some("in_memory" | "30m") => price.cache_write_30m,
+        Some("12h" | "24h") => price.cache_write_12h,
+        _ => None,
+    };
+    let (write_usd, unpriced_write, display_write_price) = if subscription_pricing {
+        (0.0, 0, Some(0.0))
+    } else if write == 0 {
+        (0.0, 0, retention_price)
+    } else if details["cache_write_30m_tokens"].as_u64().is_some()
+        || details["cache_write_12h_tokens"].as_u64().is_some()
+    {
+        let w30 = details["cache_write_30m_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            .min(write);
+        let w12 = details["cache_write_12h_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            .min(write - w30);
+        let w_rem = write - w30 - w12;
+        let mut total = 0.0;
+        let mut unpriced = 0u64;
+        if w30 > 0 {
+            match price.cache_write_30m {
+                Some(p) => total += dollars(w30, p, input_multiplier),
+                None => unpriced += w30,
+            }
+        }
+        if w12 > 0 {
+            match price.cache_write_12h {
+                Some(p) => total += dollars(w12, p, input_multiplier),
+                None => unpriced += w12,
+            }
+        }
+        if w_rem > 0 {
+            match retention_price {
+                Some(p) => total += dollars(w_rem, p, input_multiplier),
+                None => unpriced += w_rem,
+            }
+        }
+        let display = if w12 > 0 && w30 == 0 && w_rem == 0 {
+            price.cache_write_12h
+        } else if w30 > 0 && w12 == 0 && w_rem == 0 {
+            price.cache_write_30m
+        } else {
+            retention_price.or(price.cache_write_30m)
+        };
+        (total, unpriced, display)
     } else {
-        match details["cache_write_retention"].as_str() {
-            None | Some("in_memory" | "30m") => price.cache_write_30m,
-            Some("12h") => price.cache_write_12h,
-            _ => None,
+        match retention_price {
+            Some(p) => (dollars(write, p, input_multiplier), 0, Some(p)),
+            None => (0.0, write, None),
         }
     };
     let input_usd = dollars(uncached, price.input, input_multiplier);
     let cached_usd = dollars(read, price.cached_input, input_multiplier);
-    let write_usd = write_price
-        .map(|p| dollars(write, p, input_multiplier))
-        .unwrap_or(0.0);
     let output_usd = if output_known {
         dollars(output, price.output, output_multiplier)
     } else {
@@ -213,7 +260,7 @@ pub fn estimate(record: &Value, historical: bool) -> Value {
         || details["legacy"] == true
         || historical
         || price.session_scope && !waived;
-    let partial = !output_known || !input_known && input == 0 || write > 0 && write_price.is_none();
+    let partial = !output_known || !input_known && input == 0 || unpriced_write > 0;
     json!({"revision":prices().revision,"currency":"USD","status":if partial {"partial"}else if estimated {"estimated"}else {"reported"},
         "historical":historical,"price_model":price.id,"service_tier":tier,"long_context":long,"long_context_waived":long && waived,
         "billing_basis":basis,"source_type_known":details["source_kind"].is_string(),
@@ -221,8 +268,8 @@ pub fn estimate(record: &Value, historical: bool) -> Value {
         "input_usd":input_usd,"cached_input_usd":cached_usd,"cache_write_usd":write_usd,"output_usd":output_usd,
         "total_usd":input_usd+cached_usd+write_usd+output_usd,
         "cache_savings_usd":dollars(read,price.input-price.cached_input,input_multiplier),
-        "rates":{"input":price.input*input_multiplier,"cached_input":price.cached_input*input_multiplier,"output":price.output*output_multiplier,"cache_write":write_price.map(|p|p*input_multiplier)},
-        "unpriced_cache_write_tokens":if write_price.is_none(){write}else{0}})
+        "rates":{"input":price.input*input_multiplier,"cached_input":price.cached_input*input_multiplier,"output":price.output*output_multiplier,"cache_write":display_write_price.map(|p|p*input_multiplier)},
+        "unpriced_cache_write_tokens":unpriced_write})
 }
 
 #[cfg(test)]
@@ -434,5 +481,65 @@ mod tests {
             .remove("source_kind");
         assert_eq!(estimate(&value, true)["source_type_known"], false);
         assert_eq!(estimate(&value, true)["billing_basis"], "api_reference");
+    }
+
+    #[test]
+    fn gemini_4_reference_prices_and_gpt6_cache_write_details_with_24h_retention() {
+        for (model, input, cached, output) in [
+            ("gemini-4-hydrogen", 1.5, 0.075, 7.5),
+            ("google/gemini-4-neon", 3.0, 0.15, 15.0),
+            ("gemini-4-carbon", 2.0, 0.1, 10.0),
+            ("gemini-4-argon", 2.0, 0.1, 10.0),
+        ] {
+            let mut value = record(1_000_000, 500_000);
+            value["model"] = json!(model);
+            value["token_details"]["source_kind"] = json!("google");
+            value["token_details"]["service_tier"] = json!("standard");
+            let cost = estimate(&value, false);
+            assert_eq!(cost["status"], "reported");
+            let expected = 0.5 * input + 0.5 * cached + 0.001 * output;
+            assert!((cost["total_usd"].as_f64().unwrap() - expected).abs() < 1e-9);
+            assert_eq!(cost["service_tier"], "standard");
+        }
+
+        // OpenAI GPT-6+ may return prompt_cache_retention: "24h" together with
+        // cache_write_tokens_details.{ttl_30m_tokens, ttl_12h_tokens}.
+        let mut luna = json!({
+            "model": "gpt-6-luna",
+            "status": "success",
+            "input_tokens": 1953,
+            "cached_input_tokens": 0,
+            "output_tokens": 20,
+            "complete": true,
+            "token_details": {
+                "source_kind": "openai",
+                "service_tier": "default",
+                "input_estimated": false,
+                "output_estimated": false,
+                "output_available": true,
+                "cached_input_reported": true,
+                "cache_write_input_tokens": 1950,
+                "cache_write_30m_tokens": 1950,
+                "cache_write_12h_tokens": 0,
+                "cache_write_retention": "24h"
+            }
+        });
+        let luna_cost = estimate(&luna, false);
+        assert_eq!(luna_cost["status"], "reported");
+        assert_eq!(luna_cost["unpriced_cache_write_tokens"], 0);
+        // uncached 3 * 0.1/1M + write 1950 * 0.125/1M + output 20 * 0.5/1M
+        let expected_luna = (3.0 * 0.1 + 1950.0 * 0.125 + 20.0 * 0.5) / 1_000_000.0;
+        assert!((luna_cost["total_usd"].as_f64().unwrap() - expected_luna).abs() < 1e-12);
+
+        // Mixed 30m + 12h writes + fallback without breakdown for 24h
+        luna["model"] = json!("gpt-6.2-sol");
+        luna["token_details"]["cache_write_input_tokens"] = json!(1500);
+        luna["token_details"]["cache_write_30m_tokens"] = json!(500);
+        luna["token_details"]["cache_write_12h_tokens"] = json!(1000);
+        let mixed = estimate(&luna, false);
+        assert_eq!(mixed["status"], "reported");
+        let expected_mixed =
+            (453.0 * 2.0 + 500.0 * 2.5 + 1000.0 * 5.0 + 20.0 * 10.0) / 1_000_000.0;
+        assert!((mixed["total_usd"].as_f64().unwrap() - expected_mixed).abs() < 1e-12);
     }
 }

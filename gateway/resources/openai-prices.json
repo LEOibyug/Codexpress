@@ -1,6 +1,6 @@
 {
-  "revision": "openai-2026-11-18-v1",
-  "verified_at": "2026-11-18",
+  "revision": "reference-2026-11-25-v1",
+  "verified_at": "2026-11-25",
   "currency": "USD",
   "unit": "per_million_tokens",
   "source_url": "https://developers.openai.com/api/docs/pricing",
@@ -226,6 +226,38 @@
       "cached_input": 0.025,
       "output": 2,
       "source_url": "https://developers.openai.com/api/docs/models/gpt-5.1-codex-mini"
+    },
+    {
+      "id": "gemini-4-hydrogen",
+      "input": 1.5,
+      "cached_input": 0.075,
+      "output": 7.5,
+      "discount_multiplier": 0.5,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "id": "gemini-4-neon",
+      "input": 3,
+      "cached_input": 0.15,
+      "output": 15,
+      "discount_multiplier": 0.5,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "id": "gemini-4-carbon",
+      "input": 2,
+      "cached_input": 0.1,
+      "output": 10,
+      "discount_multiplier": 0.5,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    {
+      "id": "gemini-4-argon",
+      "input": 2,
+      "cached_input": 0.1,
+      "output": 10,
+      "discount_multiplier": 0.5,
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing"
     }
   ],
   "source_markdown_url": "https://developers.openai.com/api/docs/pricing.md",

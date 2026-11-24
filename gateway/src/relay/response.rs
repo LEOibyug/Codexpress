@@ -435,6 +435,8 @@ impl Attempt {
                     output_available: observer.output.is_some() || observer.output_observed,
                     cached_input_reported: observer.cached.is_some(),
                     cache_write_input_tokens: observer.cache_write,
+                    cache_write_30m_tokens: observer.cache_write_30m,
+                    cache_write_12h_tokens: observer.cache_write_12h,
                     reasoning_output_tokens: observer.reasoning,
                     reported_total_tokens: observer.total,
                     stream_complete: observer.terminal,
@@ -446,7 +448,10 @@ impl Attempt {
                         .service_tier
                         .clone()
                         .or_else(|| record.token_details.service_tier.clone()),
-                    cache_write_retention: record.token_details.cache_write_retention.clone(),
+                    cache_write_retention: observer
+                        .cache_write_retention
+                        .clone()
+                        .or_else(|| record.token_details.cache_write_retention.clone()),
                     source_kind: record.token_details.source_kind.clone(),
                     is_subscription: record.token_details.is_subscription,
                     source_identity: record.token_details.source_identity.clone(),
@@ -512,8 +517,11 @@ pub(super) struct Observer {
     output: Option<u64>,
     cached: Option<u64>,
     cache_write: Option<u64>,
+    cache_write_30m: Option<u64>,
+    cache_write_12h: Option<u64>,
     billing_model: Option<String>,
     service_tier: Option<String>,
+    cache_write_retention: Option<String>,
     reasoning: Option<u64>,
     total: Option<u64>,
     upstream_cost: Option<crate::usage::ReportedCost>,
@@ -586,6 +594,12 @@ impl Observer {
         }
         if let Some(tier) = response["service_tier"].as_str().filter(|v| v.len() <= 32) {
             self.service_tier = Some(tier.into());
+        }
+        if let Some(retention) = response["prompt_cache_retention"]
+            .as_str()
+            .filter(|v| !v.is_empty() && v.len() <= 32)
+        {
+            self.cache_write_retention = Some(retention.into());
         }
         if let Some(id) = response
             .get("id")
@@ -767,6 +781,14 @@ impl Observer {
                 .pointer("/input_tokens_details/cache_write_tokens")
                 .and_then(Value::as_u64)
                 .or(self.cache_write);
+            self.cache_write_30m = usage
+                .pointer("/input_tokens_details/cache_write_tokens_details/ttl_30m_tokens")
+                .and_then(Value::as_u64)
+                .or(self.cache_write_30m);
+            self.cache_write_12h = usage
+                .pointer("/input_tokens_details/cache_write_tokens_details/ttl_12h_tokens")
+                .and_then(Value::as_u64)
+                .or(self.cache_write_12h);
             self.reasoning = usage
                 .pointer("/output_tokens_details/reasoning_tokens")
                 .and_then(Value::as_u64)
@@ -1328,5 +1350,62 @@ mod observation_tests {
         let final_usage = state.usage.summary(1).unwrap();
         assert_eq!(final_usage["recent"][0]["generation_ms"], 20);
         assert_eq!(final_usage["recent"][0]["output_tps"], 100.0);
+    }
+
+    #[test]
+    fn extracts_gpt6_cache_write_ttl_breakdown_and_retention_for_pricing() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned(), 0, "fixture-key".into()).unwrap();
+        let source: Source = serde_json::from_value(json!({
+            "id": "openai-src", "name": "OpenAI", "kind": "openai",
+            "base_url": "https://api.openai.com/v1", "enabled": true, "priority": 0,
+            "proxy": {"mode": "direct"}, "models": ["gpt-6-luna"],
+            "secret": {"api_key": "fixture"}
+        }))
+        .unwrap();
+        let mut attempt = Attempt::new(
+            state.clone(),
+            &source,
+            "request",
+            "gpt-6-luna",
+            1000,
+            crate::usage::Ingress::Native,
+        );
+        let mut observer = Observer {
+            sse: true,
+            ..Default::default()
+        };
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "model": "gpt-6-luna",
+                "service_tier": "default",
+                "prompt_cache_retention": "24h",
+                "usage": {
+                    "input_tokens": 1953,
+                    "input_tokens_details": {
+                        "cached_tokens": 0,
+                        "cache_write_tokens": 1950,
+                        "cache_write_tokens_details": {
+                            "ttl_30m_tokens": 1950,
+                            "ttl_12h_tokens": 0
+                        }
+                    },
+                    "output_tokens": 20,
+                    "output_tokens_details": { "reasoning_tokens": 12 },
+                    "total_tokens": 1973
+                }
+            }
+        });
+        observer.value(&completed, Instant::now());
+        attempt.finish("success", Some(&observer));
+        drop(attempt);
+        let summary = state.usage.summary(1).unwrap();
+        let rec = &summary["recent"][0];
+        assert_eq!(rec["token_details"]["cache_write_30m_tokens"], 1950);
+        assert_eq!(rec["token_details"]["cache_write_12h_tokens"], 0);
+        assert_eq!(rec["token_details"]["cache_write_retention"], "24h");
+        assert_eq!(rec["cost"]["status"], "reported");
+        assert_eq!(rec["cost"]["unpriced_cache_write_tokens"], 0);
     }
 }
