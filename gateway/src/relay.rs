@@ -1375,7 +1375,11 @@ async fn forward_once(
         let retries =
             retries::UpstreamRetries::new(&request_retries, &source, &*state.settings.read().await);
         let attempt_limit = (if compatibility { 6 } else { 3 }) + retries.extra_attempts();
-        for _attempt_number in 0..attempt_limit {
+        let mut google_thinking_override: Option<crate::google::PreparedGoogleRequest> = None;
+        let mut google_thinking_retried = false;
+        let mut attempt_number = 0;
+        while attempt_number < attempt_limit {
+            attempt_number += 1;
             let eligible = if manual_candidate {
                 match &manual.trial {
                     Some(trial) => routing::manual::source_for_trial(&state, trial, model)
@@ -1454,21 +1458,25 @@ async fn forward_once(
                 (wire_bytes, false)
             };
             let (url, wire_bytes, google_stream) = if is_google {
-                let mut effective_body: Value = match serde_json::from_slice(&wire_bytes) {
-                    Ok(value) => value,
-                    Err(_) => return error(StatusCode::BAD_REQUEST, "Responses 请求需要有效 JSON"),
-                };
-                if effective_body.get("previous_response_id").is_some_and(|v| !v.is_null()) {
-                    if let Some(expanded) = history_capture.as_ref().map(|h| &h.request["input"]) {
-                        effective_body["input"] = expanded.clone();
-                        if let Some(obj) = effective_body.as_object_mut() {
-                            obj.remove("previous_response_id");
+                if let Some(prepared) = google_thinking_override.take() {
+                    (prepared.url, prepared.body, Some(prepared.stream))
+                } else {
+                    let mut effective_body: Value = match serde_json::from_slice(&wire_bytes) {
+                        Ok(value) => value,
+                        Err(_) => return error(StatusCode::BAD_REQUEST, "Responses 请求需要有效 JSON"),
+                    };
+                    if effective_body.get("previous_response_id").is_some_and(|v| !v.is_null()) {
+                        if let Some(expanded) = history_capture.as_ref().map(|h| &h.request["input"]) {
+                            effective_body["input"] = expanded.clone();
+                            if let Some(obj) = effective_body.as_object_mut() {
+                                obj.remove("previous_response_id");
+                            }
                         }
                     }
-                }
-                match crate::google::build_request(&source, &effective_body, &state.google_signatures) {
-                    Ok(prepared) => (prepared.url, prepared.body, Some(prepared.stream)),
-                    Err((err_status, message)) => return error(err_status, message),
+                    match crate::google::build_request(&source, &effective_body, &state.google_signatures) {
+                        Ok(prepared) => (prepared.url, prepared.body, Some(prepared.stream)),
+                        Err((err_status, message)) => return error(err_status, message),
+                    }
                 }
             } else {
                 let url = match target(&source, parts.uri.path(), parts.uri.query()) {
@@ -1477,6 +1485,7 @@ async fn forward_once(
                 };
                 (url, wire_bytes, None)
             };
+            let google_sent_body = (is_google && !google_thinking_retried).then(|| wire_bytes.clone());
             let mut attempt = Attempt::new(state.clone(), &source, &request_id, model, input_units, ingress);
             if let Some(record) = &mut attempt.record {
                 record.token_details.service_tier = parsed["service_tier"]
@@ -1974,6 +1983,27 @@ async fn forward_once(
                         continue;
                     }
                     context_rejected = explicit_context_rejection(value);
+                }
+            }
+            if is_google && status == StatusCode::BAD_REQUEST && !google_thinking_retried {
+                if let (Some(sent_body), Some(err_val)) = (google_sent_body.as_deref(), effective_http_error) {
+                    if let Some(repaired) = crate::google::fallback_thinking_request(
+                        &source,
+                        &parsed,
+                        &state.google_signatures,
+                        sent_body,
+                        status,
+                        err_val,
+                    ) {
+                        google_thinking_retried = true;
+                        google_thinking_override = Some(repaired);
+                        attempt.finish("failed", None);
+                        attempt.collect_error(&mut upstream, &mut prefix).await;
+                        drop(upstream);
+                        drop(attempt);
+                        attempt_number -= 1;
+                        continue;
+                    }
                 }
             }
             let mut stream_transient = false;

@@ -243,7 +243,11 @@ fn sanitize_schema(value: &Value) -> Option<Value> {
     let obj = value.as_object()?;
     let mut out = Map::new();
 
-    if let Some(any_of) = obj.get("anyOf").and_then(Value::as_array) {
+    if let Some(any_of) = obj
+        .get("anyOf")
+        .or_else(|| obj.get("oneOf"))
+        .and_then(Value::as_array)
+    {
         let non_null: Vec<Value> = any_of
             .iter()
             .filter(|entry| entry.get("type").and_then(Value::as_str) != Some("null"))
@@ -298,7 +302,6 @@ fn sanitize_schema(value: &Value) -> Option<Value> {
 
     for key in [
         "description",
-        "format",
         "minimum",
         "maximum",
         "minLength",
@@ -309,6 +312,19 @@ fn sanitize_schema(value: &Value) -> Option<Value> {
     ] {
         if let Some(v) = obj.get(key) {
             out.insert(key.into(), v.clone());
+        }
+    }
+
+    if let Some(fmt) = obj.get("format").and_then(Value::as_str) {
+        let mapped_type = out.get("type").and_then(Value::as_str);
+        let allowed = match mapped_type {
+            Some("STRING") => matches!(fmt, "enum" | "date-time"),
+            Some("NUMBER") => matches!(fmt, "float" | "double"),
+            Some("INTEGER") => matches!(fmt, "int32" | "int64"),
+            _ => false,
+        };
+        if allowed {
+            out.insert("format".into(), json!(fmt));
         }
     }
 
@@ -372,40 +388,295 @@ fn map_schema_type(raw: &str) -> Option<&'static str> {
     }
 }
 
-fn thinking_config(model: &str, effort: &str) -> Option<Value> {
-    let lower = model.to_ascii_lowercase();
-    let effort = effort.trim().to_ascii_lowercase();
-    let is_gemini_3_or_newer = lower.contains("gemini-3") || lower.contains("gemini-4");
-    let is_gemini_25 = lower.contains("gemini-2.5");
-    if is_gemini_3_or_newer {
-        let (level, include_thoughts) = match effort.as_str() {
-            "none" => ("minimal", false),
-            "minimal" => ("minimal", true),
-            "low" => ("low", true),
-            "medium" => ("medium", true),
-            "high" | "xhigh" => ("high", true),
-            _ => return None,
-        };
-        return Some(json!({
-            "includeThoughts": include_thoughts,
-            "thinkingLevel": level,
-        }));
+const SKIP_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
+pub(crate) fn is_non_thinking_model(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    let lower = lower.strip_prefix("models/").unwrap_or(&lower);
+    [
+        "-image",
+        "-tts",
+        "-transcribe",
+        "-audio",
+        "embedding",
+        "nano-banana",
+        "lyria",
+        "-omni",
+        "robotics",
+        "decision",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || lower.starts_with("gemini-1.")
+        || lower.starts_with("gemini-2.0")
+}
+
+fn gemini_major_minor(model: &str) -> Option<(u32, u32)> {
+    let lower = model.trim().to_ascii_lowercase();
+    let lower = lower.strip_prefix("models/").unwrap_or(&lower);
+    let rest = lower.strip_prefix("gemini-")?;
+    let major_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if major_len == 0 {
+        return None;
     }
-    if is_gemini_25 {
-        let budget = match effort.as_str() {
-            "none" => 0,
-            "minimal" => 512,
-            "low" => 1024,
-            "medium" => 8192,
-            "high" | "xhigh" => 24576,
-            _ => return None,
-        };
-        return Some(json!({
-            "includeThoughts": budget > 0,
-            "thinkingBudget": budget,
-        }));
+    let major: u32 = rest[..major_len].parse().ok()?;
+    let after_major = &rest[major_len..];
+    let minor = if let Some(after_dot) = after_major.strip_prefix('.') {
+        let minor_len = after_dot.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if minor_len == 0 {
+            0
+        } else {
+            after_dot[..minor_len].parse().ok()?
+        }
+    } else {
+        0
+    };
+    Some((major, minor))
+}
+
+/// Supported reasoning effort tiers advertised for Google models in catalogs and `/omp/v1/models`.
+pub(crate) fn supported_reasoning_levels(model: &str) -> Option<&'static [&'static str]> {
+    if is_non_thinking_model(model) {
+        return None;
+    }
+    let lower = model.trim().to_ascii_lowercase();
+    let lower = lower.strip_prefix("models/").unwrap_or(&lower);
+    if let Some((major, minor)) = gemini_major_minor(lower) {
+        if major >= 4 {
+            return Some(if lower.contains("hydrogen") {
+                &["low", "medium", "high", "xhigh"]
+            } else {
+                &["low", "medium", "high"]
+            });
+        }
+        if major == 3 {
+            return Some(if lower.contains("-pro") {
+                &["low", "high"]
+            } else if minor >= 7 {
+                &["low", "medium", "high"]
+            } else {
+                &["minimal", "low", "medium", "high"]
+            });
+        }
+        if major == 2 && minor == 5 {
+            return Some(&["minimal", "low", "medium", "high"]);
+        }
+        return None;
+    }
+    if lower.starts_with("gemma-4") {
+        return Some(&["high"]);
     }
     None
+}
+
+/// Repairs stale cached Google catalog entries so deprecated levels (e.g. `minimal` on Gemini 4+)
+/// are never re-advertised to clients after upgrade.
+pub(crate) fn normalize_catalog_entry(entry: &mut Value) {
+    let Some(slug) = entry.get("slug").and_then(Value::as_str).map(str::to_owned) else {
+        return;
+    };
+    let lower = slug.to_ascii_lowercase();
+    if !lower.starts_with("gemini-") && !lower.starts_with("gemma-") {
+        return;
+    }
+    if let Some(levels) = supported_reasoning_levels(&slug) {
+        entry["supported_reasoning_levels"] = json!(levels);
+    } else if let Some(obj) = entry.as_object_mut() {
+        obj.remove("supported_reasoning_levels");
+        obj.remove("thinking");
+    }
+}
+
+fn thinking_config_with_level(level: &str, include_thoughts: bool) -> Value {
+    json!({
+        "includeThoughts": include_thoughts,
+        "thinkingLevel": level,
+    })
+}
+
+fn thinking_config(model: &str, effort: &str) -> Option<Value> {
+    if is_non_thinking_model(model) {
+        return None;
+    }
+    let lower = model.trim().to_ascii_lowercase();
+    let lower = lower.strip_prefix("models/").unwrap_or(&lower);
+    let effort = effort.trim().to_ascii_lowercase();
+    if let Some((major, minor)) = gemini_major_minor(lower) {
+        if major >= 4 {
+            let (level, include_thoughts) = match effort.as_str() {
+                "none" => ("low", false),
+                "minimal" | "low" => ("low", true),
+                "medium" => ("medium", true),
+                "high" => ("high", true),
+                "xhigh" | "max" => (if lower.contains("hydrogen") { "xhigh" } else { "high" }, true),
+                _ => ("medium", true),
+            };
+            return Some(thinking_config_with_level(level, include_thoughts));
+        }
+        if major == 3 {
+            let (level, include_thoughts) = if lower.contains("-pro") {
+                match effort.as_str() {
+                    "none" => ("low", false),
+                    "minimal" | "low" => ("low", true),
+                    _ => ("high", true),
+                }
+            } else if minor >= 7 {
+                match effort.as_str() {
+                    "none" => ("low", false),
+                    "low" => ("low", true),
+                    "medium" => ("medium", true),
+                    "high" => ("high", true),
+                    _ => ("medium", true),
+                }
+            } else {
+                match effort.as_str() {
+                    "none" => ("minimal", false),
+                    "minimal" => ("minimal", true),
+                    "low" => ("low", true),
+                    "medium" => ("medium", true),
+                    "high" => ("high", true),
+                    _ => ("medium", true),
+                }
+            };
+            return Some(thinking_config_with_level(level, include_thoughts));
+        }
+        if major == 2 && minor == 5 {
+            let is_pro = lower.contains("-pro");
+            let (budget, include_thoughts) = match effort.as_str() {
+                "none" => (if is_pro { 128 } else { 0 }, false),
+                "minimal" => (512, true),
+                "low" => (1024, true),
+                "medium" => (8192, true),
+                "high" => (24576, true),
+                _ => (8192, true),
+            };
+            return Some(json!({
+                "includeThoughts": include_thoughts && budget > 0,
+                "thinkingBudget": budget,
+            }));
+        }
+        return None;
+    }
+    if lower.starts_with("gemma-4") {
+        let (level, include_thoughts) = match effort.as_str() {
+            "none" | "minimal" => ("minimal", false),
+            _ => ("high", true),
+        };
+        return Some(thinking_config_with_level(level, include_thoughts));
+    }
+    None
+}
+
+/// Builds a single-shot fallback Gemini request when upstream returns HTTP 400 rejecting the
+/// configured `thinkingLevel` or `thinkingBudget`. Returns `None` if no distinct fallback applies.
+pub(crate) fn fallback_thinking_request(
+    source: &Source,
+    parsed: &Value,
+    _signatures: &ThoughtSignatures,
+    previous_body: &[u8],
+    status: StatusCode,
+    upstream_error: &Value,
+) -> Option<PreparedGoogleRequest> {
+    if status != StatusCode::BAD_REQUEST {
+        return None;
+    }
+    let msg = upstream_error
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| upstream_error.get("message").and_then(Value::as_str))?
+        .to_ascii_lowercase();
+    let is_thinking_error = ((msg.contains("thinking level") || msg.contains("thinking_level"))
+        && (msg.contains("not supported") || msg.contains("invalid") || msg.contains("unsupported")))
+        || msg.contains("use thinking level instead")
+        || msg.contains("budget 0 is invalid")
+        || ((msg.contains("thinking budget") || msg.contains("thinking_budget"))
+            && (msg.contains("not supported") || msg.contains("invalid") || msg.contains("unsupported")));
+    if !is_thinking_error {
+        return None;
+    }
+
+    let model = parsed["model"].as_str()?;
+    let normalized_model = normalize_model(model).ok()?;
+    let stream = parsed["stream"].as_bool().unwrap_or(false);
+    let url = endpoint(source, normalized_model, stream).ok()?;
+    let mut body: Value = serde_json::from_slice(previous_body).ok()?;
+
+    let prev_thinking = body.pointer("/generationConfig/thinkingConfig").cloned();
+    let prev_level = prev_thinking
+        .as_ref()
+        .and_then(|t| t.get("thinkingLevel"))
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let prev_include = prev_thinking
+        .as_ref()
+        .and_then(|t| t.get("includeThoughts"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let orig_effort = parsed
+        .pointer("/reasoning/effort")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let is_gemini_4_plus = gemini_major_minor(normalized_model).is_some_and(|(major, _)| major >= 4);
+
+    let next_thinking = if is_gemini_4_plus {
+        let next_level = match prev_level.as_deref() {
+            Some("minimal") => "low",
+            Some("xhigh") => "high",
+            Some("medium") => {
+                if matches!(orig_effort.as_str(), "none" | "minimal" | "low") {
+                    "low"
+                } else {
+                    "high"
+                }
+            }
+            _ => "medium",
+        };
+        thinking_config_with_level(next_level, prev_include)
+    } else if msg.contains("budget 0 is invalid") {
+        json!({
+            "includeThoughts": false,
+            "thinkingBudget": 128,
+        })
+    } else if msg.contains("use thinking level instead") {
+        thinking_config_with_level("medium", prev_include)
+    } else if prev_thinking
+        .as_ref()
+        .and_then(|t| t.get("thinkingBudget"))
+        .is_some()
+    {
+        json!({
+            "includeThoughts": true,
+            "thinkingBudget": 8192,
+        })
+    } else if prev_level.as_deref() == Some("medium") {
+        let next_level = if matches!(orig_effort.as_str(), "none" | "minimal" | "low") {
+            "low"
+        } else {
+            "high"
+        };
+        thinking_config_with_level(next_level, prev_include)
+    } else {
+        thinking_config_with_level("medium", prev_include)
+    };
+
+    let root = body.as_object_mut()?;
+    let generation = root
+        .entry("generationConfig")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let generation_obj = generation.as_object_mut()?;
+    generation_obj.insert("thinkingConfig".into(), next_thinking);
+
+    let next_bytes = serde_json::to_vec(&body).ok()?;
+    if next_bytes == previous_body {
+        return None;
+    }
+    Some(PreparedGoogleRequest {
+        url,
+        body: Bytes::from(next_bytes),
+        stream,
+    })
 }
 
 fn parse_function_arguments(raw: Option<&Value>) -> Result<Value, (StatusCode, &'static str)> {
@@ -467,6 +738,7 @@ pub(crate) fn build_request(
     let stream = parsed["stream"].as_bool().unwrap_or(false);
     let url = endpoint(source, normalized_model, stream)?;
 
+    let is_gemini_3_plus = gemini_major_minor(normalized_model).is_some_and(|(major, _)| major >= 3);
     let mut system_parts = Vec::new();
     if let Some(instructions) = parsed["instructions"].as_str().filter(|s| !s.is_empty()) {
         system_parts.push(json!({"text": instructions}));
@@ -511,12 +783,18 @@ pub(crate) fn build_request(
                             call_names.insert(call_id.to_owned(), name.to_owned());
                         }
                         let args = parse_function_arguments(item.get("arguments"))?;
-                        let mut part = json!({"functionCall": {"name": name, "args": args}});
+                        let mut fc = json!({"name": name, "args": args});
+                        if is_gemini_3_plus && !call_id.is_empty() {
+                            fc["id"] = json!(call_id);
+                        }
+                        let mut part = json!({"functionCall": fc});
                         if let Some(sig) = signatures
                             .get(call_id)
                             .or_else(|| item["thought_signature"].as_str().map(str::to_owned))
                         {
                             part["thoughtSignature"] = json!(sig);
+                        } else if is_gemini_3_plus {
+                            part["thoughtSignature"] = json!(SKIP_THOUGHT_SIGNATURE);
                         }
                         push_turn(&mut contents, "model", vec![part]);
                     }
@@ -529,10 +807,14 @@ pub(crate) fn build_request(
                             .filter(|s| !s.is_empty())
                             .ok_or((StatusCode::BAD_REQUEST, "工具结果缺少对应的函数调用"))?;
                         let response = parse_function_response(&item["output"]);
+                        let mut fr = json!({"name": name, "response": response});
+                        if is_gemini_3_plus && !call_id.is_empty() {
+                            fr["id"] = json!(call_id);
+                        }
                         push_turn(
                             &mut contents,
                             "user",
-                            vec![json!({"functionResponse": {"name": name, "response": response}})],
+                            vec![json!({"functionResponse": fr})],
                         );
                     }
                     (Some("item_reference"), _) => {
@@ -762,10 +1044,18 @@ fn translate_usage(usage: &Value) -> Option<Value> {
 
 fn status_from_finish_reason(reason: Option<&str>) -> (&'static str, Value) {
     match reason {
-        Some("MAX_TOKENS") => ("incomplete", json!({"reason": "max_output_tokens"})),
-        Some("SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY") => {
-            ("incomplete", json!({"reason": "content_filter"}))
-        }
+        Some("MAX_TOKENS" | "CONTINUATION") => ("incomplete", json!({"reason": "max_output_tokens"})),
+        Some(
+            "SAFETY"
+            | "RECITATION"
+            | "BLOCKLIST"
+            | "PROHIBITED_CONTENT"
+            | "SPII"
+            | "IMAGE_SAFETY"
+            | "IMAGE_PROHIBITED_CONTENT"
+            | "IMAGE_RECITATION"
+            | "IMAGE_OTHER",
+        ) => ("incomplete", json!({"reason": "content_filter"})),
         _ => ("completed", Value::Null),
     }
 }
@@ -780,10 +1070,19 @@ pub(crate) fn translate_non_streaming(
     if value.get("error").is_some_and(|e| !e.is_null()) {
         return Err("Google AI Studio 返回了异常结果");
     }
-    let candidate = value["candidates"]
-        .as_array()
-        .and_then(|c| c.first())
-        .ok_or("Google AI Studio 响应缺少候选输出")?;
+    let candidate = match value["candidates"].as_array().and_then(|c| c.first()) {
+        Some(candidate) => candidate,
+        None => {
+            if value
+                .pointer("/promptFeedback/blockReason")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+            {
+                return Err("Google AI Studio 拒绝了该请求（内容安全过滤）");
+            }
+            return Err("Google AI Studio 响应缺少候选输出");
+        }
+    };
     let mut output = Vec::new();
     let mut reasoning_text = String::new();
     let mut message_text = String::new();
@@ -1078,6 +1377,38 @@ impl StreamTranslator {
             return;
         }
         let Some(candidate) = chunk_json["candidates"].as_array().and_then(|c| c.first()) else {
+            if let Some(reason) = chunk_json
+                .pointer("/promptFeedback/blockReason")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                self.ensure_started(out);
+                self.close_reasoning(out);
+                self.close_message(out);
+                let detail = chunk_json
+                    .pointer("/promptFeedback/blockReasonMessage")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty());
+                let message = match detail {
+                    Some(detail) => format!("Google AI Studio 拒绝了该请求（{reason}）: {detail}"),
+                    None => format!("Google AI Studio 拒绝了该请求（{reason}）"),
+                };
+                let failed = json!({
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": self.created_at,
+                    "status": "failed",
+                    "model": self.model,
+                    "output": self.completed_items,
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error",
+                        "code": "content_filter"
+                    }
+                });
+                self.emit(json!({"type": "response.failed", "response": failed}), out);
+                self.failed = true;
+            }
             return;
         };
         self.saw_candidate = true;
@@ -1213,7 +1544,7 @@ impl StreamTranslator {
                     );
                 }
             } else if let Some(text) = part["text"].as_str() {
-                if text.is_empty() && self.active_message.is_some() {
+                if text.is_empty() {
                     continue;
                 }
                 self.close_reasoning(out);
@@ -1513,7 +1844,7 @@ mod tests {
         assert_eq!(body["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"], json!(["lookup"]));
         assert_eq!(body["generationConfig"]["responseMimeType"], "application/json");
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 500);
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "medium");
+        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
         assert!(body["generationConfig"]["thinkingConfig"].get("thinkingBudget").is_none());
 
         // Gemini 2.5 uses thinkingBudget only.
@@ -1538,6 +1869,175 @@ mod tests {
             serde_json::from_slice(&build_request(&source, &parsed_20, &signatures).unwrap().body)
                 .unwrap();
         assert!(body_20["generationConfig"].get("thinkingConfig").is_none());
+    }
+
+    #[test]
+    fn maps_gemini_4_plus_and_incompatible_efforts_and_repairs_schema_and_signatures() {
+        let source = google_source();
+        let signatures = ThoughtSignatures::default();
+
+        // Gemini 4+ dynamically maps `minimal`/`none` away from MINIMAL, keeps `xhigh` on Hydrogen.
+        for (model, effort, expected_level, expected_thoughts) in [
+            ("gemini-4-hydrogen", "minimal", "low", true),
+            ("gemini-4-hydrogen", "none", "low", false),
+            ("gemini-4-hydrogen", "xhigh", "xhigh", true),
+            ("gemini-4-carbon", "minimal", "low", true),
+            ("gemini-4-carbon", "xhigh", "high", true),
+            ("gemini-4-neon", "minimal", "low", true),
+            ("gemini-5-pro", "minimal", "low", true),
+            ("gemini-3.8-flash", "minimal", "medium", true),
+            ("gemini-3.8-flash", "xhigh", "medium", true),
+            ("gemini-3.8-flash", "high", "high", true),
+            ("gemma-4-31b-it", "medium", "high", true),
+            ("gemma-4-31b-it", "none", "minimal", false),
+        ] {
+            let parsed = json!({
+                "model": model,
+                "input": "hi",
+                "reasoning": {"effort": effort}
+            });
+            let body: Value =
+                serde_json::from_slice(&build_request(&source, &parsed, &signatures).unwrap().body)
+                    .unwrap();
+            assert_eq!(
+                body["generationConfig"]["thinkingConfig"]["thinkingLevel"], expected_level,
+                "model={model} effort={effort}"
+            );
+            assert_eq!(
+                body["generationConfig"]["thinkingConfig"]["includeThoughts"], expected_thoughts,
+                "model={model} effort={effort}"
+            );
+        }
+
+        // Gemini 2.5 Pro clamps `none` to minimum budget 128 and incompatible `xhigh` to medium (8192).
+        let pro_none: Value = serde_json::from_slice(
+            &build_request(
+                &source,
+                &json!({"model": "gemini-2.5-pro", "input": "hi", "reasoning": {"effort": "none"}}),
+                &signatures,
+            )
+            .unwrap()
+            .body,
+        )
+        .unwrap();
+        assert_eq!(pro_none["generationConfig"]["thinkingConfig"]["thinkingBudget"], 128);
+        assert_eq!(pro_none["generationConfig"]["thinkingConfig"]["includeThoughts"], false);
+
+        let pro_xhigh: Value = serde_json::from_slice(
+            &build_request(
+                &source,
+                &json!({"model": "gemini-2.5-pro", "input": "hi", "reasoning": {"effort": "xhigh"}}),
+                &signatures,
+            )
+            .unwrap()
+            .body,
+        )
+        .unwrap();
+        assert_eq!(pro_xhigh["generationConfig"]["thinkingConfig"]["thinkingBudget"], 8192);
+
+        // Non-thinking transcribe model omits thinkingConfig.
+        let transcribe: Value = serde_json::from_slice(
+            &build_request(
+                &source,
+                &json!({"model": "gemini-3.5-transcribe", "input": "hi", "reasoning": {"effort": "high"}}),
+                &signatures,
+            )
+            .unwrap()
+            .body,
+        )
+        .unwrap();
+        assert!(transcribe["generationConfig"].get("thinkingConfig").is_none());
+
+        // Unsigned function_call on Gemini 3+/4 injects skip sentinel and call id; oneOf + format sanitize cleanly.
+        let unsigned_req = json!({
+            "model": "gemini-4-hydrogen",
+            "input": [
+                {"role": "user", "content": "run tool"},
+                {"type": "function_call", "call_id": "call_missing", "name": "fetch", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_missing", "output": "{\"ok\":true}"}
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "fetch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "format": "uri"},
+                        "created_at": {"type": "string", "format": "date-time"},
+                        "kind": {"oneOf": [{"type": "string"}, {"type": "null"}]}
+                    }
+                }
+            }]
+        });
+        let unsigned_body: Value =
+            serde_json::from_slice(&build_request(&source, &unsigned_req, &signatures).unwrap().body)
+                .unwrap();
+        assert_eq!(
+            unsigned_body["contents"][1]["parts"][0]["thoughtSignature"],
+            SKIP_THOUGHT_SIGNATURE
+        );
+        assert_eq!(unsigned_body["contents"][1]["parts"][0]["functionCall"]["id"], "call_missing");
+        assert_eq!(unsigned_body["contents"][2]["parts"][0]["functionResponse"]["id"], "call_missing");
+        let props = &unsigned_body["tools"][0]["functionDeclarations"][0]["parameters"]["properties"];
+        assert!(props["url"].get("format").is_none());
+        assert_eq!(props["created_at"]["format"], "date-time");
+        assert_eq!(props["kind"]["type"], "STRING");
+        assert_eq!(props["kind"]["nullable"], true);
+    }
+
+    #[test]
+    fn builds_fallback_thinking_request_for_400_thinking_rejections() {
+        let source = google_source();
+        let signatures = ThoughtSignatures::default();
+        let parsed = json!({
+            "model": "gemini-4-hydrogen",
+            "stream": true,
+            "input": "hi",
+            "reasoning": {"effort": "xhigh"}
+        });
+        let prev = build_request(&source, &parsed, &signatures).unwrap();
+        let err = json!({"error": {"message": "Thinking level XHIGH is not supported for this model."}});
+        let repaired = fallback_thinking_request(
+            &source,
+            &parsed,
+            &signatures,
+            &prev.body,
+            StatusCode::BAD_REQUEST,
+            &err,
+        )
+        .unwrap();
+        let repaired_json: Value = serde_json::from_slice(&repaired.body).unwrap();
+        assert_eq!(repaired_json["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
+
+        // Non-Gemini-4+ incompatible level falls back to medium.
+        let parsed_3 = json!({
+            "model": "gemini-3.6-flash",
+            "input": "hi",
+            "reasoning": {"effort": "minimal"}
+        });
+        let prev_3 = build_request(&source, &parsed_3, &signatures).unwrap();
+        let err_3 = json!({"error": {"message": "Thinking level MINIMAL is not supported for this model."}});
+        let repaired_3 = fallback_thinking_request(
+            &source,
+            &parsed_3,
+            &signatures,
+            &prev_3.body,
+            StatusCode::BAD_REQUEST,
+            &err_3,
+        )
+        .unwrap();
+        let repaired_3_json: Value = serde_json::from_slice(&repaired_3.body).unwrap();
+        assert_eq!(repaired_3_json["generationConfig"]["thinkingConfig"]["thinkingLevel"], "medium");
+        // Retrying the exact same medium error with non-matching status returns None.
+        assert!(fallback_thinking_request(
+            &source,
+            &parsed_3,
+            &signatures,
+            &repaired_3.body,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &err_3,
+        )
+        .is_none());
     }
 
     #[test]
@@ -1615,6 +2115,50 @@ mod tests {
             }
         }
         assert_eq!(signatures.get(&found_call.unwrap()).as_deref(), Some("sig-stream"));
+    }
+
+    #[tokio::test]
+    async fn sse_skips_empty_text_signature_part_and_surfaces_prompt_block_and_continuation() {
+        let signatures = ThoughtSignatures::default();
+        let chunks = vec![
+            Ok::<_, ()>(Bytes::from("data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"plan\"},{\"text\":\"\",\"thoughtSignature\":\"sig-empty\"}]}}]}\n\n")),
+            Ok(Bytes::from("data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]},\"finishReason\":\"CONTINUATION\"}]}\n\n")),
+        ];
+        let mut translated = Vec::new();
+        let mut out_stream = Box::pin(translate_sse_stream(
+            stream::iter(chunks),
+            "gemini-4-hydrogen".into(),
+            signatures,
+        ));
+        while let Some(item) = out_stream.next().await {
+            translated.extend_from_slice(&item.unwrap());
+        }
+        let text = String::from_utf8(translated).unwrap();
+        assert!(text.contains("event: response.incomplete\n"));
+        let completed_payload: Value = text
+            .split("\n\n")
+            .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .find(|v| v["type"] == "response.incomplete")
+            .unwrap();
+        assert_eq!(completed_payload["response"]["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(completed_payload["response"]["output"].as_array().unwrap().len(), 2);
+
+        let blocked_chunks = vec![Ok::<_, ()>(Bytes::from(
+            "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\",\"blockReasonMessage\":\"blocked\"}}\n\n",
+        ))];
+        let mut blocked_out = Vec::new();
+        let mut blocked_stream = Box::pin(translate_sse_stream(
+            stream::iter(blocked_chunks),
+            "gemini-4-hydrogen".into(),
+            ThoughtSignatures::default(),
+        ));
+        while let Some(item) = blocked_stream.next().await {
+            blocked_out.extend_from_slice(&item.unwrap());
+        }
+        let blocked_text = String::from_utf8(blocked_out).unwrap();
+        assert!(blocked_text.contains("event: response.failed\n"));
+        assert!(blocked_text.contains("content_filter"));
     }
 
     #[test]

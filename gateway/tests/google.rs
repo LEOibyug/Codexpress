@@ -703,3 +703,325 @@ async fn openai_platform_source_sanitizes_codex_only_fields_and_rejects_balance_
 
     task.abort();
 }
+
+#[tokio::test]
+async fn stale_google_catalog_on_disk_is_repaired_for_omp_models() {
+    let dir = tempfile::tempdir_in(".").unwrap();
+    let catalogs = dir.path().join("model-catalogs");
+    std::fs::create_dir(&catalogs).unwrap();
+    std::fs::write(
+        catalogs.join("google-latest.json"),
+        json!({
+            "models": [
+                {
+                    "slug": "gemini-4-hydrogen",
+                    "display_name": "Gemini 4 Hydrogen",
+                    "context_window": 1048576,
+                    "max_context_window": 1048576,
+                    "input_modalities": ["text", "image"],
+                    "supported_reasoning_levels": ["minimal", "low", "medium", "high"]
+                },
+                {
+                    "slug": "gemini-4-carbon",
+                    "display_name": "Gemini 4 Carbon",
+                    "context_window": 1048576,
+                    "max_context_window": 1048576,
+                    "input_modalities": ["text", "image"],
+                    "supported_reasoning_levels": ["minimal", "low", "medium", "high"]
+                },
+                {
+                    "slug": "gemini-3.5-transcribe",
+                    "display_name": "Gemini 3.5 Transcribe",
+                    "context_window": 98304,
+                    "max_context_window": 98304,
+                    "input_modalities": ["text", "image"],
+                    "supported_reasoning_levels": ["minimal", "low", "medium", "high"]
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let state = AppState::new(dir.path().to_owned(), 17863, "native-secret".into()).unwrap();
+    let g_source = google_source(
+        "google-1",
+        "Google AI Studio",
+        "http://127.0.0.1:1/v1beta",
+        "PRIVATE-GOOGLE-KEY",
+        vec![
+            "gemini-4-hydrogen".into(),
+            "gemini-4-carbon".into(),
+            "gemini-3.5-transcribe".into(),
+        ],
+    );
+    management::dispatch(&state, "sync", json!({"sources": [source_value(&g_source)]}))
+        .await
+        .unwrap();
+    let binding = management::dispatch(&state, "omp.binding", json!({})).await.unwrap();
+    let key = binding["key"].as_str().unwrap().to_owned();
+    let chat = chatbot::router(state);
+
+    let res = chat
+        .oneshot(
+            Request::builder()
+                .uri("/omp/v1/models")
+                .header("host", "127.0.0.1:17865")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(&to_bytes(res.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    let models = body["data"].as_array().unwrap();
+
+    let hydrogen = models.iter().find(|m| m["id"] == "gemini-4-hydrogen").unwrap();
+    assert_eq!(hydrogen["thinking"]["efforts"], json!(["low", "medium", "high", "xhigh"]));
+
+    let carbon = models.iter().find(|m| m["id"] == "gemini-4-carbon").unwrap();
+    assert_eq!(carbon["thinking"]["efforts"], json!(["low", "medium", "high"]));
+
+    let transcribe = models.iter().find(|m| m["id"] == "gemini-3.5-transcribe").unwrap();
+    assert_eq!(transcribe["reasoning"], json!(false));
+    assert!(transcribe.get("thinking").is_none());
+}
+
+#[tokio::test]
+async fn google_thinking_mapping_and_single_shot_400_fallback_and_unsigned_tool_calls() {
+    let captured: Arc<Mutex<Vec<CapturedUpstream>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_ref = captured.clone();
+    let reject_hydrogen_xhigh = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reject_hydrogen_ref = reject_hydrogen_xhigh.clone();
+
+    let upstream = Router::new().route(
+        "/v1beta/models/{spec}",
+        post(move |AxumPath(spec): AxumPath<String>, body: axum::body::Bytes| {
+            let captured = captured_ref.clone();
+            let reject_hydrogen_xhigh = reject_hydrogen_ref.clone();
+            async move {
+                use axum::response::IntoResponse;
+                let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                captured.lock().unwrap().push(CapturedUpstream {
+                    path: spec.clone(),
+                    body: parsed.clone(),
+                });
+
+                if spec.starts_with("gemini-4-neon:") {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        [("content-type", "application/json")],
+                        json!({
+                            "error": {
+                                "code": 400,
+                                "message": "Thinking level is not supported for this model. Please retry with other thinking level.",
+                                "status": "INVALID_ARGUMENT"
+                            }
+                        })
+                        .to_string(),
+                    )
+                        .into_response();
+                }
+
+                if spec.starts_with("gemini-4-hydrogen:")
+                    && reject_hydrogen_xhigh.load(Ordering::SeqCst)
+                    && parsed["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "xhigh"
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        [("content-type", "application/json")],
+                        json!({
+                            "error": {
+                                "code": 400,
+                                "message": "Thinking level XHIGH is not supported for this model. Please retry with other thinking level.",
+                                "status": "INVALID_ARGUMENT"
+                            }
+                        })
+                        .to_string(),
+                    )
+                        .into_response();
+                }
+
+                if spec.ends_with(":streamGenerateContent") {
+                    let sse = "data: {\"modelVersion\":\"gemini-4-hydrogen\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"OK stream\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":2,\"totalTokenCount\":12}}\n\n";
+                    return ([("content-type", "text/event-stream")], sse).into_response();
+                }
+
+                (
+                    [("content-type", "application/json")],
+                    json!({
+                        "modelVersion": "gemini-4-hydrogen",
+                        "candidates": [{
+                            "content": {"role": "model", "parts": [{"text": "OK"}]},
+                            "finishReason": "STOP"
+                        }],
+                        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 2, "totalTokenCount": 12}
+                    })
+                    .to_string(),
+                )
+                    .into_response()
+            }
+        }),
+    );
+
+    let (base, task) = server::serve(upstream).await;
+    let dir = tempfile::tempdir_in(".").unwrap();
+    let state = AppState::new(dir.path().to_owned(), 17863, "native-secret".into()).unwrap();
+    let g_source = google_source(
+        "google-1",
+        "Google AI Studio",
+        &format!("{base}/v1beta"),
+        "PRIVATE-GOOGLE-KEY",
+        vec![
+            "gemini-4-hydrogen".into(),
+            "gemini-4-carbon".into(),
+            "gemini-4-neon".into(),
+            "gemini-3.8-flash".into(),
+            "gemini-2.5-pro".into(),
+        ],
+    );
+    management::dispatch(&state, "sync", json!({"sources": [source_value(&g_source)]}))
+        .await
+        .unwrap();
+    let binding = management::dispatch(&state, "omp.binding", json!({})).await.unwrap();
+    let key = binding["key"].as_str().unwrap().to_owned();
+    let chat = chatbot::router(state);
+
+    let send_omp = |payload: Value| {
+        let chat = chat.clone();
+        let key = key.clone();
+        async move {
+            chat.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/omp/v1/codex/responses")
+                    .header("host", "127.0.0.1:17865")
+                    .header("authorization", format!("Bearer {key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // 1) Exact OMP title-generator repro: gemini-4-hydrogen + minimal -> thinkingLevel: "low", 200 OK
+    let res = send_omp(json!({
+        "model": "gemini-4-hydrogen",
+        "stream": true,
+        "reasoning": {"effort": "minimal", "summary": "auto"},
+        "input": [{"role": "user", "content": "你好"}]
+    }))
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        captured.lock().unwrap().last().unwrap().body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "low"
+    );
+
+    // 2) xhigh on gemini-4-hydrogen -> "xhigh"; xhigh on gemini-4-carbon -> "high"
+    assert_eq!(
+        send_omp(json!({"model": "gemini-4-hydrogen", "stream": false, "reasoning": {"effort": "xhigh"}, "input": "hi"}))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        captured.lock().unwrap().last().unwrap().body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "xhigh"
+    );
+    assert_eq!(
+        send_omp(json!({"model": "gemini-4-carbon", "stream": false, "reasoning": {"effort": "xhigh"}, "input": "hi"}))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        captured.lock().unwrap().last().unwrap().body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "high"
+    );
+
+    // 3) gemini-3.8-flash incompatible "minimal" defaults to "medium"; gemini-2.5-pro "none" -> budget 128
+    assert_eq!(
+        send_omp(json!({"model": "gemini-3.8-flash", "stream": false, "reasoning": {"effort": "minimal"}, "input": "hi"}))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        captured.lock().unwrap().last().unwrap().body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "medium"
+    );
+    assert_eq!(
+        send_omp(json!({"model": "gemini-2.5-pro", "stream": false, "reasoning": {"effort": "none"}, "input": "hi"}))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        captured.lock().unwrap().last().unwrap().body["generationConfig"]["thinkingConfig"],
+        json!({"includeThoughts": false, "thinkingBudget": 128})
+    );
+
+    // 4) Single-shot 400 thinking fallback succeeds on second attempt when upstream rejects XHIGH
+    reject_hydrogen_xhigh.store(true, Ordering::SeqCst);
+    let before_fallback = captured.lock().unwrap().len();
+    let fallback_ok = send_omp(json!({
+        "model": "gemini-4-hydrogen",
+        "stream": true,
+        "reasoning": {"effort": "xhigh"},
+        "input": "hi"
+    }))
+    .await;
+    assert_eq!(fallback_ok.status(), StatusCode::OK);
+    {
+        let log = captured.lock().unwrap();
+        assert_eq!(log.len() - before_fallback, 2);
+        assert_eq!(log[before_fallback].body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "xhigh");
+        assert_eq!(log[before_fallback + 1].body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
+    }
+
+    // 5) Persistent 400 on fallback stops after exactly 1 retry (2 total upstream hits, no loop)
+    let before_double_400 = captured.lock().unwrap().len();
+    let persistent_400 = send_omp(json!({
+        "model": "gemini-4-neon",
+        "stream": true,
+        "reasoning": {"effort": "low"},
+        "input": "hi"
+    }))
+    .await;
+    assert_eq!(persistent_400.status(), StatusCode::BAD_REQUEST);
+    {
+        let log = captured.lock().unwrap();
+        assert_eq!(log.len() - before_double_400, 2);
+        assert_eq!(log[before_double_400].body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low");
+        assert_eq!(log[before_double_400 + 1].body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "medium");
+    }
+
+    // 6) Unsigned function_call on gemini-4-hydrogen injects skip sentinel and ids
+    let unsigned_res = send_omp(json!({
+        "model": "gemini-4-hydrogen",
+        "stream": false,
+        "input": [
+            {"role": "user", "content": "check"},
+            {"type": "function_call", "call_id": "call_unsigned", "name": "ping", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_unsigned", "output": "pong"}
+        ]
+    }))
+    .await;
+    assert_eq!(unsigned_res.status(), StatusCode::OK);
+    {
+        let log = captured.lock().unwrap();
+        let last = &log.last().unwrap().body;
+        assert_eq!(
+            last["contents"][1]["parts"][0]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        assert_eq!(last["contents"][1]["parts"][0]["functionCall"]["id"], "call_unsigned");
+        assert_eq!(last["contents"][2]["parts"][0]["functionResponse"]["id"], "call_unsigned");
+    }
+
+    task.abort();
+}

@@ -227,19 +227,9 @@ fn parse_google_models_page(
             }
             if id.starts_with("gemini-") {
                 item.insert("input_modalities".into(), json!(["text", "image"]));
-                if !id.contains("-image") && !id.contains("-tts") {
-                    if (id.starts_with("gemini-3") || id.starts_with("gemini-4")) && id.contains("-pro") {
-                        item.insert("supported_reasoning_levels".into(), json!(["low", "high"]));
-                    } else if id.starts_with("gemini-2.5-")
-                        || id.starts_with("gemini-3")
-                        || id.starts_with("gemini-4")
-                    {
-                        item.insert(
-                            "supported_reasoning_levels".into(),
-                            json!(["minimal", "low", "medium", "high"]),
-                        );
-                    }
-                }
+            }
+            if let Some(levels) = crate::google::supported_reasoning_levels(id) {
+                item.insert("supported_reasoning_levels".into(), json!(levels));
             }
             catalog_entries.push(Value::Object(item));
         }
@@ -418,6 +408,34 @@ mod tests {
                     "supportedGenerationMethods": ["generateContent"]
                 },
                 {
+                    "name": "models/gemini-3.8-flash",
+                    "displayName": "Gemini 3.8 Flash",
+                    "inputTokenLimit": 1048576,
+                    "outputTokenLimit": 65536,
+                    "supportedGenerationMethods": ["generateContent"]
+                },
+                {
+                    "name": "models/gemini-4-carbon",
+                    "displayName": "Gemini 4 Carbon",
+                    "inputTokenLimit": 1048576,
+                    "outputTokenLimit": 32768,
+                    "supportedGenerationMethods": ["generateContent"]
+                },
+                {
+                    "name": "models/gemini-4-hydrogen",
+                    "displayName": "Gemini 4 Hydrogen",
+                    "inputTokenLimit": 1048576,
+                    "outputTokenLimit": 65536,
+                    "supportedGenerationMethods": ["generateContent"]
+                },
+                {
+                    "name": "models/gemini-3.5-transcribe",
+                    "displayName": "Gemini 3.5 Transcribe",
+                    "inputTokenLimit": 98304,
+                    "outputTokenLimit": 32768,
+                    "supportedGenerationMethods": ["generateContent"]
+                },
+                {
                     "name": "models/text-embedding-004",
                     "displayName": "Embedding",
                     "supportedGenerationMethods": ["embedContent"]
@@ -429,7 +447,17 @@ mod tests {
         let mut catalog = Vec::new();
         let next = parse_google_models_page(&serde_json::to_vec(&page).unwrap(), &mut models, &mut catalog).unwrap();
         assert_eq!(next.as_deref(), Some("page-2"));
-        assert_eq!(models.into_iter().collect::<Vec<_>>(), ["gemini-2.5-pro", "gemini-3.1-pro-preview"]);
+        assert_eq!(
+            models.into_iter().collect::<Vec<_>>(),
+            [
+                "gemini-2.5-pro",
+                "gemini-3.1-pro-preview",
+                "gemini-3.5-transcribe",
+                "gemini-3.8-flash",
+                "gemini-4-carbon",
+                "gemini-4-hydrogen"
+            ]
+        );
         let p25 = catalog.iter().find(|item| item["slug"] == "gemini-2.5-pro").unwrap();
         assert_eq!(p25["display_name"], "Gemini 2.5 Pro");
         assert_eq!(p25["context_window"], 1048576);
@@ -439,6 +467,14 @@ mod tests {
         assert_eq!(p25["supported_reasoning_levels"], json!(["minimal", "low", "medium", "high"]));
         let p31 = catalog.iter().find(|item| item["slug"] == "gemini-3.1-pro-preview").unwrap();
         assert_eq!(p31["supported_reasoning_levels"], json!(["low", "high"]));
+        let f38 = catalog.iter().find(|item| item["slug"] == "gemini-3.8-flash").unwrap();
+        assert_eq!(f38["supported_reasoning_levels"], json!(["low", "medium", "high"]));
+        let c4 = catalog.iter().find(|item| item["slug"] == "gemini-4-carbon").unwrap();
+        assert_eq!(c4["supported_reasoning_levels"], json!(["low", "medium", "high"]));
+        let h4 = catalog.iter().find(|item| item["slug"] == "gemini-4-hydrogen").unwrap();
+        assert_eq!(h4["supported_reasoning_levels"], json!(["low", "medium", "high", "xhigh"]));
+        let tr35 = catalog.iter().find(|item| item["slug"] == "gemini-3.5-transcribe").unwrap();
+        assert!(tr35.get("supported_reasoning_levels").is_none());
     }
 
     #[test]

@@ -208,7 +208,12 @@ impl MetadataCache {
             merge_metadata(&mut entries, catalog);
         }
         if google_sig.is_some_and(|(size, _)| size <= 4 * 1024 * 1024) {
-            if let Some(catalog) = fs::read(google_path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) {
+            if let Some(mut catalog) = fs::read(google_path).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) {
+                if let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) {
+                    for entry in models {
+                        crate::google::normalize_catalog_entry(entry);
+                    }
+                }
                 merge_metadata(&mut entries, catalog);
             }
         }
@@ -295,6 +300,11 @@ fn normalized_model(id: &str, metadata: Option<&Value>, rule: Option<&ModelCompa
             model["reasoning"] = json!(!efforts.is_empty());
             if !efforts.is_empty() && model["thinking"]["mode"].as_str().is_none() {
                 model["thinking"] = json!({"mode":"effort","efforts":efforts});
+            }
+        } else if crate::google::is_non_thinking_model(id) {
+            model["reasoning"] = json!(false);
+            if let Some(obj) = model.as_object_mut() {
+                obj.remove("thinking");
             }
         }
     }
