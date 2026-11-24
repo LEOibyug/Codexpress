@@ -221,4 +221,27 @@ final class PersistenceTests: XCTestCase {
         try ModelPolicy.setModelsEnabled(["gemini-2.5-flash"], enabled: false, in: &settings)
         XCTAssertFalse(ModelPolicy.isEnabled("gemini-2.5-flash", in: settings))
     }
+
+    func testShowInCmuxDefaultsTrueAndPersistsFalse() throws {
+        let legacyData = Data(#"{"id":"legacy-src","name":"Legacy","kind":"api","base_url":"https://api.example.com/v1","enabled":true,"priority":0,"proxy":{"mode":"direct","url":null},"models":[]}"#.utf8)
+        let decoded = try JSONDecoder().decode(Source.self, from: legacyData)
+        XCTAssertNil(decoded.show_in_cmux)
+        XCTAssertTrue(decoded.showInCmux)
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codexpress-cmux-toggle-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var hidden = decoded
+        hidden.show_in_cmux = false
+        XCTAssertFalse(hidden.showInCmux)
+
+        let store = MetadataStore(directory: directory)
+        var settings = AppSettings()
+        settings.sources = [hidden]
+        try store.save(settings)
+        let loaded = try store.load()
+        XCTAssertEqual(loaded.sources.first?.show_in_cmux, false)
+        XCTAssertEqual(loaded.sources.first?.showInCmux, false)
+    }
 }

@@ -205,6 +205,7 @@ struct SourcesView: View {
                 .accessibilityLabel("编辑来源 \(source.name)")
             Menu {
                 Button(source.enabled ? "停用来源" : "启用来源") { model.toggle(source) }.disabled(!canEdit)
+                Button(source.showInCmux ? "在 cmux 中隐藏" : "在 cmux 中展示") { model.toggleShowInCmux(source) }.disabled(!canEdit)
                 Divider()
                 SourceRoutingActions(source: source)
                 Divider()
@@ -257,6 +258,9 @@ struct SourcesView: View {
             LabeledContent("网络策略") {
                 Text(source.policyLabel + (source.proxy.url.map { " · \($0)" } ?? ""))
                     .textSelection(.enabled)
+            }
+            LabeledContent("cmux 展示") {
+                Text(source.showInCmux ? "展示" : "隐藏")
             }
             if model.state(source.id)["admission"]["capacity_active_conversations"].number != nil || source.max_active_conversations != nil {
                 LabeledContent("对话容量") {

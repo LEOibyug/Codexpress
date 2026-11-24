@@ -479,6 +479,7 @@ mod tests {
             id: id.into(),
             name: "Shared supplier".into(),
             kind: "api".into(),
+            show_in_cmux: true,
             is_subscription: false,
             base_url: format!("https://{id}.example.invalid"),
             enabled: true,

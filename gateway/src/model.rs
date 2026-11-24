@@ -23,6 +23,8 @@ pub struct Source {
     pub id: String,
     pub name: String,
     pub kind: String,
+    #[serde(default = "default_show_in_cmux")]
+    pub show_in_cmux: bool,
     #[serde(default)]
     pub is_subscription: bool,
     pub base_url: String,
@@ -43,6 +45,10 @@ pub struct Source {
 
 fn default_active_conversation_window_seconds() -> u64 {
     15
+}
+
+fn default_show_in_cmux() -> bool {
+    true
 }
 
 impl Source {

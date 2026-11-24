@@ -59,6 +59,8 @@ struct SourceEditor: View {
                         SecureField(isNew ? "API 密钥" : "新 API 密钥", text: $apiKey, prompt: Text(isNew ? "API 密钥" : "留空保留现有密钥"))
                     }
                     Toggle("启用此来源", isOn: $source.enabled).toggleStyle(.switch)
+                    Toggle("在 cmux 中展示", isOn: Binding(get: { source.showInCmux }, set: { source.show_in_cmux = $0 }))
+                        .toggleStyle(.switch)
                     if isNew && source.official && model.loginFlow != nil {
                         Text("完成当前登录后，可在来源池登录此账号。").font(.system(size: 12)).foregroundStyle(.secondary)
                     }

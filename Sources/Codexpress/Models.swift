@@ -53,6 +53,7 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
     var id = UUID().uuidString
     var name = ""
     var kind = "api"
+    var show_in_cmux: Bool? = nil
     var is_subscription: Bool? = nil
     var balanceWarningThreshold: Double? = nil
     var base_url = "https://api.openai.com/v1"
@@ -65,6 +66,7 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
     var max_active_conversations: Int? = nil
     var active_conversation_window_seconds: Int? = nil
     var official: Bool { kind == "official" }
+    var showInCmux: Bool { show_in_cmux ?? true }
     var isGoogle: Bool { kind == "google" }
     var isOpenAI: Bool { kind == "openai" }
     var supportsBalanceQuery: Bool { kind == "api" }

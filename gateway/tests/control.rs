@@ -1140,3 +1140,52 @@ async fn private_extension_operations_share_queues_with_http_disabled() {
     assert_eq!(hits.load(Ordering::SeqCst), 0);
     task.abort();
 }
+
+#[tokio::test]
+async fn source_show_in_cmux_defaults_true_and_round_trips_false_over_status_and_sources() {
+    let (_directory, state, key, base) = enabled().await;
+    let default_source = json!({
+        "id": "src-default",
+        "name": "Default Visible",
+        "kind": "api",
+        "base_url": "http://127.0.0.1:1/v1",
+        "enabled": true,
+        "priority": 0,
+        "proxy": {"mode": "direct"},
+        "secret": {"api_key": "PRIVATE-KEY-DEFAULT"}
+    });
+    let hidden_source = json!({
+        "id": "src-hidden",
+        "name": "Hidden In Cmux",
+        "kind": "api",
+        "show_in_cmux": false,
+        "base_url": "http://127.0.0.1:1/v1",
+        "enabled": true,
+        "priority": 1,
+        "proxy": {"mode": "direct"},
+        "secret": {"api_key": "PRIVATE-KEY-HIDDEN"}
+    });
+    codexpress_gateway::management::dispatch(
+        &state,
+        "sync",
+        json!({"sources": [default_source, hidden_source]}),
+    )
+    .await
+    .unwrap();
+    let http = client();
+    for path in ["status?include_usage=false", "sources"] {
+        let payload = read(
+            http.get(format!("{base}/{path}"))
+                .bearer_auth(&key)
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(payload["sources"][0]["id"], "src-default");
+        assert_eq!(payload["sources"][0]["show_in_cmux"], true);
+        assert_eq!(payload["sources"][1]["id"], "src-hidden");
+        assert_eq!(payload["sources"][1]["show_in_cmux"], false);
+    }
+    stop(&state).await;
+}

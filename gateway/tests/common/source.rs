@@ -6,6 +6,7 @@ pub fn api_source(id: &str, name: &str, base: &str, api_key: &str) -> Source {
         id: id.into(),
         name: name.into(),
         kind: "api".into(),
+        show_in_cmux: true,
         is_subscription: false,
         base_url: base.into(),
         enabled: true,

@@ -880,6 +880,7 @@ import ServiceManagement
         }
     }
     func toggle(_ source: Source) { var next = source; next.enabled.toggle(); perform { try await self.saveSource(next, apiKey: "") } }
+    func toggleShowInCmux(_ source: Source) { var next = source; next.show_in_cmux = !source.showInCmux; perform { try await self.saveSource(next, apiKey: "") } }
     func state(_ id: String) -> JSONValue { status["sources"].array.first { $0["id"].string == id } ?? .null }
     var gatewayHasActivity: Bool { running && (status["inflight"].number ?? 0) > 0 }
     func sourceHasActivity(_ id: String) -> Bool { running && (state(id)["active_requests"].number ?? 0) > 0 }
