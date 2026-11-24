@@ -29,7 +29,7 @@ struct MenuView: View {
                     }
                 }.padding(.horizontal, 11).cardSurface()
             }
-            if model.pendingSync {
+            if model.showsPendingSyncWarning {
                 InfoNote(text: "配置尚未应用，当前使用上次设置。", symbol: "clock", color: .orange)
             }
             footer

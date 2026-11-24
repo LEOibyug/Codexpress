@@ -146,8 +146,8 @@ async fn source(state: &Arc<AppState>, id: &str) -> Result<Source> {
         .find(|r| r.source.id == id)
         .map(|r| r.source.clone())
         .ok_or_else(|| anyhow!("官方来源不存在"))?;
-    if source.kind != "official" || source.proxy.mode != "explicit" {
-        bail!("请选择指定代理的官方来源");
+    if source.kind != "official" || !matches!(source.proxy.mode.as_str(), "explicit" | "system") {
+        bail!("请选择使用系统代理或指定代理的官方来源");
     }
     source.validate()?;
     Ok(source)

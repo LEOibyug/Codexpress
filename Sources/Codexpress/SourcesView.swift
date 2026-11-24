@@ -256,7 +256,7 @@ struct SourcesView: View {
                     .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
             }
             LabeledContent("网络策略") {
-                Text(source.policyLabel + (source.proxy.url.map { " · \($0)" } ?? ""))
+                Text(source.policyLabel + (source.proxy.mode == "explicit" ? (source.proxy.url.map { " · \($0)" } ?? "") : ""))
                     .textSelection(.enabled)
             }
             LabeledContent("cmux 展示") {

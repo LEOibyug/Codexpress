@@ -92,11 +92,13 @@ final class AppModelSyncTests: XCTestCase {
         let failure = directory.appendingPathComponent("fail-sync")
         try Data().write(to: failure)
         model.changeAutoResetWeeklyQuota(true, for: first)
+        XCTAssertFalse(model.busy)
         let deadline = Date().addingTimeInterval(3)
-        while model.busy, Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        while (model.busy || model.hasPendingBackgroundSync), Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertFalse(model.busy)
         XCTAssertNotNil(model.error, "An unsuccessful immediate sync must remain visible")
         XCTAssertTrue(model.pendingSync)
+        XCTAssertTrue(model.showsPendingSyncWarning)
         let persisted = try metadata.load()
         XCTAssertTrue(persisted.weeklyResetEnabled(for: first), "Sync failure must not discard the persisted user choice")
         XCTAssertFalse(persisted.weeklyResetEnabled(for: second))
@@ -113,8 +115,9 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertEqual(retried["auto_reset_weekly_accounts"], .array([.string("account-z")]))
 
         model.changeAutoResetWeeklyQuota(true, for: second)
+        XCTAssertFalse(model.busy)
         let secondDeadline = Date().addingTimeInterval(3)
-        while model.busy, Date() < secondDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        while (model.busy || model.hasPendingBackgroundSync), Date() < secondDeadline { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertFalse(model.busy)
         XCTAssertNil(model.error)
         let both = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
@@ -368,6 +371,72 @@ final class AppModelSyncTests: XCTestCase {
         }
     }
 
+    @MainActor func testRapidSettingsEditsApplyImmediatelyAndCoalesceGatewaySync() async throws {
+        try await withUsageAnalyticsModel { model, directory in
+            model.backgroundSyncDebounceNanoseconds = 60_000_000
+            var first = Source()
+            first.id = "api-1"; first.name = "API 1"; first.priority = 0; first.models = ["gpt-5.4", "gemini-2.5-pro"]
+            var second = Source()
+            second.id = "api-2"; second.name = "API 2"; second.priority = 1; second.models = ["gpt-5.4"]
+            try model.credentialSnapshot.apply(.object(["items": .array([
+                .object(["source_id": .string("api-1"), "secret": .object(["api_key": .string("k1")])]),
+                .object(["source_id": .string("api-2"), "secret": .object(["api_key": .string("k2")])]),
+            ])]), requested: ["api-1", "api-2"])
+            try await model.updateStatus()
+            try model.persistSettings({
+                var s = model.settings
+                s.sources = [first, second]
+                return s
+            }())
+            try await model.sync()
+
+            let syncCountFile = directory.appendingPathComponent("sync-count")
+            let countBefore = Int(try String(contentsOf: syncCountFile)) ?? 0
+
+            model.changeLoadBalance(true)
+            model.changeLowQuotaThreshold(25)
+            model.changeUpstreamRetry(attempts: 6, delaySeconds: 9)
+            model.toggle(second)
+            try model.setModelsEnabled(["gemini-2.5-pro"], enabled: false)
+
+            // Every setting applies locally with zero UI lockout (`busy` remains false)
+            // and without flashing the error/warning banner while coalescing.
+            XCTAssertFalse(model.busy)
+            XCTAssertFalse(model.showsPendingSyncWarning)
+            XCTAssertTrue(model.hasPendingBackgroundSync)
+            XCTAssertTrue(model.settings.loadBalanceEnabled)
+            XCTAssertEqual(model.settings.lowQuotaPercent, 25)
+            XCTAssertEqual(model.settings.upstreamAttemptLimit, 6)
+            XCTAssertEqual(model.settings.upstreamRetryDelay, 9)
+            XCTAssertEqual(model.settings.sources.first(where: { $0.id == "api-2" })?.enabled, false)
+            XCTAssertFalse(ModelPolicy.isEnabled("gemini-2.5-pro", in: model.settings))
+
+            let persisted = try MetadataStore(directory: directory).load()
+            XCTAssertTrue(persisted.loadBalanceEnabled)
+            XCTAssertEqual(persisted.lowQuotaPercent, 25)
+            XCTAssertEqual(persisted.sources.first(where: { $0.id == "api-2" })?.enabled, false)
+
+            let deadline = Date().addingTimeInterval(3)
+            while model.hasPendingBackgroundSync, Date() < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertFalse(model.hasPendingBackgroundSync)
+            XCTAssertFalse(model.pendingSync)
+            XCTAssertFalse(model.showsPendingSyncWarning)
+            XCTAssertNil(model.error)
+
+            let countAfter = Int(try String(contentsOf: syncCountFile)) ?? 0
+            XCTAssertEqual(countAfter - countBefore, 1, "Rapid consecutive edits must coalesce into a single gateway sync")
+
+            let applied = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: directory.appendingPathComponent("applied-settings.json")))
+            XCTAssertEqual(applied["load_balance"].bool, true)
+            XCTAssertEqual(applied["official_low_quota_percent"].number, 25)
+            XCTAssertEqual(applied["upstream_attempts"].number, 6)
+            XCTAssertEqual(applied["upstream_retry_delay_seconds"].number, 9)
+            XCTAssertEqual(applied["sources"].array.first(where: { $0["id"].string == "api-2" })?["enabled"].bool, false)
+        }
+    }
+
     private static let helperScript = #"""
     #!/usr/bin/env python3
     import json, os, pathlib, socket, sys, time
@@ -426,6 +495,8 @@ final class AppModelSyncTests: XCTestCase {
                 elif operation == 'official.refresh':
                     data = dict(quota=dict(stale=False, complete=True, fetched_at=int(time.time()), error=None))
                 elif operation == 'sync':
+                    counter = directory / 'sync-count'
+                    counter.write_text(str((int(counter.read_text()) if counter.exists() else 0) + 1))
                     if (directory / 'fail-sync').exists():
                         raise ValueError('Fixture sync failed')
                     (directory / 'applied-settings.json').write_text(json.dumps(request['payload']))

@@ -80,7 +80,13 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
         }
     }
     var discoversModels: Bool { automaticModelDiscovery ?? models.isEmpty }
-    var policyLabel: String { proxy.mode == "direct" ? "强制直连" : "指定代理" }
+    var policyLabel: String {
+        switch proxy.mode {
+        case "direct": return "强制直连"
+        case "system": return "系统代理"
+        default: return "指定代理"
+        }
+    }
     var activeConversationWindowSeconds: Int { active_conversation_window_seconds ?? 15 }
     static func newOfficial() -> Source {
         var s = Source(); s.kind = "official"; s.name = "官方账号"; s.base_url = "https://chatgpt.com/backend-api/codex"; s.proxy.mode = "explicit"; return s
@@ -116,8 +122,9 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw AppError.message("请填写来源名称。") }
         guard let u = URLComponents(string: base_url), ["http", "https"].contains(u.scheme?.lowercased() ?? ""), u.host != nil, u.user == nil, u.password == nil, u.query == nil, u.fragment == nil else { throw AppError.message("来源地址须为不含账号、密码、查询参数的 HTTP 或 HTTPS 地址。") }
         guard !official || base_url.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == "https://chatgpt.com/backend-api/codex" else { throw AppError.message("官方来源必须使用官方 Codex 地址。") }
-        guard ["api", "official", "google", "openai"].contains(kind), ["direct", "explicit"].contains(proxy.mode) else { throw AppError.message("来源类型或网络策略无效。") }
-        guard !official || proxy.mode == "explicit" else { throw AppError.message("官方账号必须使用指定代理。") }
+        guard ["api", "official", "google", "openai"].contains(kind),
+              ["direct", "system", "explicit"].contains(proxy.mode) else { throw AppError.message("来源类型或网络策略无效。") }
+        guard !official || proxy.mode != "direct" else { throw AppError.message("官方账号不能使用强制直连，请使用系统代理或指定代理。") }
         if proxy.mode == "explicit" {
             guard let raw = proxy.url, let p = URLComponents(string: raw), ["http", "https", "socks5", "socks5h"].contains(p.scheme?.lowercased() ?? ""), p.host != nil, let port = p.port, (1...65535).contains(port), p.user == nil, p.password == nil, p.query == nil, p.fragment == nil, p.path.isEmpty || p.path == "/" else { throw AppError.message("请填写有效的代理端口（1–65535）。") }
         }

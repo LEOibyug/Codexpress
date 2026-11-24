@@ -41,6 +41,8 @@ import ServiceManagement
     @Published private(set) var launchAtLogin = false
     @Published private(set) var metadataLoadFailed = false
     @Published private(set) var pendingSync = false
+    @Published private(set) var syncing = false
+    @Published private(set) var syncError: String?
     @Published private(set) var refreshingModels = Set<String>()
     @Published var refreshingQuotas = Set<String>()
     @Published private(set) var apiBalances: [String: JSONValue] = [:]
@@ -62,6 +64,19 @@ import ServiceManagement
     private var stagedGateway: URL?
     private var environmentSyncTask: Task<Void, Never>?
     private var environmentSyncGeneration: UInt64 = 0
+    private var backgroundSyncTask: Task<Void, Never>?
+    private var backgroundSyncSleepTask: Task<Void, Never>?
+    private var backgroundSyncInFlight = false
+    private var backgroundSyncBypassDebounce = false
+    private var backgroundSyncGeneration: UInt64 = 0
+    private var backgroundSyncNeedsHistory = false
+    private var backgroundSyncNeedsModelInfo = false
+    private var backgroundSyncSuccessNotice: String?
+    private var lastSyncedHistoryCache: HistoryCacheSettings?
+    private var knownHelperOwnedOfficialIDs = Set<String>()
+    var backgroundSyncDebounceNanoseconds: UInt64 = 180_000_000
+    var showsPendingSyncWarning: Bool { pendingSync && (!running || (!syncing && syncError != nil)) }
+    var hasPendingBackgroundSync: Bool { backgroundSyncTask != nil || syncing }
     private struct GatewayUpdate {
         let version: String
         let process: Process
@@ -96,8 +111,8 @@ import ServiceManagement
     private var balanceWarnings: BalanceWarnings?
     var sources: [Source] { settings.sources.sorted { $0.priority < $1.priority } }
     var baseURL: String { status["base_url"].string ?? "http://127.0.0.1:\(settings.port)/v1" }
-    var routingMode: String { status["mode"].string ?? settings.mode }
-    var fixedSourceID: String? { status == .null ? settings.fixed_source_id : status["fixed_source_id"].string }
+    var routingMode: String { settings.mode }
+    var fixedSourceID: String? { settings.fixed_source_id }
     var fixedName: String { sources.first { $0.id == fixedSourceID }?.name ?? "未选择" }
     var portNeedsRestart: Bool { status["port"].number.map { Int($0) != settings.port } ?? false }
     var connectionMode: String { status["connection_mode"].string ?? "unmanaged" }
@@ -232,10 +247,13 @@ import ServiceManagement
                 }
             }
             running = true
+            lastSyncedHistoryCache = nil
+            knownHelperOwnedOfficialIDs = []
             credentialStorage = try await client.call("credentials.storage.status")
             credentialSnapshot = CredentialSnapshot()
             try await loadCredentialSnapshot(settings.sources.map(\.id))
             try await sync()
+            self.error = nil
             for entry in requiredEntries {
                 guard try await client.call(entry)["running"].bool == true else {
                     throw AppError.message("网关未能恢复原先运行的接入端口。")
@@ -249,7 +267,7 @@ import ServiceManagement
             // A rejected sync still leaves our verified helper available for
             // repairing source settings. Never adopt an unverified instance.
             running = helper?.isRunning == true && helper?.processIdentifier == verifiedProcessID
-            if running { pendingSync = true }
+            if running { pendingSync = true; syncError = error.localizedDescription }
             self.error = error.localizedDescription
         }
     }
@@ -387,8 +405,18 @@ import ServiceManagement
         }
         return Int(count)
     }
-    func stop() { shuttingDown = true; timerTask?.cancel(); accountTimerTask?.cancel(); officialAccountTimerTask?.cancel(); modelRefreshTask?.cancel(); controlResetPollTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
-    func retry() { restartCount = 0; Task { await startHelper() } }
+    func stop() { shuttingDown = true; cancelBackgroundSync(); timerTask?.cancel(); accountTimerTask?.cancel(); officialAccountTimerTask?.cancel(); modelRefreshTask?.cancel(); controlResetPollTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
+    func retry() {
+        restartCount = 0
+        if running, helper?.isRunning == true {
+            perform {
+                try await self.sync()
+                self.error = nil
+            }
+        } else {
+            Task { await startHelper() }
+        }
+    }
     func requireWritableMetadata() throws {
         guard !metadataLoadFailed else { throw AppError.message("来源文件无法读取，已禁止保存。请先从备份修复 sources.json，再重新启动应用；原文件保持不变。") }
     }
@@ -442,6 +470,120 @@ import ServiceManagement
         update(&next)
         try persistSettings(next)
         try await sync()
+    }
+    private func updateSettingsImmediately(
+        syncHistory: Bool = false,
+        refreshModelsInfo: Bool = false,
+        successNotice: String? = nil,
+        _ mutate: (inout AppSettings) throws -> Void
+    ) {
+        guard !metadataLoadFailed, !busy else { return }
+        do {
+            var next = settings
+            try mutate(&next)
+            try persistSettings(next)
+            error = nil
+            scheduleBackgroundSync(
+                syncHistory: syncHistory,
+                refreshModelsInfo: refreshModelsInfo,
+                successNotice: successNotice
+            )
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+    private func cancelBackgroundSync() {
+        backgroundSyncSleepTask?.cancel()
+        backgroundSyncSleepTask = nil
+        backgroundSyncTask?.cancel()
+        backgroundSyncTask = nil
+        backgroundSyncInFlight = false
+        backgroundSyncBypassDebounce = false
+        syncing = false
+        lastSyncedHistoryCache = nil
+        knownHelperOwnedOfficialIDs = []
+    }
+    private func awaitPendingBackgroundSync() async {
+        guard backgroundSyncTask != nil else { return }
+        backgroundSyncBypassDebounce = true
+        backgroundSyncSleepTask?.cancel()
+        await backgroundSyncTask?.value
+    }
+    private func scheduleBackgroundSync(syncHistory: Bool = false, refreshModelsInfo: Bool = false, successNotice: String? = nil) {
+        backgroundSyncGeneration &+= 1
+        backgroundSyncNeedsHistory = backgroundSyncNeedsHistory || syncHistory
+        backgroundSyncNeedsModelInfo = backgroundSyncNeedsModelInfo || refreshModelsInfo
+        if let successNotice { backgroundSyncSuccessNotice = successNotice }
+        pendingSync = true
+        syncError = nil
+        guard running, !shuttingDown else { return }
+        if backgroundSyncTask == nil {
+            backgroundSyncTask = Task { @MainActor [weak self] in
+                await self?.runBackgroundSyncLoop()
+            }
+        }
+    }
+    private func waitForBackgroundSyncDebounce() async {
+        var observed = backgroundSyncGeneration
+        for _ in 0..<5 {
+            if Task.isCancelled || backgroundSyncBypassDebounce { break }
+            let sleepTask = Task<Void, Never> { [debounce = backgroundSyncDebounceNanoseconds] in
+                _ = try? await Task.sleep(nanoseconds: debounce)
+            }
+            backgroundSyncSleepTask = sleepTask
+            await sleepTask.value
+            backgroundSyncSleepTask = nil
+            if Task.isCancelled || backgroundSyncBypassDebounce || backgroundSyncGeneration == observed {
+                break
+            }
+            observed = backgroundSyncGeneration
+        }
+        backgroundSyncBypassDebounce = false
+    }
+    private func runBackgroundSyncLoop() async {
+        defer {
+            backgroundSyncInFlight = false
+            syncing = false
+            backgroundSyncTask = nil
+        }
+        while running && pendingSync && !Task.isCancelled && !shuttingDown {
+            await waitForBackgroundSyncDebounce()
+            if Task.isCancelled || !running || shuttingDown { break }
+            let targetGeneration = backgroundSyncGeneration
+            let needsHistory = backgroundSyncNeedsHistory
+            let needsModelInfo = backgroundSyncNeedsModelInfo
+            let notice = backgroundSyncSuccessNotice
+            backgroundSyncNeedsHistory = false
+            backgroundSyncNeedsModelInfo = false
+            backgroundSyncSuccessNotice = nil
+            syncing = true
+            backgroundSyncInFlight = true
+            do {
+                try await performGatewaySync(
+                    refreshCredentials: true,
+                    syncHistory: needsHistory,
+                    refreshModelsInfo: needsModelInfo
+                )
+                backgroundSyncInFlight = false
+                syncing = false
+                if backgroundSyncGeneration == targetGeneration {
+                    pendingSync = weeklyResetRevocationPending
+                    syncError = nil
+                    error = nil
+                    if let notice { self.notice = notice }
+                    break
+                }
+            } catch {
+                backgroundSyncInFlight = false
+                syncing = false
+                if !Task.isCancelled && !shuttingDown {
+                    pendingSync = true
+                    syncError = error.localizedDescription
+                    self.error = error.localizedDescription
+                }
+                break
+            }
+        }
     }
     func refreshCredentialStorage() async {
         guard canManageCredentials, !busy else { return }
@@ -529,11 +671,51 @@ import ServiceManagement
         if settingsWindowActive != active { settingsWindowActive = active }
     }
     func sync() async throws {
+        if backgroundSyncTask != nil {
+            if !backgroundSyncInFlight {
+                backgroundSyncSleepTask?.cancel()
+                backgroundSyncSleepTask = nil
+                backgroundSyncTask?.cancel()
+                backgroundSyncTask = nil
+                backgroundSyncBypassDebounce = false
+            } else {
+                await backgroundSyncTask?.value
+            }
+        }
+        let targetGeneration = backgroundSyncGeneration
+        let needsHistory = backgroundSyncNeedsHistory
+        let needsModelInfo = backgroundSyncNeedsModelInfo
+        let notice = backgroundSyncSuccessNotice
+        backgroundSyncNeedsHistory = false
+        backgroundSyncNeedsModelInfo = false
+        backgroundSyncSuccessNotice = nil
+        try await performGatewaySync(
+            refreshCredentials: true,
+            syncHistory: true || needsHistory,
+            refreshModelsInfo: true || needsModelInfo
+        )
+        if backgroundSyncGeneration == targetGeneration {
+            pendingSync = weeklyResetRevocationPending
+            syncError = nil
+            if let notice { self.notice = notice }
+        }
+    }
+    private func performGatewaySync(
+        refreshCredentials: Bool,
+        syncHistory: Bool,
+        refreshModelsInfo: Bool
+    ) async throws {
         try requireWritableMetadata()
         pendingSync = true
-        // Always retrieve helper-authoritative rotated tokens before building a source snapshot.
-        let notification = try await refreshCredentials()
-        let helperOwnedIDs = Set(notification["updated_secrets"].array.compactMap { $0["source_id"].string })
+        let helperOwnedIDs: Set<String>
+        if refreshCredentials {
+            // Always retrieve helper-authoritative rotated tokens before building a source snapshot.
+            let notification = try await self.refreshCredentials()
+            helperOwnedIDs = Set(notification["updated_secrets"].array.compactMap { $0["source_id"].string })
+            knownHelperOwnedOfficialIDs = helperOwnedIDs
+        } else {
+            helperOwnedIDs = knownHelperOwnedOfficialIDs
+        }
         var values: [JSONValue] = []
         var next = settings
         for index in next.sources.indices {
@@ -547,17 +729,25 @@ import ServiceManagement
         }
         if next.sources != settings.sources { try persistSettings(next) }
         let enrolled = settings.weeklyResetAccountIDs
+        let historySettings = settings.historyCacheSettings
         do {
-            try await mergeCredentials(try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "auto_reset_weekly_accounts":.array(enrolled.map(JSONValue.string)), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true), "load_balance":.bool(settings.loadBalanceEnabled), "idle_return_minutes":.number(Double(settings.idleReturnDelay)), "upstream_attempts":.number(Double(settings.upstreamAttemptLimit)), "upstream_retry_delay_seconds":.number(Double(settings.upstreamRetryDelay)), "model_compaction":try JSONValue.from(settings.modelCompaction ?? []), "model_policies":try JSONValue.from(settings.modelPolicies ?? [])])))
-            historyStatus = try await client.call("history.configure", historyPayload(settings.historyCacheSettings))
+            let response = try await client.call("sync", .object(["sources": .array(values), "mode": .string(settings.mode), "fixed_source_id": settings.fixed_source_id.map(JSONValue.string) ?? .null, "official_low_quota_percent":.number(Double(settings.lowQuotaPercent)), "auto_reset_weekly_accounts":.array(enrolled.map(JSONValue.string)), "degraded_context_fallback":.bool(settings.degradedContextFallback ?? true), "load_balance":.bool(settings.loadBalanceEnabled), "idle_return_minutes":.number(Double(settings.idleReturnDelay)), "upstream_attempts":.number(Double(settings.upstreamAttemptLimit)), "upstream_retry_delay_seconds":.number(Double(settings.upstreamRetryDelay)), "model_compaction":try JSONValue.from(settings.modelCompaction ?? []), "model_policies":try JSONValue.from(settings.modelPolicies ?? [])]))
+            try await mergeCredentials(response)
+            if syncHistory || lastSyncedHistoryCache != historySettings {
+                historyStatus = try await client.call("history.configure", historyPayload(historySettings))
+                lastSyncedHistoryCache = historySettings
+            }
             try await updateStatus()
             if enrolled == settings.weeklyResetAccountIDs { weeklyResetRevocationPending = false }
-            pendingSync = weeklyResetRevocationPending
-            await refreshModelInformation()
-        } catch { pendingSync = true; throw error }
+            if refreshModelsInfo { await refreshModelInformation() }
+        } catch {
+            pendingSync = true
+            syncError = error.localizedDescription
+            throw error
+        }
     }
     func poll(refreshCredentials: Bool = true) async {
-        guard running, !busy, !restarting else { return }
+        guard running, !busy, !restarting, !syncing else { return }
         do {
             try await updateStatus()
             if refreshCredentials {
@@ -571,7 +761,7 @@ import ServiceManagement
                 }
                 scheduleModelRefresh()
             }
-            if weeklyResetRevocationPending, !busy { try await sync() }
+            if weeklyResetRevocationPending, !busy, !hasPendingBackgroundSync { try await sync() }
             reportPollingError(nil)
             scheduleControlResetPoll()
         } catch { reportPollingError(error.localizedDescription) }
@@ -677,7 +867,11 @@ import ServiceManagement
     }
     func perform(_ action: @escaping () async throws -> Void) {
         guard !busy else { return }; busy = true; error = nil; notice = nil
-        Task { do { try await action() } catch { self.error = error.localizedDescription }; busy = false }
+        Task {
+            defer { self.busy = false }
+            await self.awaitPendingBackgroundSync()
+            do { try await action() } catch { self.error = error.localizedDescription }
+        }
     }
     func saveSource(_ source: Source, apiKey: String) async throws {
         try requireWritableMetadata()
@@ -685,8 +879,10 @@ import ServiceManagement
         if let current = settings.sources.first(where: { $0.id == source.id }), current.kind != source.kind { throw AppError.message("不能更改已有来源的类型，请新建来源。") }
         guard settings.sources.contains(where: { $0.id == source.id }) || settings.sources.count < 200 else { throw AppError.message("最多支持 200 个来源。") }
         if !source.official, apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, try credentialSnapshot.load(source.id) == nil { throw AppError.message("请输入 API 密钥。") }
-        try await refreshCredentials()
-        try await updateStatus()
+        if source.official {
+            try await refreshCredentials()
+            try await updateStatus()
+        }
         var source = source
         let previous = settings.sources.first { $0.id == source.id }
         if source.official { source = source.preservingOfficialIdentity(current: settings.sources.first { $0.id == source.id }, live: state(source.id)) }
@@ -789,9 +985,9 @@ import ServiceManagement
         }
     }
     func changeRouting(mode: String, fixed: String?) {
-        perform {
-            if mode == "fixed", !self.settings.sources.contains(where: { $0.id == fixed && $0.enabled }) { throw AppError.message("请选择已启用的固定来源。") }
-            try await self.updateSettingsAndSync { next in next.mode = mode; next.fixed_source_id = fixed }
+        updateSettingsImmediately { next in
+            if mode == "fixed", !next.sources.contains(where: { $0.id == fixed && $0.enabled }) { throw AppError.message("请选择已启用的固定来源。") }
+            next.mode = mode; next.fixed_source_id = fixed
         }
     }
     func recoverSource(_ id: String) {
@@ -817,9 +1013,9 @@ import ServiceManagement
         }
     }
     func changeLowQuotaThreshold(_ value: Int) {
-        perform {
+        updateSettingsImmediately { next in
             guard (1...99).contains(value) else { throw AppError.message("余量阈值须为 1–99%。") }
-            try await self.updateSettingsAndSync { $0.officialLowQuotaPercent = value }
+            next.officialLowQuotaPercent = value
         }
     }
     private func confirmedWeeklyResetAccount(for source: Source) -> String? {
@@ -832,55 +1028,71 @@ import ServiceManagement
         running && !busy && !metadataLoadFailed && loginSource != source.id && confirmedWeeklyResetAccount(for: source) != nil
     }
     func changeAutoResetWeeklyQuota(_ enabled: Bool, for source: Source) {
-        perform {
+        updateSettingsImmediately { next in
             guard self.running, self.loginSource != source.id, let account = self.confirmedWeeklyResetAccount(for: source) else {
                 throw AppError.message("账号或网络设置已变化，请刷新来源后重试。")
             }
-            try await self.updateSettingsAndSync { next in
-                var enrolled = next.autoResetWeeklyAccounts ?? [:]
-                enrolled[account] = enabled ? WeeklyResetEndpoint(source) : nil
-                next.autoResetWeeklyAccounts = enrolled
-            }
+            var enrolled = next.autoResetWeeklyAccounts ?? [:]
+            enrolled[account] = enabled ? WeeklyResetEndpoint(source) : nil
+            next.autoResetWeeklyAccounts = enrolled
         }
     }
     func changeContextFallback(_ enabled: Bool) {
-        perform {
-            try await self.updateSettingsAndSync { $0.degradedContextFallback = enabled }
-        }
+        updateSettingsImmediately { $0.degradedContextFallback = enabled }
     }
     func changeLoadBalance(_ enabled: Bool) {
-        perform {
-            try await self.updateSettingsAndSync { $0.loadBalance = enabled }
-        }
+        updateSettingsImmediately { $0.loadBalance = enabled }
     }
     func changeIdleReturnDelay(_ minutes: Int) {
-        perform {
+        updateSettingsImmediately { next in
             guard (0...10080).contains(minutes) else { throw AppError.message("闲置回切时间须为 0–10080 分钟。") }
-            try await self.updateSettingsAndSync { $0.conversationStickyMinutes = minutes }
+            next.conversationStickyMinutes = minutes
         }
     }
     func changeUpstreamRetry(attempts: Int, delaySeconds: Int) {
-        perform {
+        updateSettingsImmediately { next in
             guard (1...10).contains(attempts), (0...300).contains(delaySeconds) else {
                 throw AppError.message("尝试次数须为 1–10，等待时间须为 0–300 秒。")
             }
-            try await self.updateSettingsAndSync { next in
-                next.upstreamAttempts = attempts
-                next.upstreamRetryDelaySeconds = delaySeconds
-            }
+            next.upstreamAttempts = attempts
+            next.upstreamRetryDelaySeconds = delaySeconds
         }
     }
     func move(_ offsets: IndexSet, to destination: Int) {
         var order = sources.map(\.id); order.move(fromOffsets: offsets, toOffset: destination)
-        perform {
-            var next = order.compactMap { id in self.settings.sources.first { $0.id == id } }
-            guard next.count == self.settings.sources.count else { throw AppError.message("来源已变化，请重新排序。") }
-            for i in next.indices { next[i].priority = i }
-            try await self.updateSettingsAndSync { $0.sources = next }
+        updateSettingsImmediately { next in
+            var reordered = order.compactMap { id in next.sources.first { $0.id == id } }
+            guard reordered.count == next.sources.count else { throw AppError.message("来源已变化，请重新排序。") }
+            for i in reordered.indices { reordered[i].priority = i }
+            next.sources = reordered
         }
     }
-    func toggle(_ source: Source) { var next = source; next.enabled.toggle(); perform { try await self.saveSource(next, apiKey: "") } }
-    func toggleShowInCmux(_ source: Source) { var next = source; next.show_in_cmux = !source.showInCmux; perform { try await self.saveSource(next, apiKey: "") } }
+    func toggle(_ source: Source) {
+        var becameEnabled = false
+        updateSettingsImmediately { next in
+            guard let index = next.sources.firstIndex(where: { $0.id == source.id }) else {
+                throw AppError.message("来源不存在，请刷新后重试。")
+            }
+            next.sources[index].enabled.toggle()
+            becameEnabled = next.sources[index].enabled
+            if next.fixed_source_id == source.id && !next.sources[index].enabled {
+                next.mode = "auto"
+                next.fixed_source_id = nil
+            }
+        }
+        if becameEnabled {
+            scheduleModelRefresh()
+            accountPageOpened()
+        }
+    }
+    func toggleShowInCmux(_ source: Source) {
+        updateSettingsImmediately { next in
+            guard let index = next.sources.firstIndex(where: { $0.id == source.id }) else {
+                throw AppError.message("来源不存在，请刷新后重试。")
+            }
+            next.sources[index].show_in_cmux = !next.sources[index].showInCmux
+        }
+    }
     func state(_ id: String) -> JSONValue { status["sources"].array.first { $0["id"].string == id } ?? .null }
     var gatewayHasActivity: Bool { running && (status["inflight"].number ?? 0) > 0 }
     func sourceHasActivity(_ id: String) -> Bool { running && (state(id)["active_requests"].number ?? 0) > 0 }
@@ -963,24 +1175,26 @@ import ServiceManagement
         }
     }
     func saveOfficialQuotaRefresh(minutes: String) {
-        perform {
+        guard !metadataLoadFailed, !busy else { return }
+        do {
             guard let value = Int(minutes.trimmingCharacters(in: .whitespacesAndNewlines)), value > 0 else {
                 throw AppError.message("官方额度后台查询间隔须为正整数分钟。")
             }
-            var next = self.settings; next.officialQuotaRefreshMinutes = value
-            try self.persistSettings(next)
-            self.notice = "官方额度后台查询间隔已保存，立即生效。"
+            var next = settings; next.officialQuotaRefreshMinutes = value
+            try persistSettings(next)
+            error = nil
+            notice = "官方额度后台查询间隔已保存，立即生效。"
+        } catch {
+            self.error = error.localizedDescription
         }
     }
     private func historyPayload(_ settings: HistoryCacheSettings) -> JSONValue {
         .object(["enabled": .bool(settings.enabled), "max_bytes": .number(Double(settings.maxBytes))])
     }
     func saveHistoryCache(_ preferences: HistoryCacheSettings) {
-        perform {
+        updateSettingsImmediately(syncHistory: true) { next in
             _ = try HistoryCacheSettings.parse(enabled: preferences.enabled, gigabytes: String(Double(preferences.maxBytes) / 1_000_000_000))
-            var next = self.settings; next.historyCache = preferences
-            try self.persistSettings(next)
-            if self.running { self.historyStatus = try await self.client.call("history.configure", self.historyPayload(preferences)) }
+            next.historyCache = preferences
         }
     }
     func refreshHistoryStatus() async {
@@ -1049,34 +1263,26 @@ import ServiceManagement
         if added > 0 { settings.modelPolicies = policies }
         return added
     }
-    func setModelsEnabled(_ ids: [String], enabled: Bool) async throws {
-        try await updateModelPolicies(successMessage: enabled ? "已启用所选模型。" : "已停用所选模型。") { next in
+    func setModelsEnabled(_ ids: [String], enabled: Bool) throws {
+        try updateModelPolicies(successMessage: ids.count > 1 ? (enabled ? "已启用所选模型。" : "已停用所选模型。") : nil) { next in
             try ModelPolicy.setModelsEnabled(ids, enabled: enabled, in: &next)
         }
     }
-    func setProviderModelsEnabled(sourceID: String, modelIDs: [String], enabled: Bool) async throws {
-        try await updateModelPolicies(successMessage: enabled ? "已启用所选来源模型。" : "已停用所选来源模型。") { next in
+    func setProviderModelsEnabled(sourceID: String, modelIDs: [String], enabled: Bool) throws {
+        try updateModelPolicies(successMessage: modelIDs.count > 1 ? (enabled ? "已启用所选来源模型。" : "已停用所选来源模型。") : nil) { next in
             try ModelPolicy.setProviderModelsEnabled(sourceID: sourceID, modelIDs: modelIDs, enabled: enabled, in: &next)
         }
     }
-    private func updateModelPolicies(successMessage: String, mutate: (inout AppSettings) throws -> Void) async throws {
+    private func updateModelPolicies(successMessage: String?, mutate: (inout AppSettings) throws -> Void) throws {
         guard !busy else { throw AppError.message("请等待当前操作完成后重试。") }
-        busy = true
-        defer { busy = false }
         try requireWritableMetadata()
         var next = settings
         try mutate(&next)
         try persistSettings(next)
         preview = .null
-        pendingSync = true
-        if running {
-            do {
-                try await sync()
-            } catch {
-                throw AppError.message("模型设置已保存在本机，但同步网关失败：\(error.localizedDescription)")
-            }
-            notice = successMessage
-        } else {
+        error = nil
+        scheduleBackgroundSync(successNotice: successMessage)
+        if !running {
             notice = "模型设置已保存在本机，启动网关后生效。"
         }
     }

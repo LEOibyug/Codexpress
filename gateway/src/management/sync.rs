@@ -239,7 +239,7 @@ pub(super) async fn handle(state: &Arc<AppState>, payload: Value) -> Result<Valu
             .map(|runtime| runtime.source.clone())
             .collect::<Vec<_>>(),
     )?;
-    let pricing_sources = next
+    let mut pricing_sources = next
         .iter()
         .map(|runtime| {
             (
@@ -249,10 +249,17 @@ pub(super) async fn handle(state: &Arc<AppState>, payload: Value) -> Result<Valu
             )
         })
         .collect::<Vec<_>>();
-    let usage = state.usage.clone();
-    tokio::task::spawn_blocking(move || usage.reprice_historical(&pricing_sources))
-        .await
-        .context("历史费用更新失败")??;
+    pricing_sources.sort();
+    let should_reprice =
+        *state.last_pricing_sources.lock().await != Some(pricing_sources.clone());
+    if should_reprice {
+        let usage = state.usage.clone();
+        let pricing = pricing_sources.clone();
+        tokio::task::spawn_blocking(move || usage.reprice_historical(&pricing))
+            .await
+            .context("历史费用更新失败")??;
+        *state.last_pricing_sources.lock().await = Some(pricing_sources);
+    }
     let model_compaction_revision = crate::model_catalog::configuration_revision(
         &model_compaction, &next, &model_policies, &settings.mode, settings.fixed_source_id.as_deref(),
     );
@@ -289,5 +296,60 @@ mod tests {
         let enrolled = SyncRequest::parse(&json!({"sources":[],"auto_reset_weekly_accounts":["account-a","account-a"]})).unwrap();
         assert_eq!(enrolled.settings.auto_reset_weekly_accounts, vec!["account-a"]);
         assert!(SyncRequest::parse(&json!({"sources":[],"auto_reset_weekly_accounts":true})).is_err());
+    }
+
+    #[tokio::test]
+    async fn sync_tracks_pricing_sources_and_reprices_when_subscription_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            drop(crate::usage::UsageStore::open(&dir.path().join("usage.sqlite")).unwrap());
+            let db = rusqlite::Connection::open(dir.path().join("usage.sqlite")).unwrap();
+            db.execute(
+                "INSERT INTO usage (request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata) VALUES ('legacy-sync','api-1','API 1','gpt-6.1-sol',?1,'success',512000,100,0,1,20,'{}')",
+                [crate::model::now()],
+            )
+            .unwrap();
+        }
+        let state = AppState::new(dir.path().to_path_buf(), 0, "gateway-key".into()).unwrap();
+        let payload = |is_subscription: bool| {
+            json!({
+                "sources": [{
+                    "id": "api-1",
+                    "name": "API 1",
+                    "kind": "api",
+                    "is_subscription": is_subscription,
+                    "base_url": "https://example.com/v1",
+                    "enabled": true,
+                    "priority": 0,
+                    "proxy": { "mode": "direct" },
+                    "secret": { "api_key": "fixture-secret" }
+                }]
+            })
+        };
+
+        handle(&state, payload(false)).await.unwrap();
+        assert_eq!(
+            *state.last_pricing_sources.lock().await,
+            Some(vec![("api-1".into(), "api".into(), false)])
+        );
+        let initial = state.usage.summary_filtered(1, Some("api-1"), None).unwrap();
+        assert_eq!(initial["recent"][0]["cost"]["rates"]["input"], 4.0);
+
+        // Repeat sync with identical pricing shape keeps cached state without error.
+        handle(&state, payload(false)).await.unwrap();
+        assert_eq!(
+            *state.last_pricing_sources.lock().await,
+            Some(vec![("api-1".into(), "api".into(), false)])
+        );
+
+        // Toggling is_subscription invalidates the cached key and triggers reprice_historical.
+        handle(&state, payload(true)).await.unwrap();
+        assert_eq!(
+            *state.last_pricing_sources.lock().await,
+            Some(vec![("api-1".into(), "api".into(), true)])
+        );
+        let subscribed = state.usage.summary_filtered(1, Some("api-1"), None).unwrap();
+        assert_eq!(subscribed["recent"][0]["cost"]["long_context_waived"], true);
+        assert_eq!(subscribed["recent"][0]["cost"]["rates"]["input"], 2.0);
     }
 }

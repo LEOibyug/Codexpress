@@ -74,8 +74,19 @@ struct SettingsView: View {
                 Text(model.running ? "网关运行中" : "网关未连接").font(AppTypography.caption.weight(.medium))
                 Spacer(minLength: 0)
             }
-            if let port = model.status["port"].number, model.running {
-                Text("端口 \(Int(port).formatted(.number.grouping(.never)))").monospacedDigit().foregroundStyle(.secondary)
+            if model.running || model.syncing {
+                HStack(spacing: 6) {
+                    if let port = model.status["port"].number, model.running {
+                        Text("端口 \(Int(port).formatted(.number.grouping(.never)))").monospacedDigit().foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                    if model.syncing {
+                        HStack(spacing: 4) {
+                            ProgressView().controlSize(.mini)
+                            Text("同步中…").foregroundStyle(.secondary)
+                        }
+                    }
+                }
             }
             if model.installedGatewayUpdate != nil && page != .general {
                 Button { page = .general } label: {
@@ -97,12 +108,12 @@ struct SettingsView: View {
     }
 
     @ViewBuilder private var notices: some View {
-        if model.metadataLoadFailed || model.pendingSync {
+        if model.metadataLoadFailed || model.showsPendingSyncWarning {
             VStack(spacing: 8) {
                 if model.metadataLoadFailed {
                     banner("来源文件无法读取，已进入只读保护。请从备份修复 sources.json 后重启。", symbol: "lock.shield", color: .orange)
                 }
-                if model.pendingSync {
+                if model.showsPendingSyncWarning {
                     HStack(spacing: 8) {
                         banner("配置尚未应用到网关，当前仍使用上次设置。", symbol: "arrow.triangle.2.circlepath", color: .orange)
                         Button("重试同步") { model.retry() }.disabled(model.busy)

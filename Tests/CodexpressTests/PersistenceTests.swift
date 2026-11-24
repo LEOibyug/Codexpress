@@ -244,4 +244,40 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(loaded.sources.first?.show_in_cmux, false)
         XCTAssertEqual(loaded.sources.first?.showInCmux, false)
     }
+
+    func testSystemProxyModeValidatesAndPersistsForAllSourceKinds() throws {
+        var official = Source.newOfficial()
+        official.proxy = ProxyPolicy(mode: "system", url: nil)
+        XCTAssertEqual(official.policyLabel, "系统代理")
+        XCTAssertNoThrow(try official.validate())
+
+        var api = Source()
+        api.name = "API System"
+        api.proxy = ProxyPolicy(mode: "system", url: nil)
+        XCTAssertEqual(api.policyLabel, "系统代理")
+        XCTAssertNoThrow(try api.validate())
+
+        var google = Source.newGoogle()
+        google.proxy = ProxyPolicy(mode: "system", url: nil)
+        XCTAssertNoThrow(try google.validate())
+
+        var openai = Source.newOpenAI()
+        openai.proxy = ProxyPolicy(mode: "system", url: nil)
+        XCTAssertNoThrow(try openai.validate())
+
+        official.proxy.mode = "direct"
+        XCTAssertThrowsError(try official.validate())
+        official.proxy.mode = "system"
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codexpress-sysproxy-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MetadataStore(directory: directory)
+        var settings = AppSettings()
+        settings.sources = [official, api, google, openai]
+        try store.save(settings)
+        let loaded = try store.load()
+        XCTAssertEqual(loaded.sources.map(\.proxy.mode), ["system", "system", "system", "system"])
+        XCTAssertEqual(loaded.sources.map(\.proxy.url), [nil, nil, nil, nil])
+    }
 }

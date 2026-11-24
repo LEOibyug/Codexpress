@@ -29,7 +29,6 @@ struct ModelSettingsView: View {
     @State private var confirmingMetadataReset = false
     @State private var showingMetadataHelp = false
     @State private var updatingMetadata = false
-    @State private var updatingSelection = false
     @State private var metadataNotice: String?
     @State private var metadataError: String?
     @State private var selectionError: String?
@@ -150,10 +149,10 @@ struct ModelSettingsView: View {
                     Spacer(minLength: 0)
                     Button(filteredScope ? "启用当前" : "全部启用") {
                         applyBatchEnabled(visible, enabled: true)
-                    }.disabled(visible.isEmpty || updatingSelection || model.busy || model.metadataLoadFailed)
+                    }.disabled(visible.isEmpty || model.busy || model.metadataLoadFailed)
                     Button(filteredScope ? "停用当前" : "全部停用") {
                         applyBatchEnabled(visible, enabled: false)
-                    }.disabled(visible.isEmpty || updatingSelection || model.busy || model.metadataLoadFailed)
+                    }.disabled(visible.isEmpty || model.busy || model.metadataLoadFailed)
                 }
             }
             if let error = model.modelInformationError { InfoNote(text: "模型信息未更新：\(error)", color: .orange) }
@@ -311,7 +310,7 @@ struct ModelSettingsView: View {
                 set: { next in applyBatchEnabled([id], enabled: next) }
             ))
             .toggleStyle(.switch).controlSize(.small).labelsHidden()
-            .disabled(updatingSelection || model.busy || model.metadataLoadFailed)
+            .disabled(model.busy || model.metadataLoadFailed)
             Button { editing = EditingModel(id: id, isNew: false, returnToSourceID: nil) } label: {
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 5) {
@@ -348,13 +347,12 @@ struct ModelSettingsView: View {
     }
 
     private func applyBatchEnabled(_ ids: [String], enabled: Bool) {
-        guard !ids.isEmpty, !updatingSelection else { return }
-        updatingSelection = true; selectionError = nil
-        Task {
-            defer { updatingSelection = false }
-            do {
-                try await model.setModelsEnabled(ids, enabled: enabled)
-            } catch { selectionError = error.localizedDescription }
+        guard !ids.isEmpty else { return }
+        selectionError = nil
+        do {
+            try model.setModelsEnabled(ids, enabled: enabled)
+        } catch {
+            selectionError = error.localizedDescription
         }
     }
 
@@ -419,7 +417,6 @@ private struct ProviderModelsEditor: View {
     let onEditModel: (String) -> Void
     @State private var search = ""
     @State private var statusFilter: ModelStatusFilter = .all
-    @State private var updating = false
     @State private var error: String?
 
     private var currentSource: Source {
@@ -491,10 +488,10 @@ private struct ProviderModelsEditor: View {
                 Spacer(minLength: 0)
                 Button(filteredScope ? "启用当前" : "全部启用") {
                     apply(visible, enabled: true)
-                }.disabled(visible.isEmpty || updating || model.busy || model.metadataLoadFailed)
+                }.disabled(visible.isEmpty || model.busy || model.metadataLoadFailed)
                 Button(filteredScope ? "停用当前" : "全部停用") {
                     apply(visible, enabled: false)
-                }.disabled(visible.isEmpty || updating || model.busy || model.metadataLoadFailed)
+                }.disabled(visible.isEmpty || model.busy || model.metadataLoadFailed)
             }
             if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
             if all.isEmpty {
@@ -526,7 +523,7 @@ private struct ProviderModelsEditor: View {
                 set: { next in apply([id], enabled: next) }
             ))
             .toggleStyle(.switch).controlSize(.small).labelsHidden()
-            .disabled(updating || model.busy || model.metadataLoadFailed)
+            .disabled(model.busy || model.metadataLoadFailed)
             VStack(alignment: .leading, spacing: 4) {
                 Text(id).font(.system(size: 13, weight: .semibold, design: .monospaced))
                     .foregroundStyle(enabled ? .primary : .secondary).lineLimit(1)
@@ -543,13 +540,12 @@ private struct ProviderModelsEditor: View {
     }
 
     private func apply(_ ids: [String], enabled: Bool) {
-        guard !ids.isEmpty, !updating else { return }
-        updating = true; error = nil
-        Task {
-            defer { updating = false }
-            do {
-                try await model.setProviderModelsEnabled(sourceID: source.id, modelIDs: ids, enabled: enabled)
-            } catch { self.error = error.localizedDescription }
+        guard !ids.isEmpty else { return }
+        error = nil
+        do {
+            try model.setProviderModelsEnabled(sourceID: source.id, modelIDs: ids, enabled: enabled)
+        } catch {
+            self.error = error.localizedDescription
         }
     }
 }

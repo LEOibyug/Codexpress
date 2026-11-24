@@ -68,9 +68,13 @@ struct SourceEditor: View {
                 Section("网络") {
                     Picker("出站策略", selection: $source.proxy.mode) {
                         if !source.official { Text("强制直连").tag("direct") }
+                        Text("系统代理").tag("system")
                         Text("指定代理").tag("explicit")
                     }
-                    if source.proxy.mode == "explicit" {
+                    if source.proxy.mode == "system" {
+                        Text("不做代理干预，直接交由系统代理、环境变量或 TUN 路由处理。")
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
+                    } else if source.proxy.mode == "explicit" {
                         TextField("本地代理端口", text: $proxyPort, prompt: Text("例如 7890"))
                         if source.proxy.localPort == nil, let existing = source.proxy.url {
                             Text("现有代理：\(existing)")
@@ -161,7 +165,7 @@ struct SourceEditor: View {
 
     private func configuredSource() throws -> Source {
         var draft = source
-        if draft.proxy.mode == "direct" { draft.proxy.url = nil }
+        if draft.proxy.mode != "explicit" { draft.proxy.url = nil }
         else if !proxyPort.isEmpty || draft.proxy.url == nil || draft.proxy.localPort != nil {
             draft.proxy = try draft.proxy.withLocalPort(proxyPort)
         }

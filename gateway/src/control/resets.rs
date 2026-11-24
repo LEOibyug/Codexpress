@@ -136,9 +136,9 @@ async fn official_binding(state: &Arc<AppState>, id: &str) -> Result<Binding> {
         .source;
     if source.kind != "official"
         || source.official_account_id().is_none()
-        || source.proxy.mode != "explicit"
+        || !matches!(source.proxy.mode.as_str(), "explicit" | "system")
     {
-        bail!("请选择已登录、指定代理的官方来源");
+        bail!("请选择已登录且使用系统代理或指定代理的官方来源");
     }
     source.validate_official_account()?;
     Ok(Binding::of(source))

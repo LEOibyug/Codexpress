@@ -161,8 +161,10 @@ impl Source {
             bail!("官方来源必须使用官方 Codex 地址");
         }
         match self.proxy.mode.as_str() {
-            "direct" if self.kind == "official" => bail!("官方来源必须指定代理"),
-            "direct" => {}
+            "direct" if self.kind == "official" => {
+                bail!("官方来源不能使用强制直连，请使用系统代理或指定代理")
+            }
+            "direct" | "system" => {}
             "explicit" => {
                 let proxy = self.proxy.url.as_deref().unwrap_or("");
                 let parsed =
@@ -293,6 +295,7 @@ pub struct AppState {
     pub(crate) omp_cache_groups: Mutex<crate::omp_ingress::CacheGroups>,
     pub(crate) google_signatures: crate::google::ThoughtSignatures,
     pub bindings: Mutex<HashMap<String, String>>,
+    pub(crate) last_pricing_sources: Mutex<Option<Vec<(String, String, bool)>>>,
     pub usage: Arc<crate::usage::UsageStore>,
     pub affinity: Arc<crate::affinity::AffinityStore>,
     pub history: Arc<crate::history::HistoryStore>,
@@ -357,6 +360,7 @@ impl AppState {
             omp_cache_groups: Mutex::new(Default::default()),
             google_signatures: Default::default(),
             bindings: Mutex::new(HashMap::new()),
+            last_pricing_sources: Mutex::new(None),
             usage: Arc::new(usage),
             affinity: crate::affinity::AffinityStore::open(&state_dir.join("affinity.sqlite"))?,
             history: Arc::new(crate::history::HistoryStore::open(
@@ -454,6 +458,38 @@ mod tests {
             let mut known = official();
             known.account_id = Some("official-a".into());
             assert_ne!(original.identity(), known.identity());
+        }
+    }
+
+    #[test]
+    fn system_proxy_mode_validates_across_sources_while_direct_remains_forbidden_for_official() {
+        let mut off = official();
+        off.proxy = ProxyPolicy {
+            mode: "system".into(),
+            url: None,
+        };
+        off.validate().unwrap();
+
+        off.proxy.mode = "direct".into();
+        assert!(off.validate().is_err());
+
+        for (kind, base_url) in [
+            ("api", "https://example.com/v1"),
+            ("google", "https://generativelanguage.googleapis.com/v1beta"),
+            ("openai", "https://api.openai.com/v1"),
+        ] {
+            let src: Source = serde_json::from_value(json!({
+                "id": format!("src-{kind}"),
+                "name": kind,
+                "kind": kind,
+                "base_url": base_url,
+                "enabled": true,
+                "priority": 0,
+                "proxy": { "mode": "system" },
+                "secret": { "api_key": "fixture" }
+            }))
+            .unwrap();
+            src.validate().unwrap();
         }
     }
 }
