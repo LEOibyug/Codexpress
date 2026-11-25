@@ -139,9 +139,10 @@ fn prepare_sources(
     let mut invalidated = HashSet::new();
     for mut source in sources {
         if let Some(previous) = current.iter().find(|r| r.source.id == source.id) {
-            if source.kind == "official" && previous.source.kind == "official" {
-                // The helper owns the refresh generation for this process. Never
-                // overwrite a newer refresh token with the UI's stale snapshot.
+            if source.kind == "official" && previous.source.kind == "official"
+                && source.base_url == previous.source.base_url && source.proxy == previous.source.proxy
+            {
+                // Refresh generations belong to this credential destination, not just the source ID.
                 if previous
                     .source
                     .secret

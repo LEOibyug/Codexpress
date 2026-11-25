@@ -23,6 +23,9 @@ pub(super) fn retry_request(parts: &Parts, bytes: Bytes) -> Request<Body> {
     if let Some(ingress) = parts.extensions.get::<crate::remote::RemoteIngress>() {
         retry.extensions_mut().insert(ingress.clone());
     }
+    if let Some(device) = parts.extensions.get::<crate::remote::PublicDevice>() {
+        retry.extensions_mut().insert(*device);
+    }
     if let Some(ingress) = parts.extensions.get::<crate::chatbot::ChatbotIngress>() {
         retry.extensions_mut().insert(ingress.clone());
     }

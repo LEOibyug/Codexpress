@@ -11,17 +11,21 @@ pub(crate) struct OmpIngress {
     pub cache_group: Option<String>,
 }
 
+async fn visible_models(state: &Arc<AppState>) -> anyhow::Result<Vec<Value>> {
+    let mut models = crate::model_catalog::load(state, crate::model_policy::ClientKind::Omp).await?.models();
+    if crate::images::discoverable_for(state, crate::model_policy::ClientKind::Omp).await {
+        models.push(json!({"id":crate::images::MODEL,"name":"GPT Image 2","kind":"image",
+            "input":["text","image"],"output":["image"],"owned_by":"openai","auto_compact_token_limit":null}));
+    }
+    Ok(models)
+}
+
 pub(crate) async fn binding(state: &Arc<AppState>, enable: bool) -> anyhow::Result<Value> {
     if enable {
         crate::chatbot::configure(state, json!({"enabled":true})).await?;
     }
     let access = state.chatbot.status().await?;
-    let mut models = crate::model_catalog::load(state, crate::model_policy::ClientKind::Omp).await?.models();
-    let image_available = crate::images::discoverable_for(state, crate::model_policy::ClientKind::Omp).await;
-    if image_available {
-        models.push(json!({"id":crate::images::MODEL,"name":"GPT Image 2","kind":"image",
-            "input":["text","image"],"output":["image"],"owned_by":"openai","auto_compact_token_limit":null}));
-    }
+    let models = visible_models(state).await?;
     Ok(json!({"provider":"codexpress","api":"openai-codex-responses",
         "base_url":format!("http://127.0.0.1:{}/omp/v1",access["port"]),
         "key":state.chatbot.key()?["key"],"enabled":access["enabled"],"running":access["running"],
@@ -36,7 +40,11 @@ pub(crate) async fn budgets_revision(state: &Arc<AppState>) -> Value {
     json!({"revision": format!("{}:{}", &*state.model_compaction_revision.read().await, catalog.revision)})
 }
 
-pub(crate) fn router(_state: Arc<AppState>) -> Router<Arc<AppState>> {
+pub(crate) fn local_router() -> Router<Arc<AppState>> {
+    inference_router().route("/omp/v1/status", get(status))
+}
+
+pub(crate) fn inference_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/omp/v1/responses", post(forward).get(|| async {
             (StatusCode::NOT_IMPLEMENTED, Json(json!({"error":{"code":"unsupported_websocket","message":"此入口未实现 WebSocket，请使用 SSE"}})))
@@ -51,7 +59,6 @@ pub(crate) fn router(_state: Arc<AppState>) -> Router<Arc<AppState>> {
             Json(budgets_revision(&state).await)
         }))
         .route("/omp/v1/remote-check", get(|| async { Json(json!({"service":"codexpress","mode":"omp","version":1})) }))
-        .route("/omp/v1/status", get(status))
         .route("/omp/v1/capabilities", get(capabilities))
 }
 async fn forward(State(state): State<Arc<AppState>>, mut request: Request) -> Response {
@@ -67,13 +74,15 @@ async fn forward(State(state): State<Arc<AppState>>, mut request: Request) -> Re
         None => suffix,
     };
     *request.uri_mut() = uri.parse().expect("existing URI");
-    request.headers_mut().insert("authorization", HeaderValue::from_str(&format!("Bearer {}",state.gateway_key)).expect("gateway key"));
+    if request.extensions().get::<crate::remote::RemoteIngress>().is_none() {
+        request.headers_mut().insert("authorization", HeaderValue::from_str(&format!("Bearer {}",state.gateway_key)).expect("gateway key"));
+    }
     crate::relay::forward(State(state), request).await
 }
 
 async fn models(State(state): State<Arc<AppState>>) -> Response {
-    match binding(&state, false).await {
-        Ok(binding) => Json(json!({"object":"list","data":binding["models"]})).into_response(),
+    match visible_models(&state).await {
+        Ok(models) => Json(json!({"object":"list","data":models})).into_response(),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "无法读取来源模型目录").into_response(),
     }
 }
@@ -106,19 +115,27 @@ async fn status(State(state): State<Arc<AppState>>, Query(query): Query<StatusQu
 }
 #[derive(Deserialize)]
 struct CapabilityQuery {
-    model: String,
+    model: Option<String>,
     session_id: Option<String>,
 }
 async fn capabilities(State(state): State<Arc<AppState>>, Query(query): Query<CapabilityQuery>, request: Request<Body>) -> Response {
-    if let Some(problem) = crate::model_catalog::check_client(&state, &query.model, crate::model_policy::ClientKind::Omp).await { return problem; }
+    let Some(model) = query.model.as_deref() else {
+        // No source is selected yet; upstream support for V2 is not universal.
+        return Json(json!({"websocket":false,"remote_compaction_v2":null})).into_response();
+    };
+    if let Some(problem) = crate::model_catalog::check_client(&state, model, crate::model_policy::ClientKind::Omp).await { return problem; }
     let namespace = request.extensions().get::<crate::chatbot::ChatbotIngress>().map(|i|i.namespace.as_str()).unwrap_or("");
     let identity = session_identity(namespace, request.headers(), query.session_id.as_deref());
     let session = identity.map(|id| format!("omp:{namespace}:thread:{id}"));
-    let affinity = session.as_ref().map(|session|crate::affinity::key(session, &query.model));
-    let sources = crate::routing::candidates_with_session(&state, &query.model, None, affinity.as_deref()).await;
+    let affinity = session.as_ref().map(|session|crate::affinity::key(session, model));
+    let sources = crate::routing::candidates_with_session(&state, model, None, affinity.as_deref()).await;
     let preferred = affinity.as_deref().and_then(|key|state.affinity.preferred(key, &sources));
     let source = preferred.as_ref().and_then(|id|sources.iter().find(|source|&source.id == id)).or_else(||sources.first());
-    Json(json!({"source_id":source.map(|s|&s.id),"source_identity":source.map(|s|s.identity()),"websocket":false,"remote_compaction_v2":source.and_then(compaction_capability)})).into_response()
+    let mut result = json!({"source_id":source.map(|s|&s.id),"websocket":false,"remote_compaction_v2":source.and_then(compaction_capability)});
+    if request.extensions().get::<crate::remote::RemoteIngress>().is_none() {
+        result["source_identity"] = json!(source.map(|s|s.identity()));
+    }
+    Json(result).into_response()
 }
 
 fn unsupported_sources() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {

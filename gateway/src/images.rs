@@ -253,15 +253,26 @@ async fn gate(State(state): State<Arc<AppState>>, request: Request, next: Next) 
     }
     next.run(request).await
 }
+fn inference_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/images/generations", post(generate))
+        .route("/images/edits", post(edit))
+        .layer(DefaultBodyLimit::max(REQUEST_LIMIT))
+}
+
+pub(crate) fn device_router() -> Router<Arc<AppState>> {
+    let routes = inference_routes();
+    Router::new()
+        .nest("/v1", routes.clone())
+        .nest("/images/v1", routes.route("/models", get(models)))
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/models", get(models))
         .route("/models", get(models))
-        .route("/v1/images/generations", post(generate))
-        .route("/images/generations", post(generate))
-        .route("/v1/images/edits", post(edit))
-        .route("/images/edits", post(edit))
-        .layer(DefaultBodyLimit::max(REQUEST_LIMIT))
+        .nest("/v1", inference_routes())
+        .merge(inference_routes())
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state.clone(), crate::maintenance::http))
         .layer(middleware::from_fn_with_state(state, gate))
@@ -307,7 +318,7 @@ struct Attempt {
     diagnostic: Capture,
 }
 impl Attempt {
-    fn new(state: Arc<AppState>, source: &Source, request_id: &str, ingress: crate::usage::Ingress) -> Self {
+    fn new(state: Arc<AppState>, source: &Source, request_id: &str, ingress: crate::usage::Ingress, peer: Option<&str>) -> Self {
         let record = UsageRecord {
             attempt_id: uuid::Uuid::new_v4().to_string(),
             request_id: request_id.into(),
@@ -322,6 +333,7 @@ impl Attempt {
             cached_input_tokens: 0,
             token_details: TokenDetails {
                 source_kind: Some("official".into()),
+                remote_peer_id: peer.map(str::to_owned),
                 ..Default::default()
             },
             complete: false,
@@ -331,12 +343,13 @@ impl Attempt {
         };
         state.inflight.fetch_add(1, Ordering::Relaxed);
         state.usage.start_for_source(&record, source);
-        let diagnostic = Capture::new(
+        let diagnostic = Capture::for_request(
             &record.attempt_id,
             record.started_at,
             source,
             &state.gateway_key,
             ingress,
+            peer.is_some(),
         );
         Self {
             state,
@@ -524,7 +537,8 @@ async fn execute(
             };
             headers.insert("chatgpt-account-id", value);
         }
-        let mut attempt = Attempt::new(state.clone(), &source, &request_id, ingress);
+        let mut attempt = Attempt::new(state.clone(), &source, &request_id, ingress,
+            crate::remote::public_peer(&parts.extensions));
         attempt.diagnostic.request(
             ingress.as_str(),
             "POST",

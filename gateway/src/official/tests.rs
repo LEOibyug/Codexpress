@@ -983,6 +983,25 @@ async fn new_account_does_not_inherit_previous_account_cooldown_or_inventory() {
 }
 
 #[tokio::test]
+async fn remote_rebinding_revokes_old_and_new_consent_but_same_account_preserves_it() {
+    let (_dir, state) = setup("http://127.0.0.1:1").await;
+    let original = state.sources.read().await[0].source.clone();
+    let mut next = original.secret.clone();
+    next["account_id"] = json!("account-c");
+    state.settings.write().await.auto_reset_weekly_accounts = vec!["account-a".into(), "account-c".into(), "account-b".into()];
+    let changed = super::install(&state, &original, next.clone(), super::Installation::RemoteLogin).await.unwrap();
+    assert_eq!(state.settings.read().await.auto_reset_weekly_accounts, ["account-b"]);
+    let epoch = changed.secret["login_generation"].as_str().unwrap();
+    state.settings.write().await.auto_reset_weekly_accounts.push("account-c".into());
+    let renewed = super::install(&state, &changed, next, super::Installation::RemoteLogin).await.unwrap();
+    assert_eq!(renewed.secret["login_generation"], epoch);
+    assert!(state.settings.read().await.auto_reset_weekly(&renewed));
+    let restored = super::install(&state, &renewed, original.secret, super::Installation::RemoteLogin).await.unwrap();
+    assert_ne!(restored.secret["login_generation"], epoch);
+    assert_eq!(state.settings.read().await.auto_reset_weekly_accounts, ["account-b"]);
+}
+
+#[tokio::test]
 async fn fresh_quota_recovers_natural_reset_but_preserves_unknown_and_other_restrictions() {
     let (proxy, counters, task) = fixture(false).await;
     let (_dir, state) = setup(&proxy).await;

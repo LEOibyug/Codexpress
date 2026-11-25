@@ -140,6 +140,7 @@ struct SseQuotaFilter {
     line_len: usize,
     line_cr: bool,
     disabled: bool,
+    public: bool,
 }
 
 impl SseQuotaFilter {
@@ -147,12 +148,15 @@ impl SseQuotaFilter {
         Bytes::from(std::mem::take(&mut self.pending))
     }
 
-    fn push(&mut self, chunk: Bytes, observed_quota: bool) -> Bytes {
-        if self.disabled { return chunk; }
+    fn push(&mut self, chunk: Bytes, observed_failure: bool) -> Result<Bytes, std::io::Error> {
+        if self.disabled { return Ok(chunk); }
         let mut boundary = 0;
         for (index, &byte) in chunk.iter().enumerate() {
             if byte == b'\n' {
                 if self.line_len == 0 || (self.line_len == 1 && self.line_cr) {
+                    if self.public && index + 1 - boundary + if boundary == 0 { self.pending.len() } else { 0 } > EVENT_LIMIT {
+                        return Err(std::io::Error::other("来源事件过大"));
+                    }
                     boundary = index + 1;
                 }
                 self.line_len = 0;
@@ -163,12 +167,13 @@ impl SseQuotaFilter {
         }
         let tail = &chunk[boundary..];
         if tail.len() + if boundary == 0 { self.pending.len() } else { 0 } > EVENT_LIMIT {
+            if self.public { return Err(std::io::Error::other("来源事件过大")); }
             self.disabled = true;
             boundary = chunk.len();
         }
         if boundary == 0 {
             self.pending.extend_from_slice(tail);
-            return Bytes::new();
+            return Ok(Bytes::new());
         }
         let ready = if self.pending.is_empty() {
             chunk.slice(..boundary)
@@ -178,11 +183,11 @@ impl SseQuotaFilter {
             Bytes::from(ready)
         };
         self.pending.extend_from_slice(&chunk[boundary..]);
-        if observed_quota { rewrite_quota_frames(ready) } else { ready }
+        Ok(if observed_failure { rewrite_failure_frames(ready, self.public) } else { ready })
     }
 }
 
-fn rewrite_quota_frames(bytes: Bytes) -> Bytes {
+fn rewrite_failure_frames(bytes: Bytes, public: bool) -> Bytes {
     let mut start = 0;
     let mut end = 0;
     let mut written = 0;
@@ -192,8 +197,16 @@ fn rewrite_quota_frames(bytes: Bytes) -> Bytes {
         if line != b"\n" && line != b"\r\n" { continue; }
         let frame = &bytes[start..end];
         if frame.len() <= EVENT_LIMIT {
-            if let Some(value) = neutral_quota_event(frame) {
+            if let Some(value) = neutral_failure_event(frame, public) {
                 rewritten.extend_from_slice(&bytes[written..start]);
+                if public {
+                    rewritten.extend_from_slice(b"data: ");
+                    serde_json::to_writer(&mut rewritten, &value).expect("JSON event");
+                    rewritten.extend_from_slice(b"\n\n");
+                    written = end;
+                    start = end;
+                    continue;
+                }
                 let mut data_written = false;
                 for line in frame.split_inclusive(|&byte| byte == b'\n') {
                     if line.starts_with(b"data:") {
@@ -217,7 +230,7 @@ fn rewrite_quota_frames(bytes: Bytes) -> Bytes {
     Bytes::from(rewritten)
 }
 
-fn neutral_quota_event(frame: &[u8]) -> Option<Value> {
+fn neutral_failure_event(frame: &[u8], public: bool) -> Option<Value> {
     let mut name = None;
     let mut data = Vec::new();
     for line in frame.split(|&byte| byte == b'\n') {
@@ -237,9 +250,14 @@ fn neutral_quota_event(frame: &[u8]) -> Option<Value> {
     {
         return None;
     }
-    super::retries::quota_code(&value)?;
+    if !public { super::retries::quota_code(&value)?; }
     const MESSAGE: &str = "来源暂不可用，请稍后重试。";
     let neutral = serde_json::json!({"code":"upstream_unavailable", "type":"server_error", "message":MESSAGE});
+    if public {
+        return Some(if root_error { serde_json::json!({"type":"error","error":neutral}) } else {
+            serde_json::json!({"type":"response.failed","response":{"status":"failed","error":neutral}})
+        });
+    }
     if let Some(error) = value.pointer_mut("/response/error") {
         *error = neutral.clone();
     }
@@ -287,6 +305,7 @@ impl Attempt {
         model: &str,
         input_units: u64,
         ingress: crate::usage::Ingress,
+        peer: Option<&str>,
     ) -> Self {
         state.inflight.fetch_add(1, Ordering::Relaxed);
         let record = UsageRecord {
@@ -307,6 +326,7 @@ impl Attempt {
                 source_kind: Some(source.kind.clone()),
                 is_subscription: Some(source.is_subscription),
                 source_identity: Some(source.identity()),
+                remote_peer_id: peer.map(str::to_owned),
                 ..Default::default()
             },
             complete: false,
@@ -315,12 +335,13 @@ impl Attempt {
             generation_ms: None,
         };
         state.usage.start_for_source(&record, source);
-        let diagnostic = Capture::new(
+        let diagnostic = Capture::for_request(
             &record.attempt_id,
             record.started_at,
             source,
             &state.gateway_key,
             ingress,
+            peer.is_some(),
         );
         Self {
             state,
@@ -455,6 +476,7 @@ impl Attempt {
                     source_kind: record.token_details.source_kind.clone(),
                     is_subscription: record.token_details.is_subscription,
                     source_identity: record.token_details.source_identity.clone(),
+                    remote_peer_id: record.token_details.remote_peer_id.take(),
                     upstream_cost: observer
                         .upstream_cost
                         .clone()
@@ -1147,6 +1169,7 @@ async fn stream_body_response(
             }
         }
     }
+    let public = attempt.record.as_ref().is_some_and(|r| r.token_details.remote_peer_id.is_some());
     // Official Codex can omit Content-Type while still returning SSE.
     let sse = response_is_sse(&headers, request_is_stream, status);
     let rewrite_quota = sse && content_length != Some(0)
@@ -1207,9 +1230,9 @@ async fn stream_body_response(
         let mut received = 0u64;
         let mut finalized = content_length == Some(0);
         let mut chunk_index = 0usize;
-        let mut filter = SseQuotaFilter { disabled: !rewrite_quota, ..Default::default() };
+        let mut filter = SseQuotaFilter { disabled: !rewrite_quota, public, ..Default::default() };
         loop {
-            let chunk = if filter.pending.is_empty() {
+            let chunk = if filter.pending.is_empty() || public {
                 upstream.next().await
             } else {
                 match tokio::time::timeout(std::time::Duration::from_secs(1), upstream.next()).await {
@@ -1246,17 +1269,20 @@ async fn stream_body_response(
                         attempt.finish(if status.is_success() { "streaming" } else { "failed" }, Some(&observer));
                     }
                     confirm_manual_acceptance(&state, &source, &mut observer, &mut accepted_state, &mut route_lease, &mut session_key, status.is_success() && !rejected_attempt).await;
-                    let chunk = filter.push(chunk, observer.quota_code.is_some());
+                    let chunk = match filter.push(chunk, observer.quota_code.is_some() || (public && observer.failed)) {
+                        Ok(chunk) => chunk,
+                        Err(error) => { yield Err(error); return; }
+                    };
                     if !chunk.is_empty() { yield Ok::<Bytes, std::io::Error>(chunk); }
                     if complete_body {
-                        if !filter.pending.is_empty() { yield Ok(filter.flush()); }
+                        if !public && !filter.pending.is_empty() { yield Ok(filter.flush()); }
                         return;
                     }
                 },
                 Err(_) => {
                     attempt.diagnostic.transport("body_transport", "上游响应传输中断");
                     if !finalized { attempt.finish("interrupted", Some(&observer)); }
-                    if !filter.pending.is_empty() { yield Ok(filter.flush()); }
+                    if !public && !filter.pending.is_empty() { yield Ok(filter.flush()); }
                     yield Err(std::io::Error::other("来源流已中断"));
                     return;
                 }
@@ -1264,14 +1290,14 @@ async fn stream_body_response(
         }
         if attempt.captured_transport_error {
             if !finalized { attempt.finish("failed", Some(&observer)); }
-            if !filter.pending.is_empty() { yield Ok(filter.flush()); }
+            if !public && !filter.pending.is_empty() { yield Ok(filter.flush()); }
             yield Err(std::io::Error::other("来源流已中断"));
             return;
         }
         attempt.diagnostic.complete();
         if !finalized { finalize_response(&state, &source, status, discovery, &mut observer, &mut attempt).await; }
         confirm_manual_acceptance(&state, &source, &mut observer, &mut accepted_state, &mut route_lease, &mut session_key, status.is_success() && !rejected_attempt).await;
-        if !filter.pending.is_empty() { yield Ok(filter.flush()); }
+        if !public && !filter.pending.is_empty() { yield Ok(filter.flush()); }
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
@@ -1328,7 +1354,7 @@ mod observation_tests {
         let directory = tempfile::tempdir().unwrap();
         let state = AppState::new(directory.path().to_owned(), 0, "fixture-key".into()).unwrap();
         let source:Source = serde_json::from_value(json!({"id":"fixture","name":"fixture","kind":"api","base_url":"http://127.0.0.1:1","enabled":true,"priority":0,"proxy":{"mode":"direct"},"models":[],"secret":{"api_key":"fixture"}})).unwrap();
-        let mut attempt = Attempt::new(state.clone(), &source, "request", "model", 8, crate::usage::Ingress::Native);
+        let mut attempt = Attempt::new(state.clone(), &source, "request", "model", 8, crate::usage::Ingress::Native, None);
         let mut observer = Observer {
             sse: true,
             ..Default::default()
@@ -1370,6 +1396,7 @@ mod observation_tests {
             "gpt-6-luna",
             1000,
             crate::usage::Ingress::Native,
+            None,
         );
         let mut observer = Observer {
             sse: true,

@@ -12,9 +12,9 @@ use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 // The branches are disjoint: appended rows, then previously excluded time ranges.
 // NOT INDEXED keeps the append branch on the integer primary-key cursor.
 const DELTA: &str = r#"usage AS (
-    SELECT * FROM main.usage NOT INDEXED WHERE attempt>?9 AND started_at>=?1 AND started_at<?2
-    UNION ALL SELECT * FROM main.usage WHERE attempt<=?9 AND started_at>=?1 AND started_at<?10
-    UNION ALL SELECT * FROM main.usage WHERE attempt<=?9 AND started_at>=?11 AND started_at<?2
+    SELECT * FROM main.usage NOT INDEXED WHERE attempt>?11 AND started_at>=?1 AND started_at<?2
+    UNION ALL SELECT * FROM main.usage WHERE attempt<=?11 AND started_at>=?1 AND started_at<?12
+    UNION ALL SELECT * FROM main.usage WHERE attempt<=?11 AND started_at>=?13 AND started_at<?2
 )"#;
 
 #[derive(Clone)]
@@ -175,6 +175,8 @@ impl Cached {
             && old.ingress == query.ingress
             && old.status == query.status
             && old.search == query.search
+            && old.public_fields_only == query.public_fields_only
+            && old.remote_peer_id == query.remote_peer_id
     }
 
     fn offset(&self, query: &Query) -> Option<usize> {
@@ -319,7 +321,7 @@ fn load(
         groups.insert((source, model), Group { attempt, totals });
     }
     let mut daily = vec![zero_day(); query.days.len() - 1];
-    let sql = format!("{attempts} SELECT CAST(days.key AS INTEGER),{aggregate} FROM json_each(?8) days JOIN attempts ON started_at>=days.value AND started_at<json_extract(?8,'$['||(CAST(days.key AS INTEGER)+1)||']') WHERE {FILTERS} GROUP BY days.key ORDER BY CAST(days.key AS INTEGER)");
+    let sql = format!("{attempts} SELECT CAST(days.key AS INTEGER),{aggregate} FROM json_each(?10) days JOIN attempts ON started_at>=days.value AND started_at<json_extract(?10,'$['||(CAST(days.key AS INTEGER)+1)||']') WHERE {FILTERS} GROUP BY days.key ORDER BY CAST(days.key AS INTEGER)");
     let mut statement = connection.prepare(&sql)?;
     for row in statement.query_map(rusqlite::params_from_iter(&bindings), |row| {
         Ok((row.get::<_, usize>(0)?, row.get::<_, String>(1)?))

@@ -1486,7 +1486,8 @@ async fn forward_once(
                 (url, wire_bytes, None)
             };
             let google_sent_body = (is_google && !google_thinking_retried).then(|| wire_bytes.clone());
-            let mut attempt = Attempt::new(state.clone(), &source, &request_id, model, input_units, ingress);
+            let mut attempt = Attempt::new(state.clone(), &source, &request_id, model, input_units,
+                ingress, crate::remote::public_peer(&parts.extensions));
             if let Some(record) = &mut attempt.record {
                 record.token_details.service_tier = parsed["service_tier"]
                     .as_str()

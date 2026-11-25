@@ -143,18 +143,30 @@ async fn edits_accept_sdk_multipart_over_two_megabytes_and_send_inline_codex_jso
     body.extend_from_slice(PNG);
     body.resize(body.len() + 3 * 1024 * 1024, 0);
     body.extend_from_slice(b"\r\n--fixture--\r\n");
-    let mut req = Request::builder()
-        .method("POST")
-        .uri("/v1/images/edits")
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("authorization", format!("Bearer {key}"))
-        .header("content-type", "multipart/form-data; boundary=fixture")
-        .body(Body::from(body))
-        .unwrap();
-    req.extensions_mut()
-        .insert(super::TestTarget("http://images.example/codex".into()));
-    let response = images::router(state).oneshot(req).await.unwrap();
-    assert_eq!(response.status(), 200);
+    let device = management::dispatch(&state, "remote.preview", json!({
+        "id":"device-a", "name":"Fixture", "host":"gateway.test", "config":""
+    })).await.unwrap();
+    let bytes = bytes::Bytes::from(body);
+    for remote in [false, true] {
+        let (host, key) = if remote {
+            (format!("gateway.test:{}", state.port), device["key"].as_str().unwrap())
+        } else { (format!("127.0.0.1:{port}"), key.as_str()) };
+        let mut req = Request::builder().method("POST").uri("/v1/images/edits")
+            .header("host", host).header("authorization", format!("Bearer {key}"))
+            .header("content-type", "multipart/form-data; boundary=fixture")
+            .body(Body::from(bytes.clone())).unwrap();
+        req.extensions_mut().insert(super::TestTarget("http://images.example/codex".into()));
+        let router = if remote {
+            req.extensions_mut().insert(crate::remote::RemoteIngress { peer_id: "device-a".into() });
+            crate::remote::verified_device_router(state.clone())
+        } else { images::router(state.clone()) };
+        let result = router.oneshot(req).await.unwrap();
+        assert_eq!(result.status(), StatusCode::OK);
+        assert_eq!(output(result).await["data"][0]["b64_json"], STANDARD.encode(PNG));
+    }
+    let usage = state.usage.summary(1).unwrap();
+    assert!(usage["recent"].as_array().unwrap().iter().any(|attempt| attempt["ingress"] == "image"
+        && attempt["token_details"]["remote_peer_id"] == "device-a"));
     task.abort();
 }
 #[tokio::test]

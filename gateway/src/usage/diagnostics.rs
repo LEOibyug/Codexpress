@@ -27,12 +27,20 @@ pub struct Capture {
     body: Vec<u8>,
     secrets: Vec<String>,
     received: u64,
+    metadata_only: bool,
     capture_http_body: bool,
     encoding: String,
 }
 
 impl Capture {
     pub fn new(attempt_id: &str, created_at: u64, source: &Source, gateway_key: &str, ingress: Ingress) -> Self {
+        Self::for_request(attempt_id, created_at, source, gateway_key, ingress, false)
+    }
+
+    /// Public device traffic records status and timings, never upstream bodies,
+    /// URLs, header values or free-form errors (which may contain credentials).
+    pub(crate) fn for_request(attempt_id: &str, created_at: u64, source: &Source, gateway_key: &str,
+        ingress: Ingress, metadata_only: bool) -> Self {
         fn strings(value: &Value, secrets: &mut Vec<String>) {
             match value {
                 Value::String(s) if !s.is_empty() => secrets.push(s.clone()),
@@ -42,12 +50,12 @@ impl Capture {
             }
         }
         let mut secrets = Vec::new();
-        strings(&source.secret, &mut secrets);
-        if !gateway_key.is_empty() {
-            secrets.push(gateway_key.to_owned());
+        if !metadata_only {
+            strings(&source.secret, &mut secrets);
+            if !gateway_key.is_empty() { secrets.push(gateway_key.to_owned()); }
+            secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+            secrets.dedup();
         }
-        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
-        secrets.dedup();
         Self {
             attempt_id: attempt_id.into(),
             created_at,
@@ -55,6 +63,7 @@ impl Capture {
             body: Vec::new(),
             secrets,
             received: 0,
+            metadata_only,
             capture_http_body: false,
             encoding: String::new(),
         }
@@ -71,6 +80,7 @@ impl Capture {
         self.metadata["ingress"] = json!(Ingress::parse(ingress).unwrap_or_default());
         self.metadata["method"] = json!(self.redact(method));
         self.metadata["path"] = json!(self.redact(path));
+        if self.metadata_only { return; }
         let safe = url::Url::parse(url).ok().map(|mut url| {
             url.set_query(None);
             url.set_fragment(None);
@@ -85,6 +95,10 @@ impl Capture {
 
     pub fn response(&mut self, status: u16, headers: &HeaderMap) {
         self.metadata["http_status"] = json!(status);
+        if self.metadata_only {
+            if status >= 400 { self.metadata["error_kind"] = json!("http"); }
+            return;
+        }
         let mut safe = serde_json::Map::new();
         for name in [
             "content-type",
@@ -116,7 +130,7 @@ impl Capture {
 
     pub fn transport(&mut self, kind: &str, message: &str) {
         self.metadata["error_kind"] = json!(self.redact(kind));
-        self.metadata["error_message"] = json!(self.redact(message));
+        if !self.metadata_only { self.metadata["error_message"] = json!(self.redact(message)); }
     }
 
     pub fn chunk(&mut self, bytes: &[u8]) {
@@ -132,7 +146,7 @@ impl Capture {
     }
 
     pub fn full(&self) -> bool {
-        self.body.len() >= BODY_LIMIT
+        self.metadata_only || self.body.len() >= BODY_LIMIT
     }
     pub fn complete(&mut self) {
         self.metadata["body_complete"] = json!(true);
@@ -140,7 +154,7 @@ impl Capture {
 
     pub fn failed_event(&mut self, value: &Value) {
         // HTTP 200 remains non-capturing: later deltas must never enter this body.
-        if self.capture_http_body {
+        if self.metadata_only || self.capture_http_body {
             return;
         }
         let response = value.get("response").unwrap_or(value);
@@ -259,7 +273,7 @@ impl Capture {
         let mut metadata = self.metadata.clone();
         metadata["body_total_bytes"] = json!(self.received);
         metadata["body_saved_bytes"] = json!(text.map_or(0, str::len));
-        if self.full() && metadata["body_complete"] != true {
+        if !self.metadata_only && self.full() && metadata["body_complete"] != true {
             metadata["body_truncated"] = json!(true);
         }
         if let Some(value) = text.and_then(|text| serde_json::from_str::<Value>(text).ok()) {

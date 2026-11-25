@@ -138,6 +138,14 @@ impl Default for Settings {
 pub struct RemoteIngress {
     pub peer_id: String,
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct PublicDevice;
+
+pub(crate) fn public_peer(extensions: &http::Extensions) -> Option<&str> {
+    extensions.get::<PublicDevice>()?;
+    extensions.get::<RemoteIngress>().map(|peer| peer.peer_id.as_str())
+}
 pub struct RemoteAccess {
     settings: Mutex<Settings>,
     path: PathBuf,
@@ -347,6 +355,27 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         )
         .layer(middleware::from_fn_with_state(state.clone(), crate::maintenance::http))
         .layer(middleware::from_fn_with_state(state, gate))
+}
+
+/// In-process inference only. A TLS front end must first check the public
+/// authority and insert the device extension; there is no local-key fallback.
+pub fn verified_device_router(state: Arc<AppState>) -> axum::Router {
+    let adapters = crate::chatbot::device_router()
+        .merge(crate::images::device_router())
+        .with_state(state.clone());
+    crate::relay::router(state.clone())
+        .merge(adapters)
+        .route("/v1/remote-check", get(|| async { Json(json!({"service":"codexpress","mode":"pool","version":1})) }))
+        .layer(middleware::from_fn_with_state(state.clone(), crate::maintenance::http))
+        .route_layer(middleware::from_fn_with_state(state, |State(state): State<Arc<AppState>>, mut request: Request, next: Next| async move {
+            let peer = request.extensions().get::<RemoteIngress>();
+            if request.headers().get_all("authorization").iter().count() != 1
+                || peer.is_none_or(|p| state.remote.peer(request.headers()).as_ref() != Some(&p.peer_id)) {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            request.extensions_mut().insert(PublicDevice);
+            next.run(request).await
+        }))
 }
 
 pub fn render_config(

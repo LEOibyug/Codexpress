@@ -15,11 +15,11 @@ pub(super) const ATTEMPT_ROWS: &str = r#"
         d.attempt_id IS NOT NULL AS diagnostic_available
     FROM usage u LEFT JOIN diagnostics d ON d.attempt_id=
         COALESCE(NULLIF(json_extract(u.metadata,'$.attempt_id'),''),'legacy:'||u.attempt)
-    WHERE u.started_at>=?1 AND u.started_at<?2"#;
+    WHERE u.started_at>=?1 AND u.started_at<?2 AND (?9 IS NULL OR json_extract(u.metadata,'$.token_details.remote_peer_id')=?9)"#;
 
 pub(super) const FILTERS: &str = r#"(?3 IS NULL OR source_id=?3) AND (?4 IS NULL OR model=?4) AND (?5 IS NULL OR ingress=?5)
     AND (?6 IS NULL OR status=?6 OR (?6='unsuccessful' AND status IN ('failed','interrupted')))
-    AND (?7 IS NULL OR instr(lower(request_id||char(10)||attempt_id_key||char(10)||source_id||char(10)||source_name||char(10)||model||char(10)||status||char(10)||ingress||char(10)||COALESCE(http_status,'')||char(10)||COALESCE(error_code,'')||char(10)||COALESCE(error_kind,'')||char(10)||COALESCE(error_message,'')||char(10)||COALESCE(error_param,'')),lower(?7))>0)"#;
+    AND (?7 IS NULL OR instr(lower(request_id||char(10)||attempt_id_key||char(10)||source_id||char(10)||source_name||char(10)||model||char(10)||status||char(10)||ingress||char(10)||COALESCE(http_status,'')||CASE WHEN ?8 THEN '' ELSE char(10)||COALESCE(error_code,'')||char(10)||COALESCE(error_kind,'')||char(10)||COALESCE(error_message,'')||char(10)||COALESCE(error_param,'') END),lower(?7))>0)"#;
 pub(super) const RECORD_COLUMNS: &str = "attempt,request_id,source_id,source_name,model,started_at,status,input_tokens,output_tokens,cached_input_tokens,complete,latency_ms,metadata";
 const MAX_INTERVAL: u64 = 366 * 26 * 3600;
 const MAX_ACTIVE: usize = 10_000;
@@ -34,6 +34,8 @@ pub(super) struct Query {
     pub ingress: Option<String>,
     pub status: Option<String>,
     pub search: Option<String>,
+    pub public_fields_only: bool,
+    pub remote_peer_id: Option<String>,
     pub before: Option<i64>,
     pub limit: usize,
 }
@@ -46,7 +48,7 @@ impl Query {
         for key in object.keys() {
             let valid = matches!(
                 key.as_str(),
-                "from" | "to" | "day_starts" | "source_id" | "model" | "ingress" | "status" | "search"
+                "from" | "to" | "day_starts" | "source_id" | "model" | "ingress" | "status" | "search" | "public_fields_only" | "remote_peer_id"
             ) || !analytics && matches!(key.as_str(), "before" | "limit");
             ensure!(valid, "未知查询参数：{key}");
         }
@@ -114,6 +116,8 @@ impl Query {
             "状态筛选无效"
         );
         let search = optional_text(payload, "search", 256)?;
+        let public_fields_only = payload.get("public_fields_only").map(|v| v.as_bool().ok_or_else(|| anyhow::anyhow!("公开查询标记无效"))).transpose()?.unwrap_or(false);
+        let remote_peer_id = optional_text(payload, "remote_peer_id", 36)?.map(|s| uuid::Uuid::parse_str(&s).map(|id| id.to_string())).transpose()?;
         let before = if payload.get("before").is_none_or(Value::is_null) {
             None
         } else {
@@ -136,6 +140,8 @@ impl Query {
             ingress,
             status,
             search,
+            public_fields_only,
+            remote_peer_id,
             before,
             limit,
         })
@@ -150,6 +156,8 @@ impl Query {
             sql_text(&self.ingress),
             sql_text(&self.status),
             sql_text(&self.search),
+            SqlValue::Integer(i64::from(self.public_fields_only)),
+            sql_text(&self.remote_peer_id),
         ]
     }
 
@@ -203,6 +211,7 @@ pub(super) fn active_records(data: &StoreData, query: &Query) -> Result<Vec<Valu
         .prepare_cached("SELECT metadata FROM diagnostics WHERE attempt_id=?1")?;
     let mut records = Vec::new();
     for (record, started) in data.active.values() {
+        if query.remote_peer_id.as_ref().is_some_and(|peer| record.token_details.remote_peer_id.as_ref() != Some(peer)) { continue; }
         if record.started_at < query.from || record.started_at >= query.to {
             continue;
         }
@@ -281,6 +290,7 @@ pub(super) fn log_matches(query: &Query, record: &Value) -> bool {
                 "error_param",
             ]
             .iter()
+            .filter(|field| !query.public_fields_only || !field.starts_with("error_"))
             .map(|field| {
                 record[*field]
                     .as_str()
@@ -330,7 +340,7 @@ pub(super) fn build(data: &StoreData, payload: &Value) -> Result<Value> {
         query.before.map_or(SqlValue::Null, SqlValue::Integer),
         SqlValue::Integer((stored_limit + 1) as i64),
     ]);
-    let list_sql = format!("WITH attempts AS ({ATTEMPT_ROWS}) SELECT {RECORD_COLUMNS},ingress,http_status,error_code,diagnostic_available FROM attempts WHERE {FILTERS} AND (?8 IS NULL OR attempt<?8) ORDER BY attempt DESC LIMIT ?9");
+    let list_sql = format!("WITH attempts AS ({ATTEMPT_ROWS}) SELECT {RECORD_COLUMNS},ingress,http_status,error_code,diagnostic_available FROM attempts WHERE {FILTERS} AND (?10 IS NULL OR attempt<?10) ORDER BY attempt DESC LIMIT ?11");
     let mut statement = data.connection.prepare(&list_sql)?;
     let mut stored = statement
         .query_map(rusqlite::params_from_iter(bindings.iter()), |row| {

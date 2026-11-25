@@ -30,6 +30,7 @@ mod resets;
 mod snapshots;
 
 use resets::consume;
+pub use resets::read_receipt;
 use snapshots::refresh_selected_snapshots;
 #[cfg(test)]
 use snapshots::{credits_snapshot, quota_snapshot};
@@ -114,12 +115,20 @@ const ENDPOINTS: Endpoints<'static> = Endpoints {
 struct Flow {
     owner: Weak<AppState>,
     source: Source,
+    // Paste-only flows run on a server. An edit (even delete/recreate with the
+    // same ID/configuration) invalidates authorization from the previous pool.
+    pool_generation: Option<u64>,
     state: String,
     verifier: String,
     expires: u64,
     result: Option<Value>,
     error: Option<String>,
     exchanging: bool,
+}
+impl Flow {
+    fn current_pool(&self, state: &AppState) -> bool {
+        self.pool_generation.is_none_or(|g| state.routing_revision.load(std::sync::atomic::Ordering::Acquire) == g)
+    }
 }
 static FLOWS: OnceLock<Mutex<HashMap<String, Flow>>> = OnceLock::new();
 fn flows() -> &'static Mutex<HashMap<String, Flow>> {
@@ -177,12 +186,25 @@ fn same_account_binding(a: &Source, b: &Source) -> bool {
         && a.proxy == b.proxy
         && account(a) == account(b)
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Installation { Refresh, LocalLogin, RemoteLogin }
+
 async fn install(
     state: &Arc<AppState>,
     before: &Source,
     secret: Value,
-    new_login: bool,
+    installation: Installation,
 ) -> Result<Source> {
+    let remote_login = installation == Installation::RemoteLogin;
+    let mut secret = secret;
+    // Automatic consumption commits under settings -> sources. Use the same order
+    // so eligibility cannot see new credentials with the old account enrollment.
+    let mut policy = if remote_login { Some(state.settings.write().await) } else { None };
+    let changed_identity = account(before) != secret["account_id"].as_str().map(str::trim).filter(|id| !id.is_empty());
+    if remote_login {
+        if changed_identity { secret["login_generation"] = json!(uuid::Uuid::new_v4()); }
+        else if let Some(epoch) = before.secret.get("login_generation") { secret["login_generation"] = epoch.clone(); }
+    }
     let mut sources = state.sources.write().await;
     let current = sources
         .iter()
@@ -196,7 +218,7 @@ async fn install(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|id| !id.is_empty());
-    if new_login || account(before) != next_account {
+    if installation != Installation::Refresh || account(before) != next_account {
         if let Some(existing) = sources.iter().find(|runtime| {
             runtime.source.id != before.id
                 && runtime.source.kind == "official"
@@ -238,6 +260,9 @@ async fn install(
             }
             bail!("{PERSISTENCE_FAILURE}");
         }
+    }
+    if let Some(settings) = policy.as_mut().filter(|_| changed_identity) {
+        settings.auto_reset_weekly_accounts.retain(|id| Some(id.as_str()) != account(before) && Some(id.as_str()) != next_account);
     }
     let changed_accounts: Vec<_> = targets
         .iter()
@@ -475,7 +500,7 @@ async fn refresh_token(
             bail!("刷新返回了不同账号，请重新登录确认");
         }
     }
-    install(state, current, secret, false).await
+    install(state, current, secret, Installation::Refresh).await
 }
 pub async fn ensure_access(state: &Arc<AppState>, source_id: &str) -> Result<Source> {
     refresh_inner(state, source_id, false, ENDPOINTS).await
@@ -523,7 +548,7 @@ async fn complete(
         let flow = flows
             .get_mut(flow_id)
             .ok_or_else(|| anyhow!("登录流程不存在或已过期"))?;
-        if flow.source.id != id || !flow.owner.ptr_eq(&Arc::downgrade(state)) {
+        if flow.source.id != id || !flow.owner.ptr_eq(&Arc::downgrade(state)) || !flow.current_pool(state) {
             bail!("登录流程不属于此来源");
         }
         if flow.expires <= now() {
@@ -576,13 +601,15 @@ async fn complete(
             .filter(|flow| {
                 flow.source.id == id
                     && flow.owner.ptr_eq(&Arc::downgrade(state))
+                    && flow.current_pool(state)
                     && flow.expires > now()
             })
             .ok_or_else(|| anyhow!("登录流程已取消或过期，请使用当前登录流程"))?;
         if !active.exchanging || active.error.is_some() {
             bail!("登录流程已失效，请重新登录");
         }
-        let installed = install(state, &before, secret.clone(), true).await?;
+        let kind = if active.pool_generation.is_some() { Installation::RemoteLogin } else { Installation::LocalLogin };
+        let installed = install(state, &before, secret.clone(), kind).await?;
         drop(pending);
         Ok(json!({"connected":true,"secret":secret,"account_id":installed.account_id}))
     }
@@ -607,6 +634,15 @@ fn validate_completed_login(before: &Source, current: &Source, result: &Value) -
     Ok(())
 }
 async fn start(state: &Arc<AppState>, id: &str) -> Result<Value> {
+    start_flow(state, id, true).await
+}
+
+/// A remote browser pastes its loopback callback; never bind a callback port on the server.
+pub async fn start_paste_login(state: &Arc<AppState>, id: &str) -> Result<Value> {
+    start_flow(state, id, false).await
+}
+
+async fn start_flow(state: &Arc<AppState>, id: &str, local_callback: bool) -> Result<Value> {
     let verifier = random();
     let nonce = random();
     let flow_id = uuid::Uuid::new_v4().to_string();
@@ -636,6 +672,7 @@ async fn start(state: &Arc<AppState>, id: &str) -> Result<Value> {
         Flow {
             owner: Arc::downgrade(state),
             source,
+            pool_generation: (!local_callback).then(|| state.routing_revision.load(std::sync::atomic::Ordering::Acquire)),
             state: nonce,
             verifier,
             expires: now() + 600,
@@ -645,14 +682,12 @@ async fn start(state: &Arc<AppState>, id: &str) -> Result<Value> {
         },
     );
     drop(pending);
-    let listening = if let Ok(listener) = TcpListener::bind("127.0.0.1:1455").await {
-        tokio::spawn(async move {
-            callback_server(listener).await;
-        });
-        true
-    } else {
-        false
-    };
+    let listening = if local_callback {
+        match TcpListener::bind("127.0.0.1:1455").await {
+            Ok(listener) => { tokio::spawn(callback_server(listener)); true }
+            Err(_) => false,
+        }
+    } else { false };
     Ok(
         json!({"flow_id":flow_id,"auth_url":url.as_str(),"callback_port":1455,"manual_callback_required":!listening}),
     )
@@ -750,7 +785,7 @@ pub async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<V
             let flow = flows
                 .get(flow_id)
                 .ok_or_else(|| anyhow!("登录流程不存在"))?;
-            if flow.source.id != id || !flow.owner.ptr_eq(&Arc::downgrade(state)) {
+            if flow.source.id != id || !flow.owner.ptr_eq(&Arc::downgrade(state)) || !flow.current_pool(state) {
                 bail!("登录流程不属于此来源");
             }
             if let Some(result) = &flow.result {
@@ -787,6 +822,12 @@ pub(crate) async fn refresh_for_source(
         bail!("来源在查询期间发生变化，请刷新");
     }
     refresh_selected_snapshots(state, &current, ENDPOINTS, include_credits).await
+}
+
+/// Called only by the server scheduler after a successful quota observation.
+/// Consent, account binding, exhaustion epochs and the durable intent remain core-owned.
+pub async fn scheduled_reset(state: &Arc<AppState>, expected: &Source) -> Result<Option<Value>> {
+    auto_reset::consider(state, expected, ENDPOINTS, None).await
 }
 
 pub(crate) async fn quota_rejected(state: &Arc<AppState>, src: &Source, ticket: u64) {
@@ -860,7 +901,7 @@ pub(crate) mod fixture {
         id: &str,
         secret: Value,
     ) -> Result<Source> {
-        install(state, &source(state, id).await?, secret, true).await
+        install(state, &source(state, id).await?, secret, Installation::LocalLogin).await
     }
     pub(crate) async fn snapshots_at(state: &Arc<AppState>, id: &str, base: &str) -> Result<Value> {
         selected_snapshots_at(state, id, base, true).await

@@ -140,7 +140,7 @@ impl Source {
         Ok(())
     }
 
-    pub(crate) fn validate_configuration(&self) -> Result<()> {
+    pub fn validate_configuration(&self) -> Result<()> {
         if self.id.is_empty()
             || self.id.len() > 128
             || !self

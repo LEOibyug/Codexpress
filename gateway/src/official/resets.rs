@@ -24,6 +24,8 @@ struct Operation {
     created_at: u64,
     result: Value,
     weekly_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    confirmation_handle: Option<String>,
 }
 fn operation_path(state: &Arc<AppState>, id: &str) -> PathBuf {
     state
@@ -70,6 +72,33 @@ pub(super) fn write_record(path: &std::path::Path, value: &impl Serialize, creat
 fn reset_result(code: &str, windows: Value) -> Value {
     json!({"code":code,"windows_reset":windows,"quota":null,"credits":null})
 }
+/// Inspect an existing receipt only. Unlike consume(), this never submits or refreshes.
+pub async fn read_receipt(state: &Arc<AppState>, source_id: &str, account_id: &str, operation_id: &str, handle: Option<&str>) -> Result<Value> {
+    // A concurrent consume can be in inventory preflight before creating its durable
+    // intent. Never report "not_found" while that account submission is in progress.
+    let mutex = lock(state, format!("consume:{account_id}")).await;
+    let _guard = mutex.lock().await;
+    let path = operation_path(state, operation_id);
+    let receipt: Option<Operation> = tokio::task::spawn_blocking(move || -> Result<_> {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => bail!("无法读取重置操作记录"),
+        };
+        Ok(Some(serde_json::from_reader(std::io::BufReader::new(file))?))
+    }).await??;
+    let sources = state.sources.read().await;
+    if !sources.iter().any(|r| r.source.id == source_id && account(&r.source) == Some(account_id)) {
+        bail!("确认的账号已变化");
+    }
+    let Some(receipt) = receipt else { return Ok(json!({"code":"not_found"})) };
+    if receipt.operation_id != operation_id || receipt.source_id != source_id || receipt.account_id.as_deref() != Some(account_id)
+        || handle.is_some_and(|expected| receipt.confirmation_handle.as_deref() != Some(expected)) {
+        bail!("操作标识不属于此来源和账号");
+    }
+    Ok(json!({"code":receipt.result["code"], "windows_reset":receipt.result["windows_reset"]}))
+}
+
 pub(super) async fn consume(
     state: &Arc<AppState>,
     payload: &Value,
@@ -164,6 +193,7 @@ pub(super) async fn consume_locked(
                     excluded_cards.push(operation.credit_id);
                 }
                 Some("reset" | "already_redeemed") if automatic.is_some() => excluded_cards.push(operation.credit_id),
+                Some("reset" | "already_redeemed") if payload.get("confirmed_card").is_some() => bail!("此卡片已有兑换记录，不能重复提交"),
                 _ => {}
             }
         }
@@ -191,6 +221,12 @@ pub(super) async fn consume_locked(
     }
     // Compare the visible card to the fresh inventory; any meaningful change needs a new confirmation.
     if automatic.is_none() {
+        // Remote confirmations are opaque handles over the observed inventory. A
+        // refresh concurrent with preflight cannot silently change the approved terms.
+        if payload.get("confirmed_card").is_some_and(|shown| ["id", "status", "expires_at", "expiry_known", "reset_type"]
+            .iter().any(|key| shown[*key] != card[*key])) {
+            bail!("重置卡信息已变化，请刷新并重新确认");
+        }
         let sources = state.sources.read().await;
         if let Some(previous) = sources
             .iter()
@@ -235,6 +271,7 @@ pub(super) async fn consume_locked(
         created_at: now(),
         result: reset_result("pending_verification", Value::Null),
         weekly_generation,
+        confirmation_handle: payload["confirmation_handle"].as_str().map(str::to_owned),
     };
     write_operation(state, &operation, true)?;
     if automatic.is_some() {

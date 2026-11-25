@@ -37,6 +37,8 @@ pub struct TokenDetails {
     pub is_subscription: Option<bool>,
     pub source_identity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_peer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_cost: Option<ReportedCost>,
 }
 

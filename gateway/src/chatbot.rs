@@ -283,11 +283,30 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/responses", post(responses))
         .route("/v1/responses/compact", post(compact))
         .route("/responses/compact", post(compact))
-        .merge(crate::omp_ingress::router(state.clone()))
+        .merge(crate::omp_ingress::local_router())
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state.clone(), crate::maintenance::http))
         .layer(middleware::from_fn_with_state(state, gate))
 }
+
+pub(crate) fn device_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/v1/chat/completions", post(chat))
+        .route("/chat/v1/models", get(models))
+        .route("/chat/v1/chat/completions", post(chat))
+        .route("/chat/v1/responses", post(responses))
+        .route("/chat/v1/responses/compact", post(compact))
+        .merge(crate::omp_ingress::inference_router())
+        .route_layer(middleware::from_fn(|mut request: Request, next: Next| async move {
+            let Some(peer) = request.extensions().get::<crate::remote::RemoteIngress>() else {
+                return StatusCode::UNAUTHORIZED.into_response();
+            };
+            let namespace = crate::continuity::digest("device", &peer.peer_id);
+            request.extensions_mut().insert(ChatbotIngress { namespace });
+            next.run(request).await
+        }))
+}
+
 async fn remote_check() -> Json<Value> {
     Json(json!({"service":"codexpress","mode":"chatbot","version":1}))
 }
@@ -337,7 +356,7 @@ async fn infer(state: Arc<AppState>, request: Request, format: requests::Format)
     for field in ["session_id", "conversation_id"] {
         body.as_object_mut().unwrap().remove(field);
     }
-    let mut headers = relay_headers(&state, &parts.headers, "text/event-stream");
+    let mut headers = relay_headers(&state, &parts, "text/event-stream");
     if !headers.contains_key("thread-id") && !headers.contains_key("session-id") {
         if let Some(session) = session {
             headers.insert("session-id", session.parse().unwrap());
@@ -396,7 +415,7 @@ async fn forward_native_compaction(
             Some(problem.param),
         );
     }
-    let mut headers = relay_headers(&state, &parts.headers, accept);
+    let mut headers = relay_headers(&state, &parts, accept);
     for name in [
         "openai-beta",
         "x-codex-beta-features",
@@ -419,7 +438,7 @@ async fn forward_native_compaction(
 
 fn relay_headers(
     state: &AppState,
-    incoming: &axum::http::HeaderMap,
+    parts: &http::request::Parts,
     accept: &'static str,
 ) -> axum::http::HeaderMap {
     // Only this authenticated ingress can mint the internal relay request.
@@ -433,18 +452,20 @@ fn relay_headers(
         "session_id",
         "x-request-id",
     ] {
-        if let Some(value) = incoming.get(name) {
+        if let Some(value) = parts.headers.get(name) {
             headers.insert(axum::http::HeaderName::from_static(name), value.clone());
         }
     }
-    headers.insert(
-        header::HOST,
-        format!("127.0.0.1:{}", state.port).parse().unwrap(),
-    );
-    headers.insert(
-        header::AUTHORIZATION,
-        format!("Bearer {}", state.gateway_key).parse().unwrap(),
-    );
+    if parts.extensions.get::<crate::remote::RemoteIngress>().is_some() {
+        // The relay revalidates this device even on internal replans. Never
+        // replace its identity with the credential shared by local adapters.
+        for name in [header::HOST, header::AUTHORIZATION] {
+            if let Some(value) = parts.headers.get(&name) { headers.insert(name, value.clone()); }
+        }
+    } else {
+        headers.insert(header::HOST, format!("127.0.0.1:{}", state.port).parse().unwrap());
+        headers.insert(header::AUTHORIZATION, format!("Bearer {}", state.gateway_key).parse().unwrap());
+    }
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),

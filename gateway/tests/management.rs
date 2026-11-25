@@ -160,6 +160,12 @@ async fn official_refresh_generation_cannot_be_overwritten_by_stale_ui_sync() {
         "new-refresh"
     );
     assert_eq!(state.sources.read().await[0].source.secret["generation"], 2);
+    let mut changed_proxy = source;
+    changed_proxy["proxy"] = json!({"mode":"explicit","url":"http://127.0.0.1:7891"});
+    changed_proxy["secret"] = json!({});
+    changed_proxy["account_id"] = serde_json::Value::Null;
+    management::dispatch(&state, "sync", json!({"sources":[changed_proxy]})).await.unwrap();
+    assert!(state.sources.read().await[0].source.secret.get("refresh_token").is_none());
     let stored = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|p| std::fs::read(p.unwrap().path()).unwrap())
