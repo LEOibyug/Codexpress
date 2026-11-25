@@ -45,10 +45,9 @@ struct RemoteGatewayConsole: View {
                         Group {
                             switch page {
                             case .overview: RemoteConsoleOverview(target: target)
-                            case .models, .general: RemoteConsolePreferences(target: target, page: page)
                             case .usage: RemoteConsoleUsage(target: target)
                             case .connections: RemoteConsoleDevices(target: target)
-                            case .sources: EmptyView()
+                            case .sources, .models, .general: EmptyView()
                             }
                         }.id(page).id(management.targetGeneration)
                     } else { InfoNote(text: "此网关仅支持来源池管理。请更新远端网关以使用更多功能。") }

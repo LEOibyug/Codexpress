@@ -138,6 +138,68 @@ final class RemoteGatewayManagementTests: XCTestCase {
         catch { XCTAssertEqual(peer.requests.count, count) }
     }
 
+    func testPreferencesKeepCrossPageEditsUntilOneRevisionBoundSubmission() async throws {
+        let peer = Peer(), manager = peer.manager(try directory())
+        let status = Reply(Self.status.json.replacingOccurrences(of: "\"pool.edit\"", with: "\"pool.edit\",\"config.get\",\"config.save\",\"history.status\",\"history.configure\""))
+        let config = Reply(#"{"sources":[{"id":"a","reset_consent_binding":"bound"}],"settings":{"model_policies":[],"auto_reset_weekly_accounts":["a"],"upstream_attempts":2}}"#)
+        let history = Reply(#"{"enabled":false,"max_bytes":5000000000}"#)
+        peer.replies = [status, Self.pool, Self.device]
+        _ = await manager.connect(url: "https://alpha.example", token: "test-token")
+        let target = RemoteConsoleTarget(manager, try XCTUnwrap(manager.snapshot)), draft = RemotePreferencesDraft()
+        peer.replies = [config]
+        await draft.load(target, page: .models)
+        let policy = JSONValue.array([.object(["model": .string("demo"), "clients": .array([])])])
+        draft.settings["model_policies"] = policy
+        peer.replies = [history, status, Self.pool, history]
+        await draft.load(target, page: .general)
+        draft.settings["upstream_attempts"] = .number(4); draft.historyCapacity = "错误"
+        XCTAssertFalse(draft.canSubmit)
+        draft.historyCapacity = "2.5"
+        await manager.refresh(); await draft.load(target, page: .general)
+        XCTAssertTrue(draft.canSubmit); XCTAssertEqual(draft.historyCapacity, "2.5")
+        func writes() -> [URLRequest] { peer.requests.filter { ["history.configure", "config.save"].contains($0.url?.lastPathComponent) } }
+        XCTAssertTrue(writes().isEmpty)
+        let updatedHistory = Reply(#"{"enabled":false,"max_bytes":2500000000}"#)
+        let pool2 = Reply(Self.pool.json.replacingOccurrences(of: "\"r1\"", with: "\"r2\""))
+        peer.replies = [history, updatedHistory, Reply(#"{"revision":"r2"}"#), status, pool2, config, updatedHistory]
+        await draft.submit(page: .general)
+        XCTAssertEqual(writes().compactMap { $0.url?.lastPathComponent }, ["history.configure", "config.save"])
+        let body = try JSONDecoder().decode(JSONValue.self, from: XCTUnwrap(writes().last?.httpBody))
+        XCTAssertEqual(body["revision"], .string("r1")); XCTAssertEqual(body["payload"]["settings"]["model_policies"], policy)
+        XCTAssertEqual(body["payload"]["settings"]["upstream_attempts"], .number(4))
+        XCTAssertEqual(body["payload"]["settings"]["auto_reset_weekly_accounts"], .array([.string("a")]))
+        XCTAssertEqual(body["payload"]["sources"].array.first?["reset_consent_binding"], .string("bound"))
+        XCTAssertFalse(draft.changed); XCTAssertEqual(draft.target?.pool.revision, "r2")
+
+        draft.settings["upstream_attempts"] = .number(7)
+        let pool3 = Reply(Self.pool.json.replacingOccurrences(of: "\"r1\"", with: "\"r3\""))
+        peer.replies = [status, pool3]; await manager.refresh()
+        await draft.load(.init(manager, try XCTUnwrap(manager.snapshot)), page: .models)
+        XCTAssertTrue(draft.needsReload); XCTAssertFalse(draft.canSubmit)
+        await draft.submit(page: .models); XCTAssertEqual(writes().count, 2)
+    }
+
+    func testUnconfirmedCatalogWriteDoesNotRepeatConfirmedCacheChange() async throws {
+        let peer = Peer(), manager = peer.manager(try directory())
+        let status = Reply(Self.status.json.replacingOccurrences(of: "\"pool.edit\"", with: "\"pool.edit\",\"config.get\",\"history.configure\",\"history.status\",\"models.info\",\"models.metadata.replace\""))
+        let settings = Reply(#"{"settings":{},"sources":[]}"#), info = Reply(#"{"metadata_revision":"m1","models":[]}"#)
+        let oldCache = Reply(#"{"enabled":false,"max_bytes":5000000000}"#), newCache = Reply(#"{"enabled":true,"max_bytes":5000000000}"#)
+        peer.replies = [status, Self.pool, Self.device]
+        _ = await manager.connect(url: "https://alpha.example", token: "test-token")
+        let target = RemoteConsoleTarget(manager, try XCTUnwrap(manager.snapshot)), draft = RemotePreferencesDraft()
+        peer.replies = [settings, info, oldCache]
+        await draft.load(target, page: .models); draft.stageMetadata(nil)
+        await draft.load(target, page: .general); draft.historyEnabled = true
+        peer.replies = [oldCache, newCache, Reply("{}", code: 409)]
+        await draft.submit(page: .general)
+        XCTAssertTrue(draft.needsReload); XCTAssertFalse(draft.canSubmit)
+        XCTAssertEqual(draft.historyStatus["enabled"], .bool(true))
+        let calls = peer.requests.count; await draft.submit(page: .models); XCTAssertEqual(peer.requests.count, calls)
+        XCTAssertEqual(peer.requests.last?.url?.lastPathComponent, "models.metadata.replace")
+        let body = try JSONDecoder().decode(JSONValue.self, from: XCTUnwrap(peer.requests.last?.httpBody))
+        XCTAssertEqual(body["payload"]["metadata_revision"], .string("m1"))
+    }
+
     func testRejectsInvalidRootsAndIncompatibleServersBeforeCommitting() async throws {
         let dir = try directory(), peer = Peer()
         let manager = peer.manager(dir)

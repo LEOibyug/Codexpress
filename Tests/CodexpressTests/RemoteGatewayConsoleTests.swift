@@ -4,21 +4,6 @@ import XCTest
 final class RemoteGatewayConsoleTests: XCTestCase {
     private func json(_ raw: String) throws -> JSONValue { try JSONDecoder().decode(JSONValue.self, from: Data(raw.utf8)) }
 
-    func testChangingOneModelPreservesSourceMetadataConsentAndOtherPolicies() throws {
-        let original = try json(#"{"sources":[{"id":"one","reset_consent_binding":"bound"},{"id":"two","models":["a"]}],"settings":{"auto_reset_weekly_accounts":["one"],"upstream_attempts":4,"model_policies":[{"model":"a","source_ids":[]},{"model":"b","clients":[]}],"model_compaction":[{"model":"b","context_window":8000}]}}"#)
-        var edited = try RemoteConsoleConfig(original)
-        try edited.updateModel("a", policy: .init(model: "a", sourceIDs: ["two", "one"], clients: [.omp]), compaction: .init(model: "a", auto_compact_token_limit: 5000, context_window: 9000))
-        XCTAssertEqual(edited.payload["sources"], original["sources"])
-        let settings = try XCTUnwrap(edited.payload["settings"])
-        XCTAssertEqual(settings["auto_reset_weekly_accounts"], original["settings"]["auto_reset_weekly_accounts"])
-        XCTAssertEqual(settings["upstream_attempts"], .number(4))
-        XCTAssertEqual(settings["model_policies"], try json(#"[{"model":"b","clients":[]},{"model":"a","source_ids":["two","one"],"clients":["omp"]}]"#))
-        XCTAssertEqual(settings["model_compaction"].array.first, original["settings"]["model_compaction"].array.first)
-        try edited.updateModel("a", policy: nil, compaction: nil)
-        XCTAssertEqual(edited.settings["model_compaction"], original["settings"]["model_compaction"])
-        XCTAssertEqual(edited.settings["model_policies"], try json(#"[{"model":"b","clients":[]}]"#))
-    }
-
     @MainActor func testUncertainResetAfterRelaunchCanOnlyLookUpTheOriginalReceipt() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().resolvingSymlinksInPath()
         let dir = root.appendingPathComponent(".runtime/tmp/console-\(UUID().uuidString)")

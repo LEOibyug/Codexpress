@@ -12,30 +12,17 @@ struct GeneralSettingsView: View {
     private var officialQuotaIntervalChanged: Bool { officialQuotaMinutes != String(model.settings.officialQuotaRefreshInterval) }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                PageHeading("设置", subtitle: "管理应用启动、本机网关和后台查询。")
-                appCard
-                gatewayCard
-                quotaCard
-                CredentialStorageView()
-                HistoryCacheView()
-            }.settingsPage()
+        GeneralSettingsPage(subtitle: "管理应用启动、本机网关和后台查询。") {
+            gatewayCard
+            quotaCard
+            CredentialStorageView()
+            HistoryCacheView()
         }.onAppear {
             port = String(model.settings.port)
             officialQuotaMinutes = String(model.settings.officialQuotaRefreshInterval)
         }
             .onChange(of: model.settings.port) { _, value in port = String(value) }
             .onChange(of: model.settings.officialQuotaRefreshInterval) { _, value in officialQuotaMinutes = String(value) }
-    }
-
-    private var appCard: some View {
-        SettingsCard("Codexpress", symbol: "app.badge") {
-            SettingRow(title: "登录时启动") {
-                Toggle("登录时启动 Codexpress", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
-                    .toggleStyle(.switch).labelsHidden()
-            }
-        }
     }
 
     private var gatewayCard: some View {
@@ -90,25 +77,9 @@ struct GeneralSettingsView: View {
     }
 
     private var quotaCard: some View {
-        SettingsCard("官方额度", symbol: "clock") {
-            SettingRow(title: "后台查询间隔", subtitle: "保存后立即生效，不影响前台或手动刷新。") {
-                HStack(spacing: 8) {
-                    TextField("分钟数", text: $officialQuotaMinutes)
-                        .font(.system(size: 13, design: .monospaced)).multilineTextAlignment(.trailing).settingsField().frame(width: 80)
-                        .accessibilityLabel("官方额度后台查询间隔（分钟）")
-                        .onSubmit(saveQuotaInterval)
-                    Text("分钟").foregroundStyle(.secondary)
-                    Button("保存间隔", action: saveQuotaInterval)
-                        .disabled(!canSavePreferences || !officialQuotaIntervalChanged || !validQuotaInterval)
-                }
-            }
-            if officialQuotaIntervalChanged && !validQuotaInterval {
-                InfoNote(text: "请输入大于 0 的整数分钟。", symbol: "exclamationmark.triangle", color: .orange)
-            } else {
-                Text("API 余额仍每 30 分钟查询。查询失败时会延迟重试。")
-                    .font(AppTypography.caption).foregroundStyle(.secondary)
-            }
-        }
+        OfficialQuotaSettingsCard(minutes: $officialQuotaMinutes, subtitle: "保存后立即生效，不影响前台或手动刷新。",
+                                  error: officialQuotaIntervalChanged && !validQuotaInterval ? "请输入大于 0 的整数分钟。" : nil,
+                                  canSave: canSavePreferences && officialQuotaIntervalChanged && validQuotaInterval, save: saveQuotaInterval)
     }
 
     private func savePort() {
@@ -119,5 +90,54 @@ struct GeneralSettingsView: View {
     private func saveQuotaInterval() {
         guard canSavePreferences, officialQuotaIntervalChanged, validQuotaInterval else { return }
         model.saveOfficialQuotaRefresh(minutes: officialQuotaMinutes)
+    }
+}
+
+struct GeneralSettingsPage<Content: View>: View {
+    @EnvironmentObject private var model: AppModel
+    let subtitle: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                PageHeading("设置", subtitle: subtitle)
+                SettingsCard("Codexpress", symbol: "app.badge") {
+                    SettingRow(title: "登录时启动") {
+                        Toggle("登录时启动 Codexpress", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
+                            .toggleStyle(.switch).labelsHidden()
+                    }
+                }
+                content
+            }.settingsPage()
+        }
+    }
+}
+
+struct OfficialQuotaSettingsCard: View {
+    @Binding var minutes: String
+    let subtitle: String
+    let error: String?
+    var detail = "API 余额仍每 30 分钟查询。查询失败时会延迟重试。"
+    var canSave = false
+    var save: (() -> Void)?
+
+    var body: some View {
+        SettingsCard("官方额度", symbol: "clock") {
+            SettingRow(title: "后台查询间隔", subtitle: subtitle) {
+                HStack(spacing: 8) {
+                    TextField("分钟数", text: $minutes)
+                        .font(.system(size: 13, design: .monospaced)).multilineTextAlignment(.trailing).settingsField().frame(width: 80)
+                        .accessibilityLabel("官方额度后台查询间隔（分钟）")
+                        .onSubmit { save?() }
+                    Text("分钟").foregroundStyle(.secondary)
+                    if let save { Button("保存间隔", action: save).disabled(!canSave) }
+                }
+            }
+            if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
+            else {
+                Text(detail).font(AppTypography.caption).foregroundStyle(.secondary)
+            }
+        }
     }
 }

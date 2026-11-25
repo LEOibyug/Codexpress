@@ -60,12 +60,8 @@ struct SettingsView: View {
                 if !management.remoteSelected { notices }
                 Group {
                     if management.remoteSelected {
-                        if sourcesOnly || page == .sources {
-                            RemoteGatewayPoolView().id(management.targetGeneration)
-                        } else {
-                            RemoteGatewayConsole(page: page ?? .overview)
-                                .id(management.targetGeneration)
-                        }
+                        RemoteSettingsWorkspace(page: sourcesOnly ? .sources : (page ?? .overview))
+                            .id(management.targetGeneration)
                     } else {
                         switch page ?? .overview {
                         case .overview: OverviewView(openSources: { page = .sources }, openUsage: { page = .usage }, openConnection: { connectionSection = $0; page = .connections })

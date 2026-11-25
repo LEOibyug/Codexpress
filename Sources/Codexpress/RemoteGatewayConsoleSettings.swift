@@ -1,170 +1,147 @@
 import SwiftUI
 
-struct RemoteConsoleRoutingEditor: View {
-    @Environment(\.dismiss) private var dismiss
-    let target: RemoteConsoleTarget
-    let config: RemoteConsoleConfig
-    @State private var values: [String: JSONValue]
-    @State private var consent: Set<String>
-    @State private var authorizing: RemotePoolSource?
-    @State private var busy = false
-    @State private var failed = false
+struct RemoteGeneralSettingsPage: View {
+    @ObservedObject var draft: RemotePreferencesDraft
 
-    init(target: RemoteConsoleTarget, config: RemoteConsoleConfig) {
-        self.target = target; self.config = config
-        _values = State(initialValue: config.settings)
-        _consent = State(initialValue: Set(config.settings["auto_reset_weekly_accounts"]?.array.compactMap(\.string) ?? []))
+    var body: some View {
+        if let target = draft.target, let config = draft.config {
+            GeneralSettingsPage(subtitle: "登录时启动仅影响此 Mac；网关设置提交至 \(target.endpoint)。") {
+                OfficialQuotaSettingsCard(minutes: integerText("official_quota_refresh_minutes", default: 30, range: 1...1440),
+                    subtitle: "提交后立即生效，不影响前台或手动刷新。",
+                    error: draft.settings["official_quota_refresh_minutes"]?.string == nil ? nil : "请输入 1–1440 之间的整数分钟。",
+                    detail: "服务器的查询间隔为 1–1440 分钟。")
+                RemoteHistoryCacheCard(draft: draft, target: target)
+                routingCards(target)
+                RemoteWeeklyResetCard(draft: draft, target: target, config: config)
+            }
+        }
+    }
+
+    private func routingCards(_ target: RemoteConsoleTarget) -> some View {
+        let sources = target.pool.sources.filter(\.enabled)
+        return RoutingSettingsCards(enabledSources: sources, sourceName: \.name,
+            mode: Binding(get: { draft.settings["mode"]?.string ?? "auto" }, set: { mode in
+                draft.settings["mode"] = .string(mode)
+                if mode == "auto" { draft.settings["fixed_source_id"] = .null }
+                else if !sources.contains(where: { $0.id == draft.settings["fixed_source_id"]?.string }), let first = sources.first {
+                    draft.settings["fixed_source_id"] = .string(first.id)
+                }
+            }),
+            fixedSource: Binding(get: { draft.settings["fixed_source_id"]?.string ?? "" }, set: { draft.settings["fixed_source_id"] = .string($0) }),
+            loadBalance: flag("load_balance"), quotaThreshold: integer("official_low_quota_percent", default: 10),
+            attempts: integer("upstream_attempts", default: 3), retryDelay: integer("upstream_retry_delay_seconds", default: 3),
+            idleMinutes: integer("idle_return_minutes", default: 5), rebuild: flag("degraded_context_fallback", default: true),
+            customIdleMinutes: integerText("idle_return_minutes", default: 5, range: 0...10080))
     }
 
     private func flag(_ key: String, default fallback: Bool = false) -> Binding<Bool> {
-        Binding(get: { values[key]?.bool ?? fallback }, set: { values[key] = .bool($0) })
+        Binding(get: { draft.settings[key]?.bool ?? fallback }, set: { draft.settings[key] = .bool($0) })
     }
-    private func integer(_ key: String, _ fallback: Int) -> Binding<Int> {
-        Binding(get: { values[key]?.number.flatMap { Int(exactly: $0) } ?? fallback }, set: { values[key] = .number(Double($0)) })
+
+    private func integer(_ key: String, default fallback: Int) -> Binding<Int> {
+        Binding(get: { draft.settings[key]?.number.flatMap { Int(exactly: $0) } ?? fallback }, set: { draft.settings[key] = .number(Double($0)) })
     }
-    private func number(_ title: String, _ key: String, _ range: ClosedRange<Int>, _ fallback: Int) -> some View {
-        LabeledContent(title) {
-            let value = integer(key, fallback)
-            TextField(title, value: value, format: .number.grouping(.never)).settingsField().frame(width: 76)
-            Stepper(title, value: value, in: range).labelsHidden()
+
+    private func integerText(_ key: String, default fallback: Int, range: ClosedRange<Int>) -> Binding<String> {
+        Binding(get: { draft.settings[key]?.string ?? String(integer(key, default: fallback).wrappedValue) }, set: { text in
+            if let value = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)), range.contains(value) {
+                draft.settings[key] = .number(Double(value))
+            } else { draft.settings[key] = .string(text) }
+        })
+    }
+}
+
+private struct WeeklyResetAuthorization {
+    let target: RemoteConsoleTarget
+    let source: RemotePoolSource
+    let binding: String
+}
+
+private struct RemoteWeeklyResetCard: View {
+    @ObservedObject var draft: RemotePreferencesDraft
+    let target: RemoteConsoleTarget
+    let config: RemoteConsoleConfig
+    @State private var authorizing: WeeklyResetAuthorization?
+
+    private var enrolled: [JSONValue] { draft.settings["auto_reset_weekly_accounts"]?.array ?? [] }
+
+    var body: some View {
+        let accounts = target.pool.sources.filter { $0.kind == "official" }
+        SettingsCard("自动使用周重置卡", subtitle: "默认关闭。授权后，服务器可在该账号周额度耗尽时自动使用卡片，无需本机在线。", symbol: "calendar.badge.clock") {
+            if accounts.isEmpty { Text("没有官方账号").foregroundStyle(.secondary) }
+            ForEach(accounts) { source in
+                let binding = config.sources.first { $0["id"].string == source.id }?["reset_consent_binding"].string
+                let id = JSONValue.string(source.id)
+                SettingRow(title: source.name) {
+                    Toggle(source.name, isOn: Binding(get: { enrolled.contains(id) }, set: { enabled in
+                        if enabled {
+                            if let binding, !binding.isEmpty { authorizing = .init(target: target, source: source, binding: binding) }
+                        } else { updateEnrollment(enrolled.filter { $0 != id }) }
+                    })).toggleStyle(.switch).labelsHidden().disabled(binding?.isEmpty != false && !enrolled.contains(id))
+                }
+            }
+        }
+        .alert("允许此账号自动消耗周重置卡？", isPresented: Binding(get: { authorizing != nil }, set: { if !$0 { authorizing = nil } }), presenting: authorizing) { request in
+            Button("取消", role: .cancel) {}
+            Button("允许") {
+                let id = JSONValue.string(request.source.id)
+                guard request.target.current, draft.target?.generation == request.target.generation, !draft.submitting,
+                      draft.config?.sources.first(where: { $0["id"] == id })?["reset_consent_binding"].string == request.binding,
+                      !enrolled.contains(id) else { return }
+                updateEnrollment(enrolled + [id])
+            }
+        } message: { Text("\($0.target.endpoint) 上的「\($0.source.name)」可在周额度耗尽时自动使用卡片。提交修改后生效。") }
+    }
+
+    private func updateEnrollment(_ next: [JSONValue]) {
+        let key = "auto_reset_weekly_accounts"
+        let original = config.settings[key]?.array ?? []
+        if next.count == original.count, original.allSatisfy(next.contains) {
+            draft.settings[key] = config.settings[key]
+        } else { draft.settings[key] = .array(next) }
+    }
+}
+
+private struct RemoteHistoryCacheCard: View {
+    @ObservedObject var draft: RemotePreferencesDraft
+    let target: RemoteConsoleTarget
+    @State private var clearing: RemoteConsoleTarget?
+    @State private var busy = false
+    @State private var failed = false
+
+    private var validationError: String? {
+        do { _ = try HistoryCacheSettings.parse(enabled: draft.historyEnabled, gigabytes: draft.historyCapacity); return nil }
+        catch { return error.localizedDescription }
+    }
+
+    var body: some View {
+        if draft.historyStatus["enabled"].bool != nil, draft.historyStatus["max_bytes"].number != nil {
+            HistoryCacheSettingsCard(title: "服务器原文缓存", scope: "默认关闭。开启后仅在此服务器保存用于重建上下文的对话原文；关闭不会清空已有缓存。",
+                enabled: $draft.historyEnabled, capacity: $draft.historyCapacity, status: draft.historyStatus,
+                validationError: failed ? "未确认缓存是否已清空，请刷新后核对。" : validationError,
+                canClear: target.current, clear: { clearing = target })
+                .disabled(busy || draft.submitting)
+                .alert("清空远端原文缓存？", isPresented: Binding(get: { clearing != nil }, set: { if !$0 { clearing = nil } }), presenting: clearing) { captured in
+                    Button("取消", role: .cancel) {}
+                    Button("清空", role: .destructive) { clear(captured) }
+                } message: { Text("将立即删除 \($0.endpoint) 上已有的原文缓存。依赖这些块的对话可能无法恢复；此操作不可撤销。") }
+        } else {
+            SettingsCard("服务器原文缓存", symbol: "externaldrive") {
+                InfoNote(text: "无法确认服务器的原文缓存设置，请刷新后核对。", color: .orange)
+            }
         }
     }
-    private var valid: Bool {
-        let limits = [("upstream_attempts", 1...10, 3), ("upstream_retry_delay_seconds", 0...300, 3), ("idle_return_minutes", 0...10080, 5), ("official_low_quota_percent", 1...99, 10), ("official_quota_refresh_minutes", 1...1440, 30)]
-        return limits.allSatisfy { key, range, fallback in range.contains(integer(key, fallback).wrappedValue) } &&
-        (values["mode"]?.string != "fixed" || target.pool.sources.contains { $0.enabled && $0.id == values["fixed_source_id"]?.string })
-    }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("远端分配设置").font(.title2)
-            Text(target.endpoint).foregroundStyle(.secondary)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    SettingsCard("路由与重试", symbol: "arrow.triangle.branch") {
-                        Picker("分配方式", selection: Binding(get: { values["mode"]?.string ?? "auto" }, set: { mode in
-                            values["mode"] = .string(mode)
-                            if mode == "auto" { values["fixed_source_id"] = .null }
-                            else if values["fixed_source_id"]?.string == nil, let first = target.pool.sources.first(where: \.enabled) { values["fixed_source_id"] = .string(first.id) }
-                        })) {
-                            Text("自动切换").tag("auto"); Text("固定来源").tag("fixed").disabled(!target.pool.sources.contains(where: \.enabled))
-                        }
-                        if values["mode"]?.string == "fixed" {
-                            Picker("固定来源", selection: Binding(get: { values["fixed_source_id"]?.string ?? "" }, set: { values["fixed_source_id"] = .string($0) })) {
-                                ForEach(target.pool.sources.filter(\.enabled)) { Text($0.name).tag($0.id) }
-                            }
-                        } else { Toggle("按来源余量负载均衡", isOn: flag("load_balance")) }
-                        Toggle("无法续接时重建上下文", isOn: flag("degraded_context_fallback", default: true))
-                        number("空闲回切（分钟，0 表示关闭）", "idle_return_minutes", 0...10080, 5)
-                        number("最多尝试次数", "upstream_attempts", 1...10, 3)
-                        number("重试间隔（秒）", "upstream_retry_delay_seconds", 0...300, 3)
-                        number("官方余量保护（%）", "official_low_quota_percent", 1...99, 10)
-                        number("官方额度刷新间隔（分钟）", "official_quota_refresh_minutes", 1...1440, 30)
-                    }
-                    SettingsCard("自动使用周重置卡", symbol: "calendar.badge.clock") {
-                        Text("默认关闭。仅在远端服务器检测到对应账号周额度耗尽时使用；无需本机在线。")
-                            .font(.caption).foregroundStyle(.secondary)
-                        if !target.pool.sources.contains(where: { $0.kind == "official" }) { Text("没有官方账号").foregroundStyle(.secondary) }
-                        ForEach(target.pool.sources.filter { $0.kind == "official" }) { source in
-                            let bound = config.sources.first { $0["id"].string == source.id }?["reset_consent_binding"].string?.isEmpty == false
-                            Toggle(source.name, isOn: Binding(get: { consent.contains(source.id) }, set: { on in
-                                if on { authorizing = source } else { consent.remove(source.id) }
-                            })).disabled(!bound && !consent.contains(source.id))
-                        }
-                    }
-                }
-            }
-            if failed { InfoNote(text: "未确认保存；请关闭并刷新远端配置后核对。", color: .orange) }
-            HStack { Spacer(); Button("取消") { dismiss() }; Button("保存到远端") { save() }.buttonStyle(.borderedProminent).disabled(!valid) }
-        }.padding(22).frame(width: 560, height: 630).disabled(busy)
-        .alert("允许此账号自动消耗周重置卡？", isPresented: Binding(get: { authorizing != nil }, set: { if !$0 { authorizing = nil } }), presenting: authorizing) { source in
-            Button("取消", role: .cancel) {}; Button("允许") { consent.insert(source.id) }
-        } message: { source in Text("\(target.endpoint) 上的「\(source.name)」可在周额度耗尽时自动使用卡片。保存后生效。") }
-    }
-
-    private func save() {
-        guard valid, !busy else { return }
-        var next = config; next.settings = values; next.settings["auto_reset_weekly_accounts"] = .array(consent.sorted().map(JSONValue.string))
+    private func clear(_ captured: RemoteConsoleTarget) {
+        guard captured.current, !busy, !draft.submitting else { return }
         busy = true
-        Task { defer { busy = false }; do {
-            _ = try await target.call("config.save", next.payload); dismiss(); await target.management.refresh()
-        } catch { failed = true } }
-    }
-}
-
-private struct RemoteHistoryEdit: Identifiable {
-    let id = UUID()
-    let target: RemoteConsoleTarget
-    let original: HistoryCacheSettings
-}
-
-struct RemoteConsoleHistory: View {
-    @EnvironmentObject private var management: RemoteGatewayManagement
-    let target: RemoteConsoleTarget
-    @State private var value: JSONValue = .null
-    @State private var editing: RemoteHistoryEdit?
-    @State private var clearing: RemoteConsoleTarget?
-    @State private var failed = false
-    @State private var busy = false
-    private var preferences: HistoryCacheSettings? {
-        guard let enabled = value["enabled"].bool, let bytes = value["max_bytes"].number.flatMap({ Int64(exactly: $0) }) else { return nil }
-        return HistoryCacheSettings(enabled: enabled, maxBytes: bytes)
-    }
-    var body: some View {
-        SettingsCard("服务器原文缓存", symbol: "externaldrive") {
-            if failed { InfoNote(text: "无法确认缓存状态。请刷新后核对。", color: .orange) }
-            if let preferences {
-                LabeledContent("保存原文", value: preferences.enabled ? "已开启" : "已关闭")
-                LabeledContent("容量", value: ByteCountFormatter.string(fromByteCount: preferences.maxBytes, countStyle: .decimal))
-                if let used = value["disk_bytes"].number.flatMap({ Int64(exactly: $0) }) {
-                    LabeledContent("已用空间", value: ByteCountFormatter.string(fromByteCount: used, countStyle: .decimal))
-                }
-                HStack {
-                    Button("配置…") { editing = .init(target: target, original: preferences) }
-                    Button("清空缓存…", role: .destructive) { clearing = target }
-                }.disabled(busy)
-            } else if !failed { ProgressView("读取缓存状态…") }
-        }.task(id: management.fetchedAt) { await load() }
-        .sheet(item: $editing) { session in RemoteHistoryForm(edit: session, saved: { value = $0; failed = false }) }
-        .alert("清空远端原文缓存？", isPresented: Binding(get: { clearing != nil }, set: { if !$0 { clearing = nil } }), presenting: clearing) { captured in
-            Button("取消", role: .cancel) {}; Button("清空", role: .destructive) {
-                busy = true
-                Task { defer { busy = false }; do { value = try await captured.call("history.clear", ["confirmed": .bool(true)]); failed = false } catch { failed = true } }
-            }
-        } message: { Text("将删除 \($0.endpoint) 上已有的原文缓存。依赖这些块的对话可能无法恢复；此操作不可撤销。") }
-    }
-    private func load() async {
-        do { value = try await target.call("history.status"); failed = false } catch { if !Task.isCancelled { failed = true } }
-    }
-}
-
-private struct RemoteHistoryForm: View {
-    @Environment(\.dismiss) private var dismiss
-    let edit: RemoteHistoryEdit
-    let saved: (JSONValue) -> Void
-    @State private var enabled: Bool
-    @State private var capacity: String
-    @State private var busy = false
-    @State private var failed = false
-    init(edit: RemoteHistoryEdit, saved: @escaping (JSONValue) -> Void) {
-        self.edit = edit; self.saved = saved
-        _enabled = State(initialValue: edit.original.enabled); _capacity = State(initialValue: String(Double(edit.original.maxBytes) / 1e9))
-    }
-    private var next: HistoryCacheSettings? { try? HistoryCacheSettings.parse(enabled: enabled, gigabytes: capacity) }
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("服务器原文缓存").font(.title2)
-            Text(edit.target.endpoint)
-            Toggle("将对话原文保存在服务器上", isOn: $enabled)
-            Text("默认关闭。开启后，远端网关将保存可用于重建上下文的私密内容。关闭不会清空已有缓存。") .foregroundStyle(.secondary)
-            LabeledContent("容量（0.064–1000 GB）") { TextField("GB", text: $capacity).settingsField().frame(width: 120) }
-            if failed { InfoNote(text: "未确认缓存配置，请关闭并刷新核对。", color: .orange) }
-            HStack { Spacer(); Button("取消") { dismiss() }; Button("确认应用") {
-                guard let next else { return }; busy = true
-                Task { defer { busy = false }; do {
-                    let updated = try await edit.target.call("history.configure", ["enabled": .bool(next.enabled), "max_bytes": .number(Double(next.maxBytes))]); saved(updated); dismiss()
-                } catch { failed = true } }
-            }.disabled(next == nil || next == edit.original) }
-        }.padding(22).frame(width: 460).disabled(busy)
+        Task {
+            defer { busy = false }
+            do {
+                _ = try await captured.call("history.clear", ["confirmed": .bool(true)])
+                failed = false
+                if captured.current { await draft.reloadHistory() }
+            } catch { failed = true }
+        }
     }
 }

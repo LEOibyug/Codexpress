@@ -18,7 +18,24 @@ private struct EditingModel {
 }
 
 struct ModelSettingsView: View {
-    @EnvironmentObject var model: AppModel
+    @EnvironmentObject private var model: AppModel
+    var body: some View { ModelSettingsPage(model: ModelPageData(local: model)) }
+}
+
+struct RemoteModelSettingsPage: View {
+    @ObservedObject var draft: RemotePreferencesDraft
+
+    var body: some View {
+        if let target = draft.target, let data = try? ModelPageData(remote: RemoteModelDraft(draft: draft, target: target)) {
+            ModelSettingsPage(model: data).id(target.generation)
+        } else {
+            InfoNote(text: "无法读取当前网关的模型配置。请刷新后重试。", color: .orange)
+        }
+    }
+}
+
+private struct ModelSettingsPage: View {
+    let model: ModelPageData
     @State private var viewMode: ModelViewMode = .byModel
     @State private var selectedSourceID: String?
     @State private var search = ""
@@ -26,13 +43,15 @@ struct ModelSettingsView: View {
     @State private var statusFilter: ModelStatusFilter = .all
     @State private var editing: EditingModel?
     @State private var choosingMetadata = false
+    @State private var metadataSelection: ModelPageData.Backend?
     @State private var confirmingMetadataReset = false
     @State private var showingMetadataHelp = false
     @State private var updatingMetadata = false
     @State private var metadataNotice: String?
     @State private var metadataError: String?
     @State private var selectionError: String?
-    @State private var modelUsage: [String: JSONValue]?
+    @State private var localUsage: [String: JSONValue]?
+    private var modelUsage: [String: JSONValue]? { model.remoteUsage ?? localUsage }
     @State private var usageRefreshing = false
     @State private var usageError: String?
 
@@ -40,10 +59,10 @@ struct ModelSettingsView: View {
         .notation(.compactName).precision(.significantDigits(1...3)).locale(Locale(identifier: "en_US_POSIX"))
 
     private var rankedModels: [String] {
-        let imported = model.modelInformation.compactMap { id, information in
+        let imported = model.modelInformation.lazy.compactMap { id, information in
             information["local_metadata"].bool == true ? id : nil
         }
-        return Set(model.configuredModelIDs).union(imported).sorted { a, b in
+        return model.configuredModelIDs.union(imported).sorted { a, b in
             let aTokens = modelUsage?[a]?["total_tokens"].number ?? 0
             let bTokens = modelUsage?[b]?["total_tokens"].number ?? 0
             return aTokens == bTokens ? a < b : aTokens > bTokens
@@ -53,12 +72,15 @@ struct ModelSettingsView: View {
     var body: some View {
         Group {
             if let item = editing {
-                ModelEditor(settings: model.settings, modelID: item.id, isNew: item.isNew, onBack: { editing = nil })
+                ModelEditor(model: model, modelID: item.id, isNew: item.isNew, onBack: { editing = nil })
+                    .onAppear { model.remote?.draft.modelEditorOpen = true }
+                    .onDisappear { model.remote?.draft.modelEditorOpen = false }
                     .id("\(item.id)-\(item.isNew)-\(item.returnToSourceID ?? "")")
             } else if viewMode == .byProvider,
                       let providerID = selectedSourceID,
                       let source = model.settings.sources.first(where: { $0.id == providerID }) {
                 ProviderModelsEditor(
+                    model: model,
                     source: source,
                     rankedModels: rankedModels,
                     modelUsage: modelUsage,
@@ -69,22 +91,27 @@ struct ModelSettingsView: View {
                 mainPage
             }
         }
-        .task(id: model.running) { await refreshInformation() }
+        .task(id: model.running) { if model.remote == nil { await refreshInformation() } }
         .onChange(of: model.settings.sources.map(\.id)) { _, ids in
             if let selectedSourceID, !ids.contains(selectedSourceID) {
                 self.selectedSourceID = nil
             }
         }
         .fileImporter(isPresented: $choosingMetadata, allowedContentTypes: [.json]) { result in
+            guard let selection = metadataSelection else { return }
+            metadataSelection = nil
             switch result {
-            case .success(let url): updateMetadata(from: url)
+            case .success(let url): updateMetadata(from: url, selection: selection)
             case .failure(let error): metadataNotice = nil; metadataError = error.localizedDescription
             }
         }
         .confirmationDialog("恢复默认模型能力？", isPresented: $confirmingMetadataReset, titleVisibility: .visible) {
-            Button("恢复默认", role: .destructive) { updateMetadata(from: nil) }
+            Button("恢复默认", role: .destructive) {
+                if let selection = metadataSelection { updateMetadata(from: nil, selection: selection) }
+                metadataSelection = nil
+            }
         } message: {
-            Text("清除全部本地导入的默认值，恢复使用已缓存的官方或内置能力。不会删除各模型单独设置的规则。")
+            Text(model.remote == nil ? "清除全部本地导入的默认值，恢复使用已缓存的官方或内置能力。不会删除各模型单独设置的规则。" : "提交后清除远端导入的默认值，恢复使用已缓存的官方或内置能力。不会删除各模型单独设置的规则。")
         }
         .sheet(isPresented: $showingMetadataHelp) { metadataHelp }
     }
@@ -97,7 +124,7 @@ struct ModelSettingsView: View {
                         ForEach(ModelViewMode.allCases) { Text($0.rawValue).tag($0) }
                     }.pickerStyle(.segmented).labelsHidden().frame(width: 170)
                     Button { editing = EditingModel(id: "", isNew: true, returnToSourceID: nil) } label: { Label("添加模型", systemImage: "plus") }
-                        .buttonStyle(.borderedProminent).disabled(model.busy || model.metadataLoadFailed)
+                        .buttonStyle(.borderedProminent).disabled(model.editsDisabled)
                 }
             }
             if viewMode == .byModel {
@@ -135,9 +162,9 @@ struct ModelSettingsView: View {
                 }.disabled(!model.running || model.modelInformationRefreshing || usageRefreshing || updatingMetadata)
                 Menu(updatingMetadata ? "更新中…" : "模型能力") {
                     Group {
-                        Button("导入 JSON…") { choosingMetadata = true }
-                        Button("恢复默认…") { confirmingMetadataReset = true }
-                    }.disabled(!model.running || model.modelInformationRefreshing || updatingMetadata)
+                        Button("导入 JSON…") { metadataSelection = model.backend; choosingMetadata = true }
+                        Button("恢复默认…") { metadataSelection = model.backend; confirmingMetadataReset = true }
+                    }.disabled(!model.running || model.modelInformationRefreshing || updatingMetadata || !model.canStageMetadata)
                     Divider()
                     Button("JSON 格式与优先级…") { showingMetadataHelp = true }
                 }.fixedSize(horizontal: true, vertical: false)
@@ -149,10 +176,10 @@ struct ModelSettingsView: View {
                     Spacer(minLength: 0)
                     Button(filteredScope ? "启用当前" : "全部启用") {
                         applyBatchEnabled(visible, enabled: true)
-                    }.disabled(visible.isEmpty || model.busy || model.metadataLoadFailed)
+                    }.disabled(visible.isEmpty || model.editsDisabled)
                     Button(filteredScope ? "停用当前" : "全部停用") {
                         applyBatchEnabled(visible, enabled: false)
-                    }.disabled(visible.isEmpty || model.busy || model.metadataLoadFailed)
+                    }.disabled(visible.isEmpty || model.editsDisabled)
                 }
             }
             if let error = model.modelInformationError { InfoNote(text: "模型信息未更新：\(error)", color: .orange) }
@@ -160,6 +187,7 @@ struct ModelSettingsView: View {
             if let metadataError { InfoNote(text: "模型能力未更新：\(metadataError)", color: .orange) }
             if let selectionError { InfoNote(text: selectionError, symbol: "exclamationmark.triangle", color: .orange) }
             if let metadataNotice { InfoNote(text: metadataNotice) }
+            if let notice = model.metadataNotice { InfoNote(text: notice) }
             if ranked.isEmpty {
                 EmptyState("暂无模型", subtitle: "在来源池获取模型列表，或添加一个模型 ID。", symbol: "square.stack")
             } else if visible.isEmpty {
@@ -310,7 +338,7 @@ struct ModelSettingsView: View {
                 set: { next in applyBatchEnabled([id], enabled: next) }
             ))
             .toggleStyle(.switch).controlSize(.small).labelsHidden()
-            .disabled(model.busy || model.metadataLoadFailed)
+            .disabled(model.editsDisabled)
             Button { editing = EditingModel(id: id, isNew: false, returnToSourceID: nil) } label: {
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 5) {
@@ -350,7 +378,7 @@ struct ModelSettingsView: View {
         guard !ids.isEmpty else { return }
         selectionError = nil
         do {
-            try model.setModelsEnabled(ids, enabled: enabled)
+            try model.setEnabled(ids, enabled: enabled)
         } catch {
             selectionError = error.localizedDescription
         }
@@ -358,14 +386,22 @@ struct ModelSettingsView: View {
 
     private func refreshInformation() async {
         guard model.running else { return }
-        await model.refreshModelInformation()
+        if case let .remote(remote) = model.backend {
+            usageRefreshing = true
+            defer { usageRefreshing = false }
+            do { try await remote.draft.reloadModels(); usageError = nil }
+            catch { if !Task.isCancelled { usageError = "无法刷新远端模型信息。" } }
+            return
+        }
+        guard case let .local(local) = model.backend else { return }
+        await local.refreshModelInformation()
         guard !Task.isCancelled else { return }
         usageRefreshing = true
         defer { usageRefreshing = false }
         do {
-            let result = try await model.remoteCall("usage.models")
+            let result = try await local.remoteCall("usage.models")
             guard !Task.isCancelled else { return }
-            modelUsage = result["models"].array.reduce(into: [:]) { usage, row in
+            localUsage = result["models"].array.reduce(into: [:]) { usage, row in
                 if let id = row["model"].string { usage[id] = row }
             }
             usageError = nil
@@ -374,25 +410,29 @@ struct ModelSettingsView: View {
         }
     }
 
-    private func updateMetadata(from file: URL?) {
+    private func updateMetadata(from file: URL?, selection: ModelPageData.Backend) {
         guard model.running, !updatingMetadata else { return }
         updatingMetadata = true; metadataNotice = nil; metadataError = nil
         Task {
             defer { updatingMetadata = false }
             do {
+                if case let .remote(remote) = selection {
+                    guard remote.canStageMetadata else { throw RemoteConsoleError.invalid }
+                    let catalog: RemoteConsoleMetadataFile?
+                    if let file {
+                        catalog = try await Task.detached(priority: .utility) {
+                            try RemoteConsoleMetadataFile(data: readModelMetadata(file))
+                        }.value
+                    } else { catalog = nil }
+                    guard remote.canStageMetadata else { throw RemoteConsoleError.invalid }
+                    remote.draft.stageMetadata(catalog)
+                    return
+                }
+                guard case let .local(local) = selection else { return }
                 let payload: JSONValue
                 if let file {
                     let text = try await Task.detached(priority: .utility) {
-                        let accessing = file.startAccessingSecurityScopedResource()
-                        defer { if accessing { file.stopAccessingSecurityScopedResource() } }
-                        guard try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else {
-                            throw AppError.message("请选择普通 JSON 文件。")
-                        }
-                        let handle = try FileHandle(forReadingFrom: file)
-                        defer { try? handle.close() }
-                        let maxBytes = 256 * 1024
-                        let data = try handle.read(upToCount: maxBytes + 1) ?? Data()
-                        guard data.count <= maxBytes else { throw AppError.message("模型能力 JSON 不能超过 256 KiB。") }
+                        let data = try readModelMetadata(file)
                         guard let json = String(data: data, encoding: .utf8) else { throw AppError.message("模型能力 JSON 必须使用 UTF-8。") }
                         return json
                     }.value
@@ -400,16 +440,20 @@ struct ModelSettingsView: View {
                 } else {
                     payload = .object(["reset": .bool(true)])
                 }
-                let result = try await model.remoteCall("models.metadata.replace", payload)
-                await model.refreshModelInformation()
+                let result = try await local.remoteCall("models.metadata.replace", payload)
+                await local.refreshModelInformation()
                 metadataNotice = file == nil ? "已恢复默认模型能力。" : "已更新 \(Int(result["count"].number ?? 0)) 个模型的能力，无需重启。"
-            } catch { metadataError = error.localizedDescription }
+            } catch {
+                if case .remote = selection { metadataError = "文件无效或网关已改变。仅接受模型能力 JSON。" }
+                else { metadataError = error.localizedDescription }
+            }
         }
     }
 }
 
 private struct ProviderModelsEditor: View {
-    @EnvironmentObject var model: AppModel
+    let model: ModelPageData
+    @State private var discovering = false
     let source: Source
     let rankedModels: [String]
     let modelUsage: [String: JSONValue]?
@@ -464,10 +508,10 @@ private struct ProviderModelsEditor: View {
                 HStack(spacing: 10) {
                     if active.discoversModels {
                         Button {
-                            Task { await model.refreshModels(active.id) }
+                            Task { await refreshModels(active) }
                         } label: {
-                            Label(model.refreshingModels.contains(active.id) ? "刷新中…" : "刷新模型", systemImage: "arrow.clockwise")
-                        }.disabled(!model.running || model.busy || model.refreshingModels.contains(active.id) || (active.official && active.account_id == nil))
+                            Label(isRefreshing(active) ? "刷新中…" : "刷新模型", systemImage: "arrow.clockwise")
+                        }.disabled(!canRefresh(active))
                     }
                     Button(action: onBack) { Label("返回供应商列表", systemImage: "chevron.left") }
                         .keyboardShortcut(.cancelAction)
@@ -488,10 +532,10 @@ private struct ProviderModelsEditor: View {
                 Spacer(minLength: 0)
                 Button(filteredScope ? "启用当前" : "全部启用") {
                     apply(visible, enabled: true)
-                }.disabled(visible.isEmpty || model.busy || model.metadataLoadFailed)
+                }.disabled(visible.isEmpty || model.editsDisabled)
                 Button(filteredScope ? "停用当前" : "全部停用") {
                     apply(visible, enabled: false)
-                }.disabled(visible.isEmpty || model.busy || model.metadataLoadFailed)
+                }.disabled(visible.isEmpty || model.editsDisabled)
             }
             if let error { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
             if all.isEmpty {
@@ -523,7 +567,7 @@ private struct ProviderModelsEditor: View {
                 set: { next in apply([id], enabled: next) }
             ))
             .toggleStyle(.switch).controlSize(.small).labelsHidden()
-            .disabled(model.busy || model.metadataLoadFailed)
+            .disabled(model.editsDisabled)
             VStack(alignment: .leading, spacing: 4) {
                 Text(id).font(.system(size: 13, weight: .semibold, design: .monospaced))
                     .foregroundStyle(enabled ? .primary : .secondary).lineLimit(1)
@@ -539,11 +583,31 @@ private struct ProviderModelsEditor: View {
         }.padding(.horizontal, 14).padding(.vertical, 10)
     }
 
+    private func isRefreshing(_ source: Source) -> Bool {
+        model.refreshingModels.contains(source.id) || discovering
+    }
+
+    private func canRefresh(_ source: Source) -> Bool {
+        model.running && !model.busy && !isRefreshing(source) && model.canDiscover && (model.remote != nil || !source.official || source.account_id != nil)
+    }
+
+    private func refreshModels(_ source: Source) async {
+        guard canRefresh(source) else { return }
+        switch model.backend {
+        case let .local(local): await local.refreshModels(source.id)
+        case let .remote(remote):
+            discovering = true; error = nil
+            defer { discovering = false }
+            do { try await remote.discover(source) }
+            catch { if !Task.isCancelled { self.error = "未能刷新此供应商的模型，已保留现有设置。" } }
+        }
+    }
+
     private func apply(_ ids: [String], enabled: Bool) {
         guard !ids.isEmpty else { return }
         error = nil
         do {
-            try model.setProviderModelsEnabled(sourceID: source.id, modelIDs: ids, enabled: enabled)
+            try model.setEnabled(ids, on: source.id, enabled: enabled)
         } catch {
             self.error = error.localizedDescription
         }
@@ -551,7 +615,7 @@ private struct ProviderModelsEditor: View {
 }
 
 private struct ModelEditor: View {
-    @EnvironmentObject var model: AppModel
+    let model: ModelPageData
     let isNew: Bool
     let onBack: () -> Void
     @State private var modelID: String
@@ -570,8 +634,9 @@ private struct ModelEditor: View {
     private var information: JSONValue { model.modelInformation[modelID.trimmingCharacters(in: .whitespacesAndNewlines)] ?? .null }
     private var defaultWindow: Int? { (information["default_max_context_window"].number ?? information["default_context_window"].number).map(Int.init) }
 
-    init(settings: AppSettings, modelID: String, isNew: Bool, onBack: @escaping () -> Void) {
-        self.isNew = isNew; self.onBack = onBack
+    init(model: ModelPageData, modelID: String, isNew: Bool, onBack: @escaping () -> Void) {
+        self.model = model; self.isNew = isNew; self.onBack = onBack
+        let settings = model.settings
         let policy = settings.modelPolicies?.first { $0.model == modelID }
         let rule = settings.modelCompaction?.first { $0.model == modelID }
         _modelID = State(initialValue: modelID)
@@ -603,7 +668,7 @@ private struct ModelEditor: View {
                     clientSection
                     compactionSection
                     informationSection
-                    InfoNote(text: syncNote)
+                    InfoNote(text: model.syncNote)
                 }.disabled(saving || model.metadataLoadFailed)
             }
             Divider()
@@ -612,19 +677,14 @@ private struct ModelEditor: View {
                 Button("恢复默认值") {
                     customPolicy = isNew; customSources = false; sourceIDs = []; sourceSelectionInitialized = false; clients = ModelClient.allCases
                     customCompaction = false; threshold = ""; window = ""
-                }.help("将草稿恢复为默认值，保存后才会生效。")
+                }.help(model.remote == nil ? "将草稿恢复为默认值，保存后才会生效。" : "将草稿恢复为默认值，提交后才会生效。")
                 Spacer()
-                Text("保存后应用规则。")
+                Text(model.remote == nil ? "保存后应用规则。" : "保存到草稿后，返回并提交修改。")
                     .font(AppTypography.caption).foregroundStyle(.secondary)
                 Button(saving ? "保存中…" : isNew && savedModelID == nil ? "添加模型" : "保存模型设置") { save() }
                     .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
             }.disabled(saving || model.metadataLoadFailed)
         }.settingsPage().defaultFocus($modelIDFocused, isNew)
-    }
-
-    private var syncNote: String {
-        let local = model.connectionMode == "official" ? "" : "本地 Codex 在「接入」中手动同步；"
-        return "OMP 自动同步；\(local)远端 Codex 在「远端 SSH」中预览并应用；聊天客户端请刷新模型列表。"
     }
 
     private var informationSection: some View {
@@ -772,9 +832,10 @@ private struct ModelEditor: View {
                     modelID = id; savedModelID = id
                 }
                 catch {
-                    if model.settings.modelPolicies?.first(where: { $0.model == id }) == policy,
-                        model.settings.modelCompaction?.first(where: { $0.model == id }) == rule,
-                        model.configuredModelIDs.contains(id) { savedModelID = id }
+                    if case let .local(local) = model.backend,
+                       local.settings.modelPolicies?.first(where: { $0.model == id }) == policy,
+                       local.settings.modelCompaction?.first(where: { $0.model == id }) == rule,
+                       local.configuredModelIDs.contains(id) { savedModelID = id }
                     self.error = error.localizedDescription
                 }
                 saving = false
