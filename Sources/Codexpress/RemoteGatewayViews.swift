@@ -29,23 +29,23 @@ struct GatewayTargetSheet: View {
                 }
                 if let error = management.message { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
             }
-            Text("切换不会迁移来源，也不会更改 Codex 或 OMP 的接入地址。")
+            Text("切换不会迁移来源或更改 Codex 接入。本机 OMP 默认跟随所选网关；首次选择远端会签发专用设备 Key。")
                 .font(AppTypography.caption).foregroundStyle(.secondary)
             HStack {
                 if management.busy { ProgressView().controlSize(.small) }
                 Spacer()
-                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction).disabled(management.busy)
+                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction).disabled(management.targetSwitchBlocked)
                 Button(remote ? "连接远端" : "使用本地网关") {
-                    if !remote { management.selectLocal(); if !management.remoteSelected { dismiss() }; return }
+                    if !remote { if management.selectLocal() { dismiss() }; return }
                     Task {
                         let ok: Bool
                         if useSaved { ok = await management.selectRemote() }
                         else { ok = await management.connect(url: url, token: token) }
                         if ok { token = ""; dismiss() }
                     }
-                }.keyboardShortcut(.defaultAction).disabled(management.busy || (remote && (url.isEmpty || (!useSaved && token.isEmpty))))
+                }.keyboardShortcut(.defaultAction).disabled(management.targetSwitchBlocked || (remote && (url.isEmpty || (!useSaved && token.isEmpty))))
             }
-            if !remote, let error = management.message, management.remoteSelected { Text(error).font(AppTypography.caption).foregroundStyle(.secondary) }
+            if !remote, let error = management.message { Text(error).font(AppTypography.caption).foregroundStyle(.secondary) }
         }.padding(24).frame(width: 460)
             .onAppear { remote = management.remoteSelected; url = management.endpoint }
     }
@@ -53,18 +53,29 @@ struct GatewayTargetSheet: View {
 
 struct RemoteGatewayPoolView: View {
     @EnvironmentObject private var management: RemoteGatewayManagement
-    @State private var editing = false
+    private struct EditSession: Identifiable { let id = UUID(); let pool: RemotePoolSnapshot }
+    @State private var editing: EditSession?
+    @State private var showingOMP = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: AppMetrics.sectionSpacing) {
                 PageHeading("来源池", subtitle: [management.endpoint, management.version.map { "网关 \($0)" }].compactMap { $0 }.joined(separator: " · ")) {
+                    Button("本机 OMP…") { showingOMP = true }
                     Button("刷新") { Task { await management.refresh() } }.disabled(management.busy)
                 }
+                RemoteGatewayFreshness()
                 if let error = management.message { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
+                if let error = management.ompMessage {
+                    HStack {
+                        InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange)
+                        Button("重试 OMP 接入") { Task { await management.retryOMP() } }.disabled(management.busy)
+                    }
+                }
                 if let pool = management.snapshot {
+                    RemoteRuntimeSummary(data: management.runtimeData)
                     SettingsCard("远端来源", symbol: "server.rack", accessory: {
-                        Button("编辑来源池") { editing = true }.disabled(management.busy)
+                        Button("编辑来源池") { editing = EditSession(pool: pool) }.disabled(management.busy)
                     }) {
                         if pool.sources.isEmpty { Text("暂无来源").foregroundStyle(.secondary) }
                         else {
@@ -80,10 +91,29 @@ struct RemoteGatewayPoolView: View {
                             }
                         }
                     }
-                    .sheet(isPresented: $editing) { RemotePoolEditor(snapshot: pool) }
                 } else if management.busy { ProgressView("正在读取远端来源池…") }
                 else { Text("远端来源池不可用。请刷新或切换管理网关。").foregroundStyle(.secondary) }
             }.settingsPage()
+        }
+        .sheet(item: $editing) { RemotePoolEditor(snapshot: $0.pool) }
+        .sheet(isPresented: $showingOMP) {
+            VStack(alignment: .trailing, spacing: 0) {
+                OMPSettingsView()
+                Button("完成") { showingOMP = false }.keyboardShortcut(.cancelAction).padding()
+            }.frame(width: 660, height: 530)
+        }
+        .background(WindowOpenRefresh(refresh: { Task { await management.refresh() } }))
+    }
+}
+
+struct RemoteGatewayFreshness: View {
+    @EnvironmentObject private var management: RemoteGatewayManagement
+
+    var body: some View {
+        if let date = management.fetchedAt {
+            let stale = management.snapshot == nil || Date().timeIntervalSince(date) > 60
+            Text("\(stale ? "数据已过期，上次成功刷新" : "上次刷新")：\(date.formatted(date: .abbreviated, time: .standard))")
+                .font(AppTypography.caption).foregroundStyle(stale ? Color.orange : Color.secondary)
         }
     }
 }
@@ -143,6 +173,10 @@ private struct RemotePoolEditor: View {
                         }.textFieldStyle(.roundedBorder)
                     }
                 }.padding(2)
+            }
+            if management.snapshot != original {
+                Text("当前快照不可用或已变更。请确认刷新结果后重新打开编辑器。")
+                    .font(AppTypography.caption).foregroundStyle(.orange)
             }
             if let error = management.message { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
             HStack {

@@ -418,6 +418,7 @@ import ServiceManagement
     func stop() {
         guard !shuttingDown else { return }
         shuttingDown = true
+        gatewayManagement.stopMonitoring()
         cancelBackgroundSync(); timerTask?.cancel(); accountTimerTask?.cancel(); officialAccountTimerTask?.cancel(); modelRefreshTask?.cancel(); controlResetPollTask?.cancel()
         if let helper, helper.isRunning { helper.terminate() }
         logPipe?.fileHandleForReading.readabilityHandler = nil

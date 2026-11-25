@@ -14,6 +14,8 @@ struct MenuView: View {
                 if let pool = management.snapshot {
                     Text("来源池 · \(pool.sources.count) 个来源")
                 } else { Text(management.busy ? "正在连接…" : "远端未连接") }
+                RemoteGatewayFreshness()
+                if let error = management.message { Text(error).font(AppTypography.caption).foregroundStyle(.orange) }
                 Divider()
                 HStack {
                     Button("管理远端来源池") { showSettings(.sources) }
@@ -21,6 +23,7 @@ struct MenuView: View {
                     Button("退出") { NSApp.terminate(nil) }.keyboardShortcut("q")
                 }
             }.padding(16).frame(width: 320)
+                .background(WindowOpenRefresh(refresh: { Task { await management.refresh() } }))
         } else { localMenu }
     }
 
@@ -55,7 +58,7 @@ struct MenuView: View {
         }.padding(16).frame(width: 364)
             .background(.regularMaterial)
             .environment(\.windowIsActive, windowActive)
-            .background(AccountWindowOpenRefresh(refresh: {
+            .background(WindowOpenRefresh(refresh: {
                 Task { await model.refreshAccountInfo(sourceIDs: Array(model.sources.prefix(4)).map(\.id)) }
             }, activityChanged: { windowActive = $0 }))
             .task(id: model.running) { await model.refreshAccountInfo(sourceIDs: Array(model.sources.prefix(4)).map(\.id)) }
@@ -196,7 +199,7 @@ struct MenuView: View {
 
 // MenuBarExtra can retain its hosting view while hidden, so a SwiftUI task
 // alone does not reliably run on every reopening of the existing panel.
-private struct AccountWindowOpenRefresh: NSViewRepresentable {
+struct WindowOpenRefresh: NSViewRepresentable {
     var refresh: () -> Void
     var activityChanged: (Bool) -> Void = { _ in }
     func makeNSView(context: Context) -> ObserverView { let view = ObserverView(); view.refresh = refresh; view.activityChanged = activityChanged; return view }
@@ -205,21 +208,24 @@ private struct AccountWindowOpenRefresh: NSViewRepresentable {
     final class ObserverView: NSView {
         var refresh: () -> Void = {}
         var activityChanged: (Bool) -> Void = { _ in }
+        private var wasActive: Bool?
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             NotificationCenter.default.removeObserver(self)
+            wasActive = nil
             if let window {
-                NotificationCenter.default.addObserver(self, selector: #selector(didOpen(_:)), name: NSWindow.didBecomeKeyNotification, object: window)
-                for name in [NSWindow.didResignKeyNotification, NSWindow.didChangeOcclusionStateNotification] {
+                for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification, NSWindow.didChangeOcclusionStateNotification] {
                     NotificationCenter.default.addObserver(self, selector: #selector(activity(_:)), name: name, object: window)
                 }
             }
             DispatchQueue.main.async { [weak self] in self?.reportActivity() }
         }
-        @objc private func didOpen(_ notification: Notification) { refresh(); activity(notification) }
         @objc private func activity(_ notification: Notification) { reportActivity() }
         private func reportActivity() {
             let active = window.map { $0.isKeyWindow && $0.isVisible && $0.occlusionState.contains(.visible) } ?? false
+            guard active != wasActive else { return }
+            wasActive = active
+            if active { refresh() }
             activityChanged(active)
         }
         deinit { NotificationCenter.default.removeObserver(self) }

@@ -109,9 +109,7 @@ struct GatewayMenuIcon: View {
         Self.current = self
         model = AppModel.shared
         if let model, !model.gatewayManagement.remoteSelected && model.sources.isEmpty { showSettings() }
-        if let management = model?.gatewayManagement, management.remoteSelected {
-            Task { await management.refresh() }
-        }
+        model?.gatewayManagement.startMonitoring()
         Task { await model?.start() }
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

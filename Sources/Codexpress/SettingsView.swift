@@ -132,8 +132,9 @@ struct SettingsView: View {
     }
 
     @ViewBuilder private var notices: some View {
-        if model.metadataLoadFailed || model.showsPendingSyncWarning {
+        if model.metadataLoadFailed || model.showsPendingSyncWarning || management.message != nil {
             VStack(spacing: 8) {
+                if let error = management.message { banner(error, symbol: "exclamationmark.triangle", color: .orange) }
                 if model.metadataLoadFailed {
                     banner("来源文件无法读取，已进入只读保护。请从备份修复 sources.json 后重启。", symbol: "lock.shield", color: .orange)
                 }

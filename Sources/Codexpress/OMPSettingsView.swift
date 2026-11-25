@@ -3,6 +3,7 @@ import AppKit
 
 struct OMPSettingsView: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject private var management: RemoteGatewayManagement
     @State private var installation: OMPInstallation?
     @State private var detecting = false
     @State private var installing = false
@@ -12,7 +13,7 @@ struct OMPSettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                PageHeading("本机 OMP", subtitle: "安装 Codexpress 扩展，在 OMP 中使用来源池模型、绘图与用量查询。")
+                PageHeading("本机 OMP", subtitle: management.remoteSelected ? "在这台 Mac 安装扩展，使用所选远端网关。" : "安装 Codexpress 扩展，在 OMP 中使用来源池模型、绘图与用量查询。")
                 SettingsCard("扩展安装", symbol: "puzzlepiece.extension", accessory: {
                     if detecting || installing {
                         ProgressView().controlSize(.small).accessibilityLabel(detecting ? "正在检测 OMP" : "正在安装扩展")
@@ -45,13 +46,16 @@ struct OMPSettingsView: View {
                             .disabled(installing || detecting || installation?.executable == nil)
                     }
                 }
-                SettingsCard("安装后登录", symbol: "link") {
-                    if !model.running { InfoNote(text: "登录前请在设置中启动本机网关。") }
-                    Text("重新启动 OMP，在 /login 中选择 Codexpress，或运行：")
-                    Text("omp login codexpress")
-                        .font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
-                    Text("登录后通过 /model 选择来源池模型；绘图工具在 OMP 设置中启用。")
-                        .foregroundStyle(.secondary)
+                SettingsCard(management.remoteSelected ? "使用远端模型" : "安装后登录", symbol: "link") {
+                    if management.remoteSelected {
+                        Text("安装后重启一次 OMP，通过 /model 选择 codexpress 模型。以后切换网关无需重新登录。")
+                    } else {
+                        if !model.running { InfoNote(text: "登录前请在设置中启动本机网关。") }
+                        Text("重新启动 OMP，在 /login 中选择 Codexpress，或运行：")
+                        Text("omp login codexpress").font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
+                        Text("登录后通过 /model 选择来源池模型；绘图工具在 OMP 设置中启用。")
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }.settingsPage()
         }
@@ -91,7 +95,7 @@ struct OMPSettingsView: View {
             do {
                 try await installation.installExtension(packageURL: package)
                 installed = true
-                model.notice = "扩展已安装。重新启动 OMP，在 /login 中选择 Codexpress。"
+                model.notice = management.remoteSelected ? "扩展已安装。重新启动 OMP 后可选择远端模型。" : "扩展已安装。重新启动 OMP，在 /login 中选择 Codexpress。"
             } catch { self.error = error.localizedDescription }
         }
     }
