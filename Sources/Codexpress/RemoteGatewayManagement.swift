@@ -67,9 +67,10 @@ private struct RemoteStatus: Decodable {
     enum CodingKeys: String, CodingKey { case instanceID = "instance_id", protocolVersion = "protocol", version, capabilities, runtime }
 }
 
-private struct RemoteManagementError: Error {
+private struct RemoteManagementError: LocalizedError {
     let message: String
     let invalidatesIdentity: Bool
+    var errorDescription: String? { message }
     init(_ message: String, invalidatesIdentity: Bool = false) {
         self.message = message
         self.invalidatesIdentity = invalidatesIdentity
@@ -166,6 +167,8 @@ final class RemoteGatewayManagement: ObservableObject {
     @Published private(set) var endpoint = ""
     @Published private(set) var version: String?
     @Published private(set) var snapshot: RemotePoolSnapshot?
+    @Published private(set) var capabilities = Set<String>()
+    var targetGeneration: UUID { targetID }
     private enum Activity { case idle, refreshing, exclusive }
     @Published private var activity: Activity = .idle
     var busy: Bool { activity != .idle }
@@ -346,6 +349,7 @@ final class RemoteGatewayManagement: ObservableObject {
     }
 
     private func invalidateSharedTarget() throws {
+        capabilities.removeAll()
         prepareOMPOnLoad = ompMessage == nil
         try integrations.invalidate()
     }
@@ -373,6 +377,7 @@ final class RemoteGatewayManagement: ObservableObject {
         var verified = pool
         verified.loadID = targetID
         snapshot = verified
+        capabilities = Set(status.capabilities ?? [])
         version = status.version
         let now = Date()
         fetchedAt = now
@@ -403,6 +408,35 @@ final class RemoteGatewayManagement: ObservableObject {
         }
         try check(id)
         ompMessage = failure
+    }
+
+    /// Read-only polling may run concurrently. Mutation admission is checked again on the server under its pool lock.
+    func operation(_ name: String, payload: JSONValue = .object([:]), on target: RemotePoolSnapshot) async throws -> JSONValue {
+        func matchesTarget() -> Bool {
+            remoteSelected && target.loadID == targetID && snapshot?.revision == target.revision && profile?.instanceID == target.instanceID
+        }
+        guard matchesTarget(), let profile else { throw RemoteManagementError("网关或来源池已改变，请刷新后重新操作。") }
+        guard capabilities.contains(name), !name.isEmpty, name.count <= 64,
+              name.utf8.allSatisfy({ (97...122).contains($0) || $0 == 46 || $0 == 95 }) else {
+            throw RemoteManagementError("当前网关不支持此操作。")
+        }
+        let body = try JSONEncoder().encode(JSONValue.object(["instance_id": .string(target.instanceID), "revision": .string(target.revision), "payload": payload]))
+        try Task.checkCancellation()
+        let result: JSONValue
+        do {
+            result = try await exchange(try Self.root(profile.endpoint), path: "admin/v1/operations/\(name)", token: profile.token, body: body, method: "POST")
+        } catch {
+            guard matchesTarget() else { throw CancellationError() }
+            if let failure = error as? RemoteManagementError { throw failure }
+            throw RemoteManagementError("未收到网关确认。请先刷新核对结果，不要直接重复提交。")
+        }
+        guard remoteSelected, targetID == target.loadID, self.profile?.instanceID == target.instanceID else { throw CancellationError() }
+        if name == "config.save" {
+            // A GET issued before this write may still be in flight. Never join that stale GET after saving.
+            if activity == .refreshing { supersede(); activity = .idle }
+        } else if snapshot?.revision != target.revision { throw CancellationError() }
+        try Task.checkCancellation()
+        return result
     }
 
     @discardableResult
@@ -539,6 +573,12 @@ final class RemoteGatewayManagement: ObservableObject {
 
     private func request<T: Decodable>(_ root: URL, path: String, token: String, body: Data?, method: String = "GET", id: UUID) async throws -> T {
         try check(id)
+        let value: T = try await exchange(root, path: path, token: token, body: body, method: method)
+        try check(id)
+        return value
+    }
+
+    private func exchange<T: Decodable>(_ root: URL, path: String, token: String, body: Data?, method: String) async throws -> T {
         guard !token.isEmpty, token.utf8.allSatisfy({ (33...126).contains($0) }) else {
             throw RemoteManagementError("请输入有效的管理令牌。")
         }
@@ -552,14 +592,16 @@ final class RemoteGatewayManagement: ObservableObject {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
         let (data, response) = try await send(request)
-        try check(id)
         guard let http = response as? HTTPURLResponse, http.url == request.url else { throw RemoteManagementError("远端响应地址无效。", invalidatesIdentity: true) }
         switch http.statusCode {
         case 200: break
         case 300..<400: throw RemoteManagementError("远端返回重定向，已拒绝跟随。请使用最终 HTTPS 根地址。", invalidatesIdentity: true)
         case 401, 403: throw RemoteManagementError("远端拒绝管理令牌。请核实管理权限后重新连接。", invalidatesIdentity: true)
         case 409: throw RemoteManagementError("远端来源池已变更。请刷新后重新编辑，未覆盖服务器配置。")
-        case 422: throw RemoteManagementError("远端拒绝了来源池配置。请刷新并检查输入。")
+        case 404: throw RemoteManagementError("当前网关没有这个项目或功能。")
+        case 413: throw RemoteManagementError("提交的数据超过网关限制。")
+        case 429: throw RemoteManagementError("网关繁忙，请稍后手动刷新。")
+        case 400, 422: throw RemoteManagementError("网关拒绝了输入，请检查字段、凭据和操作条件。")
         default: throw RemoteManagementError("远端管理请求失败（HTTP \(http.statusCode)）。请刷新后重试。")
         }
         do { return try JSONDecoder().decode(T.self, from: data) }

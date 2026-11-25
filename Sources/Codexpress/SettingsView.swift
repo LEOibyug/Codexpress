@@ -25,6 +25,7 @@ struct SettingsView: View {
     @State private var choosingGateway = false
     @State private var page: SettingsPage? = .overview
     @State private var connectionSection: ConnectionSection = .codex
+    private var sourcesOnly: Bool { management.remoteSelected && !management.capabilities.contains("config.edit") }
 
     var body: some View {
         NavigationSplitView {
@@ -36,9 +37,9 @@ struct SettingsView: View {
                     .help("切换正在管理的网关")
                 List(selection: $page) {
                     Section("工作台") {
-                        ForEach(management.remoteSelected ? [SettingsPage.sources] : [.overview, .sources, .models, .usage]) { navigationItem($0) }
+                        ForEach(sourcesOnly ? [SettingsPage.sources] : [.overview, .sources, .models, .usage]) { navigationItem($0) }
                     }
-                    if !management.remoteSelected {
+                    if !sourcesOnly {
                         Section("配置") {
                             navigationItem(.connections)
                             navigationItem(.general)
@@ -59,7 +60,12 @@ struct SettingsView: View {
                 if !management.remoteSelected { notices }
                 Group {
                     if management.remoteSelected {
-                        RemoteGatewayPoolView()
+                        if sourcesOnly || page == .sources {
+                            RemoteGatewayPoolView().id(management.targetGeneration)
+                        } else {
+                            RemoteGatewayConsole(page: page ?? .overview)
+                                .id(management.targetGeneration)
+                        }
                     } else {
                         switch page ?? .overview {
                         case .overview: OverviewView(openSources: { page = .sources }, openUsage: { page = .usage }, openConnection: { connectionSection = $0; page = .connections })
@@ -87,7 +93,7 @@ struct SettingsView: View {
                 ResetCreditsSheet(request: request).environmentObject(model)
             }
             .onReceive(NotificationCenter.default.publisher(for: .codexpressNavigate)) { notification in
-                if let destination = notification.object as? SettingsPage { page = management.remoteSelected ? .sources : destination }
+                if let destination = notification.object as? SettingsPage { page = sourcesOnly ? .sources : destination }
             }
     }
 

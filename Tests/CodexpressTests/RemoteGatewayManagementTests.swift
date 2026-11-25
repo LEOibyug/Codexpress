@@ -116,6 +116,28 @@ final class RemoteGatewayManagementTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: dir.appendingPathComponent("control.sock").path))
     }
 
+    func testOperationsNeverReuseDraftAfterSelectionChangesEvenForIdenticalServerIdentity() async throws {
+        let dir = try directory(), peer = Peer(), manager = peer.manager(dir)
+        let status = Reply(Self.status.json.replacingOccurrences(of: "\"pool.edit\"", with: "\"pool.edit\",\"device.issue\""))
+        peer.replies = [status, Self.pool, Self.device]
+        _ = await manager.connect(url: "https://alpha.example", token: "alpha-token")
+        let draft = try XCTUnwrap(manager.snapshot)
+        peer.replies = [Reply(#"{"id":"issued","key":"for-alpha-only"}"#), status, Self.pool, Self.device]
+        peer.beforeReply = { req in
+            guard req.url?.path == "/admin/v1/operations/device.issue" else { return }
+            XCTAssertEqual(req.value(forHTTPHeaderField: "Authorization"), "Bearer alpha-token")
+            let body = try? JSONDecoder().decode(JSONValue.self, from: req.httpBody ?? Data())
+            XCTAssertEqual(body?["instance_id"].string, draft.instanceID)
+            XCTAssertEqual(body?["revision"].string, draft.revision)
+            _ = await manager.connect(url: "https://beta.example", token: "beta-token")
+        }
+        do { _ = try await manager.operation("device.issue", payload: .object(["name": .string("test")]), on: draft); XCTFail("旧设备密钥不应出现在新目标") }
+        catch is CancellationError { }
+        let count = peer.requests.count
+        do { _ = try await manager.operation("device.issue", on: draft); XCTFail("不可跨网关提交") }
+        catch { XCTAssertEqual(peer.requests.count, count) }
+    }
+
     func testRejectsInvalidRootsAndIncompatibleServersBeforeCommitting() async throws {
         let dir = try directory(), peer = Peer()
         let manager = peer.manager(dir)
