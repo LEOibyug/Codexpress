@@ -51,6 +51,8 @@ image-client.json
 chatbot-access.json
 image-access.json
 remote-access.json
+remote-management.json
+.remote-management-*
 sources.json
 reset-operations.json
 balance-warnings.json

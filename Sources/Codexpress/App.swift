@@ -6,12 +6,22 @@ import AppKit
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     var body: some Scene {
         MenuBarExtra {
-            MenuView().environmentObject(model).task { delegate.model = model; await model.start() }
+            MenuView().environmentObject(model).environmentObject(model.gatewayManagement)
+                .task { delegate.model = model; await model.start() }
         } label: {
-            GatewayMenuIcon(running: model.running, active: model.gatewayHasActivity)
+            ManagementMenuIcon(model: model, management: model.gatewayManagement)
         }
         .menuBarExtraStyle(.window)
 
+    }
+}
+
+private struct ManagementMenuIcon: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var management: RemoteGatewayManagement
+    var body: some View {
+        GatewayMenuIcon(running: management.remoteSelected ? management.snapshot != nil : model.running,
+                        active: !management.remoteSelected && model.gatewayHasActivity)
     }
 }
 
@@ -59,7 +69,7 @@ struct GatewayMenuIcon: View {
     private let terminationGuard = TerminationGuard()
     func showSettings(destination: SettingsPage? = nil) {
         if settingsWindow == nil {
-            let content = SettingsView().environmentObject(AppModel.shared)
+            let content = SettingsView().environmentObject(AppModel.shared).environmentObject(AppModel.shared.gatewayManagement)
             let window = NSWindow(contentViewController: NSHostingController(rootView: content))
             window.title = "Codexpress"
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
@@ -73,7 +83,7 @@ struct GatewayMenuIcon: View {
             settingsWindow = window
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
-        AppModel.shared.accountPageOpened()
+        if !AppModel.shared.gatewayManagement.remoteSelected { AppModel.shared.accountPageOpened() }
         NSApp.activate(ignoringOtherApps: true)
         if let destination {
             DispatchQueue.main.async {
@@ -98,7 +108,10 @@ struct GatewayMenuIcon: View {
         NSApp.setActivationPolicy(.accessory)
         Self.current = self
         model = AppModel.shared
-        if model?.sources.isEmpty == true { showSettings() }
+        if let model, !model.gatewayManagement.remoteSelected && model.sources.isEmpty { showSettings() }
+        if let management = model?.gatewayManagement, management.remoteSelected {
+            Task { await management.refresh() }
+        }
         Task { await model?.start() }
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

@@ -56,6 +56,7 @@ import ServiceManagement
     @Published private(set) var environmentSynced = false
     @Published private(set) var environmentSyncError: String?
     let directory: URL
+    let gatewayManagement: RemoteGatewayManagement
     let environmentAccess: ChatbotEnvironmentAccess
     private let metadata: MetadataStore
     var credentialSnapshot = CredentialSnapshot()
@@ -133,6 +134,7 @@ import ServiceManagement
     init(stateDirectory: URL? = nil, environmentAccess: ChatbotEnvironmentAccess? = nil) {
         let override = ProcessInfo.processInfo.environment["CODEXPRESS_STATE_DIR"]
         directory = stateDirectory ?? override.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Codexpress", isDirectory: true)
+        gatewayManagement = RemoteGatewayManagement(directory: directory)
         if let environmentAccess {
             self.environmentAccess = environmentAccess
         } else if stateDirectory == nil && override == nil {
@@ -161,7 +163,7 @@ import ServiceManagement
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
     func start() async {
-        guard timerTask == nil, !starting else { return }
+        guard !gatewayManagement.remoteSelected, timerTask == nil, !starting else { return }
         starting = true
         defer { starting = false }
         await startHelper()

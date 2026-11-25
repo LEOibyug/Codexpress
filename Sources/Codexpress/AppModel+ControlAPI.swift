@@ -3,7 +3,7 @@ import Foundation
 
 extension AppModel {
     private var canPresentControlReset: Bool {
-        running && !busy && creditResetRequest == nil && loginSource == nil && consuming.isEmpty
+        !gatewayManagement.remoteSelected && running && !busy && creditResetRequest == nil && loginSource == nil && consuming.isEmpty
             && NSApp?.modalWindow == nil
             && !(NSApp?.windows.contains(where: { $0.attachedSheet != nil }) ?? false)
     }

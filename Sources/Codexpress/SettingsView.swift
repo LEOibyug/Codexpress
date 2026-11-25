@@ -21,49 +21,73 @@ extension Notification.Name {
 
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var management: RemoteGatewayManagement
+    @State private var choosingGateway = false
     @State private var page: SettingsPage? = .overview
     @State private var connectionSection: ConnectionSection = .codex
 
     var body: some View {
         NavigationSplitView {
             VStack(spacing: 0) {
+                Button { choosingGateway = true } label: {
+                    Label(management.remoteSelected ? "远端网关" : "本地网关", systemImage: "arrow.left.arrow.right")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }.controlSize(.large).padding(.horizontal, 12).padding(.top, 12)
+                    .help("切换正在管理的网关")
                 List(selection: $page) {
                     Section("工作台") {
-                        ForEach([SettingsPage.overview, .sources, .models, .usage]) { navigationItem($0) }
+                        ForEach(management.remoteSelected ? [SettingsPage.sources] : [.overview, .sources, .models, .usage]) { navigationItem($0) }
                     }
-                    Section("配置") {
-                        navigationItem(.connections)
-                        navigationItem(.general)
+                    if !management.remoteSelected {
+                        Section("配置") {
+                            navigationItem(.connections)
+                            navigationItem(.general)
+                        }
                     }
                 }.listStyle(.sidebar).scrollContentBackground(.hidden)
                     .padding(.top, 6)
 
-                gatewayFooter
+                if management.remoteSelected {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(management.busy ? "正在连接…" : management.snapshot != nil ? "已连接远端" : "远端未连接")
+                        Text(management.endpoint).font(AppTypography.small).foregroundStyle(.secondary).lineLimit(2)
+                    }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                } else { gatewayFooter }
             }.navigationSplitViewColumnWidth(min: 180, ideal: 194, max: 218)
         } detail: {
             VStack(spacing: 0) {
-                notices
+                if !management.remoteSelected { notices }
                 Group {
-                    switch page ?? .overview {
-                    case .overview: OverviewView(openSources: { page = .sources }, openUsage: { page = .usage }, openConnection: { connectionSection = $0; page = .connections })
-                    case .sources: SourcesView()
-                    case .models: ModelSettingsView()
-                    case .usage: UsageView()
-                    case .connections: ConnectionSettingsView(section: $connectionSection)
-                    case .general: GeneralSettingsView()
+                    if management.remoteSelected {
+                        RemoteGatewayPoolView()
+                    } else {
+                        switch page ?? .overview {
+                        case .overview: OverviewView(openSources: { page = .sources }, openUsage: { page = .usage }, openConnection: { connectionSection = $0; page = .connections })
+                        case .sources: SourcesView()
+                        case .models: ModelSettingsView()
+                        case .usage: UsageView()
+                        case .connections: ConnectionSettingsView(section: $connectionSection)
+                        case .general: GeneralSettingsView()
+                        }
                     }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }.background(AppPalette.canvas)
-                .overlay(alignment: .bottomTrailing) { AppFeedbackOverlay() }
+                .overlay(alignment: .bottomTrailing) { if !management.remoteSelected { AppFeedbackOverlay() } }
         }.navigationSplitViewStyle(.balanced)
             .background(AppPalette.canvas)
             .font(AppTypography.body).frame(minWidth: 960, minHeight: 700)
             .environment(\.windowIsActive, model.settingsWindowActive)
+            .sheet(isPresented: $choosingGateway) { GatewayTargetSheet() }
+            .onChange(of: management.remoteSelected) { _, remote in
+                page = remote ? .sources : .overview
+                if !remote { Task { await model.start() } }
+            }
+            .onAppear { if management.remoteSelected { page = .sources } }
             .sheet(item: $model.creditResetRequest, onDismiss: { model.controlResetDismissed() }) { request in
                 ResetCreditsSheet(request: request).environmentObject(model)
             }
             .onReceive(NotificationCenter.default.publisher(for: .codexpressNavigate)) { notification in
-                if let destination = notification.object as? SettingsPage { page = destination }
+                if let destination = notification.object as? SettingsPage { page = management.remoteSelected ? .sources : destination }
             }
     }
 

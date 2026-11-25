@@ -3,9 +3,28 @@ import AppKit
 
 struct MenuView: View {
     @EnvironmentObject var model: AppModel
+    @EnvironmentObject var management: RemoteGatewayManagement
     @State private var windowActive = false
 
     var body: some View {
+        if management.remoteSelected {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("远端网关", systemImage: "network").font(AppTypography.sectionTitle)
+                Text(management.endpoint).foregroundStyle(.secondary).lineLimit(2)
+                if let pool = management.snapshot {
+                    Text("来源池 · \(pool.sources.count) 个来源")
+                } else { Text(management.busy ? "正在连接…" : "远端未连接") }
+                Divider()
+                HStack {
+                    Button("管理远端来源池") { showSettings(.sources) }
+                    Spacer()
+                    Button("退出") { NSApp.terminate(nil) }.keyboardShortcut("q")
+                }
+            }.padding(16).frame(width: 320)
+        } else { localMenu }
+    }
+
+    private var localMenu: some View {
         VStack(alignment: .leading, spacing: 13) {
             header
             connection
