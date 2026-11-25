@@ -5,6 +5,7 @@ struct SourceEditor: View {
     @Environment(\.dismiss) private var dismiss
     @State var source: Source
     let isNew: Bool
+    let remote: RemotePoolDraft?
     private let initialModels: [String]
     @State private var apiKey = ""
     @State private var modelsText = ""
@@ -22,8 +23,8 @@ struct SourceEditor: View {
     @State private var activityWindowSeconds = "15"
     @FocusState private var nameFocused: Bool
 
-    init(source: Source, isNew: Bool) {
-        _source = State(initialValue: source); self.isNew = isNew
+    init(source: Source, isNew: Bool, remote: RemotePoolDraft? = nil) {
+        _source = State(initialValue: source); self.isNew = isNew; self.remote = remote
         initialModels = source.models
         _modelsText = State(initialValue: source.models.joined(separator: ", "))
         _automaticModels = State(initialValue: source.discoversModels)
@@ -35,15 +36,53 @@ struct SourceEditor: View {
         _activityWindowSeconds = State(initialValue: String(source.activeConversationWindowSeconds))
     }
 
+    private var remoteDestination: [String] {
+        guard remote != nil else { return [] }
+        return [source.base_url, source.proxy.mode, source.proxy.mode == "explicit" ? source.proxy.url ?? "" : ""]
+    }
+
+    // Clear an entered key in the same edit that changes its destination, before Save can run.
+    private func destinationField(_ field: Binding<String>) -> Binding<String> {
+        guard remote != nil else { return field }
+        return Binding(get: { field.wrappedValue }, set: { value in
+            if value != field.wrappedValue && !apiKey.isEmpty {
+                apiKey = ""; localError = "地址或代理已更改，请重新输入此目标的 API 密钥。"
+            }
+            field.wrappedValue = value
+        })
+    }
+
     private var discoveryInput: [String] {
-        [source.base_url, source.proxy.mode, proxyPort, apiKey, String(automaticModels), String(model.running), model.settings.sources.first(where: { $0.id == source.id })?.account_id ?? ""]
+        if remote != nil { return remoteDestination + [String(apiKey.isEmpty), String(automaticModels)] }
+        return [source.base_url, source.proxy.mode, proxyPort, apiKey, String(automaticModels), String(model.running), model.settings.sources.first(where: { $0.id == source.id })?.account_id ?? ""]
     }
     private var canFetch: Bool {
+        if let remote {
+            guard remote.valid, !isNew, apiKey.isEmpty, remote.target.management.capabilities.contains("models.list"),
+                  let configured = try? configuredSource() else { return false }
+            return remote.isSavedDestination(configured)
+        }
         guard model.running else { return false }
         if source.official {
             return !model.isMissingCredential(source) && model.settings.sources.contains { $0.id == source.id && $0.account_id != nil }
         }
         return !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (!isNew && !model.isMissingCredential(source) && model.settings.sources.first(where: { $0.id == source.id })?.base_url == source.base_url)
+    }
+
+    private var keyPrompt: String {
+        if remote != nil { return isNew ? "请输入 API 密钥" : "留空保留密钥；更换地址或代理后须重新输入" }
+        return isNew || model.isMissingCredential(source) ? "请输入 API 密钥" : "留空保留现有密钥"
+    }
+
+    private var saveTitle: String {
+        if saving { return "保存中…" }
+        if remote == nil && isNew && source.official && model.loginFlow == nil { return "添加并登录…" }
+        return isNew ? "添加来源" : "保存来源"
+    }
+
+    private var saveUnavailable: Bool {
+        if let remote { return saving || !remote.valid }
+        return saving || !model.running || model.busy || model.metadataLoadFailed
     }
 
     var body: some View {
@@ -55,18 +94,18 @@ struct SourceEditor: View {
                 Section("基本信息") {
                     TextField("名称", text: $source.name).focused($nameFocused)
                     if !source.official {
-                        TextField("API 基址", text: $source.base_url).textContentType(.URL)
-                        SecureField("API 密钥", text: $apiKey, prompt: Text(isNew || model.isMissingCredential(source) ? "请输入 API 密钥" : "留空保留现有密钥"))
+                        TextField("API 基址", text: destinationField($source.base_url)).textContentType(.URL)
+                        SecureField("API 密钥", text: $apiKey, prompt: Text(keyPrompt))
                     }
                     Toggle("启用此来源", isOn: $source.enabled).toggleStyle(.switch)
                     Toggle("在 cmux 中展示", isOn: Binding(get: { source.showInCmux }, set: { source.show_in_cmux = $0 }))
                         .toggleStyle(.switch)
-                    if isNew && source.official && model.loginFlow != nil {
+                    if remote == nil && isNew && source.official && model.loginFlow != nil {
                         Text("完成当前登录后，可在来源池登录此账号。").font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                 }
                 Section("网络") {
-                    Picker("出站策略", selection: $source.proxy.mode) {
+                    Picker("出站策略", selection: destinationField($source.proxy.mode)) {
                         if !source.official { Text("强制直连").tag("direct") }
                         Text("系统代理").tag("system")
                         Text("指定代理").tag("explicit")
@@ -75,11 +114,21 @@ struct SourceEditor: View {
                         Text("不做代理干预，直接交由系统代理、环境变量或 TUN 路由处理。")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
                     } else if source.proxy.mode == "explicit" {
-                        TextField("本地代理端口", text: $proxyPort, prompt: Text("例如 7890"))
-                        if source.proxy.localPort == nil, let existing = source.proxy.url {
-                            Text("现有代理：\(existing)")
+                        if remote != nil {
+                            TextField("代理 URL", text: destinationField(Binding(get: { source.proxy.url ?? "" }, set: { source.proxy.url = $0 })), prompt: Text("例如 http://127.0.0.1:7890"))
+                            Text("localhost 指服务器，不是这台 Mac。不要在 URL 中填写凭据。")
                                 .font(.system(size: 12)).foregroundStyle(.secondary)
+                        } else {
+                            TextField("本地代理端口", text: $proxyPort, prompt: Text("例如 7890"))
+                            if source.proxy.localPort == nil, let existing = source.proxy.url {
+                                Text("现有代理：\(existing)")
+                                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                            }
                         }
+                    }
+                    if remote != nil && source.official {
+                        Text("更换代理后，需要在服务器重新登录并重新确认自动重置授权。")
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                 }
                 Section("模型") {
@@ -96,7 +145,10 @@ struct SourceEditor: View {
                             Button("刷新") { Task { await loadModels() } }
                                 .disabled(loadingModels || saving || !canFetch)
                         }
-                        if source.official && !canFetch {
+                        if let remote, !canFetch {
+                            Text(remote.target.management.capabilities.contains("models.list") ? "仅能查询已提交的来源。若修改了地址、代理或密钥，请先提交更改。" : "此服务器不支持手动刷新模型。")
+                                .font(.system(size: 12)).foregroundStyle(.secondary)
+                        } else if source.official && !canFetch {
                             Text("登录后自动获取模型。").font(.system(size: 12)).foregroundStyle(.secondary)
                         }
                         if !source.models.isEmpty {
@@ -131,12 +183,12 @@ struct SourceEditor: View {
             VStack(alignment: .leading, spacing: 10) {
                 if let localError { InfoNote(text: localError, symbol: "exclamationmark.triangle", color: .orange) }
                 HStack(spacing: 12) {
-                    Text("保存后，来源设置才会生效。")
+                    Text(remote == nil ? "保存后，来源设置才会生效。" : "保存到草稿，提交后才在服务器生效。")
                         .font(AppTypography.caption).foregroundStyle(.secondary)
                     Spacer()
                     Button("取消", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction).disabled(saving)
-                    Button(saving ? "保存中…" : isNew && source.official && model.loginFlow == nil ? "添加并登录…" : isNew ? "添加来源" : "保存来源") { save() }
-                        .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(saving || !model.running || model.busy || model.metadataLoadFailed)
+                    Button(saveTitle) { save() }
+                        .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(saveUnavailable)
                 }
             }.padding(.horizontal, 24).padding(.vertical, 14)
         }.font(AppTypography.body).background(AppPalette.canvas).frame(width: 640, height: 600)
@@ -144,7 +196,7 @@ struct SourceEditor: View {
             .defaultFocus($nameFocused, true)
             .task(id: discoveryInput) {
                 fetchID = UUID(); loadingModels = false; modelError = nil
-                guard automaticModels, canFetch, !saving else { return }
+                guard remote == nil, automaticModels, canFetch, !saving else { return }
                 do { try await Task.sleep(for: .milliseconds(800)) } catch { return }
                 guard !saving else { return }
                 await loadModels()
@@ -166,7 +218,7 @@ struct SourceEditor: View {
     private func configuredSource() throws -> Source {
         var draft = source
         if draft.proxy.mode != "explicit" { draft.proxy.url = nil }
-        else if !proxyPort.isEmpty || draft.proxy.url == nil || draft.proxy.localPort != nil {
+        else if remote == nil && (!proxyPort.isEmpty || draft.proxy.url == nil || draft.proxy.localPort != nil) {
             draft.proxy = try draft.proxy.withLocalPort(proxyPort)
         }
         return draft
@@ -178,8 +230,16 @@ struct SourceEditor: View {
         loadingModels = true; modelError = nil
         defer { if fetchID == requestID { loadingModels = false } }
         do {
-            let draft = try configuredSource()
-            let models = try await model.fetchModels(for: draft, apiKey: apiKey)
+            let models: [String]
+            if let remote {
+                guard canFetch else { return }
+                let response = try await remote.target.call("models.list", ["source_id": .string(source.id)])
+                guard canFetch else { return }
+                models = try remoteConsoleDecode([String].self, response["models"])
+            } else {
+                let draft = try configuredSource()
+                models = try await model.fetchModels(for: draft, apiKey: apiKey)
+            }
             guard !Task.isCancelled, !saving, fetchID == requestID, discoveryInput == input else { return }
             source.models = models
         } catch {
@@ -204,10 +264,15 @@ struct SourceEditor: View {
                 draft.automaticModelDiscovery = automaticModels
                 if !automaticModels {
                     draft.models = Array(Set(modelsText.split(whereSeparator: { $0 == "," || $0 == "，" }).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
-                } else if source.models == initialModels, apiKey.isEmpty,
+                } else if remote == nil, source.models == initialModels, apiKey.isEmpty,
                           let current = model.settings.sources.first(where: { $0.id == source.id }),
                           current.base_url == draft.base_url, current.proxy == draft.proxy {
                     draft.models = current.models
+                }
+                if let remote {
+                    try remote.stage(draft, key: apiKey)
+                    apiKey = ""; saving = false; dismiss()
+                    return
                 }
                 try await model.saveSource(draft, apiKey: apiKey)
                 apiKey = ""; dismiss()

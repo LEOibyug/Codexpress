@@ -2,8 +2,12 @@ import SwiftUI
 
 /// The server replaces settings atomically. Keep untouched settings and source metadata exactly as received.
 struct RemoteConsoleConfig {
-    let sources: [JSONValue]
-    let settings: [String: JSONValue]
+    var sources: [JSONValue]
+    var settings: [String: JSONValue]
+
+    init(sources: [JSONValue], settings: [String: JSONValue]) {
+        self.sources = sources; self.settings = settings
+    }
 
     init(_ value: JSONValue) throws {
         guard case let .array(sources) = value["sources"], case let .object(settings) = value["settings"] else { throw RemoteConsoleError.invalid }
@@ -20,6 +24,7 @@ struct RemoteConsoleConfig {
     @Published private(set) var modelInfo: JSONValue = .null
     @Published private(set) var modelUsage: [String: JSONValue] = [:]
     @Published var modelEditorOpen = false
+    var sourceEditorOpen = false
     @Published private(set) var historyStatus: JSONValue = .null
     @Published var historyEnabled = false
     @Published var historyCapacity = ""
@@ -57,7 +62,7 @@ struct RemoteConsoleConfig {
         guard !submitting, peer.current, !needsReload || discard else { return }
         do {
             if target?.pool.revision != peer.pool.revision || config == nil || discard {
-                if (changed || modelEditorOpen) && !discard { requireReload("服务器配置已变更。请重新载入后编辑，原草稿不会覆盖服务器。"); return }
+                if (changed || modelEditorOpen || sourceEditorOpen) && !discard { requireReload("服务器配置已变更。请重新载入后编辑，原草稿不会覆盖服务器。"); return }
                 let next = try RemoteConsoleConfig(try await peer.call("config.get"))
                 guard !submitting, peer.current else { return }
                 editingSession = UUID()
@@ -140,6 +145,7 @@ struct RemoteConsoleConfig {
                 let result = try await target.call("config.save", ["sources": .array(sources), "settings": .object(settings)])
                 guard result["revision"].string != nil else { throw RemoteConsoleError.invalid }
                 config = nil // Never re-use the revision that was consumed by this write.
+                sources = [] // Drop pending write-only API keys even if the subsequent refresh fails.
             }
             await target.management.refresh()
             submitting = false

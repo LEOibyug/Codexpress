@@ -30,6 +30,7 @@ struct RemoteSourceAccountActions: View {
     let source: RemotePoolSource
     let snapshot: RemotePoolSnapshot
     let generation: UUID
+    let canQueryUpstream: Bool
     @State private var flow: String?
     @State private var login: RemoteLoginLink?
     @State private var callback = ""
@@ -85,7 +86,7 @@ struct RemoteSourceAccountActions: View {
                             } }
                         }
                         if management.capabilities.contains("official.refresh") {
-                            Button("刷新远端额度") { run { quota = try await call("official.refresh")["quota"] } }
+                            Button("刷新远端额度") { run { quota = try await call("official.refresh")["quota"] } }.disabled(!canQueryUpstream)
                         }
                         if let quota {
                             ForEach(QuotaOverview(quota).mainWindows) { window in LabeledContent(window.title, value: "\(window.remainingLabel) · \(window.resetLabel)") }
@@ -96,7 +97,7 @@ struct RemoteSourceAccountActions: View {
                     Section("服务器模型发现") {
                         Button("查询此来源模型") { run {
                             models = try await call("models.list")["models"].array.compactMap(\.string)
-                        } }
+                        } }.disabled(!canQueryUpstream)
                         if let models { Text(models.isEmpty ? "未发现模型" : models.joined(separator: ", ")).textSelection(.enabled) }
                     }
                 }

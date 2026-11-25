@@ -8,22 +8,7 @@ struct MenuView: View {
 
     var body: some View {
         if management.remoteSelected {
-            VStack(alignment: .leading, spacing: 12) {
-                Label("远端网关", systemImage: "network").font(AppTypography.sectionTitle)
-                Text(management.endpoint).foregroundStyle(.secondary).lineLimit(2)
-                if let pool = management.snapshot {
-                    Text("来源池 · \(pool.sources.count) 个来源")
-                } else { Text(management.busy ? "正在连接…" : "远端未连接") }
-                RemoteGatewayFreshness()
-                if let error = management.message { Text(error).font(AppTypography.caption).foregroundStyle(.orange) }
-                Divider()
-                HStack {
-                    Button("管理远端来源池") { showSettings(.sources) }
-                    Spacer()
-                    Button("退出") { NSApp.terminate(nil) }.keyboardShortcut("q")
-                }
-            }.padding(16).frame(width: 320)
-                .background(WindowOpenRefresh(refresh: { Task { await management.refresh() } }))
+            RemoteGatewayMenuHost()
         } else { localMenu }
     }
 

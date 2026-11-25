@@ -63,6 +63,7 @@ struct RemoteConsoleAccount: View {
     private var binding: String? { value["account_binding"].string }
     private var sourceFields: [String: JSONValue] { ["source_id": .string(session.source.id)] }
     private var official: Bool { session.source.kind == "official" }
+    private var canConsume: Bool { session.target.current && management.capabilities.isSuperset(of: ["official.credits.consume", "official.credits.result", "official.snapshot"]) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -76,7 +77,8 @@ struct RemoteConsoleAccount: View {
                 }
             }
             HStack {
-                Button(official ? "刷新额度和卡片" : "查询上游余额") { Task { await load(force: true) } }.disabled(busy || !session.target.current)
+                Button(official ? "刷新额度和卡片" : "查询上游余额") { Task { await load(force: true) } }
+                    .disabled(busy || !session.target.current || !management.capabilities.contains(official ? "official.refresh" : "balance.query"))
                 Spacer(); Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction)
             }
         }.padding(22).frame(width: 550, height: 550)
@@ -118,7 +120,7 @@ struct RemoteConsoleAccount: View {
                         }
                         Spacer()
                         Button("使用…") { if let binding { confirmation = RemoteCardSelection(id: id, binding: binding, card: card) } }
-                            .disabled(!session.target.current || busy || !journalAvailable || binding == nil || !inventory.isFresh || !CreditInventory.isUsable(card) || records.contains { $0.binding == binding && $0.card == id })
+                            .disabled(!canConsume || busy || !journalAvailable || binding == nil || !inventory.isFresh || !CreditInventory.isUsable(card) || records.contains { $0.binding == binding && $0.card == id })
                     }
                 }
             }
@@ -133,7 +135,7 @@ struct RemoteConsoleAccount: View {
                             if let windows = record.windows { Text("已重置 \(windows) 个额度窗口").font(.caption) }
                             Text(record.id.uuidString).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                         }
-                        Spacer(); Button("核对结果") { lookup(record) }.disabled(busy || !session.target.current)
+                        Spacer(); Button("核对结果") { lookup(record) }.disabled(busy || !session.target.current || !management.capabilities.contains("official.credits.result"))
                     }
                 }
             }
@@ -162,7 +164,7 @@ struct RemoteConsoleAccount: View {
     }
 
     private func redeem(_ selected: RemoteCardSelection) {
-        guard !busy, session.target.current, journalAvailable else { return }
+        guard !busy, canConsume, journalAvailable else { return }
         busy = true
         Task {
             defer { busy = false }
@@ -171,7 +173,7 @@ struct RemoteConsoleAccount: View {
                 let live = try await session.target.call("official.snapshot", sourceFields)
                 guard live["account_binding"].string == selected.binding,
                       let current = CreditInventory(live["credits"]).usableCards.first(where: { $0["id"].string == selected.id }),
-                      ["status", "expires_at", "expiry_known", "reset_type"].allSatisfy({ current[$0] == selected.card[$0] }), session.target.current else { throw RemoteConsoleError.invalid }
+                      ["status", "expires_at", "expiry_known", "reset_type"].allSatisfy({ current[$0] == selected.card[$0] }), canConsume else { throw RemoteConsoleError.invalid }
                 let record = try book.reserve(source: session.source.id, binding: selected.binding, card: selected.id)
                 records = try book.read()
                 var fields = record.resultFields; fields["confirmed"] = .bool(true); fields["credit_id"] = .string(record.card)

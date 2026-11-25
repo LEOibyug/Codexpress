@@ -53,10 +53,8 @@ struct GatewayTargetSheet: View {
 
 struct RemoteGatewayPoolView: View {
     @EnvironmentObject private var management: RemoteGatewayManagement
-    private struct EditSession: Identifiable { let id = UUID(); let pool: RemotePoolSnapshot; let generation: UUID; let fullEditor: Bool }
+    private struct EditSession: Identifiable { let id = UUID(); let pool: RemotePoolSnapshot }
     @State private var editing: EditSession?
-    private struct AccountSession: Identifiable { let id = UUID(); let source: RemotePoolSource; let pool: RemotePoolSnapshot; let generation: UUID }
-    @State private var account: AccountSession?
     @State private var showingOMP = false
 
     var body: some View {
@@ -78,7 +76,7 @@ struct RemoteGatewayPoolView: View {
                     RemoteRuntimeSummary(data: management.runtimeData)
                     SettingsCard("远端来源", symbol: "server.rack", accessory: {
                         Button("编辑来源池") {
-                            editing = EditSession(pool: pool, generation: management.targetGeneration, fullEditor: management.capabilities.contains("config.edit"))
+                            editing = EditSession(pool: pool)
                         }.disabled(management.busy)
                     }) {
                         if pool.sources.isEmpty { Text("暂无来源").foregroundStyle(.secondary) }
@@ -90,9 +88,6 @@ struct RemoteGatewayPoolView: View {
                                     Text(source.name)
                                     if pool.mode == "fixed", source.id == pool.fixedSourceID { Text("固定").font(AppTypography.caption).foregroundStyle(.tint) }
                                     Spacer()
-                                    if management.capabilities.contains("config.edit"), management.capabilities.contains("models.list") || (source.kind == "official" && management.capabilities.contains("official.refresh")) {
-                                        Button(source.kind == "official" ? "登录与额度…" : "模型发现…") { account = AccountSession(source: source, pool: pool, generation: management.targetGeneration) }
-                                    }
                                     Text(source.enabled ? "已启用" : "已停用").foregroundStyle(.secondary)
                                 }
                             }
@@ -102,14 +97,8 @@ struct RemoteGatewayPoolView: View {
                 else { Text("远端来源池不可用。请刷新或切换管理网关。").foregroundStyle(.secondary) }
             }.settingsPage()
         }
-        .sheet(item: $editing) { session in
-            if session.fullEditor { RemoteSourceSettings(snapshot: session.pool, generation: session.generation) }
-            else { RemotePoolEditor(snapshot: session.pool) }
-        }
-        .sheet(item: $account) { session in
-            RemoteSourceAccountActions(source: session.source, snapshot: session.pool, generation: session.generation)
-        }
-        .onChange(of: management.targetGeneration) { _, _ in editing = nil; account = nil }
+        .sheet(item: $editing) { session in RemotePoolEditor(snapshot: session.pool) }
+        .onChange(of: management.targetGeneration) { _, _ in editing = nil }
         .sheet(isPresented: $showingOMP) {
             VStack(alignment: .trailing, spacing: 0) {
                 OMPSettingsView()

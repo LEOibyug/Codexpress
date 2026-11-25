@@ -410,6 +410,12 @@ final class RemoteGatewayManagement: ObservableObject {
         ompMessage = failure
     }
 
+    func ingressKeys(for target: RemotePoolSnapshot) throws -> RemoteIngressKeys {
+        guard remoteSelected, target.loadID == targetID, let profile,
+              target.instanceID == profile.instanceID, snapshot?.revision == target.revision else { throw CancellationError() }
+        return RemoteIngressKeys(directory: file.directory, endpoint: profile.endpoint, instance: profile.instanceID)
+    }
+
     /// Read-only polling may run concurrently. Mutation admission is checked again on the server under its pool lock.
     func operation(_ name: String, payload: JSONValue = .object([:]), on target: RemotePoolSnapshot) async throws -> JSONValue {
         func matchesTarget() -> Bool {
@@ -435,6 +441,7 @@ final class RemoteGatewayManagement: ObservableObject {
             // A GET issued before this write may still be in flight. Never join that stale GET after saving.
             if activity == .refreshing { supersede(); activity = .idle }
         } else if snapshot?.revision != target.revision { throw CancellationError() }
+        if name == "device.issue", result["key"].string == profile.token { throw RemoteManagementError("设备密钥无效。") }
         try Task.checkCancellation()
         return result
     }

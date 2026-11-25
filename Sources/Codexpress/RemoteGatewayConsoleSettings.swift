@@ -6,32 +6,40 @@ struct RemoteGeneralSettingsPage: View {
     var body: some View {
         if let target = draft.target, let config = draft.config {
             GeneralSettingsPage(subtitle: "登录时启动仅影响此 Mac；网关设置提交至 \(target.endpoint)。") {
-                OfficialQuotaSettingsCard(minutes: integerText("official_quota_refresh_minutes", default: 30, range: 1...1440),
+                OfficialQuotaSettingsCard(minutes: draft.integerText("official_quota_refresh_minutes", default: 30, range: 1...1440),
                     subtitle: "提交后立即生效，不影响前台或手动刷新。",
                     error: draft.settings["official_quota_refresh_minutes"]?.string == nil ? nil : "请输入 1–1440 之间的整数分钟。",
                     detail: "服务器的查询间隔为 1–1440 分钟。")
                 RemoteHistoryCacheCard(draft: draft, target: target)
-                routingCards(target)
+                RemoteRoutingSettingsCards(draft: draft, target: target)
                 RemoteWeeklyResetCard(draft: draft, target: target, config: config)
             }
         }
     }
 
-    private func routingCards(_ target: RemoteConsoleTarget) -> some View {
-        let sources = target.pool.sources.filter(\.enabled)
-        return RoutingSettingsCards(enabledSources: sources, sourceName: \.name,
-            mode: Binding(get: { draft.settings["mode"]?.string ?? "auto" }, set: { mode in
-                draft.settings["mode"] = .string(mode)
-                if mode == "auto" { draft.settings["fixed_source_id"] = .null }
-                else if !sources.contains(where: { $0.id == draft.settings["fixed_source_id"]?.string }), let first = sources.first {
-                    draft.settings["fixed_source_id"] = .string(first.id)
-                }
-            }),
-            fixedSource: Binding(get: { draft.settings["fixed_source_id"]?.string ?? "" }, set: { draft.settings["fixed_source_id"] = .string($0) }),
-            loadBalance: flag("load_balance"), quotaThreshold: integer("official_low_quota_percent", default: 10),
-            attempts: integer("upstream_attempts", default: 3), retryDelay: integer("upstream_retry_delay_seconds", default: 3),
-            idleMinutes: integer("idle_return_minutes", default: 5), rebuild: flag("degraded_context_fallback", default: true),
-            customIdleMinutes: integerText("idle_return_minutes", default: 5, range: 0...10080))
+}
+
+struct RemoteRoutingSettingsCards: View {
+    @ObservedObject var draft: RemotePreferencesDraft
+    let target: RemoteConsoleTarget
+
+    var body: some View {
+        if let all = try? RemotePoolDraft(draft, target: target).list() {
+            let sources = all.filter(\.enabled)
+            RoutingSettingsCards(enabledSources: sources, sourceName: \.name,
+                mode: Binding(get: { draft.settings["mode"]?.string ?? "auto" }, set: { mode in
+                    draft.settings["mode"] = .string(mode)
+                    if mode == "auto" { draft.settings["fixed_source_id"] = .null }
+                    else if !sources.contains(where: { $0.id == draft.settings["fixed_source_id"]?.string }), let first = sources.first {
+                        draft.settings["fixed_source_id"] = .string(first.id)
+                    }
+                }),
+                fixedSource: Binding(get: { draft.settings["fixed_source_id"]?.string ?? "" }, set: { draft.settings["fixed_source_id"] = .string($0) }),
+                loadBalance: flag("load_balance"), quotaThreshold: integer("official_low_quota_percent", default: 10),
+                attempts: integer("upstream_attempts", default: 3), retryDelay: integer("upstream_retry_delay_seconds", default: 3),
+                idleMinutes: integer("idle_return_minutes", default: 5), rebuild: flag("degraded_context_fallback", default: true),
+                customIdleMinutes: draft.integerText("idle_return_minutes", default: 5, range: 0...10080))
+        } else { InfoNote(text: "无法读取来源配置，请重新载入。", color: .orange) }
     }
 
     private func flag(_ key: String, default fallback: Bool = false) -> Binding<Bool> {
@@ -41,12 +49,14 @@ struct RemoteGeneralSettingsPage: View {
     private func integer(_ key: String, default fallback: Int) -> Binding<Int> {
         Binding(get: { draft.settings[key]?.number.flatMap { Int(exactly: $0) } ?? fallback }, set: { draft.settings[key] = .number(Double($0)) })
     }
+}
 
-    private func integerText(_ key: String, default fallback: Int, range: ClosedRange<Int>) -> Binding<String> {
-        Binding(get: { draft.settings[key]?.string ?? String(integer(key, default: fallback).wrappedValue) }, set: { text in
+private extension RemotePreferencesDraft {
+    func integerText(_ key: String, default fallback: Int, range: ClosedRange<Int>) -> Binding<String> {
+        Binding(get: { self.settings[key]?.string ?? String(self.settings[key]?.number.flatMap { Int(exactly: $0) } ?? fallback) }, set: { text in
             if let value = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)), range.contains(value) {
-                draft.settings[key] = .number(Double(value))
-            } else { draft.settings[key] = .string(text) }
+                self.settings[key] = .number(Double(value))
+            } else { self.settings[key] = .string(text) }
         })
     }
 }
@@ -70,7 +80,7 @@ private struct RemoteWeeklyResetCard: View {
         SettingsCard("自动使用周重置卡", subtitle: "默认关闭。授权后，服务器可在该账号周额度耗尽时自动使用卡片，无需本机在线。", symbol: "calendar.badge.clock") {
             if accounts.isEmpty { Text("没有官方账号").foregroundStyle(.secondary) }
             ForEach(accounts) { source in
-                let binding = config.sources.first { $0["id"].string == source.id }?["reset_consent_binding"].string
+                let binding = draft.sources.first { $0["id"].string == source.id }?["reset_consent_binding"].string
                 let id = JSONValue.string(source.id)
                 SettingRow(title: source.name) {
                     Toggle(source.name, isOn: Binding(get: { enrolled.contains(id) }, set: { enabled in
@@ -86,7 +96,7 @@ private struct RemoteWeeklyResetCard: View {
             Button("允许") {
                 let id = JSONValue.string(request.source.id)
                 guard request.target.current, draft.target?.generation == request.target.generation, !draft.submitting,
-                      draft.config?.sources.first(where: { $0["id"] == id })?["reset_consent_binding"].string == request.binding,
+                      draft.sources.first(where: { $0["id"] == id })?["reset_consent_binding"].string == request.binding,
                       !enrolled.contains(id) else { return }
                 updateEnrollment(enrolled + [id])
             }

@@ -10,12 +10,13 @@ struct RemoteSettingsWorkspace: View {
 
     var body: some View {
         switch page {
-        case .sources: RemoteGatewayPoolView()
-        case .general, .models:
+        case .sources where !management.capabilities.contains("config.get"): RemoteGatewayPoolView()
+        case .sources, .general, .models:
             VStack(spacing: 0) {
                 if draft.config != nil {
                     Group {
-                        if page == .models { RemoteModelSettingsPage(draft: draft) }
+                        if page == .sources { RemoteSourcesPage(draft: draft) }
+                        else if page == .models { RemoteModelSettingsPage(draft: draft) }
                         else { RemoteGeneralSettingsPage(draft: draft) }
                     }.id(draft.editingSession)
                         .disabled(draft.submitting || draft.needsReload || management.snapshot == nil)
@@ -30,7 +31,7 @@ struct RemoteSettingsWorkspace: View {
                         }.disabled(draft.submitting)
                     }.padding(.horizontal).padding(.vertical, 6)
                 }
-                if draft.config != nil && (page == .general || !draft.modelEditorOpen) {
+                if draft.config != nil && (page != .models || !draft.modelEditorOpen) {
                     Divider()
                     HStack {
                         Spacer()
@@ -56,7 +57,7 @@ struct RemoteSettingsWorkspace: View {
             .alert("重新载入服务器设置？", isPresented: $confirmingReload) {
                 Button("取消", role: .cancel) {}
                 Button("重新载入", role: .destructive) { Task { await refresh(discard: true) } }
-            } message: { Text("将放弃此网关尚未提交的模型和设置修改。") }
+            } message: { Text("将放弃此网关尚未提交的来源、模型和设置修改。") }
         default: RemoteGatewayConsole(page: page)
         }
     }

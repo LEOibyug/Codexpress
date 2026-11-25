@@ -588,7 +588,8 @@ private struct ProviderModelsEditor: View {
     }
 
     private func canRefresh(_ source: Source) -> Bool {
-        model.running && !model.busy && !isRefreshing(source) && model.canDiscover && (model.remote != nil || !source.official || source.account_id != nil)
+        model.running && !model.busy && !isRefreshing(source) && model.canDiscover &&
+            (model.remote.map { RemotePoolDraft($0.draft, target: $0.target).isSavedDestination(source) } ?? (!source.official || source.account_id != nil))
     }
 
     private func refreshModels(_ source: Source) async {

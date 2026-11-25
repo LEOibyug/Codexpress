@@ -90,7 +90,7 @@ import Foundation
 
     func settings() throws -> AppSettings {
         var settings = AppSettings()
-        settings.sources = try RemoteSourceConfiguration(.object(["sources": .array(draft.sources), "settings": .object(draft.settings)])).sources
+        settings.sources = try draft.sources.map(RemoteConsoleConfig.source)
         if let rows = draft.settings["model_policies"], rows != .null { settings.modelPolicies = try remoteConsoleDecode([ModelPolicy].self, rows) }
         if let rows = draft.settings["model_compaction"], rows != .null { settings.modelCompaction = try remoteConsoleDecode([ModelCompactionRule].self, rows) }
         try ModelPolicy.validate(settings.modelPolicies ?? [])
@@ -179,24 +179,26 @@ import Foundation
         if rows != existing { fields[key] = .array(rows) }
     }
 
+    static func stageDiscoveredPolicies(_ source: Source, previous: [String], config: inout RemoteConsoleConfig) throws {
+        var next = AppSettings()
+        next.sources = try config.sources.map(RemoteConsoleConfig.source)
+        let old = try config.settings["model_policies"].flatMap { $0 == .null ? nil : try remoteConsoleDecode([ModelPolicy].self, $0) } ?? []
+        try ModelPolicy.validate(old); next.modelPolicies = old
+        AppModel.applyDefaultDisabledPolicies(for: source, previousModels: previous, in: &next)
+        try updateRows(key: "model_policies", old: old, new: next.modelPolicies ?? [], id: \.model, in: &config.settings)
+    }
+
     func discover(_ source: Source) async throws {
-        guard canEdit, target.management.capabilities.contains("models.list") else { throw RemoteConsoleError.invalid }
+        let pool = RemotePoolDraft(draft, target: target)
+        guard canEdit, target.management.capabilities.contains("models.list"), pool.isSavedDestination(source) else { throw RemoteConsoleError.invalid }
         let result = try await target.call("models.list", ["source_id": .string(source.id)])
-        guard canEdit, case let .array(rows) = result["models"], !rows.isEmpty,
-              let index = draft.sources.firstIndex(where: { $0["id"].string == source.id }),
-              case var .object(fields) = draft.sources[index] else { throw RemoteConsoleError.invalid }
+        guard canEdit, case let .array(rows) = result["models"], !rows.isEmpty, pool.isSavedDestination(source),
+              try pool.list().contains(source) else { throw RemoteConsoleError.invalid }
         let ids = try rows.map { value -> String in
             guard let id = value.string else { throw RemoteConsoleError.invalid }; try ModelPolicy.validateModelID(id); return id
         }
-        var next = try settings()
-        guard let i = next.sources.firstIndex(where: { $0 == source }) else { throw RemoteConsoleError.invalid }
         guard source.models != ids else { return }
-        let old = next.modelPolicies ?? []
-        var discovered = next.sources[i]; discovered.models = ids; next.sources[i] = discovered
-        AppModel.applyDefaultDisabledPolicies(for: discovered, previousModels: source.models, in: &next)
-        var settings = draft.settings
-        try Self.updateRows(key: "model_policies", old: old, new: next.modelPolicies ?? [], id: \.model, in: &settings)
-        fields["models"] = .array(rows)
-        draft.sources[index] = .object(fields); draft.settings = settings
+        var discovered = source; discovered.models = ids
+        try pool.stage(discovered)
     }
 }
