@@ -29,6 +29,7 @@ impl ManualRouting {
                     runtime.source.id == trial.source_id
                         && runtime.source.identity() == trial.identity
                         && runtime.source.enabled
+                        && runtime.source.has_credentials()
                 })
             }) {
                 *pending = None;
@@ -72,7 +73,7 @@ impl ManualRouting {
             runtime.source.id == trial.source_id
                 && runtime.source.identity() == trial.identity
                 && runtime.source.enabled
-                && has_credentials(&runtime.source)
+                && runtime.source.has_credentials()
                 && !super::official_exhausted(runtime, sources)
         });
         if source.is_none_or(|runtime| {
@@ -112,19 +113,6 @@ pub(crate) async fn claim(state: &Arc<AppState>, model: &str) -> Option<Trial> {
     let sources = state.sources.read().await;
     state.manual_routing.refresh(&sources, &state.affinity);
     state.manual_routing.claim(model, &sources, &policies)
-}
-
-pub(super) fn has_credentials(source: &Source) -> bool {
-    let fields: &[&str] = if source.kind == "official" {
-        &["access_token", "refresh_token"]
-    } else {
-        &["api_key"]
-    };
-    fields.iter().any(|field| {
-        source.secret[*field]
-            .as_str()
-            .is_some_and(|s| !s.is_empty())
-    })
 }
 
 pub(crate) async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> Result<Value> {
@@ -176,7 +164,7 @@ pub(crate) async fn handle(state: &Arc<AppState>, op: &str, payload: Value) -> R
     if !source.enabled {
         bail!("请先启用此来源");
     }
-    if !has_credentials(source) {
+    if !source.has_credentials() {
         bail!("请先登录或填写此来源的密钥");
     }
     if super::official_exhausted(runtime, &sources) {
@@ -212,7 +200,7 @@ pub(crate) async fn source_for_trial(
                 && r.source.enabled
                 && model_policy::source_allowed(&policies, model, &r.source.id)
                 && !super::official_exhausted(r, &sources)
-                && has_credentials(&r.source)
+                && r.source.has_credentials()
                 && (r.source.models.is_empty() || r.source.models.iter().any(|m| m == model))
         })
         .map(|r| r.source.clone())
@@ -230,6 +218,7 @@ pub(crate) async fn reserve(
         r.source.id == source.id
             && r.source.identity() == source.identity()
             && r.source.enabled
+            && r.source.has_credentials()
             && model_policy::source_allowed(&policies, model, &r.source.id)
             && !super::official_exhausted(r, &sources)
             && (r.source.models.is_empty() || r.source.models.iter().any(|m| m == model))

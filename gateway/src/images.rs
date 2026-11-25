@@ -282,6 +282,7 @@ fn source_available(runtime: &SourceRuntime) -> bool {
     // Chat quota exhaustion does not establish image quota exhaustion.
     runtime.source.kind == "official"
         && runtime.source.enabled
+        && runtime.source.has_credentials()
         && (matches!(runtime.health.as_str(), "ready" | "exhausted")
             || matches!(runtime.health.as_str(), "cooldown" | "proxy_error")
                 && runtime.cooldown_until.is_some_and(|until| until <= now()))

@@ -155,7 +155,7 @@ final class ChatbotEnvironmentAccessTests: XCTestCase {
                 elif op == 'gateway.update.info':
                     data = dict(protocol=1, version='0.8.26')
                 elif op == 'credentials.storage.status':
-                    data = dict(mode='file')
+                    data = dict(mode='file', file_path=str(directory / 'credentials.json'))
                 elif op == 'chatbot.status':
                     data = dict(enabled=True, running=True, port=17899, base_url='http://127.0.0.1:17899/v1')
                 elif op == 'chatbot.key':

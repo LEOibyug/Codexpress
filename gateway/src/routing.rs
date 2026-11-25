@@ -115,6 +115,7 @@ async fn recovery_readiness(
     for runtime in runtimes.iter() {
         let source = &runtime.source;
         if !source.enabled
+            || !source.has_credentials()
             || !model_policy::source_allowed(&policies, model, &source.id)
             || !(model.is_empty()
                 || source.models.is_empty()
@@ -230,6 +231,7 @@ async fn candidate_sources(
         .filter(|runtime| {
             let source = &runtime.source;
             source.enabled
+                && source.has_credentials()
                 && model_policy::source_allowed(&policies, model, &source.id)
                 && (model.is_empty()
                     || source.models.is_empty()
@@ -401,7 +403,7 @@ pub async fn reserve_idle_return(
     let from_rank = all.iter().position(|source| source.id == preferred)?;
     let mut targets: Vec<_> = sources.iter().filter(|runtime| {
         let source = &runtime.source;
-        source.enabled && model_policy::source_allowed(&policies, model, &source.id)
+        source.enabled && source.has_credentials() && model_policy::source_allowed(&policies, model, &source.id)
             && (if custom_sources {
                 all.iter().position(|candidate| candidate.id == source.id).is_some_and(|rank| rank < from_rank)
             } else {
@@ -468,6 +470,7 @@ async fn reserve_model_with_policy(
         runtime.source.id == source.id
             && runtime.source.identity() == source.identity()
             && runtime.source.enabled
+            && runtime.source.has_credentials()
             && model_policy::source_allowed(&policies, model, &runtime.source.id)
             && (model.is_empty()
                 || runtime.source.models.is_empty()
@@ -477,6 +480,7 @@ async fn reserve_model_with_policy(
         .iter()
         .filter(|runtime| {
             runtime.source.enabled
+                && runtime.source.has_credentials()
                 && model_policy::source_allowed(&policies, model, &runtime.source.id)
                 && (model.is_empty()
                     || runtime.source.models.is_empty()
@@ -562,7 +566,7 @@ fn admission_status(
         "已停用"
     } else if official_exhausted(runtime, sources) {
         "额度耗尽"
-    } else if strict && !manual::has_credentials(&runtime.source) {
+    } else if !runtime.source.has_credentials() {
         if runtime.source.kind == "official" {
             "需要登录"
         } else {

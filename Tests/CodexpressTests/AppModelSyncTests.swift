@@ -3,6 +3,59 @@ import Darwin
 @testable import Codexpress
 
 final class AppModelSyncTests: XCTestCase {
+    @MainActor func testUnverifiedCredentialStoreCannotReceiveCredentialsDuringStartupRepairOrShutdown() async throws {
+        let directory = try gatewayFixtureDirectory()
+        var source = Source(); source.name = "Existing API"
+        var settings = AppSettings(); settings.sources = [source]
+        let metadata = MetadataStore(directory: directory)
+        try metadata.save(settings)
+        let original = try Data(contentsOf: metadata.file)
+        let log = directory.appendingPathComponent("operations")
+        try Data().write(to: log)
+        let model = AppModel(stateDirectory: directory)
+        defer { model.stop() }
+        XCTAssertEqual(model.localCredentialFile.path, directory.appendingPathComponent("credentials.json").path)
+
+        for invalid in [#"{"mode":"file","file_path":"relative.json"}"#, #"{"mode":"keychain"}"#] {
+            try Data(invalid.utf8).write(to: directory.appendingPathComponent("storage-status.json"))
+            await model.startHelper()
+            XCTAssertFalse(model.running)
+            XCTAssertTrue(model.error?.contains("未读取任何凭据") == true)
+            do { try await model.sync(); XCTFail("Unverified store accepted a sync") } catch {}
+            do { try await model.saveSource(source, apiKey: "fixture-key"); XCTFail("Unverified store accepted a key") } catch {}
+            await model.poll()
+        }
+        let active = try await model.activeRequestsBeforeTermination()
+        XCTAssertEqual(active, 0)
+        await model.shutdown()
+        let operations = try String(contentsOf: log).split(separator: "\n")
+        XCTAssertEqual(operations.filter { $0 == "credentials.storage.status" }.count, 2)
+        XCTAssertTrue(operations.allSatisfy { ["status", "gateway.update.info", "credentials.storage.status"].contains($0) }, "Unexpected operations: \(operations)")
+        XCTAssertEqual(try Data(contentsOf: metadata.file), original)
+    }
+
+    @MainActor func testAPIKeysCanBeRestoredIndividuallyWithoutChangingTheFixedRoute() async throws {
+        let directory = try gatewayFixtureDirectory()
+        var first = Source(); first.name = "First"; first.automaticModelDiscovery = false
+        var fixed = Source(); fixed.name = "Fixed"; fixed.automaticModelDiscovery = false
+        var settings = AppSettings(); settings.sources = [first, fixed]; settings.mode = "fixed"; settings.fixed_source_id = fixed.id
+        let metadata = MetadataStore(directory: directory)
+        try metadata.save(settings)
+        let model = await startGateway(in: directory)
+        defer { model.stop() }
+
+        try await model.saveSource(first, apiKey: "fixture-first")
+        XCTAssertTrue(model.isMissingCredential(fixed))
+        let applied = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: directory.appendingPathComponent("applied-settings.json")))
+        XCTAssertEqual(applied["mode"].string, "fixed")
+        XCTAssertEqual(applied["fixed_source_id"].string, fixed.id)
+        XCTAssertEqual(applied["sources"].array.map { $0["id"].string }, [first.id, fixed.id])
+        XCTAssertEqual(applied["sources"].array.first?["secret"]["api_key"].string, "fixture-first")
+        try await model.saveSource(fixed, apiKey: "fixture-fixed")
+        XCTAssertFalse(model.isMissingCredential(fixed))
+        XCTAssertEqual(try metadata.load().fixed_source_id, fixed.id)
+    }
+
     @MainActor func testBackupRefreshKeepsVisibleDataAndRejectsPreviousDirectoryResults() async throws {
         let directory = try gatewayFixtureDirectory()
         let first = directory.appendingPathComponent("first")
@@ -314,6 +367,7 @@ final class AppModelSyncTests: XCTestCase {
         let model = AppModel(stateDirectory: directory)
         await model.startHelper()
         XCTAssertTrue(model.running, model.error ?? "Fixture helper did not start")
+        XCTAssertEqual(model.localCredentialFile.path, directory.appendingPathComponent("legacy-file.json").path)
         return model
     }
 
@@ -433,22 +487,26 @@ final class AppModelSyncTests: XCTestCase {
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(directory / 'control.sock'))
     server.listen()
+    api_keys = {}
     while True:
         connection, _ = server.accept()
         with connection:
             request = json.loads(connection.makefile('rb').readline())
             operation = request['op']
+            if (directory / 'operations').exists():
+                with (directory / 'operations').open('a') as log: log.write(operation + '\n')
             try:
                 if operation == 'status':
                     mode = directory / 'connection-mode'
                     applied = directory / 'applied-settings.json'
                     sources = json.loads(applied.read_text())['sources'] if applied.exists() else []
                     for source in sources: source.pop('secret', None)
-                    data = dict(process_id=os.getpid(), port=17863, sources=sources, connection_mode=mode.read_text() if mode.exists() else 'unmanaged')
+                    data = dict(process_id=os.getpid(), port=17863, inflight=0, sources=sources, connection_mode=mode.read_text() if mode.exists() else 'unmanaged')
                 elif operation == 'gateway.update.info':
                     data = dict(protocol=1, version='0.8.26')
                 elif operation == 'credentials.storage.status':
-                    data = dict(mode='file')
+                    status = directory / 'storage-status.json'
+                    data = json.loads(status.read_text()) if status.exists() else dict(mode='file', file_path=str(directory / 'legacy-file.json'))
                 elif operation == 'models.list':
                     (directory / 'models-started').touch()
                     while (directory / 'hold-models').exists(): time.sleep(0.01)
@@ -471,6 +529,10 @@ final class AppModelSyncTests: XCTestCase {
                 elif operation == 'credentials':
                     notice = directory / 'updated-secrets.json'
                     data = dict(updated_secrets=json.loads(notice.read_text()) if notice.exists() else [])
+                elif operation == 'credentials.save_api':
+                    payload = request['payload']
+                    api_keys[payload['source_id']] = dict(api_key=payload['api_key'])
+                    data = {}
                 elif operation == 'credentials.read':
                     sources = json.loads((directory / 'sources.json').read_text())['sources']
                     by_id = {source['id']: source for source in sources}
@@ -479,7 +541,7 @@ final class AppModelSyncTests: XCTestCase {
                         account = by_id.get(source_id, {}).get('account_id')
                         override = directory / ('account-' + source_id)
                         if override.exists(): account = override.read_text()
-                        secret = dict(account_id=account, access_token='fixture-token') if account else None
+                        secret = dict(account_id=account, access_token='fixture-token') if account else api_keys.get(source_id)
                         items.append(dict(source_id=source_id, secret=secret))
                     data = dict(items=items)
                 elif operation == 'official.refresh':

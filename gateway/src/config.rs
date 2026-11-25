@@ -84,9 +84,9 @@ pub fn secure_write(path: &Path, bytes: &[u8]) -> Result<()> {
             .mode(0o600)
             .open(&temporary)?;
         file.write_all(bytes)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         Ok(())
     })();
     if result.is_err() {

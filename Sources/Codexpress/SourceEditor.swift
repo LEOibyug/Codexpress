@@ -41,9 +41,9 @@ struct SourceEditor: View {
     private var canFetch: Bool {
         guard model.running else { return false }
         if source.official {
-            return model.settings.sources.contains { $0.id == source.id && $0.account_id != nil }
+            return !model.isMissingCredential(source) && model.settings.sources.contains { $0.id == source.id && $0.account_id != nil }
         }
-        return !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (!isNew && model.settings.sources.first(where: { $0.id == source.id })?.base_url == source.base_url)
+        return !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (!isNew && !model.isMissingCredential(source) && model.settings.sources.first(where: { $0.id == source.id })?.base_url == source.base_url)
     }
 
     var body: some View {
@@ -56,7 +56,7 @@ struct SourceEditor: View {
                     TextField("名称", text: $source.name).focused($nameFocused)
                     if !source.official {
                         TextField("API 基址", text: $source.base_url).textContentType(.URL)
-                        SecureField(isNew ? "API 密钥" : "新 API 密钥", text: $apiKey, prompt: Text(isNew ? "API 密钥" : "留空保留现有密钥"))
+                        SecureField("API 密钥", text: $apiKey, prompt: Text(isNew || model.isMissingCredential(source) ? "请输入 API 密钥" : "留空保留现有密钥"))
                     }
                     Toggle("启用此来源", isOn: $source.enabled).toggleStyle(.switch)
                     Toggle("在 cmux 中展示", isOn: Binding(get: { source.showInCmux }, set: { source.show_in_cmux = $0 }))

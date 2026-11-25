@@ -112,7 +112,7 @@ impl Source {
         };
         // Keep established account digests unchanged; unidentified sources must
         // not share quota or conversation state before their first login.
-        let encoded = if self.kind == "official" && authority.is_empty() {
+        let encoded = if authority.is_empty() {
             serde_json::to_vec(&(&self.kind, base_url, ("source", &self.id)))
         } else {
             serde_json::to_vec(&(&self.kind, base_url, authority))
@@ -121,7 +121,26 @@ impl Source {
         format!("{:x}", Sha256::digest(encoded))
     }
 
+    fn has_access_credential(&self) -> bool {
+        let field = if self.kind == "official" { "access_token" } else { "api_key" };
+        self.secret[field].as_str().is_some_and(|s| !s.is_empty())
+    }
+
+    pub(crate) fn has_credentials(&self) -> bool {
+        self.has_access_credential()
+            || (self.kind == "official"
+                && self.secret["refresh_token"].as_str().is_some_and(|s| !s.is_empty()))
+    }
+
     pub fn validate(&self) -> Result<()> {
+        self.validate_configuration()?;
+        if self.kind != "official" && !self.has_access_credential() {
+            bail!("API 来源需要密钥");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_configuration(&self) -> Result<()> {
         if self.id.is_empty()
             || self.id.len() > 128
             || !self
@@ -181,16 +200,6 @@ impl Source {
             }
             _ => bail!("未知代理策略"),
         }
-        if matches!(self.kind.as_str(), "api" | "google" | "openai")
-            && self
-                .secret
-                .get("api_key")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .is_empty()
-        {
-            bail!("API 来源需要密钥");
-        }
         Ok(())
     }
 }
@@ -212,12 +221,7 @@ pub struct SourceRuntime {
 
 impl SourceRuntime {
     pub fn new(source: Source) -> Self {
-        let ready = source.kind != "official"
-            || source
-                .secret
-                .get("access_token")
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty());
+        let ready = source.has_access_credential();
         Self {
             source,
             health: if ready { "ready" } else { "auth_required" }.into(),

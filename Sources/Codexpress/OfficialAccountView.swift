@@ -22,7 +22,7 @@ struct OfficialAccountView: View {
                     .disabled(!model.running || model.busy || model.metadataLoadFailed || model.loginFlow != nil)
                 Button { model.refresh(source.id) } label: {
                     Label(model.refreshingQuotas.contains(source.id) ? "刷新中…" : "刷新额度", systemImage: "arrow.clockwise")
-                }.disabled(!model.running || source.account_id == nil || model.refreshingQuotas.contains(source.id))
+                }.disabled(!model.running || model.isMissingCredential(source) || source.account_id == nil || model.refreshingQuotas.contains(source.id))
             }.controlSize(.small)
             SettingRow(title: "自动使用重置卡", subtitle: source.account_id == nil ? "登录此账号后可启用。" : "此账号的周额度耗尽时，自动消耗最早到期的可用卡片。更换账号或网络设置后需重新启用。") {
                 Toggle("自动使用重置卡", isOn: Binding(get: { source.matchesOfficialStatus(live) && model.settings.weeklyResetEnabled(for: source) }, set: { model.changeAutoResetWeeklyQuota($0, for: source) }))
@@ -108,7 +108,7 @@ struct OfficialResetControl: View {
                 }
             }
         }.controlSize(.small).fixedSize(horizontal: true, vertical: false)
-            .disabled(!model.running || source.account_id == nil)
+            .disabled(!model.running || model.isMissingCredential(source) || source.account_id == nil)
     }
 
     private func resetButton(quick: Bool) -> some View {

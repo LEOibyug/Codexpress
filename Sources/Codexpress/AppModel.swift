@@ -51,7 +51,7 @@ import ServiceManagement
     @Published private(set) var modelErrors: [String: String] = [:]
     @Published private(set) var codexConnectionPhase: String?
     @Published private(set) var configurationBackups: [JSONValue] = []
-    @Published private(set) var credentialStorage: JSONValue = .null
+    @Published private var verifiedCredentialFile: URL?
     @Published private(set) var environmentSyncWorking = false
     @Published private(set) var environmentSynced = false
     @Published private(set) var environmentSyncError: String?
@@ -59,8 +59,14 @@ import ServiceManagement
     let gatewayManagement: RemoteGatewayManagement
     let environmentAccess: ChatbotEnvironmentAccess
     private let metadata: MetadataStore
-    var credentialSnapshot = CredentialSnapshot()
-    let client: GatewayClient
+    @Published var credentialSnapshot = CredentialSnapshot()
+    private let handshakeClient: GatewayClient
+    var client: GatewayClient {
+        get throws {
+            guard canManageCredentials else { throw AppError.message("本机网关尚未确认凭据文件，已停止管理请求。") }
+            return handshakeClient
+        }
+    }
     private var helper: Process?
     private var stagedGateway: URL?
     private var environmentSyncTask: Task<Void, Never>?
@@ -124,13 +130,9 @@ import ServiceManagement
         if localModelSettingsNeedsSync { return "模型设置已变更，请手动同步到本地 Codex。" }
         return "本地模型配置已更新；重新载入 Codex 或下次启动后新建会话生效。"
     }
-    var credentialStorageMode: String { credentialStorage["mode"].string ?? "keychain" }
-    var canManageCredentials: Bool { helper?.isRunning == true && !metadataLoadFailed }
-    var localCredentialFile: URL {
-        let standard = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Codexpress", isDirectory: true)
-        let home = directory.standardizedFileURL == standard.standardizedFileURL ? FileManager.default.homeDirectoryForCurrentUser : directory
-        return home.appendingPathComponent(".codexpress/credentials.json")
-    }
+    var canManageCredentials: Bool { running && helper?.isRunning == true && !shuttingDown && !metadataLoadFailed }
+    var localCredentialFile: URL { verifiedCredentialFile ?? directory.appendingPathComponent("credentials.json") }
+    func isMissingCredential(_ source: Source) -> Bool { running && credentialSnapshot.load(source.id) == nil }
     init(stateDirectory: URL? = nil, environmentAccess: ChatbotEnvironmentAccess? = nil) {
         let override = ProcessInfo.processInfo.environment["CODEXPRESS_STATE_DIR"]
         directory = stateDirectory ?? override.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Codexpress", isDirectory: true)
@@ -143,7 +145,7 @@ import ServiceManagement
             self.environmentAccess = ChatbotEnvironmentAccess(homeDirectory: directory.appendingPathComponent("env-home", isDirectory: true), launchctl: .noop)
         }
         metadata = MetadataStore(directory: directory)
-        client = GatewayClient(socketPath: directory.appendingPathComponent("control.sock").path)
+        handshakeClient = GatewayClient(socketPath: directory.appendingPathComponent("control.sock").path)
         do {
             let loaded = try metadata.load()
             modelSettingsRevision = try ModelSettingsRevision.value(for: loaded)
@@ -194,13 +196,16 @@ import ServiceManagement
         guard !startInProgress else { return }
         startInProgress = true
         defer { startInProgress = false }
+        running = false
+        verifiedCredentialFile = nil
+        credentialSnapshot = CredentialSnapshot()
         var verifiedProcessID: Int32?
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
             // Do not adopt a possibly unrelated live helper without the metadata we own.
             if helper?.isRunning != true {
-                if (try? await client.call("status")) != nil { throw AppError.message("此状态目录已有网关运行，已拒绝接管其他实例。请先退出另一个 Codexpress 实例。") }
+                if (try? await handshakeClient.call("status")) != nil { throw AppError.message("此状态目录已有网关运行，已拒绝接管其他实例。请先退出另一个 Codexpress 实例。") }
                 guard !shuttingDown else { return }
                 if stagedGateway == nil {
                     let source = try ProcessInfo.processInfo.environment["CODEXPRESS_GATEWAY_PATH"].map { URL(fileURLWithPath: $0) } ?? GatewayExecutable.bundled()
@@ -230,7 +235,7 @@ import ServiceManagement
                 }
             }
             for _ in 0..<30 {
-                if let result = try? await client.call("status") {
+                if let result = try? await handshakeClient.call("status") {
                     guard let child = helper, child.isRunning, result["process_id"].number == Double(child.processIdentifier) else { throw AppError.message("网关实例不匹配，已拒绝同步来源。") }
                     status = result; verifiedProcessID = child.processIdentifier; break
                 }
@@ -238,17 +243,24 @@ import ServiceManagement
                 try? await Task.sleep(for: .milliseconds(100))
             }
             guard verifiedProcessID != nil else { throw AppError.message("网关未能启动。请检查端口冲突和受保护的 gateway.log。") }
-            let info = try await client.call("gateway.update.info")
+            let info = try await handshakeClient.call("gateway.update.info")
             if let expectedVersion {
                 guard info["protocol"].number == 1, info["version"].string == expectedVersion else {
                     throw AppError.message("新版网关与当前应用不兼容。")
                 }
             }
-            running = true
+            let storage = try await handshakeClient.call("credentials.storage.status")
+            guard storage["mode"].string == "file", let path = storage["file_path"].string, path.hasPrefix("/") else {
+                throw AppError.message("网关未提供本机凭据文件，未读取任何凭据。请更新 Codexpress 并重新启动。")
+            }
+            guard !shuttingDown, helper?.isRunning == true, helper?.processIdentifier == verifiedProcessID else {
+                throw AppError.message("网关已停止，未读取凭据。")
+            }
+            try await loadCredentialSnapshot(settings.sources.map(\.id), using: handshakeClient)
+            guard !shuttingDown else { return }
+            verifiedCredentialFile = URL(fileURLWithPath: path)
             lastSyncedHistoryCache = nil
-            credentialStorage = try await client.call("credentials.storage.status")
-            credentialSnapshot = CredentialSnapshot()
-            try await loadCredentialSnapshot(settings.sources.map(\.id))
+            running = true
             try await sync()
             self.error = nil
             for entry in requiredEntries {
@@ -261,9 +273,9 @@ import ServiceManagement
             await poll()
             _ = await syncChatbotEnvironmentIfEnabled(showSuccessNotice: false)
         } catch {
-            // A rejected sync still leaves our verified helper available for
-            // repairing source settings. Never adopt an unverified instance.
-            running = helper?.isRunning == true && helper?.processIdentifier == verifiedProcessID
+            // Keep an admitted helper available to repair a rejected sync, never a failed handshake or credential read.
+            running = running && helper?.isRunning == true && helper?.processIdentifier == verifiedProcessID
+            if !running { verifiedCredentialFile = nil }
             if running { pendingSync = true; syncError = error.localizedDescription }
             self.error = error.localizedDescription
         }
@@ -271,6 +283,7 @@ import ServiceManagement
     private func helperStopped(pid: Int32) async {
         guard helper?.processIdentifier == pid else { return }
         running = false
+        verifiedCredentialFile = nil
         guard !shuttingDown, !restarting else { return }
         guard restartCount < 3 else { error = "网关反复退出，已停止自动重启。请检查本地端口后手动重试。"; return }
         restarting = true; restartCount += 1
@@ -394,7 +407,7 @@ import ServiceManagement
     }
     func activeRequestsBeforeTermination() async throws -> Int {
         guard let helper, helper.isRunning else { return 0 }
-        let fresh = try await client.call("status")
+        let fresh = try await handshakeClient.call("status")
         guard fresh["process_id"].number == Double(helper.processIdentifier),
               let count = fresh["inflight"].number, count.isFinite, count >= 0,
               count < Double(Int.max), count.rounded(.down) == count else {
@@ -402,7 +415,13 @@ import ServiceManagement
         }
         return Int(count)
     }
-    func stop() { shuttingDown = true; cancelBackgroundSync(); timerTask?.cancel(); accountTimerTask?.cancel(); officialAccountTimerTask?.cancel(); modelRefreshTask?.cancel(); controlResetPollTask?.cancel(); helper?.terminate(); logPipe?.fileHandleForReading.readabilityHandler = nil }
+    func stop() {
+        guard !shuttingDown else { return }
+        shuttingDown = true
+        cancelBackgroundSync(); timerTask?.cancel(); accountTimerTask?.cancel(); officialAccountTimerTask?.cancel(); modelRefreshTask?.cancel(); controlResetPollTask?.cancel()
+        if let helper, helper.isRunning { helper.terminate() }
+        logPipe?.fileHandleForReading.readabilityHandler = nil
+    }
     func retry() {
         restartCount = 0
         if running, helper?.isRunning == true {
@@ -563,25 +582,10 @@ import ServiceManagement
             }
         }
     }
-    func refreshCredentialStorage() async {
-        guard canManageCredentials, !busy else { return }
-        do { credentialStorage = try await client.call("credentials.storage.status") }
-        catch { self.error = error.localizedDescription }
-    }
-    func changeCredentialStorage(_ mode: String) {
-        perform {
-            try self.requireWritableMetadata()
-            guard self.canManageCredentials else { throw AppError.message("请先启动网关，再切换凭据存储。") }
-            let result = try await self.client.call("credentials.storage.switch", .object(["mode": .string(mode), "file_path": .string(self.localCredentialFile.path), "source_ids": .array(self.settings.sources.map { .string($0.id) })]))
-            self.credentialStorage = result
-            try await self.loadCredentialSnapshot(self.settings.sources.map(\.id))
-            try await self.updateStatus()
-            self.running = true
-            try await self.sync()
-            self.notice = mode == "file" ? "已改用本地文件保存凭据，旧钥匙串副本保留。" : "已改用钥匙串保存凭据，旧本地文件副本保留。"
-        }
-    }
     func loadCredentialSnapshot(_ ids: [String]) async throws {
+        try await loadCredentialSnapshot(ids, using: client)
+    }
+    private func loadCredentialSnapshot(_ ids: [String], using client: GatewayClient) async throws {
         guard !ids.isEmpty else { return }
         let previous = credentialSnapshot
         let response = try await client.call("credentials.read", .object(["source_ids": .array(ids.map(JSONValue.string))]))
@@ -608,7 +612,10 @@ import ServiceManagement
         let balanceSources = settings.sources
         let balanceCredentials = credentialSnapshot
         let fresh = try await client.call("status")
-        guard let child = helper, child.isRunning, fresh["process_id"].number == Double(child.processIdentifier) else { running = false; throw AppError.message("网关实例已改变，停止发送管理请求。") }
+        guard let child = helper, child.isRunning, fresh["process_id"].number == Double(child.processIdentifier) else {
+            running = false; verifiedCredentialFile = nil
+            throw AppError.message("网关实例已改变，停止发送管理请求。")
+        }
         if status != fresh { status = fresh }
         if Bundle.main.bundleIdentifier == "local.codexpress.mac" {
             let events = try await client.call("notifications.list")
@@ -794,7 +801,7 @@ import ServiceManagement
             let includeCredits = !officialRefreshSchedule.isRetrying(id) && officialRefreshSchedule.needsCredits(id)
             try? await queryOfficial(id, includeCredits: includeCredits)
         } else if before.supportsBalanceQuery {
-            guard !refreshingBalances.contains(id) else { return }
+            guard !isMissingCredential(before), !refreshingBalances.contains(id) else { return }
             if !force, let cached = apiBalances[id], (cached["failure_count"].number ?? 0) > 0,
                let retry = cached["next_retry_at"].number, retry > Date().timeIntervalSince1970 { return }
             let credential = credentialSnapshot.load(id)
@@ -905,7 +912,7 @@ import ServiceManagement
             defer { modelRefreshTask = nil }
             for source in sources where source.enabled && source.discoversModels {
                 guard !busy, Date().timeIntervalSince(lastModelRefresh[source.id] ?? .distantPast) >= maximumAge else { continue }
-                if source.official && source.account_id == nil { continue }
+                if isMissingCredential(source) || (source.official && source.account_id == nil) { continue }
                 await refreshModels(source.id)
             }
         }

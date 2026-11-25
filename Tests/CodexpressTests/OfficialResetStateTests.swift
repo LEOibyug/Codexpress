@@ -3,7 +3,8 @@ import Darwin
 @testable import Codexpress
 
 private func officialResetTestDirectory() -> URL {
-    FileManager.default.temporaryDirectory.appendingPathComponent("r-\(UUID().uuidString.prefix(8))", isDirectory: true)
+    let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().resolvingSymlinksInPath()
+    return project.appendingPathComponent(".runtime/tmp/r-\(UUID().uuidString.prefix(8))", isDirectory: true)
 }
 
 final class OfficialResetStateTests: XCTestCase {
@@ -503,7 +504,7 @@ final class OfficialResetStateTests: XCTestCase {
             elif operation == 'gateway.update.info':
                 data = dict(version='0.8.26', protocol=1)
             elif operation == 'credentials.storage.status':
-                data = dict(mode='keychain')
+                data = dict(mode='file', file_path=str(directory / 'credentials.json'))
             elif operation == 'credentials.read':
                 by_id = {source['id']: source for source in sources}
                 data = dict(items=[dict(source_id=source_id, secret=secret(by_id[source_id]) if source_id in by_id else None) for source_id in request['payload']['source_ids']])

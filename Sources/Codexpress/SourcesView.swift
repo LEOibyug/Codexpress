@@ -184,8 +184,10 @@ struct SourcesView: View {
     }
 
     private func sourceHeader(_ source: Source, index: Int) -> some View {
-        let needsLogin = source.official && source.account_id == nil
+        let missingCredential = model.isMissingCredential(source)
+        let needsLogin = source.official && (source.account_id == nil || missingCredential)
         let takingOver = model.status["manual_route"]["source_id"].string == source.id
+        let health = needsLogin ? "需要登录" : missingCredential ? "缺少密钥" : healthLabel(model.state(source.id)["health"].string)
         return HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(source.name).font(AppTypography.sectionTitle).lineLimit(1).help(source.name)
@@ -195,13 +197,13 @@ struct SourcesView: View {
             if takingOver {
                 StatusPill(text: "正在抢占", color: .accentColor).fixedSize()
             }
-            StatusPill(text: source.enabled ? (needsLogin ? "需要登录" : healthLabel(model.state(source.id)["health"].string)) : "已停用",
+            StatusPill(text: source.enabled ? health : "已停用",
                        color: sourceColor(source), active: model.sourceHasActivity(source.id)).fixedSize()
             if needsLogin {
                 Button("登录…") { model.login(source) }.buttonStyle(.borderedProminent)
                     .disabled(!canEdit || model.loginFlow != nil)
             }
-            Button("编辑…") { editing = EditingSource(source: source, isNew: false) }
+            Button(!source.official && missingCredential ? "填写 API Key…" : "编辑…") { editing = EditingSource(source: source, isNew: false) }
                 .accessibilityLabel("编辑来源 \(source.name)")
             Menu {
                 Button(source.enabled ? "停用来源" : "启用来源") { model.toggle(source) }.disabled(!canEdit)
@@ -274,7 +276,7 @@ struct SourcesView: View {
                     if model.refreshingModels.contains(source.id) { ProgressView().controlSize(.mini) }
                     Button("刷新模型") { Task { await model.refreshModels(source.id) } }
                         .buttonStyle(.borderless)
-                        .disabled(model.busy || !model.running || model.refreshingModels.contains(source.id) || (source.official && source.account_id == nil))
+                        .disabled(model.busy || !model.running || model.isMissingCredential(source) || model.refreshingModels.contains(source.id) || (source.official && source.account_id == nil))
                 }
             }
             if !source.models.isEmpty {
@@ -286,7 +288,7 @@ struct SourcesView: View {
 
     private func sourceColor(_ source: Source) -> Color {
         guard source.enabled else { return .secondary }
-        if source.official && source.account_id == nil { return .orange }
+        if model.isMissingCredential(source) || (source.official && source.account_id == nil) { return .orange }
         switch model.state(source.id)["health"].string { case "ready": return .green; case nil: return .secondary; default: return .orange }
     }
 }

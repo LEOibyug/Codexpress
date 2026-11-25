@@ -92,7 +92,13 @@ impl SyncRequest {
         }
         let mut ids = HashSet::new();
         for source in &sources {
-            source.validate()?;
+            // A local source can outlive its private credential. Only the exact
+            // empty object denotes this state; malformed credentials still fail.
+            if source.secret.as_object().is_some_and(|secret| secret.is_empty()) {
+                source.validate_configuration()?;
+            } else {
+                source.validate()?;
+            }
             if !ids.insert(source.id.clone()) {
                 bail!("来源标识不能重复");
             }

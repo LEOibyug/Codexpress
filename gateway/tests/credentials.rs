@@ -4,136 +4,73 @@ use codexpress_gateway::{
     model::AppState,
 };
 use serde_json::{json, Value};
-use std::{
-    collections::HashMap,
-    os::unix::fs::{symlink, PermissionsExt},
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
-};
+use std::{fs, os::unix::fs::{symlink, PermissionsExt}, path::Path, sync::Arc};
 
-#[derive(Default)]
-struct MemoryStore {
-    values: Mutex<HashMap<String, Value>>,
-    reads: AtomicUsize,
-    fail: AtomicBool,
+fn state_directory() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    dir
 }
-impl CredentialStore for MemoryStore {
-    fn load(&self, id: &str) -> anyhow::Result<Option<Value>> {
-        self.reads.fetch_add(1, Ordering::SeqCst);
-        Ok(self.values.lock().unwrap().get(id).cloned())
-    }
-    fn save(&self, id: &str, secret: &Value) -> anyhow::Result<()> {
-        if self.fail.load(Ordering::SeqCst) {
-            anyhow::bail!("fixture write failed");
-        }
-        self.values
-            .lock()
-            .unwrap()
-            .insert(id.into(), secret.clone());
-        Ok(())
-    }
-    fn delete(&self, id: &str) -> anyhow::Result<()> {
-        self.values.lock().unwrap().remove(id);
-        Ok(())
-    }
+
+fn write_policy(dir: &Path, policy: Value) {
+    let path = dir.join("credential-storage.json");
+    fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 #[test]
-fn cached_credentials_migrate_and_rotated_official_tokens_survive_restart_without_keychain_access()
-{
-    let dir = tempfile::tempdir().unwrap();
-    let keychain = Arc::new(MemoryStore::default());
-    let api = json!({"api_key":"fixture-api"});
-    let oauth = json!({"access_token":"fixture-old","refresh_token":"fixture-refresh","account_id":"account"});
-    keychain.save("api", &api).unwrap();
-    keychain.save("official", &oauth).unwrap();
-    let store = ManagedCredentialStore::open(dir.path(), keychain.clone()).unwrap();
-    for _ in 0..5 {
-        assert_eq!(store.load("api").unwrap(), Some(api.clone()));
-        assert_eq!(store.load("missing").unwrap(), None);
-    }
-    assert_eq!(
-        keychain.reads.load(Ordering::SeqCst),
-        2,
-        "present and absent items are read once per helper process"
-    );
-    let file = dir.path().join(".codexpress/credentials.json");
-    let ids = vec!["api".into(), "official".into(), "missing".into()];
-    store.switch_storage("file", Some(&file), &ids).unwrap();
-    assert_eq!(
-        std::fs::metadata(file.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
-    assert_eq!(
-        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    let reads = keychain.reads.load(Ordering::SeqCst);
-    let rotated = json!({"access_token":"fixture-new","refresh_token":"fixture-rotated","account_id":"account"});
-    store.save("official", &rotated).unwrap();
+fn file_only_restart_preserves_rotations_without_reviving_inactive_legacy_files() {
+    let dir = state_directory();
+    let path = dir.path().join("credentials.json");
+    let old = dir.path().join(".codexpress/credentials.json");
+    let stale = json!({"api_key":"inactive-fixture"});
+    FileStore::new(old.clone()).unwrap().save("api", &stale).unwrap();
+    let api = json!({"api_key":"new-fixture"});
+    let oauth = json!({"access_token":"renewed", "refresh_token":"rotated"});
+
+    let store = ManagedCredentialStore::open(dir.path()).unwrap();
+    assert_eq!(store.storage_status().unwrap(), json!({"mode":"file","file_path":path}));
+    assert_eq!(store.load("api").unwrap(), None);
+    // Previous releases left a private file behind when switching back to Keychain.
+    write_policy(dir.path(), json!({"mode":"keychain","file_path":null}));
+    let store = ManagedCredentialStore::open(dir.path()).unwrap();
+    assert_eq!(store.load("api").unwrap(), None);
+    store.save("api", &api).unwrap();
+    store.save("official", &json!({"refresh_token":"before-rotation"})).unwrap();
+    store.save("official", &oauth).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777, 0o700);
     drop(store);
-    let reopened = ManagedCredentialStore::open(dir.path(), keychain.clone()).unwrap();
-    assert_eq!(reopened.storage_status().unwrap()["mode"], "file");
-    assert_eq!(reopened.load("official").unwrap(), Some(rotated.clone()));
+    let reopened = ManagedCredentialStore::open(dir.path()).unwrap();
+    assert_eq!(reopened.load("official").unwrap(), Some(oauth));
     assert_eq!(reopened.load("api").unwrap(), Some(api));
-    assert_eq!(
-        keychain.reads.load(Ordering::SeqCst),
-        reads,
-        "file mode must not touch keychain"
-    );
-    reopened.switch_storage("keychain", None, &ids).unwrap();
-    assert_eq!(keychain.values.lock().unwrap()["official"], rotated);
-    assert!(
-        file.exists(),
-        "migration explicitly retains original copies"
-    );
-    reopened.delete("api").unwrap();
-    assert_eq!(reopened.load("api").unwrap(), None);
+
+    write_policy(dir.path(), json!({"mode":"file","file_path":old}));
+    let previous_file_user = ManagedCredentialStore::open(dir.path()).unwrap();
+    assert_eq!(previous_file_user.storage_status().unwrap()["file_path"], json!(old));
+    assert_eq!(previous_file_user.load("api").unwrap(), Some(stale));
+    previous_file_user.delete("api").unwrap();
+    assert_eq!(FileStore::new(old).unwrap().load("api").unwrap(), None);
+    assert_eq!(FileStore::new(path).unwrap().load("api").unwrap(), Some(json!({"api_key":"new-fixture"})));
 }
 
 #[test]
-fn migration_failure_keeps_active_store_and_bad_files_never_fall_back_or_get_overwritten() {
-    let dir = tempfile::tempdir().unwrap();
-    let keychain = Arc::new(MemoryStore::default());
-    let store = ManagedCredentialStore::open(dir.path(), keychain.clone()).unwrap();
-    store.save("api", &json!({"api_key":"fixture"})).unwrap();
-    let file = dir.path().join(".codexpress/credentials.json");
-    let ids = vec!["api".into()];
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::create_dir(&file).unwrap(); // Reliable failure even with admin permissions.
-    assert!(store.switch_storage("file", Some(&file), &ids).is_err());
-    assert_eq!(store.storage_status().unwrap()["mode"], "keychain");
-    assert!(store.load("api").unwrap().is_some());
-    std::fs::remove_dir(&file).unwrap();
+fn unsafe_or_corrupt_files_cannot_be_used_or_overwritten() {
+    let dir = state_directory();
+    let file = dir.path().join("credentials.json");
     let policy = dir.path().join("credential-storage.json");
-    std::fs::create_dir(&policy).unwrap();
-    assert!(store.switch_storage("file", Some(&file), &ids).is_err());
-    assert_eq!(
-        store.storage_status().unwrap()["mode"],
-        "keychain",
-        "failed policy commit cannot publish the new backend"
-    );
-    std::fs::remove_dir(&policy).unwrap();
-    store.switch_storage("file", Some(&file), &ids).unwrap();
-    keychain.fail.store(true, Ordering::SeqCst);
-    assert!(store.switch_storage("keychain", None, &ids).is_err());
-    assert_eq!(store.storage_status().unwrap()["mode"], "file");
+    write_policy(dir.path(), json!({"mode":"unknown"}));
+    assert!(ManagedCredentialStore::open(dir.path()).is_err());
+    fs::write(&policy, b"broken policy").unwrap();
+    assert!(ManagedCredentialStore::open(dir.path()).is_err());
+    assert_eq!(fs::read(&policy).unwrap(), b"broken policy");
     let original = b"broken credential file";
-    std::fs::write(&file, original).unwrap();
-    let reopened = ManagedCredentialStore::open(dir.path(), keychain.clone()).unwrap();
-    let reads = keychain.reads.load(Ordering::SeqCst);
-    assert!(reopened.load("api").is_err());
-    assert!(reopened
-        .save("api", &json!({"api_key":"replacement"}))
-        .is_err());
-    assert_eq!(std::fs::read(&file).unwrap(), original);
-    assert_eq!(keychain.reads.load(Ordering::SeqCst), reads);
+    fs::write(&file, original).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    let store = FileStore::new(file.clone()).unwrap();
+    assert!(store.load("api").is_err());
+    assert!(store.save("api", &json!({"api_key":"replacement"})).is_err());
+    assert_eq!(fs::read(&file).unwrap(), original);
     std::fs::remove_file(&file).unwrap();
     let outside = dir.path().join("outside");
     std::fs::write(&outside, b"leave alone").unwrap();
@@ -153,11 +90,9 @@ fn migration_failure_keeps_active_store_and_bad_files_never_fall_back_or_get_ove
 }
 
 #[tokio::test]
-async fn management_uses_private_store_for_api_and_official_and_migration_serializes_with_refresh()
-{
-    let dir = tempfile::tempdir().unwrap();
-    let keychain = Arc::new(MemoryStore::default());
-    let store = Arc::new(ManagedCredentialStore::open(dir.path(), keychain).unwrap());
+async fn management_uses_private_file_for_api_and_protects_live_official_accounts() {
+    let dir = state_directory();
+    let store = Arc::new(ManagedCredentialStore::open(dir.path()).unwrap());
     let state = AppState::new_with_credential_store(
         dir.path().to_path_buf(),
         0,
@@ -176,21 +111,7 @@ async fn management_uses_private_store_for_api_and_official_and_migration_serial
         .await
         .unwrap();
     assert_eq!(before["items"][0]["secret"]["api_key"], "fixture-api");
-    let path = dir.path().join(".codexpress/credentials.json");
-    let held = state.sources.write().await;
-    let task_state = state.clone();
-    let task = tokio::spawn(async move {
-        management::dispatch(
-            &task_state,
-            "credentials.storage.switch",
-            json!({"mode":"file","file_path":path,"source_ids":["api"]}),
-        )
-        .await
-    });
-    tokio::task::yield_now().await;
-    assert!(!task.is_finished());
-    drop(held);
-    assert_eq!(task.await.unwrap().unwrap()["mode"], "file");
+    assert!(management::dispatch(&state, "credentials.storage.switch", json!({"mode":"keychain","source_ids":["api"]})).await.is_err());
     let oauth = json!({"access_token":"fixture-new","refresh_token":"fixture-rotated","account_id":"account"});
     state.persist_credential("official", &oauth).unwrap();
     let read = management::dispatch(
@@ -245,4 +166,38 @@ async fn management_uses_private_store_for_api_and_official_and_migration_serial
             .unwrap()["items"][0]["secret"],
         Value::Null
     );
+}
+
+#[tokio::test]
+async fn missing_api_key_blocks_only_its_source_and_preserves_fixed_routing_until_repaired() {
+    let dir = state_directory();
+    let store = Arc::new(ManagedCredentialStore::open(dir.path()).unwrap());
+    let state = AppState::new_with_credential_store(dir.path().into(), 0, "fixture".into(), Some(store)).unwrap();
+    let missing = json!({"id":"missing","name":"Legacy API","kind":"api","enabled":true,
+        "priority":0,"proxy":{"mode":"direct"},"base_url":"https://unused.invalid/v1","secret":{}});
+    let mut ready = missing.clone();
+    ready["id"] = json!("ready");
+    ready["secret"] = json!({"api_key":"usable-fixture"});
+    let mut config = json!({"sources":[missing,ready],"mode":"auto"});
+    management::dispatch(&state, "sync", config.clone()).await.unwrap();
+    let status = management::dispatch(&state, "status", json!({})).await.unwrap();
+    assert!(management::dispatch(&state, "routing.try", json!({"source_id":"missing"})).await.is_err());
+    let row = status["sources"].as_array().unwrap().iter().find(|row| row["id"] == "missing").unwrap();
+    assert_eq!(row["health"], "auth_required");
+    let candidates = codexpress_gateway::routing::candidates(&state, "fixture", None).await;
+    assert_eq!(candidates.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["ready"]);
+
+    config["mode"] = json!("fixed");
+    config["fixed_source_id"] = json!("missing");
+    management::dispatch(&state, "sync", config.clone()).await.unwrap();
+    let mut malformed = config.clone();
+    malformed["sources"][0]["secret"] = json!({"api_key":""});
+    assert!(management::dispatch(&state, "sync", malformed).await.is_err());
+    assert!(codexpress_gateway::routing::candidates(&state, "fixture", None).await.is_empty());
+    management::dispatch(&state, "credentials.save_api", json!({"source_id":"missing","api_key":"reentered"})).await.unwrap();
+    let saved = management::dispatch(&state, "credentials.read", json!({"source_ids":["missing"]})).await.unwrap();
+    config["sources"][0]["secret"] = saved["items"][0]["secret"].clone();
+    management::dispatch(&state, "sync", config).await.unwrap();
+    let restored = codexpress_gateway::routing::candidates(&state, "fixture", None).await;
+    assert_eq!(restored.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["missing"]);
 }

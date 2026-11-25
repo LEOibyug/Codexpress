@@ -1,15 +1,10 @@
 use anyhow::{bail, Context, Result};
-use codexpress_gateway::{
-    config,
-    credentials::{KeychainStore, ManagedCredentialStore},
-    management,
-    model::AppState,
-};
+use codexpress_gateway::{config, credentials::ManagedCredentialStore, management, model::AppState};
 use std::{
     fs,
     os::{
         fd::AsRawFd,
-        unix::fs::{OpenOptionsExt, PermissionsExt},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::PathBuf,
 };
@@ -51,8 +46,20 @@ async fn run() -> Result<()> {
     if !state_dir.is_absolute() || port == 0 {
         bail!("状态目录必须为绝对路径，端口必须大于零");
     }
-    fs::create_dir_all(&state_dir)?;
-    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&state_dir)?;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&state_dir)
+        .context("状态目录须为普通目录，不能是符号链接")?;
+    if directory.metadata()?.uid() != unsafe { libc::geteuid() } {
+        bail!("状态目录须属于当前用户");
+    }
+    directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    drop(directory);
     let process_lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -80,10 +87,7 @@ async fn run() -> Result<()> {
     if key.trim().len() < 32 {
         bail!("本地访问凭据无效，请检查应用状态目录");
     }
-    let credential_store = std::sync::Arc::new(ManagedCredentialStore::open(
-        &state_dir,
-        std::sync::Arc::new(KeychainStore::new(&state_dir)),
-    )?);
+    let credential_store = std::sync::Arc::new(ManagedCredentialStore::open(&state_dir)?);
     let state = AppState::new_with_credential_store(
         state_dir.clone(),
         port,
