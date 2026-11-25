@@ -4,18 +4,7 @@ import Darwin
 
 final class AppModelSyncTests: XCTestCase {
     @MainActor func testBackupRefreshKeepsVisibleDataAndRejectsPreviousDirectoryResults() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("b-\(UUID().uuidString.prefix(8))", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let helper = directory.appendingPathComponent("gateway-fixture")
-        try Self.helperScript.write(to: helper, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
-        let previousHelper = ProcessInfo.processInfo.environment["CODEXPRESS_GATEWAY_PATH"]
-        setenv("CODEXPRESS_GATEWAY_PATH", helper.path, 1)
-        defer {
-            if let previousHelper { setenv("CODEXPRESS_GATEWAY_PATH", previousHelper, 1) }
-            else { unsetenv("CODEXPRESS_GATEWAY_PATH") }
-        }
+        let directory = try gatewayFixtureDirectory()
         let first = directory.appendingPathComponent("first")
         let second = directory.appendingPathComponent("second")
         for (home, id) in [(first, "snapshot-first"), (second, "snapshot-second")] {
@@ -24,10 +13,8 @@ final class AppModelSyncTests: XCTestCase {
         }
         var settings = AppSettings(); settings.codexHome = first.path
         try MetadataStore(directory: directory).save(settings)
-        let model = AppModel(stateDirectory: directory)
+        let model = await startGateway(in: directory)
         defer { model.stop() }
-        await model.startHelper()
-        XCTAssertTrue(model.running, model.error ?? "Fixture helper did not start")
         await model.refreshConfigurationBackups()
         XCTAssertEqual(model.configurationBackups.first?["id"].string, "snapshot-first")
         try Data().write(to: directory.appendingPathComponent("hold-backups"))
@@ -36,6 +23,7 @@ final class AppModelSyncTests: XCTestCase {
         while !FileManager.default.fileExists(atPath: directory.appendingPathComponent("backups-started").path), Date() < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("backups-started").path))
         XCTAssertEqual(model.configurationBackups.first?["id"].string, "snapshot-first", "Refreshing must not hide existing backups")
         var changed = model.settings; changed.codexHome = second.path
         try model.persistSettings(changed)
@@ -51,19 +39,7 @@ final class AppModelSyncTests: XCTestCase {
     }
 
     @MainActor func testSettingChangePersistsWhenSyncFailsAndCanBeRetried() async throws {
-        let temp = ProcessInfo.processInfo.environment["CODEXPRESS_TEST_TMPDIR"].map(URL.init(fileURLWithPath:)) ?? FileManager.default.temporaryDirectory
-        let directory = temp.appendingPathComponent("s-\(UUID().uuidString.prefix(8))", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let helper = directory.appendingPathComponent("gateway-fixture")
-        try Self.helperScript.write(to: helper, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
-        let previousHelper = ProcessInfo.processInfo.environment["CODEXPRESS_GATEWAY_PATH"]
-        setenv("CODEXPRESS_GATEWAY_PATH", helper.path, 1)
-        defer {
-            if let previousHelper { setenv("CODEXPRESS_GATEWAY_PATH", previousHelper, 1) }
-            else { unsetenv("CODEXPRESS_GATEWAY_PATH") }
-        }
+        let directory = try gatewayFixtureDirectory()
         var settings = AppSettings(); settings.codexHome = directory.appendingPathComponent("codex").path
         var first = Source.newOfficial(); first.id = "source-1"; first.account_id = "account-z"
         first.proxy.url = "http://127.0.0.1:7890"; first.automaticModelDiscovery = false
@@ -77,10 +53,8 @@ final class AppModelSyncTests: XCTestCase {
         try "official".write(to: directory.appendingPathComponent("connection-mode"), atomically: true, encoding: .utf8)
         let localFailure = directory.appendingPathComponent("fail-local-models")
         try Data().write(to: localFailure)
-        let model = AppModel(stateDirectory: directory)
+        let model = await startGateway(in: directory)
         defer { model.stop() }
-        await model.startHelper()
-        XCTAssertTrue(model.running, model.error ?? "Fixture helper did not start")
         XCTAssertNil(model.localModelSettingsSyncError)
         XCTAssertTrue(model.localModelSettingsNeedsSync)
         XCTAssertFalse(model.showsLocalModelSettingsWarning)
@@ -109,10 +83,14 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertEqual(unchanged["auto_reset_weekly_accounts"], .array([]))
 
         try FileManager.default.removeItem(at: failure)
+        let notification = directory.appendingPathComponent("updated-secrets.json")
+        try Data(#"[{"source_id":"source-1","secret":{"account_id":"stale"}}]"#.utf8).write(to: notification)
         try await model.sync()
         XCTAssertFalse(model.pendingSync)
         let retried = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
         XCTAssertEqual(retried["auto_reset_weekly_accounts"], .array([.string("account-z")]))
+        XCTAssertEqual(retried["sources"].array.first?["secret"], .object([:]), "Never send tokens back for a helper-owned official account")
+        try FileManager.default.removeItem(at: notification)
 
         model.changeAutoResetWeeklyQuota(true, for: second)
         XCTAssertFalse(model.busy)
@@ -122,6 +100,7 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertNil(model.error)
         let both = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: applied))
         XCTAssertEqual(both["auto_reset_weekly_accounts"], .array([.string("account-a"), .string("account-z")]))
+        XCTAssertEqual(both["sources"].array.first?["secret"]["access_token"].string, "fixture-token", "A background sync must read the current ownership notification")
 
         try await model.finishLogin(first.id)
         XCTAssertTrue(try metadata.load().weeklyResetEnabled(for: first), "Same-account relogin retains consent")
@@ -216,7 +195,7 @@ final class AppModelSyncTests: XCTestCase {
     }
 
     @MainActor func testUsageAnalyticsSharesRequestsAndKeepsSnapshotsAcrossPageCancellationAndRefreshFailure() async throws {
-        try await withUsageAnalyticsModel { model, directory in
+        try await withGatewayModel { model, directory in
             let query = UsageQuery.last(days: 30)
             let hold = directory.appendingPathComponent("hold-analytics")
             defer { try? FileManager.default.removeItem(at: hold) }
@@ -276,7 +255,7 @@ final class AppModelSyncTests: XCTestCase {
     }
 
     @MainActor func testUsageAnalyticsSeparatesFiltersAndCalendarWindowsButReusesRollingWindows() async throws {
-        try await withUsageAnalyticsModel { model, directory in
+        try await withGatewayModel { model, directory in
             var calendar = Calendar(identifier: .gregorian)
             calendar.timeZone = TimeZone(secondsFromGMT: 0)!
             let now = Date(timeIntervalSince1970: 1_800_000_123)
@@ -313,26 +292,37 @@ final class AppModelSyncTests: XCTestCase {
         }
     }
 
-    @MainActor private func withUsageAnalyticsModel(_ body: @MainActor (AppModel, URL) async throws -> Void) async throws {
+    private func gatewayFixtureDirectory() throws -> URL {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let directory = root.appendingPathComponent(".runtime/u-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        let temp = ProcessInfo.processInfo.environment["CODEXPRESS_TEST_TMPDIR"].map(URL.init(fileURLWithPath:)) ?? root.appendingPathComponent(".runtime")
+        let directory = temp.appendingPathComponent("s-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
+        addTeardownBlock { try FileManager.default.removeItem(at: directory) }
         let helper = directory.appendingPathComponent("gateway-fixture")
         try Self.helperScript.write(to: helper, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
         let previousHelper = ProcessInfo.processInfo.environment["CODEXPRESS_GATEWAY_PATH"]
         setenv("CODEXPRESS_GATEWAY_PATH", helper.path, 1)
-        defer {
+        addTeardownBlock {
             if let previousHelper { setenv("CODEXPRESS_GATEWAY_PATH", previousHelper, 1) }
             else { unsetenv("CODEXPRESS_GATEWAY_PATH") }
         }
-        var settings = AppSettings(); settings.codexHome = directory.appendingPathComponent("codex").path
-        try MetadataStore(directory: directory).save(settings)
+        return directory
+    }
+
+    @MainActor private func startGateway(in directory: URL) async -> AppModel {
         let model = AppModel(stateDirectory: directory)
-        defer { model.stop() }
         await model.startHelper()
         XCTAssertTrue(model.running, model.error ?? "Fixture helper did not start")
+        return model
+    }
+
+    @MainActor private func withGatewayModel(_ body: @MainActor (AppModel, URL) async throws -> Void) async throws {
+        let directory = try gatewayFixtureDirectory()
+        var settings = AppSettings(); settings.codexHome = directory.appendingPathComponent("codex").path
+        try MetadataStore(directory: directory).save(settings)
+        let model = await startGateway(in: directory)
+        defer { model.stop() }
         try await body(model, directory)
     }
 
@@ -349,7 +339,7 @@ final class AppModelSyncTests: XCTestCase {
     }
 
     @MainActor func testModelDiscoveryDiscardsResultAfterCredentialChange() async throws {
-        try await withUsageAnalyticsModel { model, directory in
+        try await withGatewayModel { model, directory in
             var source = Source(); source.name = "API"; source.models = ["original"]; source.automaticModelDiscovery = true
             var settings = model.settings; settings.sources = [source]
             try model.persistSettings(settings)
@@ -372,8 +362,7 @@ final class AppModelSyncTests: XCTestCase {
     }
 
     @MainActor func testRapidSettingsEditsApplyImmediatelyAndCoalesceGatewaySync() async throws {
-        try await withUsageAnalyticsModel { model, directory in
-            model.backgroundSyncDebounceNanoseconds = 60_000_000
+        try await withGatewayModel { model, directory in
             var first = Source()
             first.id = "api-1"; first.name = "API 1"; first.priority = 0; first.models = ["gpt-5.4", "gemini-2.5-pro"]
             var second = Source()
@@ -480,7 +469,8 @@ final class AppModelSyncTests: XCTestCase {
                         while (directory / 'hold-backups').exists(): time.sleep(0.01)
                     data = json.loads((pathlib.Path(request['payload']['codex_home']) / 'backups.json').read_text())
                 elif operation == 'credentials':
-                    data = dict(updated_secrets=[])
+                    notice = directory / 'updated-secrets.json'
+                    data = dict(updated_secrets=json.loads(notice.read_text()) if notice.exists() else [])
                 elif operation == 'credentials.read':
                     sources = json.loads((directory / 'sources.json').read_text())['sources']
                     by_id = {source['id']: source for source in sources}

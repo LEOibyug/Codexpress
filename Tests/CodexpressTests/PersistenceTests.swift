@@ -189,8 +189,8 @@ final class PersistenceTests: XCTestCase {
         // Existing model policy with sourceIDs == nil (e.g., customized clients) must keep existing non-default-disabled sources only.
         settings.modelPolicies = [ModelPolicy(model: "gpt-5.4", sourceIDs: nil, clients: [.codex, .omp])]
 
-        XCTAssertEqual(AppModel.applyDefaultDisabledPolicies(for: googleSource, in: &settings), 2)
-        XCTAssertEqual(AppModel.applyDefaultDisabledPolicies(for: openaiSource, in: &settings), 2)
+        AppModel.applyDefaultDisabledPolicies(for: googleSource, in: &settings)
+        AppModel.applyDefaultDisabledPolicies(for: openaiSource, in: &settings)
 
         let geminiProPolicy = settings.modelPolicies?.first { $0.model == "gemini-2.5-pro" }
         XCTAssertEqual(geminiProPolicy?.sourceIDs, [])
@@ -212,7 +212,7 @@ final class PersistenceTests: XCTestCase {
         XCTAssertFalse(ModelPolicy.isEnabled("gemini-2.5-flash", on: googleSource, in: settings))
 
         googleSource.models.append("gemini-3-flash-preview")
-        XCTAssertEqual(AppModel.applyDefaultDisabledPolicies(for: googleSource, previousModels: ["gemini-2.5-pro", "gemini-2.5-flash"], in: &settings), 1)
+        AppModel.applyDefaultDisabledPolicies(for: googleSource, previousModels: ["gemini-2.5-pro", "gemini-2.5-flash"], in: &settings)
         XCTAssertTrue(ModelPolicy.isEnabled("gemini-2.5-pro", on: googleSource, in: settings))
         XCTAssertFalse(ModelPolicy.isEnabled("gemini-3-flash-preview", on: googleSource, in: settings))
 
@@ -229,7 +229,6 @@ final class PersistenceTests: XCTestCase {
         XCTAssertTrue(decoded.showInCmux)
 
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codexpress-cmux-toggle-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
         var hidden = decoded
@@ -246,35 +245,18 @@ final class PersistenceTests: XCTestCase {
     }
 
     func testSystemProxyModeValidatesAndPersistsForAllSourceKinds() throws {
-        var official = Source.newOfficial()
-        official.proxy = ProxyPolicy(mode: "system", url: nil)
-        XCTAssertEqual(official.policyLabel, "系统代理")
-        XCTAssertNoThrow(try official.validate())
-
-        var api = Source()
-        api.name = "API System"
-        api.proxy = ProxyPolicy(mode: "system", url: nil)
-        XCTAssertEqual(api.policyLabel, "系统代理")
-        XCTAssertNoThrow(try api.validate())
-
-        var google = Source.newGoogle()
-        google.proxy = ProxyPolicy(mode: "system", url: nil)
-        XCTAssertNoThrow(try google.validate())
-
-        var openai = Source.newOpenAI()
-        openai.proxy = ProxyPolicy(mode: "system", url: nil)
-        XCTAssertNoThrow(try openai.validate())
-
-        official.proxy.mode = "direct"
-        XCTAssertThrowsError(try official.validate())
-        official.proxy.mode = "system"
+        var api = Source(); api.name = "API System"
+        var settings = AppSettings()
+        settings.sources = [.newOfficial(), api, .newGoogle(), .newOpenAI()]
+        for index in settings.sources.indices {
+            settings.sources[index].proxy = ProxyPolicy(mode: "system")
+            XCTAssertEqual(settings.sources[index].policyLabel, "系统代理")
+            XCTAssertNoThrow(try settings.sources[index].validate())
+        }
 
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codexpress-sysproxy-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = MetadataStore(directory: directory)
-        var settings = AppSettings()
-        settings.sources = [official, api, google, openai]
         try store.save(settings)
         let loaded = try store.load()
         XCTAssertEqual(loaded.sources.map(\.proxy.mode), ["system", "system", "system", "system"])

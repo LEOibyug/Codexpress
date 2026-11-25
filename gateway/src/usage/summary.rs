@@ -1,26 +1,9 @@
-use super::{analytics::rate_sums, grouping, requests::RECORD_COLUMNS, Ingress, StoreData};
+use super::{analytics::{rate_sums, COST_COUNTS, COST_FIELDS}, grouping, requests::RECORD_COLUMNS, Ingress, StoreData};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 pub(super) const INGRESS_COLUMN: &str = "COALESCE(NULLIF(json_extract(u.metadata,'$.ingress'),''),(SELECT NULLIF(json_extract(d.metadata,'$.ingress'),'') FROM diagnostics d WHERE d.attempt_id=COALESCE(NULLIF(json_extract(u.metadata,'$.attempt_id'),''),'legacy:'||u.attempt)),'unknown')";
-
-const COST_FIELDS: [&str; 6] = [
-    "total_usd",
-    "input_usd",
-    "cached_input_usd",
-    "cache_write_usd",
-    "output_usd",
-    "cache_savings_usd",
-];
-const COST_COUNTS: [&str; 6] = [
-    "priced_requests",
-    "unpriced_requests",
-    "unobserved_requests",
-    "partial_cost_requests",
-    "estimated_cost_requests",
-    "upstream_priced_requests",
-];
 
 pub(super) fn build(
     data: &StoreData,
@@ -49,6 +32,11 @@ pub(super) fn build(
 
 fn load_groups(connection: &Connection, since: u64) -> Result<Vec<Value>> {
     let [timed_tokens, generation_ms, throughput_tokens, throughput_ms] = rate_sums();
+    let sums = COST_FIELDS
+        .iter()
+        .map(|name| format!("SUM(json_extract(metadata,'$.cost.{name}'))"))
+        .collect::<Vec<_>>()
+        .join(",");
     let mut grouped = connection.prepare(&format!(r#"SELECT source_id,
         (SELECT latest.source_name FROM usage AS latest WHERE latest.source_id=usage.source_id ORDER BY latest.attempt DESC LIMIT 1),
         COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cached_input_tokens), SUM(complete=0), SUM(status!='success'),
@@ -58,43 +46,37 @@ fn load_groups(connection: &Connection, since: u64) -> Result<Vec<Value>> {
         {timed_tokens}, {generation_ms},
         SUM(CASE WHEN (json_extract(metadata,'$.token_details.cached_input_reported')=1 AND json_extract(metadata,'$.token_details.input_estimated')=0) OR (json_extract(metadata,'$.token_details') IS NULL AND cached_input_tokens>0) THEN input_tokens ELSE 0 END),
         SUM(CASE WHEN (json_extract(metadata,'$.token_details.cached_input_reported')=1 AND json_extract(metadata,'$.token_details.input_estimated')=0) OR (json_extract(metadata,'$.token_details') IS NULL AND cached_input_tokens>0) THEN cached_input_tokens ELSE 0 END), model,
-        {throughput_tokens}, {throughput_ms}
-        FROM usage WHERE started_at>=?1 GROUP BY source_id,model ORDER BY source_id,model"#))?;
-    let mut rows = grouped.query_map([since], |r| Ok(json!({"source_id":r.get::<_, String>(0)?,"source_name":r.get::<_, String>(1)?,"requests":r.get::<_,u64>(2)?,"input_tokens":r.get::<_,u64>(3)?,"output_tokens":r.get::<_,u64>(4)?,"cached_input_tokens":r.get::<_,u64>(5)?,"incomplete_requests":r.get::<_,u64>(6)?,"failures":r.get::<_,u64>(7)?,"estimated_requests":r.get::<_,u64>(8)?,"reasoning_output_tokens":r.get::<_,Option<u64>>(9)?,"successes":r.get::<_,u64>(10)?,"total_latency_ms":r.get::<_,u64>(11)?,"total_first_token_ms":r.get::<_,Option<u64>>(12)?,"first_token_samples":r.get::<_,u64>(13)?,"timed_output_tokens":r.get::<_,u64>(14)?,"total_generation_ms":r.get::<_,u64>(15)?,"cached_reported_input_tokens":r.get::<_,u64>(16)?,"cached_reported_tokens":r.get::<_,u64>(17)?,"active_requests":0,"model":r.get::<_,String>(18)?,"throughput_output_tokens":r.get::<_,u64>(19)?,"throughput_latency_ms":r.get::<_,u64>(20)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let sums = COST_FIELDS
-        .iter()
-        .map(|name| format!("SUM(json_extract(metadata,'$.cost.{name}'))"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut cost_query = connection.prepare(&format!("SELECT source_id,model,{sums},
+        {throughput_tokens}, {throughput_ms}, {sums},
         SUM(json_type(metadata,'$.cost.total_usd') IS NOT NULL),
         SUM(json_extract(metadata,'$.cost.status') IN ('unknown_model','unknown_tier')),
         SUM(json_extract(metadata,'$.cost.status')='unobserved'),
         SUM(json_extract(metadata,'$.cost.status')='partial'),
         SUM(json_extract(metadata,'$.cost.status')='estimated' OR json_extract(metadata,'$.cost.historical')=1),
         SUM(COALESCE(json_extract(metadata,'$.cost.billing_basis')='upstream_charge',0))
-        FROM usage WHERE started_at>=?1 GROUP BY source_id,model"))?;
-    for row in cost_query.query_map([since], |r| {
-        let mut value = json!({"source_id":r.get::<_,String>(0)?,"model":r.get::<_,String>(1)?});
+        FROM usage WHERE started_at>=?1 GROUP BY source_id,model ORDER BY source_id,model"#))?;
+    let groups = grouped.query_map([since], |r| {
+        let mut value = json!({
+            "source_id":r.get::<_, String>(0)?, "source_name":r.get::<_, String>(1)?,
+            "requests":r.get::<_,u64>(2)?, "input_tokens":r.get::<_,u64>(3)?,
+            "output_tokens":r.get::<_,u64>(4)?, "cached_input_tokens":r.get::<_,u64>(5)?,
+            "incomplete_requests":r.get::<_,u64>(6)?, "failures":r.get::<_,u64>(7)?,
+            "estimated_requests":r.get::<_,u64>(8)?, "reasoning_output_tokens":r.get::<_,Option<u64>>(9)?,
+            "successes":r.get::<_,u64>(10)?, "total_latency_ms":r.get::<_,u64>(11)?,
+            "total_first_token_ms":r.get::<_,Option<u64>>(12)?, "first_token_samples":r.get::<_,u64>(13)?,
+            "timed_output_tokens":r.get::<_,u64>(14)?, "total_generation_ms":r.get::<_,u64>(15)?,
+            "cached_reported_input_tokens":r.get::<_,u64>(16)?, "cached_reported_tokens":r.get::<_,u64>(17)?,
+            "active_requests":0, "model":r.get::<_,String>(18)?,
+            "throughput_output_tokens":r.get::<_,u64>(19)?, "throughput_latency_ms":r.get::<_,u64>(20)?
+        });
         for (i, name) in COST_FIELDS.iter().enumerate() {
-            value[*name] = json!(r.get::<_, Option<f64>>(i + 2)?);
+            value[*name] = json!(r.get::<_, Option<f64>>(21 + i)?);
         }
         for (i, name) in COST_COUNTS.iter().enumerate() {
-            value[*name] = json!(r.get::<_, u64>(i + 2 + COST_FIELDS.len())?);
+            value[*name] = json!(r.get::<_, u64>(21 + COST_FIELDS.len() + i)?);
         }
         Ok(value)
-    })? {
-        let value = row?;
-        if let Some(row) = rows
-            .iter_mut()
-            .find(|row| row["source_id"] == value["source_id"] && row["model"] == value["model"])
-        {
-            for name in COST_FIELDS.iter().chain(COST_COUNTS.iter()) {
-                row[*name] = value[*name].clone();
-            }
-        }
-    }
-    Ok(rows)
+    })?;
+    Ok(groups.collect::<rusqlite::Result<_>>()?)
 }
 
 fn load_recent(

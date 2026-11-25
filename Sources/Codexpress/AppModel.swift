@@ -66,15 +66,11 @@ import ServiceManagement
     private var environmentSyncGeneration: UInt64 = 0
     private var backgroundSyncTask: Task<Void, Never>?
     private var backgroundSyncSleepTask: Task<Void, Never>?
-    private var backgroundSyncInFlight = false
     private var backgroundSyncBypassDebounce = false
     private var backgroundSyncGeneration: UInt64 = 0
     private var backgroundSyncNeedsHistory = false
-    private var backgroundSyncNeedsModelInfo = false
     private var backgroundSyncSuccessNotice: String?
     private var lastSyncedHistoryCache: HistoryCacheSettings?
-    private var knownHelperOwnedOfficialIDs = Set<String>()
-    var backgroundSyncDebounceNanoseconds: UInt64 = 180_000_000
     var showsPendingSyncWarning: Bool { pendingSync && (!running || (!syncing && syncError != nil)) }
     var hasPendingBackgroundSync: Bool { backgroundSyncTask != nil || syncing }
     private struct GatewayUpdate {
@@ -248,7 +244,6 @@ import ServiceManagement
             }
             running = true
             lastSyncedHistoryCache = nil
-            knownHelperOwnedOfficialIDs = []
             credentialStorage = try await client.call("credentials.storage.status")
             credentialSnapshot = CredentialSnapshot()
             try await loadCredentialSnapshot(settings.sources.map(\.id))
@@ -473,8 +468,6 @@ import ServiceManagement
     }
     private func updateSettingsImmediately(
         syncHistory: Bool = false,
-        refreshModelsInfo: Bool = false,
-        successNotice: String? = nil,
         _ mutate: (inout AppSettings) throws -> Void
     ) {
         guard !metadataLoadFailed, !busy else { return }
@@ -483,11 +476,7 @@ import ServiceManagement
             try mutate(&next)
             try persistSettings(next)
             error = nil
-            scheduleBackgroundSync(
-                syncHistory: syncHistory,
-                refreshModelsInfo: refreshModelsInfo,
-                successNotice: successNotice
-            )
+            scheduleBackgroundSync(syncHistory: syncHistory)
         } catch {
             self.error = error.localizedDescription
         }
@@ -497,11 +486,9 @@ import ServiceManagement
         backgroundSyncSleepTask = nil
         backgroundSyncTask?.cancel()
         backgroundSyncTask = nil
-        backgroundSyncInFlight = false
         backgroundSyncBypassDebounce = false
         syncing = false
         lastSyncedHistoryCache = nil
-        knownHelperOwnedOfficialIDs = []
     }
     private func awaitPendingBackgroundSync() async {
         guard backgroundSyncTask != nil else { return }
@@ -509,10 +496,9 @@ import ServiceManagement
         backgroundSyncSleepTask?.cancel()
         await backgroundSyncTask?.value
     }
-    private func scheduleBackgroundSync(syncHistory: Bool = false, refreshModelsInfo: Bool = false, successNotice: String? = nil) {
+    private func scheduleBackgroundSync(syncHistory: Bool = false, successNotice: String? = nil) {
         backgroundSyncGeneration &+= 1
         backgroundSyncNeedsHistory = backgroundSyncNeedsHistory || syncHistory
-        backgroundSyncNeedsModelInfo = backgroundSyncNeedsModelInfo || refreshModelsInfo
         if let successNotice { backgroundSyncSuccessNotice = successNotice }
         pendingSync = true
         syncError = nil
@@ -527,8 +513,8 @@ import ServiceManagement
         var observed = backgroundSyncGeneration
         for _ in 0..<5 {
             if Task.isCancelled || backgroundSyncBypassDebounce { break }
-            let sleepTask = Task<Void, Never> { [debounce = backgroundSyncDebounceNanoseconds] in
-                _ = try? await Task.sleep(nanoseconds: debounce)
+            let sleepTask = Task<Void, Never> {
+                _ = try? await Task.sleep(nanoseconds: 180_000_000)
             }
             backgroundSyncSleepTask = sleepTask
             await sleepTask.value
@@ -542,7 +528,6 @@ import ServiceManagement
     }
     private func runBackgroundSyncLoop() async {
         defer {
-            backgroundSyncInFlight = false
             syncing = false
             backgroundSyncTask = nil
         }
@@ -551,20 +536,12 @@ import ServiceManagement
             if Task.isCancelled || !running || shuttingDown { break }
             let targetGeneration = backgroundSyncGeneration
             let needsHistory = backgroundSyncNeedsHistory
-            let needsModelInfo = backgroundSyncNeedsModelInfo
             let notice = backgroundSyncSuccessNotice
             backgroundSyncNeedsHistory = false
-            backgroundSyncNeedsModelInfo = false
             backgroundSyncSuccessNotice = nil
             syncing = true
-            backgroundSyncInFlight = true
             do {
-                try await performGatewaySync(
-                    refreshCredentials: true,
-                    syncHistory: needsHistory,
-                    refreshModelsInfo: needsModelInfo
-                )
-                backgroundSyncInFlight = false
+                try await performGatewaySync(syncHistory: needsHistory, refreshModelsInfo: false)
                 syncing = false
                 if backgroundSyncGeneration == targetGeneration {
                     pendingSync = weeklyResetRevocationPending
@@ -574,7 +551,6 @@ import ServiceManagement
                     break
                 }
             } catch {
-                backgroundSyncInFlight = false
                 syncing = false
                 if !Task.isCancelled && !shuttingDown {
                     pendingSync = true
@@ -608,17 +584,17 @@ import ServiceManagement
         let previous = credentialSnapshot
         let response = try await client.call("credentials.read", .object(["source_ids": .array(ids.map(JSONValue.string))]))
         try credentialSnapshot.apply(response, requested: ids)
-        for id in ids where (try? previous.load(id)) != (try? credentialSnapshot.load(id)) { apiBalances[id] = nil }
+        for id in ids where previous.load(id) != credentialSnapshot.load(id) { apiBalances[id] = nil }
     }
     private func mergeCredentials(_ data: JSONValue) async throws {
         try requireWritableMetadata()
         let changed = data["updated_secrets"].array.compactMap { item -> String? in
             guard let id = item["source_id"].string, settings.sources.contains(where: { $0.id == id && $0.official }) else { return nil }
-            return (try? credentialSnapshot.load(id)) == item["secret"] ? nil : id
+            return credentialSnapshot.load(id) == item["secret"] ? nil : id
         }
         try await loadCredentialSnapshot(Array(Set(changed)).sorted())
         var next = settings
-        next.sources = try OfficialCredentialMirror.mergedSources(settings.sources, response: data, loadDurable: credentialSnapshot.load)
+        next.sources = try OfficialCredentialMirror.mergedSources(settings.sources, response: data, snapshot: credentialSnapshot)
         if next.sources != settings.sources { try persistSettings(next) }
     }
     @discardableResult func refreshCredentials() async throws -> JSONValue {
@@ -640,7 +616,7 @@ import ServiceManagement
         }
         var next = settings
         for i in next.sources.indices where next.sources[i].official {
-            if let durable = try credentialSnapshot.load(next.sources[i].id), let account = durable["account_id"].string, !account.isEmpty { next.sources[i].account_id = account }
+            if let durable = credentialSnapshot.load(next.sources[i].id), let account = durable["account_id"].string, !account.isEmpty { next.sources[i].account_id = account }
             else if let live = fresh["sources"].array.first(where: { $0["id"].string == next.sources[i].id }), let account = live["account_id"].string, !account.isEmpty { next.sources[i].account_id = account }
         }
         if next.sources != settings.sources { try persistSettings(next) }
@@ -654,7 +630,7 @@ import ServiceManagement
         if officialScheduleChanged { scheduleOfficialAccountRefresh() }
         for before in balanceSources where before.supportsBalanceQuery {
             guard let current = settings.sources.first(where: { $0.id == before.id }), current.sameConfiguration(as: before),
-                  (try? balanceCredentials.load(before.id)) == (try? credentialSnapshot.load(before.id)) else { continue }
+                  balanceCredentials.load(before.id) == credentialSnapshot.load(before.id) else { continue }
             let live = fresh["sources"].array.first(where: { $0["id"].string == before.id }) ?? .null
             guard live == .null || (live["base_url"].string == current.base_url
                 && live["proxy"]["mode"].string == current.proxy.mode && live["proxy"]["url"].string == current.proxy.url) else {
@@ -664,7 +640,7 @@ import ServiceManagement
             let balance = live["balance"]
             guard (apiBalances[before.id] ?? .null) != balance else { continue }
             apiBalances[before.id] = balance == .null ? nil : balance
-            await checkBalanceWarning(source: current, balance: balance, credential: try? credentialSnapshot.load(current.id))
+            await checkBalanceWarning(source: current, balance: balance, credential: credentialSnapshot.load(current.id))
         }
     }
     func setSettingsWindowActive(_ active: Bool) {
@@ -672,7 +648,7 @@ import ServiceManagement
     }
     func sync() async throws {
         if backgroundSyncTask != nil {
-            if !backgroundSyncInFlight {
+            if !syncing {
                 backgroundSyncSleepTask?.cancel()
                 backgroundSyncSleepTask = nil
                 backgroundSyncTask?.cancel()
@@ -683,44 +659,27 @@ import ServiceManagement
             }
         }
         let targetGeneration = backgroundSyncGeneration
-        let needsHistory = backgroundSyncNeedsHistory
-        let needsModelInfo = backgroundSyncNeedsModelInfo
         let notice = backgroundSyncSuccessNotice
         backgroundSyncNeedsHistory = false
-        backgroundSyncNeedsModelInfo = false
         backgroundSyncSuccessNotice = nil
-        try await performGatewaySync(
-            refreshCredentials: true,
-            syncHistory: true || needsHistory,
-            refreshModelsInfo: true || needsModelInfo
-        )
+        try await performGatewaySync(syncHistory: true, refreshModelsInfo: true)
         if backgroundSyncGeneration == targetGeneration {
             pendingSync = weeklyResetRevocationPending
             syncError = nil
             if let notice { self.notice = notice }
         }
     }
-    private func performGatewaySync(
-        refreshCredentials: Bool,
-        syncHistory: Bool,
-        refreshModelsInfo: Bool
-    ) async throws {
+    private func performGatewaySync(syncHistory: Bool, refreshModelsInfo: Bool) async throws {
         try requireWritableMetadata()
         pendingSync = true
-        let helperOwnedIDs: Set<String>
-        if refreshCredentials {
-            // Always retrieve helper-authoritative rotated tokens before building a source snapshot.
-            let notification = try await self.refreshCredentials()
-            helperOwnedIDs = Set(notification["updated_secrets"].array.compactMap { $0["source_id"].string })
-            knownHelperOwnedOfficialIDs = helperOwnedIDs
-        } else {
-            helperOwnedIDs = knownHelperOwnedOfficialIDs
-        }
+        // Always retrieve helper-authoritative rotated tokens before building a source snapshot.
+        let notification = try await refreshCredentials()
+        let helperOwnedIDs = Set(notification["updated_secrets"].array.lazy.compactMap { $0["source_id"].string })
         var values: [JSONValue] = []
         var next = settings
         for index in next.sources.indices {
             let sourceID = next.sources[index].id
-            let secret = try credentialSnapshot.load(sourceID) ?? (next.sources[index].official ? .object(["access_token": .string(""), "refresh_token": .string(""), "id_token": .string(""), "expires_at": .number(0)]) : .object([:]))
+            let secret = credentialSnapshot.load(sourceID) ?? (next.sources[index].official ? .object(["access_token": .string(""), "refresh_token": .string(""), "id_token": .string(""), "expires_at": .number(0)]) : .object([:]))
             // After a crash, durable storage may be newer than the metadata mirror.
             if next.sources[index].official, let account = secret["account_id"].string, !account.isEmpty { next.sources[index].account_id = account }
             guard case .object(var value) = try JSONValue.from(next.sources[index]) else { continue }
@@ -802,7 +761,7 @@ import ServiceManagement
                 let id = source.id
                 guard officialRefreshSchedule.isRetrying(id) == (pass == 0), !refreshingQuotas.contains(id),
                       officialRefreshSchedule.isDue(id, interval: interval, since: officialBackgroundStartedAt),
-                      (try? credentialSnapshot.load(id))?["access_token"].string?.isEmpty == false else { continue }
+                      credentialSnapshot.load(id)?["access_token"].string?.isEmpty == false else { continue }
                 Task { await refreshAccount(id, foreground: false) }
                 slots -= 1
                 if slots == 0 { return }
@@ -829,25 +788,25 @@ import ServiceManagement
     func refreshAccount(_ id: String, foreground: Bool, force: Bool = false) async {
         guard running, !busy, !shuttingDown, !Task.isCancelled, let before = settings.sources.first(where: { $0.id == id }), before.enabled || foreground else { return }
         if before.official {
-            guard before.enabled, !refreshingQuotas.contains(id), officialRefreshSchedule.isDue(id, foreground: foreground, interval: Double(settings.officialQuotaRefreshInterval) * 60, since: officialBackgroundStartedAt), let secret = try? credentialSnapshot.load(id), secret["access_token"].string?.isEmpty == false else { return }
+            guard before.enabled, !refreshingQuotas.contains(id), officialRefreshSchedule.isDue(id, foreground: foreground, interval: Double(settings.officialQuotaRefreshInterval) * 60, since: officialBackgroundStartedAt), let secret = credentialSnapshot.load(id), secret["access_token"].string?.isEmpty == false else { return }
             let includeCredits = !officialRefreshSchedule.isRetrying(id) && officialRefreshSchedule.needsCredits(id)
             try? await queryOfficial(id, includeCredits: includeCredits)
         } else if before.supportsBalanceQuery {
             guard !refreshingBalances.contains(id) else { return }
             if !force, let cached = apiBalances[id], (cached["failure_count"].number ?? 0) > 0,
                let retry = cached["next_retry_at"].number, retry > Date().timeIntervalSince1970 { return }
-            let credential = try? credentialSnapshot.load(id)
+            let credential = credentialSnapshot.load(id)
             refreshingBalances.insert(id)
             defer { refreshingBalances.remove(id) }
             do {
                 let balance = try await client.call("balance.query", .object(["source_id": .string(id), "force": .bool(force)]))
                 guard running, let current = settings.sources.first(where: { $0.id == id }), current.base_url == before.base_url, current.proxy == before.proxy,
-                      (try? credentialSnapshot.load(id)) == credential else { return }
+                      credentialSnapshot.load(id) == credential else { return }
                 apiBalances[id] = balance
                 await checkBalanceWarning(source: current, balance: balance, credential: credential)
             } catch {
                 guard settings.sources.contains(where: { $0.id == id && $0.base_url == before.base_url && $0.proxy == before.proxy }),
-                      (try? credentialSnapshot.load(id)) == credential else { return }
+                      credentialSnapshot.load(id) == credential else { return }
                 if case .object(var cached) = apiBalances[id], cached["amount"]?.number != nil {
                     cached["stale"] = .bool(true)
                     cached["error"] = .string(error.localizedDescription)
@@ -876,29 +835,31 @@ import ServiceManagement
     func saveSource(_ source: Source, apiKey: String) async throws {
         try requireWritableMetadata()
         try source.validate()
-        if let current = settings.sources.first(where: { $0.id == source.id }), current.kind != source.kind { throw AppError.message("不能更改已有来源的类型，请新建来源。") }
-        guard settings.sources.contains(where: { $0.id == source.id }) || settings.sources.count < 200 else { throw AppError.message("最多支持 200 个来源。") }
-        if !source.official, apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, try credentialSnapshot.load(source.id) == nil { throw AppError.message("请输入 API 密钥。") }
+        var previous = settings.sources.first { $0.id == source.id }
+        if let previous, previous.kind != source.kind { throw AppError.message("不能更改已有来源的类型，请新建来源。") }
+        guard previous != nil || settings.sources.count < 200 else { throw AppError.message("最多支持 200 个来源。") }
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !source.official, key.isEmpty, credentialSnapshot.load(source.id) == nil { throw AppError.message("请输入 API 密钥。") }
         if source.official {
             try await refreshCredentials()
             try await updateStatus()
+            previous = settings.sources.first { $0.id == source.id }
         }
         var source = source
-        let previous = settings.sources.first { $0.id == source.id }
-        if source.official { source = source.preservingOfficialIdentity(current: settings.sources.first { $0.id == source.id }, live: state(source.id)) }
+        if source.official { source = source.preservingOfficialIdentity(current: previous, live: state(source.id)) }
         let connectionChanged = previous?.kind != source.kind || previous?.base_url != source.base_url
             || previous?.proxy != source.proxy || previous?.account_id != source.account_id
-            || (!source.official && !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            || (!source.official && !key.isEmpty)
         try requireUniqueOfficialAccount(source)
-        if !source.official, !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            _ = try await client.call("credentials.save_api", .object(["source_id": .string(source.id), "api_key": .string(apiKey.trimmingCharacters(in: .whitespacesAndNewlines))]))
+        if !source.official, !key.isEmpty {
+            _ = try await client.call("credentials.save_api", .object(["source_id": .string(source.id), "api_key": .string(key)]))
             try await loadCredentialSnapshot([source.id])
         }
         try await updateSettingsAndSync { next in
             if let i = next.sources.firstIndex(where: { $0.id == source.id }) { next.sources[i] = source }
             else { var item = source; item.priority = next.sources.count; next.sources.append(item) }
             if next.fixed_source_id == source.id && !source.enabled { next.mode = "auto"; next.fixed_source_id = nil }
-            _ = Self.applyDefaultDisabledPolicies(for: source, previousModels: previous?.models ?? [], in: &next)
+            Self.applyDefaultDisabledPolicies(for: source, previousModels: previous?.models ?? [], in: &next)
         }
         if connectionChanged {
             modelErrors[source.id] = nil
@@ -924,7 +885,7 @@ import ServiceManagement
             if key.isEmpty, settings.sources.first(where: { $0.id == source.id })?.base_url != source.base_url {
                 throw AppError.message("请填写 API 密钥后获取模型。")
             }
-            let secret = key.isEmpty ? try credentialSnapshot.load(source.id) : .object(["api_key": .string(key)])
+            let secret = key.isEmpty ? credentialSnapshot.load(source.id) : .object(["api_key": .string(key)])
             guard let secret, secret["api_key"].string?.isEmpty == false else { throw AppError.message("请填写 API 密钥后获取模型。") }
             guard case .object(var value) = try JSONValue.from(source) else { throw AppError.message("来源配置无效。") }
             value["secret"] = secret
@@ -950,23 +911,23 @@ import ServiceManagement
     func refreshVisibleModels() { scheduleModelRefresh(maximumAge: 300) }
     func refreshModels(_ id: String) async {
         guard !refreshingModels.contains(id), let before = settings.sources.first(where: { $0.id == id }), before.discoversModels else { return }
-        let credential = try? credentialSnapshot.load(id)
+        let credential = credentialSnapshot.load(id)
         refreshingModels.insert(id); lastModelRefresh[id] = Date(); modelErrors[id] = nil
         defer { refreshingModels.remove(id) }
         do {
             let models = try await fetchModels(for: before)
             // Discard a response if the editor, login or deletion changed its source.
             guard !Task.isCancelled, running, !busy, let index = settings.sources.firstIndex(where: { $0.id == id }), settings.sources[index] == before,
-                  (try? credentialSnapshot.load(id)) == credential else { lastModelRefresh[id] = nil; return }
+                  credentialSnapshot.load(id) == credential else { lastModelRefresh[id] = nil; return }
             guard before.models != models || before.automaticModelDiscovery != true else { return }
             try await updateSettingsAndSync { next in
                 next.sources[index].automaticModelDiscovery = true
                 next.sources[index].models = models
-                _ = Self.applyDefaultDisabledPolicies(for: next.sources[index], previousModels: before.models, in: &next)
+                Self.applyDefaultDisabledPolicies(for: next.sources[index], previousModels: before.models, in: &next)
             }
         } catch {
             if !Task.isCancelled, settings.sources.contains(where: { $0 == before }),
-               (try? credentialSnapshot.load(id)) == credential { modelErrors[id] = error.localizedDescription }
+               credentialSnapshot.load(id) == credential { modelErrors[id] = error.localizedDescription }
         }
     }
     func removeSource(_ id: String) {
@@ -1235,33 +1196,22 @@ import ServiceManagement
         if settings.sources.contains(where: \.official) { ids.insert("gpt-image-2") }
         return ids.sorted()
     }
-    @discardableResult
-    static func applyDefaultDisabledPolicies(for source: Source, previousModels: [String] = [], in settings: inout AppSettings) -> Int {
-        guard source.defaultsDiscoveredModelsDisabled, source.discoversModels, !source.models.isEmpty else { return 0 }
-        var policies = settings.modelPolicies ?? []
+    static func applyDefaultDisabledPolicies(for source: Source, previousModels: [String] = [], in settings: inout AppSettings) {
+        guard source.defaultsDiscoveredModelsDisabled, source.discoversModels, !source.models.isEmpty else { return }
         let previousSet = Set(previousModels)
-        var added = 0
+        var policies = settings.modelPolicies ?? []
+        lazy var otherSources = settings.sources.lazy.filter { $0.id != source.id && !$0.defaultsDiscoveredModelsDisabled }.sorted { $0.priority < $1.priority }
         for modelID in source.models where !previousSet.contains(modelID) {
-            let otherSourceIDs = settings.sources
-                .filter { $0.id != source.id && !$0.defaultsDiscoveredModelsDisabled && ($0.models.isEmpty || $0.models.contains(modelID)) }
-                .sorted { $0.priority < $1.priority }
-                .map(\.id)
-            if let index = policies.firstIndex(where: { $0.model == modelID }) {
-                if policies[index].sourceIDs == nil {
-                    policies[index].sourceIDs = otherSourceIDs
-                    added += 1
-                }
+            let index = policies.firstIndex { $0.model == modelID }
+            if let index, policies[index].sourceIDs != nil { continue }
+            let sourceIDs = otherSources.compactMap { $0.models.isEmpty || $0.models.contains(modelID) ? $0.id : nil }
+            if let index {
+                policies[index].sourceIDs = sourceIDs
             } else {
-                policies.append(ModelPolicy(
-                    model: modelID,
-                    sourceIDs: otherSourceIDs,
-                    clients: ModelPolicy.applicableClients(for: modelID)
-                ))
-                added += 1
+                policies.append(ModelPolicy(model: modelID, sourceIDs: sourceIDs, clients: ModelPolicy.applicableClients(for: modelID)))
             }
         }
-        if added > 0 { settings.modelPolicies = policies }
-        return added
+        if !policies.isEmpty { settings.modelPolicies = policies }
     }
     func setModelsEnabled(_ ids: [String], enabled: Bool) throws {
         try updateModelPolicies(successMessage: ids.count > 1 ? (enabled ? "已启用所选模型。" : "已停用所选模型。") : nil) { next in
@@ -1339,17 +1289,11 @@ import ServiceManagement
         do {
             let result = try await client.call("config.models.apply", payload)
             guard settings.codexHome == home, modelSettingsRevision == revision else { return }
-            if result["applied"].bool == true {
-                var next = settings
-                next.localCodexAppliedModelSettingsRevision = revision
-                try persistSettings(next)
-                localModelSettingsSyncError = nil
-            } else {
-                var next = settings
-                next.localCodexAppliedModelSettingsRevision = nil
-                try persistSettings(next)
-                localModelSettingsSyncError = result["reason"].string == "missing" ? "配置目录或文件不存在，请先检查目录并完成接入。" : nil
-            }
+            let applied = result["applied"].bool == true
+            var next = settings
+            next.localCodexAppliedModelSettingsRevision = applied ? revision : nil
+            try persistSettings(next)
+            localModelSettingsSyncError = !applied && result["reason"].string == "missing" ? "配置目录或文件不存在，请先检查目录并完成接入。" : nil
         } catch {
             localModelSettingsSyncError = error.localizedDescription
             throw AppError.message("本地 Codex 模型设置同步失败：\(error.localizedDescription) 请检查配置后重试。")

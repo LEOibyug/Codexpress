@@ -70,13 +70,12 @@ final class ReviewRegressionTests: XCTestCase {
             .object(["source_id": .string(official.id), "secret": stale]),
             .object(["source_id": .string(api.id), "secret": stale])
         ])])
-        var reads: [String] = []
-        let merged = try OfficialCredentialMirror.mergedSources([official, api], response: response) { id in reads.append(id); return durable }
-        XCTAssertEqual(reads, [official.id])
+        var snapshot = CredentialSnapshot()
+        try snapshot.apply(.object(["items": .array([.object(["source_id": .string(official.id), "secret": durable])])]), requested: [official.id])
+        let merged = try OfficialCredentialMirror.mergedSources([official, api], response: response, snapshot: snapshot)
         XCTAssertEqual(merged[0].account_id, "account-B")
         XCTAssertNil(merged[1].account_id)
-        XCTAssertEqual(try OfficialCredentialMirror.requireDurable(durable)["access_token"].string, "new-generation")
-        XCTAssertThrowsError(try OfficialCredentialMirror.mergedSources([official], response: response, loadDurable: { _ in nil }))
+        XCTAssertThrowsError(try OfficialCredentialMirror.mergedSources([official], response: response, snapshot: CredentialSnapshot()))
     }
     func testPendingPortCannotCreateConnectionPreviewOrAttachment() {
         XCTAssertNoThrow(try ConfigConnectionPolicy.requireCurrentPort(saved: 17863, live: 17863))

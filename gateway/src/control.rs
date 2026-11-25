@@ -6,7 +6,7 @@ mod jobs;
 mod resets;
 mod safety;
 
-use crate::{config::secure_write, model::AppState};
+use crate::{config::secure_write, listener::{Listener, ListenerChange}, model::AppState};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,11 +26,6 @@ struct Settings {
     enabled: bool,
     port: u16,
     key: String,
-}
-struct Listener {
-    port: u16,
-    task: tokio::task::JoinHandle<()>,
-    shutdown: tokio::sync::oneshot::Sender<()>,
 }
 pub struct ControlAccess {
     settings: Mutex<Settings>,
@@ -124,7 +119,7 @@ impl ControlAccess {
         let listener = self.listener.lock().await;
         let settings = self.settings()?;
         Ok(
-            json!({"enabled":settings.enabled,"running":listener.as_ref().is_some_and(|l|!l.task.is_finished()),"port":settings.port,"base_url":format!("http://127.0.0.1:{}/v1",settings.port),"key_set":true}),
+            json!({"enabled":settings.enabled,"running":listener.as_ref().is_some_and(Listener::running),"port":settings.port,"base_url":format!("http://127.0.0.1:{}/v1",settings.port),"key_set":true}),
         )
     }
 }
@@ -174,49 +169,17 @@ pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
     {
         bail!("管理 API 必须使用独立 Key，不能复用其他入口或上游凭据");
     }
-    let current = listener
-        .as_ref()
-        .is_some_and(|l| l.port == next.port && !l.task.is_finished());
-    let socket = if next.enabled && !current {
-        Some(
-            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, next.port))
-                .await
-                .context("管理 API 端口被占用，请更换端口")?,
-        )
-    } else {
-        None
-    };
+    let change = ListenerChange::prepare(listener.as_ref(), next.enabled, std::net::Ipv4Addr::LOCALHOST, next.port)
+        .await.context("管理 API 端口被占用，请更换端口")?;
     secure_write(&state.control.path, &serde_json::to_vec(&next)?)
         .map_err(|_| anyhow::anyhow!("无法保存管理 API 设置"))?;
     *state
         .control
         .settings
         .lock()
-        .map_err(|_| anyhow::anyhow!("管理 API 设置忙碌"))? = next.clone();
+        .map_err(|_| anyhow::anyhow!("管理 API 设置忙碌"))? = next;
     state.control.revision.fetch_add(1, Ordering::Release);
-    if let Some(socket) = socket {
-        let shared = state.clone();
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _ = axum::serve(socket, router(shared))
-                .with_graceful_shutdown(async {
-                    let _ = stopped.await;
-                })
-                .await;
-        });
-        if let Some(old) = listener.take() {
-            let _ = old.shutdown.send(());
-        }
-        *listener = Some(Listener {
-            port: next.port,
-            task,
-            shutdown,
-        });
-    } else if !next.enabled {
-        if let Some(old) = listener.take() {
-            let _ = old.shutdown.send(());
-        }
-    }
+    change.apply(&mut listener, || router(state.clone()));
     drop(listener);
     state.control.status().await
 }

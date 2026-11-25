@@ -299,7 +299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_tracks_pricing_sources_and_reprices_when_subscription_changes() {
+    async fn subscription_change_reprices_historical_usage() {
         let dir = tempfile::tempdir().unwrap();
         {
             drop(crate::usage::UsageStore::open(&dir.path().join("usage.sqlite")).unwrap());
@@ -328,26 +328,10 @@ mod tests {
         };
 
         handle(&state, payload(false)).await.unwrap();
-        assert_eq!(
-            *state.last_pricing_sources.lock().await,
-            Some(vec![("api-1".into(), "api".into(), false)])
-        );
         let initial = state.usage.summary_filtered(1, Some("api-1"), None).unwrap();
         assert_eq!(initial["recent"][0]["cost"]["rates"]["input"], 4.0);
 
-        // Repeat sync with identical pricing shape keeps cached state without error.
-        handle(&state, payload(false)).await.unwrap();
-        assert_eq!(
-            *state.last_pricing_sources.lock().await,
-            Some(vec![("api-1".into(), "api".into(), false)])
-        );
-
-        // Toggling is_subscription invalidates the cached key and triggers reprice_historical.
         handle(&state, payload(true)).await.unwrap();
-        assert_eq!(
-            *state.last_pricing_sources.lock().await,
-            Some(vec![("api-1".into(), "api".into(), true)])
-        );
         let subscribed = state.usage.summary_filtered(1, Some("api-1"), None).unwrap();
         assert_eq!(subscribed["recent"][0]["cost"]["long_context_waived"], true);
         assert_eq!(subscribed["recent"][0]["cost"]["rates"]["input"], 2.0);

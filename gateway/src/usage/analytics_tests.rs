@@ -395,7 +395,7 @@ fn same_name_costs_preserve_mixed_json_numbers_in_both_orders() {
 
 #[test]
 fn high_cardinality_timings_stay_exact_after_appends_and_aligned_expansion() {
-    let (dir, _) = fixture();
+    let dir = tempfile::tempdir().unwrap();
     let store = crate::usage::UsageStore::open(&dir.path().join("usage.sqlite")).unwrap();
     let from = 100_000;
     let day = 86_400;

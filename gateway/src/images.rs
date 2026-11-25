@@ -6,6 +6,7 @@ pub(crate) mod native;
 use crate::{
     chatbot,
     config::secure_write,
+    listener::{Listener, ListenerChange},
     model::{now, AppState, Source, SourceRuntime},
     transport,
     usage::{diagnostics::Capture, TokenDetails, UsageRecord},
@@ -43,11 +44,6 @@ struct Settings {
     key: String,
     #[serde(default)]
     source_id: Option<String>,
-}
-struct Listener {
-    task: tokio::task::JoinHandle<()>,
-    shutdown: tokio::sync::oneshot::Sender<()>,
-    port: u16,
 }
 pub struct ImageAccess {
     settings: Mutex<Settings>,
@@ -124,7 +120,7 @@ impl ImageAccess {
         let listener = self.listener.lock().await;
         let s = self.settings()?;
         Ok(
-            json!({"enabled":s.enabled,"running":listener.as_ref().is_some_and(|l|!l.task.is_finished()),"port":s.port,"base_url":format!("http://127.0.0.1:{}/v1",s.port),"key_set":true,"source_id":s.source_id,"model":MODEL}),
+            json!({"enabled":s.enabled,"running":listener.as_ref().is_some_and(Listener::running),"port":s.port,"base_url":format!("http://127.0.0.1:{}/v1",s.port),"key_set":true,"source_id":s.source_id,"model":MODEL}),
         )
     }
 }
@@ -203,47 +199,15 @@ pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
             }
         }
     }
-    let current = listener
-        .as_ref()
-        .is_some_and(|l| l.port == next.port && !l.task.is_finished());
-    let socket = if next.enabled && !current {
-        Some(
-            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, next.port))
-                .await
-                .context("图片生成端口被占用，请更换端口")?,
-        )
-    } else {
-        None
-    };
+    let change = ListenerChange::prepare(listener.as_ref(), next.enabled, std::net::Ipv4Addr::LOCALHOST, next.port)
+        .await.context("图片生成端口被占用，请更换端口")?;
     secure_write(&state.images.path, &serde_json::to_vec(&next)?)?;
     *state
         .images
         .settings
         .lock()
-        .map_err(|_| anyhow::anyhow!("图片生成接入忙碌"))? = next.clone();
-    if let Some(socket) = socket {
-        let shared = state.clone();
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _ = axum::serve(socket, router(shared))
-                .with_graceful_shutdown(async {
-                    let _ = stopped.await;
-                })
-                .await;
-        });
-        if let Some(old) = listener.take() {
-            let _ = old.shutdown.send(());
-        }
-        *listener = Some(Listener {
-            task,
-            shutdown,
-            port: next.port,
-        });
-    } else if !next.enabled {
-        if let Some(old) = listener.take() {
-            let _ = old.shutdown.send(());
-        }
-    }
+        .map_err(|_| anyhow::anyhow!("图片生成接入忙碌"))? = next;
+    change.apply(&mut listener, || router(state.clone()));
     drop(listener);
     state.images.status().await
 }

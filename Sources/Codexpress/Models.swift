@@ -323,12 +323,12 @@ enum OfficialCredentialMirror {
               value["account_id"].string?.isEmpty == false else { throw AppError.message("官方凭据尚未完整保存，请重新登录。") }
         return value
     }
-    static func mergedSources(_ sources: [Source], response: JSONValue, loadDurable: (String) throws -> JSONValue?) throws -> [Source] {
+    static func mergedSources(_ sources: [Source], response: JSONValue, snapshot: CredentialSnapshot) throws -> [Source] {
         var next = sources
         // An IPC result is an update notification only. Its secret may already be superseded.
         for item in response["updated_secrets"].array {
             guard let id = item["source_id"].string, let index = next.firstIndex(where: { $0.id == id && $0.official }) else { continue }
-            let durable = try requireDurable(loadDurable(id))
+            let durable = try requireDurable(snapshot.load(id))
             next[index].account_id = durable["account_id"].string
         }
         return next

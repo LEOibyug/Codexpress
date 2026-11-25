@@ -3,7 +3,7 @@
 mod requests;
 mod responses;
 
-use crate::{config::secure_write, model::AppState};
+use crate::{config::secure_write, listener::{Listener, ListenerChange}, model::AppState};
 use anyhow::{bail, Context, Result};
 use axum::{
     body::Body,
@@ -34,11 +34,6 @@ struct Settings {
     enabled: bool,
     port: u16,
     key: String,
-}
-struct Listener {
-    port: u16,
-    task: tokio::task::JoinHandle<()>,
-    shutdown: tokio::sync::oneshot::Sender<()>,
 }
 pub struct ChatbotAccess {
     settings: Mutex<Settings>,
@@ -107,7 +102,7 @@ impl ChatbotAccess {
         let listener = self.listener.lock().await;
         let settings = self.settings()?;
         Ok(
-            json!({"enabled":settings.enabled,"running":listener.as_ref().is_some_and(|l|!l.task.is_finished()),"port":settings.port,"base_url":format!("http://127.0.0.1:{}/v1",settings.port),"listen_address":"0.0.0.0","lan_enabled":true,"key_set":true}),
+            json!({"enabled":settings.enabled,"running":listener.as_ref().is_some_and(Listener::running),"port":settings.port,"base_url":format!("http://127.0.0.1:{}/v1",settings.port),"listen_address":"0.0.0.0","lan_enabled":true,"key_set":true}),
         )
     }
     pub fn key(&self) -> Result<Value> {
@@ -163,47 +158,15 @@ pub async fn configure(state: &Arc<AppState>, payload: Value) -> Result<Value> {
     {
         bail!("请为聊天客户端使用独立 Key，不要复用来源或远端机器密钥");
     }
-    let current = listener
-        .as_ref()
-        .is_some_and(|l| l.port == next.port && !l.task.is_finished());
-    let socket = if next.enabled && !current {
-        Some(
-            tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, next.port))
-                .await
-                .context("聊天客户端端口被占用，请更换端口")?,
-        )
-    } else {
-        None
-    };
+    let change = ListenerChange::prepare(listener.as_ref(), next.enabled, std::net::Ipv4Addr::UNSPECIFIED, next.port)
+        .await.context("聊天客户端端口被占用，请更换端口")?;
     secure_write(&state.chatbot.path, &serde_json::to_vec(&next)?)?;
     *state
         .chatbot
         .settings
         .lock()
-        .map_err(|_| anyhow::anyhow!("聊天客户端接入忙碌"))? = next.clone();
-    if let Some(socket) = socket {
-        let shared = state.clone();
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _ = axum::serve(socket, router(shared))
-                .with_graceful_shutdown(async {
-                    let _ = stopped.await;
-                })
-                .await;
-        });
-        if let Some(old) = listener.take() {
-            let _ = old.shutdown.send(());
-        }
-        *listener = Some(Listener {
-            port: next.port,
-            task,
-            shutdown,
-        });
-    } else if !next.enabled {
-        if let Some(old) = listener.take() {
-            let _ = old.shutdown.send(());
-        }
-    }
+        .map_err(|_| anyhow::anyhow!("聊天客户端接入忙碌"))? = next;
+    change.apply(&mut listener, || router(state.clone()));
     drop(listener);
     state.chatbot.status().await
 }

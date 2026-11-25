@@ -1,28 +1,12 @@
 use super::*;
-use crate::usage::{TokenDetails, UsageRecord};
-use rusqlite::{params, Connection};
-use std::{collections::HashMap, time::Instant};
+use crate::usage::{TokenDetails, UsageRecord, UsageStore};
+use rusqlite::params;
+use std::time::Instant;
 
 pub(in crate::usage) fn fixture() -> (tempfile::TempDir, StoreData) {
     let dir = tempfile::tempdir().unwrap();
-    let connection = Connection::open(dir.path().join("usage.sqlite")).unwrap();
-    connection.execute_batch("CREATE TABLE usage (
-        attempt INTEGER PRIMARY KEY,request_id TEXT NOT NULL,source_id TEXT NOT NULL,source_name TEXT NOT NULL,model TEXT NOT NULL,
-        started_at INTEGER NOT NULL,status TEXT NOT NULL,input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,
-        cached_input_tokens INTEGER NOT NULL,complete INTEGER NOT NULL,latency_ms INTEGER NOT NULL,metadata TEXT NOT NULL DEFAULT '{}');
-        CREATE INDEX usage_time ON usage(started_at);
-        CREATE TABLE diagnostics(attempt_id TEXT PRIMARY KEY,created_at INTEGER NOT NULL,metadata TEXT NOT NULL,body BLOB);")
-        .unwrap();
-    (
-        dir,
-        StoreData {
-            connection,
-            active: HashMap::new(),
-            analytics_cache: Default::default(),
-            settlements: Default::default(),
-            last_attempt: 0,
-        },
-    )
+    let store = UsageStore::open(&dir.path().join("usage.sqlite")).unwrap();
+    (dir, store.data.into_inner().unwrap())
 }
 
 pub(in crate::usage) fn record(id: &str, at: u64) -> UsageRecord {

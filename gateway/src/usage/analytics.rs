@@ -8,7 +8,7 @@ mod cache;
 pub(super) use cache::{preserve_after_write, Cached};
 
 const MAX_OPTIONS: usize = 10_000;
-const COST_FIELDS: [&str; 6] = [
+pub(super) const COST_FIELDS: [&str; 6] = [
     "total_usd",
     "input_usd",
     "cached_input_usd",
@@ -16,7 +16,7 @@ const COST_FIELDS: [&str; 6] = [
     "output_usd",
     "cache_savings_usd",
 ];
-const COST_COUNTS: [&str; 6] = [
+pub(super) const COST_COUNTS: [&str; 6] = [
     "priced_requests",
     "unpriced_requests",
     "unobserved_requests",
