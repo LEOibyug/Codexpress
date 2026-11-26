@@ -82,7 +82,6 @@ struct SettingsView: View {
             .sheet(isPresented: $choosingGateway) { GatewayTargetSheet() }
             .onChange(of: management.remoteSelected) { _, remote in
                 page = remote ? .sources : .overview
-                if !remote { Task { await model.start() } }
             }
             .onAppear { if management.remoteSelected { page = .sources } }
             .sheet(item: $model.creditResetRequest, onDismiss: { model.controlResetDismissed() }) { request in

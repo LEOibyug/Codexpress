@@ -4,7 +4,7 @@ import Darwin
 struct GatewayClient: Sendable {
     let socketPath: String
     static let limit = 8 * 1024 * 1024
-    func call(_ op: String, _ payload: JSONValue = .object([:])) async throws -> JSONValue {
+    func call(_ op: String, _ payload: JSONValue = .object([:]), peerPID: pid_t? = nil) async throws -> JSONValue {
         let path = socketPath
         return try await Task.detached(priority: .utility) {
             let id = UUID().uuidString
@@ -31,6 +31,13 @@ struct GatewayClient: Sendable {
             }
             let connected = withUnsafePointer(to: &address) { ptr in ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
             guard connected == 0 else { throw AppError.message("无法连接网关。请检查网关是否已启动及本地端口是否被占用。") }
+            if let peerPID {
+                var actual: pid_t = 0
+                var length = socklen_t(MemoryLayout.size(ofValue: actual))
+                guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &actual, &length) == 0, actual == peerPID else {
+                    throw AppError.message("网关实例已改变，未发送管理请求。")
+                }
+            }
             try data.withUnsafeBytes { bytes in
                 var offset = 0
                 while offset < bytes.count {

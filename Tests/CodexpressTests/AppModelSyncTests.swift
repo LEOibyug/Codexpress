@@ -34,6 +34,56 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: metadata.file), original)
     }
 
+    @MainActor func testRemoteStandbyPreservesBusyHelperAndRestartsOnlyOnReturn() async throws {
+        let dir = try gatewayFixtureDirectory()
+        var settings = AppSettings(); settings.codexHome = dir.appendingPathComponent("codex").path
+        try MetadataStore(directory: dir).save(settings)
+        let model = AppModel(stateDirectory: dir)
+        defer { model.stop() }
+        await model.start()
+        let ipc = GatewayClient(socketPath: dir.appendingPathComponent("control.sock").path)
+        let original = try await ipc.call("status")["process_id"]
+        let later = ContinuousClock.now.advanced(by: .seconds(301))
+        model.localGatewayTargetChanged(remote: true)
+        await model.suspendLocalGatewayIfDue(at: .now.advanced(by: .seconds(299)))
+        model.localGatewayTargetChanged(remote: false)
+        await model.suspendLocalGatewayIfDue(at: later)
+        let same = try await ipc.call("status")["process_id"]
+        XCTAssertEqual(same, original, "Returning within the grace period must keep the same helper")
+
+        let busy = dir.appendingPathComponent("active-stream")
+        try Data().write(to: busy)
+        model.localGatewayTargetChanged(remote: true)
+        await model.suspendLocalGatewayIfDue(at: later)
+        let stillServing = try await ipc.call("status")["process_id"]
+        XCTAssertEqual(stillServing, original, "Only the gateway, not the last cached status, can admit shutdown")
+        try FileManager.default.removeItem(at: busy)
+        await model.suspendLocalGatewayIfDue(at: later)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while model.running, .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(model.running)
+        do { _ = try await ipc.call("status"); XCTFail("Local endpoint still accepts connections") } catch {}
+        model.localGatewayTargetChanged(remote: false)
+        let resumed = ContinuousClock.now.advanced(by: .seconds(4))
+        while model.gatewayVersion == nil, .now < resumed { try await Task.sleep(for: .milliseconds(10)) }
+        let next = try await ipc.call("status")["process_id"]
+        XCTAssertNotEqual(next, original)
+        XCTAssertTrue(model.running)
+
+        // A return after admission but before exit must also bring back exactly one serving process.
+        let hold = dir.appendingPathComponent("hold-exit")
+        try Data().write(to: hold)
+        model.localGatewayTargetChanged(remote: true)
+        await model.suspendLocalGatewayIfDue(at: .now.advanced(by: .seconds(301)))
+        model.localGatewayTargetChanged(remote: false)
+        try FileManager.default.removeItem(at: hold)
+        let handoff = ContinuousClock.now.advanced(by: .seconds(4))
+        while (model.status["process_id"] == next || !model.running), .now < handoff { try await Task.sleep(for: .milliseconds(10)) }
+        let final = try await ipc.call("status")["process_id"]
+        XCTAssertNotEqual(final, next)
+        XCTAssertTrue(model.running)
+    }
+
     @MainActor func testAPIKeysCanBeRestoredIndividuallyWithoutChangingTheFixedRoute() async throws {
         let directory = try gatewayFixtureDirectory()
         var first = Source(); first.name = "First"; first.automaticModelDiscovery = false
@@ -504,6 +554,8 @@ final class AppModelSyncTests: XCTestCase {
                     data = dict(process_id=os.getpid(), port=17863, inflight=0, sources=sources, connection_mode=mode.read_text() if mode.exists() else 'unmanaged')
                 elif operation == 'gateway.update.info':
                     data = dict(protocol=1, version='0.8.26')
+                elif operation == 'gateway.update.stop_when_idle':
+                    data = dict(stopping=not (directory / 'active-stream').exists())
                 elif operation == 'credentials.storage.status':
                     status = directory / 'storage-status.json'
                     data = json.loads(status.read_text()) if status.exists() else dict(mode='file', file_path=str(directory / 'legacy-file.json'))
@@ -565,5 +617,9 @@ final class AppModelSyncTests: XCTestCase {
             except Exception:
                 response = dict(id=request['id'], ok=False, error='Fixture read failed')
             connection.sendall((json.dumps(response) + '\n').encode())
+            if operation == 'gateway.update.stop_when_idle' and data['stopping']:
+                while (directory / 'hold-exit').exists(): time.sleep(0.01)
+                (directory / 'control.sock').unlink()
+                break
     """#
 }

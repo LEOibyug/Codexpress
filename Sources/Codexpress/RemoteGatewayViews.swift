@@ -27,6 +27,8 @@ struct GatewayTargetSheet: View {
                         .settingsField().accessibilityLabel("管理令牌")
                     Text("验证成功后保存到本机私有文件，不使用钥匙串。").font(AppTypography.caption).foregroundStyle(.secondary)
                 }
+                Text("使用远端满 5 分钟后，本地网关将在空闲时关闭。仍使用本机地址的客户端需等切回本地后再连接。")
+                    .font(AppTypography.caption).foregroundStyle(.secondary)
                 if let error = management.message { InfoNote(text: error, symbol: "exclamationmark.triangle", color: .orange) }
             }
             Text("切换不会迁移来源或更改 Codex 接入。本机 OMP 默认跟随所选网关；首次选择远端会签发专用设备 Key。")

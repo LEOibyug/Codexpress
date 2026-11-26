@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import SwiftUI
 import ServiceManagement
@@ -68,6 +69,9 @@ import ServiceManagement
         }
     }
     private var helper: Process?
+    private var gatewaySelectionObserver: AnyCancellable?
+    private var localStandbyDeadline: ContinuousClock.Instant?
+    private var standbyStopProcess: Process?
     private var stagedGateway: URL?
     private var environmentSyncTask: Task<Void, Never>?
     private var environmentSyncGeneration: UInt64 = 0
@@ -163,12 +167,40 @@ import ServiceManagement
             operations = try ResetOperationStore(directory: directory).load()
         } catch { self.error = "重置卡操作记录读取失败，已停用手动提交。"; consuming.insert("all") }
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        gatewaySelectionObserver = gatewayManagement.$remoteSelected.removeDuplicates().dropFirst().sink { [weak self] remote in
+            self?.localGatewayTargetChanged(remote: remote)
+        }
     }
+    func localGatewayTargetChanged(remote: Bool) {
+        guard !shuttingDown else { return }
+        if remote {
+            localStandbyDeadline = .now.advanced(by: .seconds(5 * 60))
+        } else {
+            localStandbyDeadline = nil
+            restartCount = 0
+            if helper?.isRunning != true, !restarting { stopLocalPolling() }
+            Task { await start() }
+        }
+    }
+
+    func suspendLocalGatewayIfDue(at now: ContinuousClock.Instant) async {
+        guard let deadline = localStandbyDeadline, now >= deadline, !shuttingDown,
+              let process = helper, process.isRunning, standbyStopProcess == nil,
+              !starting, !startInProgress, !restarting, !busy, !hasPendingBackgroundSync,
+              gatewayUpdateUIIdle else { return }
+        // The helper atomically checks streams and background work before closing admission.
+        standbyStopProcess = process
+        let reply = try? await handshakeClient.call("gateway.update.stop_when_idle", peerPID: process.processIdentifier)
+        if standbyStopProcess === process, reply?["stopping"].bool != true { standbyStopProcess = nil }
+        // Once accepted, the termination handler owns the handoff, even if the target changes mid-call.
+    }
+
     func start() async {
-        guard !gatewayManagement.remoteSelected, timerTask == nil, !starting else { return }
+        guard !shuttingDown, !gatewayManagement.remoteSelected, standbyStopProcess == nil, timerTask == nil, !starting else { return }
         starting = true
         defer { starting = false }
         await startHelper()
+        guard !shuttingDown, !gatewayManagement.remoteSelected || helper?.isRunning == true else { return }
         timerTask = Task { [weak self] in
             var tick = 0
             while !Task.isCancelled {
@@ -176,6 +208,10 @@ import ServiceManagement
                 try? await Task.sleep(for: .seconds(interval))
                 guard !Task.isCancelled, let self else { break }
                 tick = (tick + 1) % 5
+                if self.localStandbyDeadline != nil {
+                    await self.suspendLocalGatewayIfDue(at: .now)
+                    if Task.isCancelled || self.standbyStopProcess != nil { continue }
+                }
                 await self.poll(refreshCredentials: tick == 0)
                 if tick == 0 { await self.refreshInstalledGatewayUpdate() }
                 await self.applyPendingGatewayUpdateIfIdle()
@@ -192,7 +228,8 @@ import ServiceManagement
         scheduleOfficialAccountRefresh()
     }
     func startHelper(port: Int? = nil, expectedVersion: String? = nil, requiredEntries: [String] = []) async {
-        guard !metadataLoadFailed, !shuttingDown else { return }
+        guard !metadataLoadFailed, !shuttingDown, standbyStopProcess == nil,
+              !gatewayManagement.remoteSelected || restarting else { return }
         guard !startInProgress else { return }
         startInProgress = true
         defer { startInProgress = false }
@@ -206,7 +243,7 @@ import ServiceManagement
             // Do not adopt a possibly unrelated live helper without the metadata we own.
             if helper?.isRunning != true {
                 if (try? await handshakeClient.call("status")) != nil { throw AppError.message("此状态目录已有网关运行，已拒绝接管其他实例。请先退出另一个 Codexpress 实例。") }
-                guard !shuttingDown else { return }
+                guard !shuttingDown, !gatewayManagement.remoteSelected || restarting else { return }
                 if stagedGateway == nil {
                     let source = try ProcessInfo.processInfo.environment["CODEXPRESS_GATEWAY_PATH"].map { URL(fileURLWithPath: $0) } ?? GatewayExecutable.bundled()
                     stagedGateway = try gatewayExecutables.stage(source, replacing: "gateway-a")
@@ -284,11 +321,25 @@ import ServiceManagement
         guard helper?.processIdentifier == pid else { return }
         running = false
         verifiedCredentialFile = nil
+        if standbyStopProcess != nil || (localStandbyDeadline != nil && !restarting) {
+            standbyStopProcess = nil
+            helper = nil
+            logPipe?.fileHandleForReading.readabilityHandler = nil
+            logPipe = nil
+            pendingGatewayUpdate = nil
+            credentialSnapshot = CredentialSnapshot()
+            status = .null
+            gatewayVersion = nil
+            stopLocalPolling()
+            if localStandbyDeadline == nil { await start() }
+            return
+        }
         guard !shuttingDown, !restarting else { return }
         guard restartCount < 3 else { error = "网关反复退出，已停止自动重启。请检查本地端口后手动重试。"; return }
         restarting = true; restartCount += 1
         try? await Task.sleep(for: .seconds(restartCount))
-        await startHelper(); restarting = false
+        if localStandbyDeadline == nil { await startHelper() } else { stopLocalPolling() }
+        restarting = false
     }
     private var gatewayExecutables: GatewayExecutable {
         GatewayExecutable(directory: directory.appendingPathComponent("gateway-runtime", isDirectory: true))
@@ -415,11 +466,18 @@ import ServiceManagement
         }
         return Int(count)
     }
+    private func stopLocalPolling() {
+        timerTask?.cancel(); timerTask = nil
+        accountTimerTask?.cancel(); accountTimerTask = nil
+        officialAccountTimerTask?.cancel(); officialAccountTimerTask = nil; officialBackgroundWakeAt = nil
+        modelRefreshTask?.cancel(); controlResetPollTask?.cancel()
+    }
     func stop() {
         guard !shuttingDown else { return }
         shuttingDown = true
         gatewayManagement.stopMonitoring()
-        cancelBackgroundSync(); timerTask?.cancel(); accountTimerTask?.cancel(); officialAccountTimerTask?.cancel(); modelRefreshTask?.cancel(); controlResetPollTask?.cancel()
+        stopLocalPolling()
+        cancelBackgroundSync()
         if let helper, helper.isRunning { helper.terminate() }
         logPipe?.fileHandleForReading.readabilityHandler = nil
     }
