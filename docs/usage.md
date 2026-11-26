@@ -420,7 +420,7 @@ Responses 本身允许 `system` 消息。第三方代理若在 HTTP 400／422 �
 
 ## OMP 一键接入
 
-本机目标从「接入 → OMP」、远端目标从「来源池 → 本机 OMP…」点击「安装扩展」，然后重新启动 OMP。本机首次绑定请在 `/login` 选择 **Codexpress** 或运行 `omp login codexpress`；已授权的远端可直接用 `/model` 选择模型。默认绑定跟随 Mac 当前网关：本机使用 `/omp/v1/codex/responses`；独立远端使用服务器的 `/v1/responses` 和专用设备 Key。切换不需要重复登录，也不会把进行中的请求重发到新目标。
+本机目标从「接入 → OMP」、远端目标从「来源池 → 本机 OMP…」点击「安装扩展」，然后重新启动 OMP。本机首次绑定请在 `/login` 选择 **Codexpress** 或运行 `omp login codexpress`；已授权的远端可直接用 `/model` 选择模型。默认绑定跟随 Mac 当前网关：本机使用 `/omp/v1/codex/responses`；独立远端优先使用服务器的 `/omp/v1` 原生入口和专用设备 Key，不提供原生入口的旧服务器使用 `/v1/responses`。切换不需要重复登录，也不会把进行中的请求重发到新目标。
 
 本机目标通过 `control.sock` 发现；`CODEXPRESS_STATE_DIR` 可指定其他 Codexpress 状态目录。扩展不复制固定模型清单，也不创建 `models.yml`。用 `omp --model codexpress/模型ID` 选择模型，不使用在扩展加载前验证的 `--provider codexpress`。已显式指定独立网关地址的 OMP profile 继续使用自己的连接，不跟随 Mac。
 
@@ -430,7 +430,7 @@ OMP 接入页提供扩展安装和登录指引。安装会复制内置发行包�
 
 真实会话与线程 ID 独立于提示缓存 Key，重开同一会话保留线程身份；共享缓存 Key 不合并不同对话。扩展优先采用请求自身的原生 provider session ID，避免 advisor 被误归入主会话。Token 与缓存命中取自上游返回，不把本机原文缓存当作上游命中。API 来源保留原生正文、工具、加密推理项及事件；官方来源仅作其协议必需的参数适配。原版 OMP 的单次费用按宿主模型价格计算；上游实际扣费以 Codexpress 的账单核对和统计为准，不把套餐额度或余额变化当作单次请求费用。
 
-本机网关使用 SSE，并支持 Codex V2 与 V1 兼容压缩；网关只报告结果、错误或不支持，由 OMP 决定方法顺序。独立远端网关走标准 Responses SSE，不尝试本机专用的 V2 路径。
+本机网关保留原有 V2 与 V1 压缩策略。远端使用扩展 0.1.15 时，OMP 按当前模型和会话查询所选来源的流式上下文压缩（V2）能力，查询不发起上游生成。官方 ChatGPT 订阅默认开启；Responses API 和 OpenAI Platform 默认关闭。确认供应商支持后，在远端「来源池 → 编辑来源 → 模型」打开「允许 OMP 使用流式上下文压缩（V2）」，保存来源并提交更改。Google AI Studio 不提供该开关。旧服务器未明确声明支持、或实际来源已明确拒绝 V2 时，不再把该来源视为支持；其他压缩方式仍由 OMP 决定。
 
 本机目标的 `/codexpress` 支持查看状态、重新绑定、抢占、恢复及主动刷新余额、额度和账单。重置卡仍需在 Codexpress 窗口中确认；这些操作使用 Unix socket，不依赖管理 HTTP 开关。跟随独立远端时，OMP 只使用设备 Key；修改来源池请在 Mac 的远端网关界面操作。
 
