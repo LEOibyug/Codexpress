@@ -519,6 +519,7 @@ mod tests {
             kind: "api".into(),
             show_in_cmux: true,
             is_subscription: false,
+            remote_compaction_v2: None,
             base_url: format!("https://{id}.example.invalid"),
             enabled: true,
             priority: 0,

@@ -8,6 +8,7 @@ pub fn api_source(id: &str, name: &str, base: &str, api_key: &str) -> Source {
         kind: "api".into(),
         show_in_cmux: true,
         is_subscription: false,
+        remote_compaction_v2: None,
         base_url: base.into(),
         enabled: true,
         priority: 0,

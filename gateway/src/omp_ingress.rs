@@ -119,7 +119,7 @@ struct CapabilityQuery {
     session_id: Option<String>,
 }
 async fn capabilities(State(state): State<Arc<AppState>>, Query(query): Query<CapabilityQuery>, request: Request<Body>) -> Response {
-    let Some(model) = query.model.as_deref() else {
+    let Some(model) = query.model.as_deref().filter(|m| !m.trim().is_empty()) else {
         // No source is selected yet; upstream support for V2 is not universal.
         return Json(json!({"websocket":false,"remote_compaction_v2":null})).into_response();
     };
@@ -129,9 +129,9 @@ async fn capabilities(State(state): State<Arc<AppState>>, Query(query): Query<Ca
     let session = identity.map(|id| format!("omp:{namespace}:thread:{id}"));
     let affinity = session.as_ref().map(|session|crate::affinity::key(session, model));
     let sources = crate::routing::candidates_with_session(&state, model, None, affinity.as_deref()).await;
-    let preferred = affinity.as_deref().and_then(|key|state.affinity.preferred(key, &sources));
-    let source = preferred.as_ref().and_then(|id|sources.iter().find(|source|&source.id == id)).or_else(||sources.first());
-    let mut result = json!({"source_id":source.map(|s|&s.id),"websocket":false,"remote_compaction_v2":source.and_then(compaction_capability)});
+    let source = sources.first(); // Already ordered by model policy, load and session affinity.
+    let public = request.extensions().get::<crate::remote::PublicDevice>().is_some();
+    let mut result = json!({"source_id":source.map(|s|&s.id),"websocket":false,"remote_compaction_v2":source.and_then(|s| compaction_capability(s, public))});
     if request.extensions().get::<crate::remote::RemoteIngress>().is_none() {
         result["source_identity"] = json!(source.map(|s|s.identity()));
     }
@@ -142,11 +142,14 @@ fn unsupported_sources() -> &'static std::sync::Mutex<std::collections::HashSet<
     static SOURCES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
     &SOURCES
 }
-pub(crate) fn compaction_capability(source: &crate::model::Source) -> Option<bool> {
-    if source.kind == "google" {
+pub(crate) fn compaction_capability(source: &crate::model::Source, public_device: bool) -> Option<bool> {
+    // Local OMP may try an unknown Responses source. Public device requests
+    // require explicit opt-in except for the official Codex subscription route.
+    if source.kind == "google" || public_device && !source.remote_compaction_v2.unwrap_or(source.kind == "official") {
         return Some(false);
     }
-    unsupported_sources().lock().ok()?.contains(&source.identity()).then_some(false)
+    let unsupported = unsupported_sources().lock().map_or(true, |s| s.contains(&source.identity()));
+    if unsupported { Some(false) } else { public_device.then_some(true) }
 }
 pub(crate) fn observe_compaction_rejection(source: &crate::model::Source, status: StatusCode, value: &Value) {
     if !matches!(status.as_u16(), 400 | 404 | 422 | 501) { return; }
@@ -270,20 +273,30 @@ mod tests {
 
     #[test]
     fn only_explicit_unsupported_marks_actual_source_identity() {
-        let source: crate::model::Source = serde_json::from_value(json!({
+        let mut source: crate::model::Source = serde_json::from_value(json!({
             "id":"capability-test","name":"测试","kind":"api","base_url":"http://127.0.0.1:1",
             "enabled":true,"priority":0,"proxy":{"mode":"direct"},"secret":{"api_key":"first"}
         })).unwrap();
+        for (kind, default) in [("official", true), ("api", false), ("openai", false), ("google", false)] {
+            source.kind = kind.into();
+            for setting in [None, Some(false), Some(true)] {
+                source.remote_compaction_v2 = setting;
+                assert_eq!(compaction_capability(&source, true), Some(kind != "google" && setting.unwrap_or(default)));
+            }
+        }
+        source.kind = "api".into(); // Explicit opt-in does not override an upstream rejection.
         for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::SERVICE_UNAVAILABLE] {
             observe_compaction_rejection(&source, status, &json!({"error":{"code":"unsupported_compaction"}}));
-            assert_eq!(compaction_capability(&source), None);
+            assert_eq!(compaction_capability(&source, false), None);
         }
         observe_compaction_rejection(&source, StatusCode::BAD_REQUEST, &json!({"error":{"code":"invalid_request"}}));
-        assert_eq!(compaction_capability(&source), None);
+        assert_eq!(compaction_capability(&source, false), None);
         observe_compaction_rejection(&source, StatusCode::BAD_REQUEST, &json!({"error":{"code":"unsupported_parameter","param":"compaction_trigger"}}));
-        assert_eq!(compaction_capability(&source), Some(false));
+        assert_eq!(compaction_capability(&source, false), Some(false));
+        assert_eq!(compaction_capability(&source, true), Some(false));
         let mut changed = source.clone();
         changed.secret = json!({"api_key":"second"});
-        assert_eq!(compaction_capability(&changed), None);
+        assert_eq!(compaction_capability(&changed, false), None);
+        assert_eq!(compaction_capability(&changed, true), Some(true));
     }
 }

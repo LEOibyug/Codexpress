@@ -1310,7 +1310,7 @@ async fn forward_once(
         };
         if omp_ingress && parts.uri.path() == "/v1/responses"
             && crate::chatbot::is_compaction_v2(&parsed)
-            && crate::omp_ingress::compaction_capability(&candidate) == Some(false)
+            && crate::omp_ingress::compaction_capability(&candidate, parts.extensions.get::<crate::remote::PublicDevice>().is_some()) == Some(false)
         {
             let mut response = (StatusCode::BAD_REQUEST, axum::Json(json!({"error":{
                 "code":"unsupported_compaction","type":"invalid_request_error",

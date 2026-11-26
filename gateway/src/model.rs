@@ -27,6 +27,8 @@ pub struct Source {
     pub show_in_cmux: bool,
     #[serde(default)]
     pub is_subscription: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_compaction_v2: Option<bool>,
     pub base_url: String,
     pub enabled: bool,
     pub priority: i32,
@@ -153,6 +155,9 @@ impl Source {
         }
         if !["api", "official", "google", "openai"].contains(&self.kind.as_str()) {
             bail!("未知来源类型");
+        }
+        if self.kind == "google" && self.remote_compaction_v2 == Some(true) {
+            bail!("Google AI Studio 来源不支持 V2 压缩");
         }
         if self
             .max_active_conversations
