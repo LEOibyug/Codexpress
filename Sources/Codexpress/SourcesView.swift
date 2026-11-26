@@ -97,7 +97,8 @@ struct SourcesPage: View {
             }
             .sheet(isPresented: $importing) {
                 if let remote {
-                    RemoteSourceImport(sources: model.sources, endpoint: remote.pool.target.endpoint, current: remote.pool.valid, hasCredentials: model.canManageCredentials) { source, includeKey in
+                    RemoteSourceImport(sources: model.sources, endpoint: remote.pool.target.endpoint, current: remote.pool.valid,
+                                       hasCredentials: model.canManageCredentials, supportsSourceCompactionV2: remote.pool.target.supportsSourceCompactionV2) { source, includeKey in
                         try remote.pool.importSource(source, includeKey: includeKey, credential: model.credentialSnapshot.load(source.id))
                     }
                 }

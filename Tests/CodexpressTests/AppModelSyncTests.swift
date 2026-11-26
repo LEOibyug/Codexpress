@@ -88,6 +88,7 @@ final class AppModelSyncTests: XCTestCase {
         let directory = try gatewayFixtureDirectory()
         var first = Source(); first.name = "First"; first.automaticModelDiscovery = false
         var fixed = Source(); fixed.name = "Fixed"; fixed.automaticModelDiscovery = false
+        first.remote_compaction_v2 = true
         var settings = AppSettings(); settings.sources = [first, fixed]; settings.mode = "fixed"; settings.fixed_source_id = fixed.id
         let metadata = MetadataStore(directory: directory)
         try metadata.save(settings)
@@ -101,6 +102,8 @@ final class AppModelSyncTests: XCTestCase {
         XCTAssertEqual(applied["fixed_source_id"].string, fixed.id)
         XCTAssertEqual(applied["sources"].array.map { $0["id"].string }, [first.id, fixed.id])
         XCTAssertEqual(applied["sources"].array.first?["secret"]["api_key"].string, "fixture-first")
+        XCTAssertEqual(applied["sources"].array.first?["remote_compaction_v2"], .null)
+        XCTAssertEqual(try metadata.load().sources.first?.remote_compaction_v2, true)
         try await model.saveSource(fixed, apiKey: "fixture-fixed")
         XCTAssertFalse(model.isMissingCredential(fixed))
         XCTAssertEqual(try metadata.load().fixed_source_id, fixed.id)

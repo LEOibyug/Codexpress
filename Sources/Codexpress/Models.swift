@@ -55,6 +55,7 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
     var kind = "api"
     var show_in_cmux: Bool? = nil
     var is_subscription: Bool? = nil
+    var remote_compaction_v2: Bool? = nil
     var balanceWarningThreshold: Double? = nil
     var base_url = "https://api.openai.com/v1"
     var enabled = true
@@ -71,6 +72,14 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
     var isOpenAI: Bool { kind == "openai" }
     var supportsBalanceQuery: Bool { kind == "api" }
     var defaultsDiscoveredModelsDisabled: Bool { isGoogle || isOpenAI }
+    // nil means the adapter cannot use V2; it is not the same as a disabled preference.
+    var effectiveRemoteCompactionV2: Bool? {
+        switch kind {
+        case "official": remote_compaction_v2 ?? true
+        case "api", "openai": remote_compaction_v2 ?? false
+        default: nil
+        }
+    }
     var kindLabel: String {
         switch kind {
         case "official": return "官方账号"
@@ -145,6 +154,13 @@ struct Source: Codable, Identifiable, Equatable, Sendable {
         source.max_active_conversations = parsedLimit
         source.active_conversation_window_seconds = parsedWindow
         return source
+    }
+    func localGatewayPayload(secret: JSONValue) throws -> JSONValue {
+        var local = self
+        local.remote_compaction_v2 = nil
+        guard case .object(var fields) = try JSONValue.from(local) else { throw AppError.message("来源配置无效。") }
+        fields["secret"] = secret
+        return .object(fields)
     }
 }
 

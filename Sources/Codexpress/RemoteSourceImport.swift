@@ -6,6 +6,7 @@ struct RemoteSourceImport: View {
     let endpoint: String
     let current: Bool
     let hasCredentials: Bool
+    let supportsSourceCompactionV2: Bool
     let apply: (Source, Bool) throws -> Void
     @State private var selected = ""
     @State private var includeKey = false
@@ -19,6 +20,10 @@ struct RemoteSourceImport: View {
                 Text("请选择").tag(""); ForEach(sources) { Text($0.name).tag($0.id) }
             }.onChange(of: selected) { _, _ in includeKey = false; message = nil }
             Text("仅复制所选来源的设置。新来源默认停用；本机代理、官方账号身份和登录凭据均不导入。")
+            if !supportsSourceCompactionV2, let source, !source.isGoogle, source.remote_compaction_v2 != nil {
+                Text("此服务器不支持设置流式上下文压缩（V2），不会导入这一项。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if let source, !source.official {
                 Toggle("同时导入此来源的 API 密钥", isOn: $includeKey).disabled(!hasCredentials)
                 if !hasCredentials { Text("本机凭据当前不可用。可先导入设置，再手动输入远端密钥。").font(.caption) }

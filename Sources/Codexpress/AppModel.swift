@@ -750,9 +750,8 @@ import ServiceManagement
             let secret = credentialSnapshot.load(sourceID) ?? (next.sources[index].official ? .object(["access_token": .string(""), "refresh_token": .string(""), "id_token": .string(""), "expires_at": .number(0)]) : .object([:]))
             // After a crash, durable storage may be newer than the metadata mirror.
             if next.sources[index].official, let account = secret["account_id"].string, !account.isEmpty { next.sources[index].account_id = account }
-            guard case .object(var value) = try JSONValue.from(next.sources[index]) else { continue }
-            value["secret"] = next.sources[index].official && helperOwnedIDs.contains(sourceID) ? .object([:]) : secret
-            values.append(.object(value))
+            let syncedSecret = next.sources[index].official && helperOwnedIDs.contains(sourceID) ? JSONValue.object([:]) : secret
+            values.append(try next.sources[index].localGatewayPayload(secret: syncedSecret))
         }
         if next.sources != settings.sources { try persistSettings(next) }
         let enrolled = settings.weeklyResetAccountIDs
@@ -955,9 +954,7 @@ import ServiceManagement
             }
             let secret = key.isEmpty ? credentialSnapshot.load(source.id) : .object(["api_key": .string(key)])
             guard let secret, secret["api_key"].string?.isEmpty == false else { throw AppError.message("请填写 API 密钥后获取模型。") }
-            guard case .object(var value) = try JSONValue.from(source) else { throw AppError.message("来源配置无效。") }
-            value["secret"] = secret
-            payload = .object(["source": .object(value)])
+            payload = .object(["source": try source.localGatewayPayload(secret: secret)])
         }
         let result = try await client.call("models.list", payload)
         let models = result["models"].array.compactMap(\.string)

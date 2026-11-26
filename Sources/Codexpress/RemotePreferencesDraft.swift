@@ -142,7 +142,7 @@ struct RemoteConsoleConfig {
                 modelInfo = .null // Before another import, load the new independent metadata revision.
             }
             if configChanged {
-                let result = try await target.call("config.save", ["sources": .array(sources), "settings": .object(settings)])
+                let result = try await target.saveConfiguration(sources: sources, settings: settings)
                 guard result["revision"].string != nil else { throw RemoteConsoleError.invalid }
                 config = nil // Never re-use the revision that was consumed by this write.
                 sources = [] // Drop pending write-only API keys even if the subsequent refresh fails.

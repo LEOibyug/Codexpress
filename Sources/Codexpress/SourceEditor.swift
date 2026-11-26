@@ -162,6 +162,14 @@ struct SourceEditor: View {
                     } else {
                         TextField("支持模型", text: $modelsText, prompt: Text("模型 ID，以逗号分隔；留空不限"))
                     }
+                    if let remote, remote.target.supportsSourceCompactionV2, let enabled = source.effectiveRemoteCompactionV2 {
+                        Toggle("允许 OMP 使用流式上下文压缩（V2）", isOn: Binding(get: { enabled }, set: { source.remote_compaction_v2 = $0 }))
+                            .toggleStyle(.switch)
+                        if !source.official {
+                            Text("仅在确认此 API 支持 Responses 流式上下文压缩时开启。")
+                                .font(.system(size: 12)).foregroundStyle(.secondary)
+                        }
+                    }
                 }
                 conversationCapacitySection
                 if source.supportsBalanceQuery {

@@ -55,6 +55,7 @@ extension RemoteConsoleConfig {
 
     @MainActor mutating func importSource(_ local: Source, includeKey: Bool, credential: @autoclosure () -> JSONValue?) throws {
         var source = local; source.id = UUID().uuidString; source.account_id = nil
+        if source.isGoogle && source.remote_compaction_v2 == true { source.remote_compaction_v2 = nil }
         source.proxy = ProxyPolicy(mode: source.official ? "system" : "direct"); source.enabled = false
         var key = ""
         if includeKey {

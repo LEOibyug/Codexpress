@@ -179,6 +179,41 @@ final class RemoteGatewayManagementTests: XCTestCase {
         await draft.submit(page: .models); XCTAssertEqual(writes().count, 2)
     }
 
+    func testImportedCompactionOverridesRoundTripOnlyOnGatewaysThatDeclareSupport() async throws {
+        let peer = Peer(), manager = peer.manager(try directory())
+        let config = Reply(#"{"sources":[],"settings":{}}"#)
+        var official = Source.newOfficial(); official.remote_compaction_v2 = false
+        var api = Source.newOpenAI(); api.remote_compaction_v2 = true
+        for (host, supports) in [("old.example", false), ("new.example", true)] {
+            let flags = "\"pool.edit\",\"config.get\",\"config.save\"" + (supports ? ",\"source.compaction_v2\"" : "")
+            let status = Reply(Self.status.json.replacingOccurrences(of: "\"pool.edit\"", with: flags))
+            peer.replies = [status, Self.pool, Self.device, config]
+            let connected = await manager.connect(url: "https://\(host)", token: "test-token")
+            XCTAssertTrue(connected)
+            let target = RemoteConsoleTarget(manager, try XCTUnwrap(manager.snapshot)), draft = RemotePreferencesDraft()
+            await draft.load(target, page: .sources)
+            let pool = RemotePoolDraft(draft, target: target)
+            for local in [official, api] { try pool.importSource(local, includeKey: false, credential: nil) }
+            for var edited in try pool.list() {
+                if supports { XCTAssertEqual(edited.effectiveRemoteCompactionV2, !edited.official) }
+                edited.name += "（已编辑）"
+                try pool.stage(edited)
+            }
+
+            let pool2 = Reply(Self.pool.json.replacingOccurrences(of: "\"r1\"", with: "\"r2\""))
+            peer.replies = [Reply(#"{"revision":"r2"}"#), status, pool2, config]
+            await draft.submit(page: .sources)
+            let request = try XCTUnwrap(peer.requests.last { $0.url?.host == host && $0.url?.lastPathComponent == "config.save" })
+            let body = try JSONDecoder().decode(JSONValue.self, from: XCTUnwrap(request.httpBody))
+            let rows = body["payload"]["sources"].array
+            XCTAssertEqual(rows.map { $0["name"].string }, ["官方账号（已编辑）", "OpenAI API Platform（已编辑）"])
+            for (row, expected) in zip(rows, [false, true]) {
+                guard case let .object(fields) = row else { return XCTFail("来源不是 JSON 对象") }
+                XCTAssertEqual(fields["remote_compaction_v2"], supports ? .bool(expected) : nil)
+            }
+        }
+    }
+
     func testUnconfirmedCatalogWriteDoesNotRepeatConfirmedCacheChange() async throws {
         let peer = Peer(), manager = peer.manager(try directory())
         let status = Reply(Self.status.json.replacingOccurrences(of: "\"pool.edit\"", with: "\"pool.edit\",\"config.get\",\"history.configure\",\"history.status\",\"models.info\",\"models.metadata.replace\""))

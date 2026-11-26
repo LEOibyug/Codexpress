@@ -5,6 +5,18 @@ import XCTest
 final class RemoteSourceSettingsTests: XCTestCase {
     private var empty: JSONValue { .object(["sources": .array([]), "settings": .object(["mode": .string("auto"), "upstream_attempts": .number(7)])]) }
 
+    func testCompactionDefaultsFollowAdapterWithoutMakingThemExplicitInTheDraft() throws {
+        let cases: [(Source, Bool?)] = [(.newOfficial(), true), (Source(), false), (.newOpenAI(), false), (.newGoogle(), nil)]
+        for (source, expected) in cases {
+            var local = source; local.name = "来源"
+            var config = try RemoteConsoleConfig(empty)
+            try config.importSource(local, includeKey: false, credential: nil)
+            let draft = try RemoteConsoleConfig.source(XCTUnwrap(config.sources.first))
+            XCTAssertNil(draft.remote_compaction_v2, draft.kind)
+            XCTAssertEqual(draft.effectiveRemoteCompactionV2, expected, draft.kind)
+        }
+    }
+
     func testImportCopiesOnlySelectedMetadataAndNeverRequestsOfficialCredentials() throws {
         var config = try RemoteConsoleConfig(empty)
         var local = Source.newOfficial(); local.account_id = "private-account"; local.proxy.url = "http://localhost:1234"
@@ -20,12 +32,15 @@ final class RemoteSourceSettingsTests: XCTestCase {
     func testAPIKeyRequiresOptInAndOnlyKeyFieldCanCrossBoundary() throws {
         var config = try RemoteConsoleConfig(empty)
         var local = Source.newGoogle(); local.proxy = ProxyPolicy(mode: "explicit", url: "http://localhost:7890")
+        local.remote_compaction_v2 = true // A stale preference cannot enable the native Google adapter.
+        XCTAssertNil(local.effectiveRemoteCompactionV2)
         let fixture: JSONValue = .object(["api_key": .string("fixture-key"), "access_token": .string("fixture-oauth")])
         try config.importSource(local, includeKey: false, credential: fixture)
         try config.importSource(local, includeKey: true, credential: fixture)
         let rows = config.sources
         XCTAssertEqual(rows.count, 2); XCTAssertEqual(rows[0]["api_key"], .null); XCTAssertEqual(rows[1]["api_key"], .string("fixture-key")); XCTAssertEqual(rows[1]["access_token"], .null)
         XCTAssertNotEqual(rows[0]["id"], rows[1]["id"]); XCTAssertEqual(rows[1]["proxy"], .object(["mode": .string("direct")]))
+        XCTAssertEqual(rows[1]["remote_compaction_v2"], .null)
         XCTAssertEqual(config.settings["upstream_attempts"], .number(7))
     }
 

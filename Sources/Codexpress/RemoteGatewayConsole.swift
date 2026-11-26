@@ -17,6 +17,21 @@ import SwiftUI
         pool.loadID == generation && management.snapshot?.revision == pool.revision
     }
 
+    var supportsSourceCompactionV2: Bool { management.capabilities.contains("source.compaction_v2") }
+
+    func saveConfiguration(sources: [JSONValue], settings: [String: JSONValue]) async throws -> JSONValue {
+        var rows = sources
+        if !supportsSourceCompactionV2 {
+            // Older servers reject unknown keys, even null. Adapt the request, not the draft or local metadata.
+            for i in rows.indices {
+                guard case .object(var fields) = rows[i], fields["remote_compaction_v2"] != nil else { continue }
+                fields.removeValue(forKey: "remote_compaction_v2")
+                rows[i] = .object(fields)
+            }
+        }
+        return try await call("config.save", ["sources": .array(rows), "settings": .object(settings)])
+    }
+
     func call(_ name: String, _ fields: [String: JSONValue] = [:]) async throws -> JSONValue {
         guard current else { throw CancellationError() }
         let result = try await management.operation(name, payload: .object(fields), on: pool)
